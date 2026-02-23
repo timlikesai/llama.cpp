@@ -146,8 +146,6 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_V_f16(
                 const int d_in_blk = abs_dim % 32;
                 const block_mxfp4 & blk = V_mxfp4[t * stride_V + blk_idx];
 
-                const float scale = ggml_cuda_e8m0_to_fp32(blk.e) * 0.5f;
-
                 // Nibble extraction: d_in_blk is always even, so both values are in the same byte half.
                 const int half_idx = d_in_blk / 16;       // 0 = low nibbles, 1 = high nibbles
                 const int byte_base = d_in_blk - half_idx * 16;
@@ -156,9 +154,14 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_V_f16(
                 const uint8_t nib0 = (blk.qs[byte_base]     >> shift) & 0xF;
                 const uint8_t nib1 = (blk.qs[byte_base + 1] >> shift) & 0xF;
 
-                const float f0 = kvalues_mxfp4[nib0] * scale;
-                const float f1 = kvalues_mxfp4[nib1] * scale;
-                val = make_half2(f0, f1);
+                // Hardware FP4 dequantization: nibble → float via E2M1 type conversion.
+                // Intrinsic E2M1 values {0,0.5,1,1.5,2,3,4,6} = kvalues_mxfp4 * 0.5,
+                // so scale uses e8m0 directly (no * 0.5f).
+                const float scale = ggml_cuda_e8m0_to_fp32(blk.e);
+                __nv_fp4x2_e2m1 fp4_pair;
+                fp4_pair.__x = nib0 | (nib1 << 4);
+                const float2 f2 = float2(fp4_pair);
+                val = make_half2(f2.x * scale, f2.y * scale);
             }
             tile_V[t * stride_tile_V + d_h2] = val;
         }
@@ -314,29 +317,23 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
         // Layout: low 16 values in low nibbles, high 16 values in high nibbles.
 #pragma unroll
         for (int i = 0; i < vals_per_block / 4; ++i) {
-            // ggml_cuda_float_to_fp4_e2m1 returns a 4-bit FP4 index (sign in bit 3, magnitude in bits 0-2).
-            const uint8_t xi0 = ggml_cuda_float_to_fp4_e2m1(vals[0               + 2 * i + 0], inv_d);
-            const uint8_t xi1 = ggml_cuda_float_to_fp4_e2m1(vals[0               + 2 * i + 1], inv_d);
-            const uint8_t xi2 = ggml_cuda_float_to_fp4_e2m1(vals[vals_per_block/2 + 2 * i + 0], inv_d);
-            const uint8_t xi3 = ggml_cuda_float_to_fp4_e2m1(vals[vals_per_block/2 + 2 * i + 1], inv_d);
-
-            // Byte layout: (low_nibble | high_nibble << 4)
-            const uint8_t byte0 = xi0 | (xi2 << 4);
-            const uint8_t byte1 = xi1 | (xi3 << 4);
-
-            // Pack two bytes into the appropriate position within the int.
-            // Each int = 4 bytes = 8 nibbles.
             const int int_idx = block_idx * (vals_per_block / 8) + i / 2;
 
-            // We need to use atomicOr since multiple threads may write to different bytes of the same int.
-            // Actually, each block maps to exactly vals_per_block/8 = 4 ints, and one thread processes the whole block.
-            // So no atomics needed for qs - direct write.
+            // Hardware FP4 conversion: 4 floats → 4 packed nibbles in one operation.
+            // __nv_fp4x4_e2m1 layout: float4(a,b,c,d) → char2(.x = b<<4|a, .y = d<<4|c).
+            // We need byte0 = low_half|high_half<<4, so order: low0, high0, low1, high1.
+            __nv_fp4x4_e2m1 fp4_packed(make_float4(
+                vals[0               + 2 * i + 0] * inv_d,
+                vals[vals_per_block/2 + 2 * i + 0] * inv_d,
+                vals[0               + 2 * i + 1] * inv_d,
+                vals[vals_per_block/2 + 2 * i + 1] * inv_d
+            ));
+            const char2 packed = *reinterpret_cast<const char2 *>(&fp4_packed);
+
             if (i % 2 == 0) {
-                // First two bytes of the int.
-                tile_Q_qs[jc * stride_q_qs + int_idx] = (int)byte0 | ((int)byte1 << 8);
+                tile_Q_qs[jc * stride_q_qs + int_idx] = (int)(unsigned char)packed.x | ((int)(unsigned char)packed.y << 8);
             } else {
-                // Last two bytes of the int.
-                tile_Q_qs[jc * stride_q_qs + int_idx] |= ((int)byte0 << 16) | ((int)byte1 << 24);
+                tile_Q_qs[jc * stride_q_qs + int_idx] |= ((int)(unsigned char)packed.x << 16) | ((int)(unsigned char)packed.y << 24);
             }
         }
 
@@ -357,7 +354,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
 // ------------------------------------------------------------------------------------------------------------------
 
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
-    bool use_logit_softcap, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check>
+    bool use_logit_softcap, bool needs_fixup, bool is_fixup, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
         const float2         * const __restrict__ Q_f2,
         const block_mxfp4    * const __restrict__ K_mxfp4,
@@ -561,6 +558,10 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
     }
 
     // VKQ with F16 MMA: V from shared memory (half2), softmax from registers (B_VKQ).
+    // All configs intentionally set nbatch_V2 = DV/2 so this loop executes exactly once.
+    // Unlike F16 which interleaves V loads across multiple iterations, MXFP4 does a single-pass
+    // dequantize-and-compute. Multi-iteration interleaving was tested and hurt performance due to
+    // the extra __syncthreads and shared memory pressure from partial V tiles.
     constexpr int stride_tile_V = nbatch_V2 + 4;  // half2 stride
 
 #pragma unroll
@@ -701,19 +702,17 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
     if constexpr (ncols2 == 1) {
         constexpr bool oob_check = true;
         for (; kb0 < kb0_stop - 1; ++kb0) {
-            constexpr bool last_iter_v = false;
-            constexpr int  k_VKQ_sup_v = nbatch_fa;
+            constexpr int k_VKQ_sup_v = nbatch_fa;
             flash_attn_ext_mxfp4_iter
-                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, last_iter_v, oob_check>
+                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check>
                 (Q_f2, K_mxfp4, V_mxfp4, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask,
                  tile_Q_qs, tile_Q_sc, tile_K_qs, tile_K_sc, tile_V, tile_mask,
                  VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v);
         }
-        constexpr bool last_iter_v = true;
-        const     int  k_VKQ_sup_v = ne11 - kb0 * nbatch_fa;
+        const int k_VKQ_sup_v = ne11 - kb0 * nbatch_fa;
         flash_attn_ext_mxfp4_iter
-            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, last_iter_v, oob_check>
+            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check>
             (Q_f2, K_mxfp4, V_mxfp4, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask,
              tile_Q_qs, tile_Q_sc, tile_K_qs, tile_K_sc, tile_V, tile_mask,
@@ -721,19 +720,17 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
     } else {
         constexpr bool oob_check = false;
         for (; kb0 < kb0_stop - 1; ++kb0) {
-            constexpr bool last_iter_v = false;
-            constexpr int  k_VKQ_sup_v = nbatch_fa;
+            constexpr int k_VKQ_sup_v = nbatch_fa;
             flash_attn_ext_mxfp4_iter
-                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, last_iter_v, oob_check>
+                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check>
                 (Q_f2, K_mxfp4, V_mxfp4, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask,
                  tile_Q_qs, tile_Q_sc, tile_K_qs, tile_K_sc, tile_V, tile_mask,
                  VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v);
         }
-        constexpr bool last_iter_v = true;
-        constexpr int  k_VKQ_sup_v = nbatch_fa;
+        constexpr int k_VKQ_sup_v = nbatch_fa;
         flash_attn_ext_mxfp4_iter
-            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, last_iter_v, oob_check>
+            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check>
             (Q_f2, K_mxfp4, V_mxfp4, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask,
              tile_Q_qs, tile_Q_sc, tile_K_qs, tile_K_sc, tile_V, tile_mask,

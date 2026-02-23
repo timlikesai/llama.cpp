@@ -1061,35 +1061,6 @@ namespace ggml_cuda_mma {
 #endif  // BLACKWELL_MMA_AVAILABLE
     }
 
-    // FP8 E4M3 block-scaled MMA: m16n8k32 with E8M0 block scales.
-    // Processes 32 FP8 elements per instruction (2x throughput vs F16 m16n8k16).
-    static __device__ __forceinline__ void mma_block_scaled_mxf8f6f4(
-            tile<16, 8, float> &     D,
-            const tile<16, 8, int> & A,   // 4 int regs (16 rows x 32 FP8 bytes = 512 bytes / 32 threads)
-            const tile<8, 8, int> &  B,   // 2 int regs (32 x 8 FP8 bytes = 256 bytes / 32 threads)
-            uint32_t                 a_scale,  // E8M0, 1 byte in low bits
-            uint32_t                 b_scale)  // E8M0, 1 byte in low bits
-    {
-#ifdef BLACKWELL_MMA_AVAILABLE
-        const int * Axi = (const int *) A.x;
-        const int * Bxi = (const int *) B.x;
-        float     * Dxi = (float     *) D.x;
-
-        asm volatile(
-            "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col"
-            ".f32.e4m3.e4m3.f32.ue8m0 "
-            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
-            "{%10}, {%11, %12}, {%13}, {%14, %15};"
-            : "+f"(Dxi[0]), "+f"(Dxi[1]), "+f"(Dxi[2]), "+f"(Dxi[3])
-            : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]),
-              "r"(Bxi[0]), "r"(Bxi[1]),
-              "r"(a_scale), "h"((uint16_t)0), "h"((uint16_t)0),
-              "r"(b_scale), "h"((uint16_t)0), "h"((uint16_t)0));
-#else
-        GGML_UNUSED_VARS(D, A, B, a_scale, b_scale);
-#endif  // BLACKWELL_MMA_AVAILABLE
-    }
-
     static __device__ __forceinline__ void mma(
             tile<16, 8, float> & D, const tile<16, 8, half2> & A, const tile<8, 8, half2> & B) {
 #ifdef TURING_MMA_AVAILABLE
