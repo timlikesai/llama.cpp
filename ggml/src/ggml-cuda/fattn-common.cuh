@@ -608,6 +608,88 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4(
     return sum;
 }
 
+// SoA version of MXFP4 K dot product for VEC kernel.
+// Takes row base pointer + per-head qs/e offsets instead of block_mxfp4 *.
+// Enables DIRECT INT LOADS from aligned SoA qs region (4x fewer load instructions).
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4_soa(
+        const char * __restrict__ K_row, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+        const int qs_head_off, const int e_head_off) {
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int ib    = k_KQ / (2*QI_MXFP4);
+        const int iqs4  = k_KQ % QI_MXFP4;
+        const int shift = (k_KQ / QI_MXFP4) & 1;
+
+        // DIRECT INT LOAD from SoA qs region (aligned!).
+        const int v = *reinterpret_cast<const int *>(K_row + qs_head_off + ib * 16 + sizeof(int) * iqs4);
+
+        const int2 lut = get_int_from_table_16(v, kvalues_mxfp4);
+        const int v_lut = shift ? lut.y : lut.x;
+
+        const int u = Q_q8[k_KQ_0/nthreads];
+        const int sumi = ggml_cuda_dp4a(v_lut, u, 0);
+
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        sum += ggml_cuda_e8m0_to_fp32(*reinterpret_cast<const uint8_t *>(K_row + e_head_off + ib)) * 0.5f * (sumi*Q_ds.x);
+    }
+
+    return sum;
+}
+
+// SoA version of MXFP4 V dequantization for VEC kernel.
+// Takes row base pointer + per-head qs/e offsets instead of block_mxfp4 *.
+// Enables direct aligned loads from contiguous SoA qs region.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_mxfp4_soa(
+        const char * __restrict__ V_row, void * __restrict__ dst, const int64_t i0,
+        const int qs_head_off, const int e_head_off) {
+
+    const int64_t ib    =  i0          /  QK_MXFP4;
+    const int     iqs   =  i0          % (QK_MXFP4/2);
+    const int     shift = (i0 % QK_MXFP4) / (QK_MXFP4/2);
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+
+    // SoA: qs region starts at offset 0, contiguous. i0 is always a multiple of ne,
+    // so iqs is a multiple of ne → aligned for direct loads.
+    uint8_t qs[ne];
+    if constexpr (ne == 4) {
+        *reinterpret_cast<int *>(qs) = *reinterpret_cast<const int *>(V_row + qs_head_off + ib * 16 + iqs);
+    } else {
+        *reinterpret_cast<uint16_t *>(qs) = *reinterpret_cast<const uint16_t *>(V_row + qs_head_off + ib * 16 + iqs);
+    }
+
+    const float d = ggml_cuda_e8m0_to_fp32(*reinterpret_cast<const uint8_t *>(V_row + e_head_off + ib)) * 0.5f;
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 dh = __float2half2_rn(d);
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            const int q0 = shift ? (qs[l0 + 0] >> 4) : (qs[l0 + 0] & 0xF);
+            const int q1 = shift ? (qs[l0 + 1] >> 4) : (qs[l0 + 1] & 0xF);
+            ((half2 *) dst)[l0/2] = dh * make_half2(kvalues_mxfp4[q0], kvalues_mxfp4[q1]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            const int q = shift ? (qs[l] >> 4) : (qs[l] & 0xF);
+            ((float *) dst)[l] = d * kvalues_mxfp4[q];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {

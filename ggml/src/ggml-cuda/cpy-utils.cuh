@@ -233,6 +233,36 @@ static __device__ void quantize_f32_mxfp4_block(const float * __restrict__ x, bl
     }
 }
 
+// SoA version: writes qs to row_base + block_idx*16, e to row_base + blocks_per_row*16 + block_idx.
+// Same quantization math as quantize_f32_mxfp4_block, different write layout.
+// Per-row SoA: all qs bytes contiguous at offset 0, all e bytes contiguous after qs.
+static __device__ void quantize_f32_mxfp4_block_soa(
+        const float * __restrict__ x,
+        char * __restrict__ row_base,
+        const int block_idx,
+        const int blocks_per_row) {
+    float amax = 0.0f;
+
+    for (int j = 0; j < QK_MXFP4; ++j) {
+        amax = fmaxf(amax, fabsf(x[j]));
+    }
+
+    const int e = (amax == 0.0f) ? 0 : __float2int_rn(log2f(amax)) - 2 + 127;
+    const uint8_t e_val = (uint8_t) max(0, min(255, e));
+    const float inv_d = (amax == 0.0f) ? 0.0f : 1.0f / ggml_cuda_e8m0_to_fp32(e_val);
+
+    // Write qs to SoA qs region (contiguous, starts at offset 0).
+    uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * 16);
+    for (int j = 0; j < QK_MXFP4/2; ++j) {
+        const uint8_t xi0 = ggml_cuda_float_to_fp4_e2m1(x[0          + j], inv_d);
+        const uint8_t xi1 = ggml_cuda_float_to_fp4_e2m1(x[QK_MXFP4/2 + j], inv_d);
+        qs_dst[j] = xi0 | (xi1 << 4);
+    }
+
+    // Write e to SoA e region (after all qs bytes in the row).
+    *(row_base + blocks_per_row * 16 + block_idx) = e_val;
+}
+
 static __device__ void cpy_blck_f32_mxfp4(const char * cxi, char * cdsti) {
     quantize_f32_mxfp4_block((const float *)cxi, (block_mxfp4 *)cdsti);
 }
