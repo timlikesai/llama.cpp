@@ -118,7 +118,10 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
 }
 
 // Single-pass V loader: Dequantize MXFP4 → F16 (half2) in shared memory.
-// Each warp handles a batch of tokens, each thread handles 2 V dims (→ 1 half2).
+// Each warp handles a batch of tokens. Each thread processes one byte-pair from qs,
+// extracting both low and high nibble pairs to produce 2 half2 values per byte-pair.
+// This halves the global memory byte loads vs per-half2 extraction (each qs byte is
+// loaded once instead of twice for low/high nibble halves).
 // Layout matches F16 kernel: tile_V[token * stride_tile_V + dim_h2].
 template<int nwarps, int nbatch_fa, int stride_tile_V, int nbatch_V2, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_V_f16(
@@ -127,6 +130,9 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_V_f16(
         const int stride_V,
         const int i0_start,
         const int k_VKQ_sup) {
+    // Number of byte-pairs to process: each byte-pair yields 2 half2 values (low + high nibbles).
+    constexpr int nbyte_pairs = nbatch_V2 / 2;
+
 #pragma unroll
     for (int t0 = 0; t0 < nbatch_fa; t0 += nwarps) {
         const int t = t0 + threadIdx.y;
@@ -135,39 +141,46 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_V_f16(
         }
 
 #pragma unroll
-        for (int d0 = 0; d0 < nbatch_V2; d0 += WARP_SIZE) {
-            const int d_h2 = d0 + threadIdx.x;  // half2 index
-            if (d0 + WARP_SIZE > nbatch_V2 && d_h2 >= nbatch_V2) {
+        for (int bp0 = 0; bp0 < nbyte_pairs; bp0 += WARP_SIZE) {
+            const int bp = bp0 + threadIdx.x;
+            if (bp0 + WARP_SIZE > nbyte_pairs && bp >= nbyte_pairs) {
                 break;
             }
 
-            half2 val;
+            const int blk_idx   = bp / 8;     // MXFP4 block index within this batch.
+            const int bp_in_blk = bp % 8;     // Byte-pair index within block (0..7).
+
+            // Output half2 indices: low nibble pair and high nibble pair (8 apart).
+            const int d_h2_lo = i0_start / 2 + blk_idx * 16 + bp_in_blk;
+            const int d_h2_hi = d_h2_lo + 8;
+
+            half2 val_lo, val_hi;
             if (oob_check && t >= k_VKQ_sup) {
-                val = make_half2(0.0f, 0.0f);
+                val_lo = make_half2(0.0f, 0.0f);
+                val_hi = make_half2(0.0f, 0.0f);
             } else {
-                const int abs_dim = i0_start + 2 * d_h2;  // Absolute V dimension (2 per half2).
-                const int blk_idx = abs_dim / 32;
-                const int d_in_blk = abs_dim % 32;
-                const block_mxfp4 & blk = V_mxfp4[t * stride_V + blk_idx];
+                const block_mxfp4 & blk = V_mxfp4[t * stride_V + i0_start / 32 + blk_idx];
 
-                // Nibble extraction: d_in_blk is always even, so both values are in the same byte half.
-                const int half_idx = d_in_blk / 16;       // 0 = low nibbles, 1 = high nibbles
-                const int byte_base = d_in_blk - half_idx * 16;
-                const int shift = half_idx * 4;
+                // Load 2 adjacent qs bytes once (byte-by-byte due to odd alignment).
+                const uint8_t b0 = blk.qs[2 * bp_in_blk];
+                const uint8_t b1 = blk.qs[2 * bp_in_blk + 1];
 
-                const uint8_t nib0 = (blk.qs[byte_base]     >> shift) & 0xF;
-                const uint8_t nib1 = (blk.qs[byte_base + 1] >> shift) & 0xF;
-
-                // Hardware FP4 dequantization: nibble → float via E2M1 type conversion.
-                // Intrinsic E2M1 values {0,0.5,1,1.5,2,3,4,6} = kvalues_mxfp4 * 0.5,
-                // so scale uses e8m0 directly (no * 0.5f).
-                // E8M0 scales are power-of-two → F16 multiply is exact (just exponent add).
+                // E8M0 scale: same for both low and high halves within the block.
+                // Power-of-two → F16 multiply is exact (just exponent add).
                 const half2 scale_h2 = __float2half2_rn(ggml_cuda_e8m0_to_fp32(blk.e));
-                __nv_fp4x2_e2m1 fp4_pair;
-                fp4_pair.__x = nib0 | (nib1 << 4);
-                val = __hmul2(__float22half2_rn(float2(fp4_pair)), scale_h2);
+
+                // Low nibbles (dims 0..15 within the block).
+                __nv_fp4x2_e2m1 fp4_lo;
+                fp4_lo.__x = (b0 & 0x0F) | ((b1 & 0x0F) << 4);
+                val_lo = __hmul2(__float22half2_rn(float2(fp4_lo)), scale_h2);
+
+                // High nibbles (dims 16..31 within the block).
+                __nv_fp4x2_e2m1 fp4_hi;
+                fp4_hi.__x = (b0 >> 4) | (b1 & 0xF0);
+                val_hi = __hmul2(__float22half2_rn(float2(fp4_hi)), scale_h2);
             }
-            tile_V[t * stride_tile_V + d_h2] = val;
+            tile_V[t * stride_tile_V + d_h2_lo] = val_lo;
+            tile_V[t * stride_tile_V + d_h2_hi] = val_hi;
         }
     }
 }
