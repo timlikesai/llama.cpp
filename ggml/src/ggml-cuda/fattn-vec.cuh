@@ -98,8 +98,35 @@ static __global__ void flash_attn_ext_vec(
     const int head = blockIdx.z - sequence*ne02;
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
     Q += nb03*sequence + nb02* head              + nb01*ic0;
-    K += nb13*sequence + nb12*(head / gqa_ratio);
-    V += nb23*sequence + nb22*(head / gqa_ratio);
+    if constexpr (type_K == GGML_TYPE_MXFP4) {
+        K += nb13*sequence;  // SoA: row base only, head offset computed separately.
+    } else {
+        K += nb13*sequence + nb12*(head / gqa_ratio);
+    }
+    if constexpr (type_V == GGML_TYPE_MXFP4) {
+        V += nb23*sequence;  // SoA: row base only, head offset computed separately.
+    } else {
+        V += nb23*sequence + nb22*(head / gqa_ratio);
+    }
+
+    // SoA head offsets for MXFP4: qs and e regions within each KV cache row.
+    // These are unused (and optimized away) for non-MXFP4 types.
+    int K_qs_head_off = 0, K_e_head_off = 0;
+    int V_qs_head_off = 0, V_e_head_off = 0;
+    if constexpr (type_K == GGML_TYPE_MXFP4) {
+        constexpr int blocks_per_head_K = D / QK_MXFP4;
+        const int stride_K_blocks = nb11 / sizeof(block_mxfp4);
+        const int z_KV = head / gqa_ratio;
+        K_qs_head_off = z_KV * blocks_per_head_K * 16;
+        K_e_head_off  = stride_K_blocks * 16 + z_KV * blocks_per_head_K;
+    }
+    if constexpr (type_V == GGML_TYPE_MXFP4) {
+        constexpr int blocks_per_head_V = D / QK_MXFP4;
+        const int stride_V_blocks = nb21 / sizeof(block_mxfp4);
+        const int z_KV = head / gqa_ratio;
+        V_qs_head_off = z_KV * blocks_per_head_V * 16;
+        V_e_head_off  = stride_V_blocks * 16 + z_KV * blocks_per_head_V;
+    }
 
     const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
 
@@ -259,7 +286,13 @@ static __global__ void flash_attn_ext_vec(
 
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                float sum;
+                if constexpr (type_K == GGML_TYPE_MXFP4) {
+                    sum = vec_dot_fattn_vec_KQ_mxfp4_soa<D, nthreads_KQ>(
+                        K + i_KQ*nb11, Q_i32[j], Q_ds[j], K_qs_head_off, K_e_head_off);
+                } else {
+                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                }
                 sum = warp_reduce_sum<nthreads_KQ>(sum);
 
                 if (use_logit_softcap) {
@@ -323,8 +356,12 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 half2 tmp[V_rows_per_thread/2];
-                dequantize_V(V + k*nb21, tmp,
-                    2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                const int64_t v_i0 = 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread;
+                if constexpr (type_V == GGML_TYPE_MXFP4) {
+                    dequantize_V_mxfp4_soa<half, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
+                } else {
+                    dequantize_V(V + k*nb21, tmp, v_i0);
+                }
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
 #pragma unroll
@@ -342,8 +379,12 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 float2 tmp[V_rows_per_thread/2];
-                dequantize_V(V + k*nb21, tmp,
-                    2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                const int64_t v_i0 = 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread;
+                if constexpr (type_V == GGML_TYPE_MXFP4) {
+                    dequantize_V_mxfp4_soa<float, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
+                } else {
+                    dequantize_V(V + k*nb21, tmp, v_i0);
+                }
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
 #pragma unroll
