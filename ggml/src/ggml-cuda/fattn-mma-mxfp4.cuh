@@ -251,6 +251,8 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
     constexpr int blocks_per_col = DKQ / vals_per_block;
 
     // Each thread processes one block of 32 values within a Q column.
+    // Threads stay warp-synchronized (no early break) so we can use __shfl_xor_sync
+    // to exchange E8M0 scales between even/odd block partners, eliminating atomicOr.
     constexpr int threads_total = nwarps * WARP_SIZE;
     constexpr int total_blocks = ncols * blocks_per_col;
 
@@ -258,9 +260,8 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
     for (int b0 = 0; b0 < total_blocks; b0 += threads_total) {
         const int b = b0 + threadIdx.y * WARP_SIZE + threadIdx.x;
 
-        if (b0 + threads_total > total_blocks && b >= total_blocks) {
-            break;
-        }
+        // Use active flag instead of break to keep all warp threads in sync for shuffle.
+        const bool active = (b0 + threads_total <= total_blocks || b < total_blocks);
 
         const int jc = b / blocks_per_col;       // Column index (0..ncols-1).
         const int block_idx = b % blocks_per_col; // Block index within column.
@@ -268,8 +269,9 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
         const int j = jc / ncols2;
         const int c = jc % ncols2;
 
-        // Check bounds.
-        bool valid = (ncols1 == 1 || jt * ncols1 + j < int(ne01.z)) &&
+        // Check bounds. Inactive threads (b >= total_blocks) also get valid=false.
+        bool valid = active &&
+                     (ncols1 == 1 || jt * ncols1 + j < int(ne01.z)) &&
                      (ncols2 == 1 || zt_gqa * ncols2 + c < gqa_ratio);
 
         // Load 32 float values for this block from Q.
@@ -315,36 +317,41 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
 
         // Pack 32 values into 16 bytes (8 ints) of nibble data.
         // Layout: low 16 values in low nibbles, high 16 values in high nibbles.
+        if (active) {
 #pragma unroll
-        for (int i = 0; i < vals_per_block / 4; ++i) {
-            const int int_idx = block_idx * (vals_per_block / 8) + i / 2;
+            for (int i = 0; i < vals_per_block / 4; ++i) {
+                const int int_idx = block_idx * (vals_per_block / 8) + i / 2;
 
-            // Hardware FP4 conversion: 4 floats → 4 packed nibbles in one operation.
-            // __nv_fp4x4_e2m1 layout: float4(a,b,c,d) → char2(.x = b<<4|a, .y = d<<4|c).
-            // We need byte0 = low_half|high_half<<4, so order: low0, high0, low1, high1.
-            __nv_fp4x4_e2m1 fp4_packed(make_float4(
-                vals[0               + 2 * i + 0] * inv_d,
-                vals[vals_per_block/2 + 2 * i + 0] * inv_d,
-                vals[0               + 2 * i + 1] * inv_d,
-                vals[vals_per_block/2 + 2 * i + 1] * inv_d
-            ));
-            const char2 packed = *reinterpret_cast<const char2 *>(&fp4_packed);
+                // Hardware FP4 conversion: 4 floats → 4 packed nibbles in one operation.
+                // __nv_fp4x4_e2m1 layout: float4(a,b,c,d) → char2(.x = b<<4|a, .y = d<<4|c).
+                // We need byte0 = low_half|high_half<<4, so order: low0, high0, low1, high1.
+                __nv_fp4x4_e2m1 fp4_packed(make_float4(
+                    vals[0               + 2 * i + 0] * inv_d,
+                    vals[vals_per_block/2 + 2 * i + 0] * inv_d,
+                    vals[0               + 2 * i + 1] * inv_d,
+                    vals[vals_per_block/2 + 2 * i + 1] * inv_d
+                ));
+                const char2 packed = *reinterpret_cast<const char2 *>(&fp4_packed);
 
-            if (i % 2 == 0) {
-                tile_Q_qs[jc * stride_q_qs + int_idx] = (int)(unsigned char)packed.x | ((int)(unsigned char)packed.y << 8);
-            } else {
-                tile_Q_qs[jc * stride_q_qs + int_idx] |= ((int)(unsigned char)packed.x << 16) | ((int)(unsigned char)packed.y << 24);
+                if (i % 2 == 0) {
+                    tile_Q_qs[jc * stride_q_qs + int_idx] = (int)(unsigned char)packed.x | ((int)(unsigned char)packed.y << 8);
+                } else {
+                    tile_Q_qs[jc * stride_q_qs + int_idx] |= ((int)(unsigned char)packed.x << 16) | ((int)(unsigned char)packed.y << 24);
+                }
             }
         }
 
-        // Store scale. Scales are packed pairs: even blocks in low byte, odd blocks in high byte.
-        const int scale_pair_idx = block_idx / 2;
-        if (block_idx % 2 == 0) {
-            // Even block: write low byte, clear high byte (will be OR'd by odd block).
-            atomicOr(&tile_Q_sc[jc * stride_q_sc + scale_pair_idx], (uint32_t)e);
-        } else {
-            // Odd block: write high byte.
-            atomicOr(&tile_Q_sc[jc * stride_q_sc + scale_pair_idx], (uint32_t)e << 8);
+        // Exchange scales between even/odd block partners via warp shuffle.
+        // XOR-1 pairs adjacent lanes: lane 0↔1, 2↔3, etc.
+        // blocks_per_col is always even (DKQ ∈ {64,128,256} / 32), so adjacent lanes
+        // always process even/odd blocks within the same column.
+        const uint8_t e_partner = __shfl_xor_sync(0xFFFFFFFF, e, 1);
+
+        // Even block writes both scales as a single uint32 (no atomicOr needed).
+        // Upper 2 bytes are zero since e and e_partner are uint8_t.
+        if (active && block_idx % 2 == 0) {
+            const int scale_pair_idx = block_idx / 2;
+            tile_Q_sc[jc * stride_q_sc + scale_pair_idx] = (uint32_t)e | ((uint32_t)e_partner << 8);
         }
     }
 }
@@ -679,16 +686,6 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
     float KQ_max[2];
     KQ_max[0] = -FLT_MAX / 2.0f;
     KQ_max[1] = -FLT_MAX / 2.0f;
-
-    // Zero Q scale region (needed for atomicOr).
-    {
-        const int total_sc = ncols * stride_q_sc;
-        for (int i = threadIdx.y * WARP_SIZE + threadIdx.x; i < total_sc; i += nwarps * WARP_SIZE) {
-            tile_Q_sc[i] = 0;
-        }
-    }
-
-    __syncthreads();
 
     // Quantize Q: F32 → MXFP4 in shared memory.
     flash_attn_ext_mxfp4_quantize_Q<DKQ, ncols, nwarps, stride_q_qs, stride_q_sc>
