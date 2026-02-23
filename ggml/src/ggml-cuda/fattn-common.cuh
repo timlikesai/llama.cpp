@@ -543,7 +543,7 @@ static __device__ __forceinline__ void dequantize_V_mxfp4(const void * __restric
 
     static_assert(ne == 2 || ne == 4, "bad ne");
     uint8_t qs[ne];
-    // alignment=1: block_mxfp4.qs is at byte offset 1 (after 1-byte e field), so pointers are often odd-aligned.
+    // alignment=1: block_mxfp4.qs is at byte offset 1 → odd-aligned, Blackwell enforces strict alignment.
     ggml_cuda_memcpy_1<ne, 1>(qs, x[ib].qs + iqs);
 
     const float d = ggml_cuda_e8m0_to_fp32(x[ib].e) * 0.5f;
@@ -590,7 +590,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4(
         const int shift = (k_KQ / QI_MXFP4) & 1;      // 0=low nibbles, 1=high nibbles
 
         int v;
-        // alignment=1: block_mxfp4.qs is at byte offset 1 (after 1-byte e field), so pointers are often odd-aligned.
+        // alignment=1: block_mxfp4.qs is at byte offset 1 → odd-aligned, Blackwell enforces strict alignment.
         ggml_cuda_memcpy_1<sizeof(int), 1>(&v, K_mxfp4[ib].qs + sizeof(int)*iqs4);
 
         // Use get_int_from_table_16 for efficient LUT lookup of all 8 nibbles,
