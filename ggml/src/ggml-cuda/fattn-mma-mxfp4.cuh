@@ -415,6 +415,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
         uint32_t * const __restrict__ tile_K_sc_next,
         half2    * const __restrict__ tile_V,
         half     * const __restrict__ tile_mask,
+        half     * const __restrict__ tile_mask_next,
         tile<16, 8, float>   * const __restrict__ VKQ_C,
         float                * const __restrict__ KQ_max,
         float                * const __restrict__ KQ_rowsum,
@@ -475,7 +476,23 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
         }
     }
 
-    // ---- Phase 2: Softmax + VKQ rescale (pure register work) ----
+    // ---- Phase 2a: Preload K[i+1] + mask[i+1] into alternate buffers (not on last iteration) ----
+    // Safe before softmax: K_next and mask_next are DIFFERENT buffers from K_curr and mask_curr.
+    // No shared memory conflict with KQ MMA (reads K_curr) or softmax (reads mask_curr).
+
+    if (!last_iter) {
+        const int k_VKQ_next = (kb0 + 1) * nbatch_fa;
+
+        flash_attn_ext_mxfp4_load_K<DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check>
+            (K_mxfp4 + int64_t(k_VKQ_next) * stride_K, tile_K_qs_next, tile_K_sc_next, stride_K, k_VKQ_sup_next);
+
+        if (ncols2 > 1 || mask_h) {
+            flash_attn_ext_mxfp4_load_mask<ncols1, nwarps, nbatch_fa, oob_check>
+                (mask_h + k_VKQ_next, tile_mask_next, stride_mask, k_VKQ_sup_next, jt * ncols1, ne01);
+        }
+    }
+
+    // ---- Phase 2b: Softmax + VKQ rescale (reads mask_curr, pure register work) ----
 
     if (use_logit_softcap) {
 #pragma unroll
@@ -568,10 +585,10 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
         B_VKQ[k] = get_transposed(get_half2(KQ_C[k]));
     }
 
-    // ---- sync_A: all warps done reading tile_K_qs (current) and tile_mask ----
+    // ---- sync_A: ensures all warps past previous iter's VKQ MMA before V is overwritten ----
     __syncthreads();
 
-    // ---- Phase 3: Load V[i] + K[i+1] + mask[i+1] (overlapped global→shared) ----
+    // ---- Phase 3: Load V[i] only (K_next + mask_next already loaded in Phase 2a) ----
 
     constexpr int stride_tile_V = nbatch_V2 + 4;
 
@@ -581,20 +598,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
         (V_mxfp4 + int64_t(k_VKQ_0) * stride_V, tile_V, stride_V,
          0, k_VKQ_sup);
 
-    // Preload K[i+1] and mask[i+1] into the next K buffer (not on last iteration).
-    if (!last_iter) {
-        const int k_VKQ_next = (kb0 + 1) * nbatch_fa;
-
-        flash_attn_ext_mxfp4_load_K<DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check>
-            (K_mxfp4 + int64_t(k_VKQ_next) * stride_K, tile_K_qs_next, tile_K_sc_next, stride_K, k_VKQ_sup_next);
-
-        if (ncols2 > 1 || mask_h) {
-            flash_attn_ext_mxfp4_load_mask<ncols1, nwarps, nbatch_fa, oob_check>
-                (mask_h + k_VKQ_next, tile_mask, stride_mask, k_VKQ_sup_next, jt * ncols1, ne01);
-        }
-    }
-
-    // ---- sync_B: V, K_next, mask_next all ready ----
+    // ---- sync_B: V ready ----
     __syncthreads();
 
     // ---- Phase 4: VKQ MMA (reads tile_V) ----
@@ -619,7 +623,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
     GGML_UNUSED_VARS(Q_f2, K_mxfp4, V_mxfp4, mask_h, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02,
         stride_K, stride_V, stride_mask,
-        tile_Q_qs, tile_Q_sc, tile_K_qs, tile_K_sc, tile_K_qs_next, tile_K_sc_next, tile_V, tile_mask,
+        tile_Q_qs, tile_Q_sc, tile_K_qs, tile_K_sc, tile_K_qs_next, tile_K_sc_next, tile_V, tile_mask, tile_mask_next,
         VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, last_iter, k_VKQ_sup_next);
     NO_DEVICE_CODE;
 #endif // BLACKWELL_MMA_AVAILABLE
@@ -690,15 +694,18 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
     int      * tile_Q_qs = (int      *) smem_mxfp4;
     uint32_t * tile_Q_sc = (uint32_t *)(tile_Q_qs + ncols * stride_q_qs);
 
-    // KV region: K_qs_A + K_sc_A + K_qs_B + K_sc_B + V_f16 + mask (reloaded each iteration).
+    // KV region: K_qs_A + K_sc_A + K_qs_B + K_sc_B + V_f16 + mask_A + mask_B (reloaded each iteration).
     int      * tile_K_qs_A = (int      *)(tile_Q_sc + ncols * stride_q_sc);
     uint32_t * tile_K_sc_A = (uint32_t *)(tile_K_qs_A + nbatch_fa * stride_k_qs);
     int      * tile_K_qs_B = (int      *)(tile_K_sc_A + nbatch_fa * stride_k_sc);
     uint32_t * tile_K_sc_B = (uint32_t *)(tile_K_qs_B + nbatch_fa * stride_k_qs);
     // V F16 data comes after K_B region.
-    half2    * tile_V    = (half2 *)(tile_K_sc_B + nbatch_fa * stride_k_sc);
+    half2    * tile_V      = (half2 *)(tile_K_sc_B + nbatch_fa * stride_k_sc);
     constexpr int nbytes_V = nbatch_fa * stride_tile_V * (int)sizeof(half2);
-    half     * tile_mask = (half *)((char *)tile_V + nbytes_V);
+    // Double-buffered mask: allows K_next + mask_next loads to overlap with softmax reading mask_curr.
+    constexpr int nbytes_mask = ncols1 * (nbatch_fa + 8) * (int)sizeof(half);
+    half     * tile_mask_A = (half *)((char *)tile_V + nbytes_V);
+    half     * tile_mask_B = (half *)((char *)tile_mask_A + nbytes_mask);
 
     // VKQ accumulators in registers.
     T_C_VKQ VKQ_C[DV / T_C_VKQ::I];
@@ -714,17 +721,19 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
 
     __syncthreads();
 
-    // Main iteration loop over K/V tiles with K double buffering.
-    // K[0] is preloaded into buffer A before the loop. Each iteration's iter function
-    // loads K[i+1] into the "next" buffer while computing with the "current" buffer.
-    // After each iteration, the buffers are swapped.
+    // Main iteration loop over K/V tiles with K and mask double buffering.
+    // K[0] and mask[0] are preloaded into buffer A before the loop. Each iteration's
+    // iter function loads K[i+1] and mask[i+1] into the "next" buffers (overlapped with
+    // softmax reading "current" buffers). After each iteration, the buffers are swapped.
     int kb0 = kb0_start;
 
-    // Alternating K buffer pointers.
+    // Alternating K and mask buffer pointers.
     int      * tile_K_qs_curr = tile_K_qs_A;
     uint32_t * tile_K_sc_curr = tile_K_sc_A;
     int      * tile_K_qs_next = tile_K_qs_B;
     uint32_t * tile_K_sc_next = tile_K_sc_B;
+    half     * tile_mask_curr = tile_mask_A;
+    half     * tile_mask_next = tile_mask_B;
 
     if constexpr (ncols2 == 1) {
         constexpr bool oob_check = true;
@@ -736,7 +745,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
 
             if (mask_h) {
                 flash_attn_ext_mxfp4_load_mask<ncols1, nwarps, nbatch_fa, oob_check>
-                    (mask_h + k_VKQ_0, tile_mask, stride_mask, k_VKQ_sup_v, jt * ncols1, ne01);
+                    (mask_h + k_VKQ_0, tile_mask_curr, stride_mask, k_VKQ_sup_v, jt * ncols1, ne01);
             }
             flash_attn_ext_mxfp4_load_K<DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check>
                 (K_mxfp4 + int64_t(k_VKQ_0) * stride_K, tile_K_qs_curr, tile_K_sc_curr, stride_K, k_VKQ_sup_v);
@@ -755,16 +764,17 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
                  ne01, ne02, stride_K, stride_V, stride_mask,
                  tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
                  tile_K_qs_next, tile_K_sc_next,
-                 tile_V, tile_mask,
+                 tile_V, tile_mask_curr, tile_mask_next,
                  VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
                  false, k_VKQ_sup_next);
 
-            // Swap K buffers.
-            { int * tmp = tile_K_qs_curr; tile_K_qs_curr = tile_K_qs_next; tile_K_qs_next = tmp; }
+            // Swap K and mask buffers.
+            { int      * tmp = tile_K_qs_curr; tile_K_qs_curr = tile_K_qs_next; tile_K_qs_next = tmp; }
             { uint32_t * tmp = tile_K_sc_curr; tile_K_sc_curr = tile_K_sc_next; tile_K_sc_next = tmp; }
+            { half     * tmp = tile_mask_curr; tile_mask_curr = tile_mask_next; tile_mask_next = tmp; }
         }
         {
-            // Last iteration: K already loaded by previous iter (or by pre-loop if only 1 iter).
+            // Last iteration: K and mask already loaded by previous iter (or by pre-loop if only 1 iter).
             const int k_VKQ_sup_v = ne11 - kb0 * nbatch_fa;
 
             flash_attn_ext_mxfp4_iter
@@ -773,7 +783,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
                  ne01, ne02, stride_K, stride_V, stride_mask,
                  tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
                  tile_K_qs_next, tile_K_sc_next,
-                 tile_V, tile_mask,
+                 tile_V, tile_mask_curr, tile_mask_next,
                  VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
                  true, 0);
         }
@@ -786,7 +796,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
             const int k_VKQ_0 = kb0_start * nbatch_fa;
 
             flash_attn_ext_mxfp4_load_mask<ncols1, nwarps, nbatch_fa, oob_check>
-                (mask_h + k_VKQ_0, tile_mask, stride_mask, k_VKQ_sup_v, jt * ncols1, ne01);
+                (mask_h + k_VKQ_0, tile_mask_curr, stride_mask, k_VKQ_sup_v, jt * ncols1, ne01);
             flash_attn_ext_mxfp4_load_K<DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check>
                 (K_mxfp4 + int64_t(k_VKQ_0) * stride_K, tile_K_qs_curr, tile_K_sc_curr, stride_K, k_VKQ_sup_v);
             __syncthreads();
@@ -801,13 +811,14 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
                  ne01, ne02, stride_K, stride_V, stride_mask,
                  tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
                  tile_K_qs_next, tile_K_sc_next,
-                 tile_V, tile_mask,
+                 tile_V, tile_mask_curr, tile_mask_next,
                  VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
                  false, nbatch_fa);
 
-            // Swap K buffers.
-            { int * tmp = tile_K_qs_curr; tile_K_qs_curr = tile_K_qs_next; tile_K_qs_next = tmp; }
+            // Swap K and mask buffers.
+            { int      * tmp = tile_K_qs_curr; tile_K_qs_curr = tile_K_qs_next; tile_K_qs_next = tmp; }
             { uint32_t * tmp = tile_K_sc_curr; tile_K_sc_curr = tile_K_sc_next; tile_K_sc_next = tmp; }
+            { half     * tmp = tile_mask_curr; tile_mask_curr = tile_mask_next; tile_mask_next = tmp; }
         }
         {
             constexpr int k_VKQ_sup_v = nbatch_fa;
@@ -818,7 +829,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
                  ne01, ne02, stride_K, stride_V, stride_mask,
                  tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
                  tile_K_qs_next, tile_K_sc_next,
-                 tile_V, tile_mask,
+                 tile_V, tile_mask_curr, tile_mask_next,
                  VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
                  true, 0);
         }
@@ -1216,9 +1227,10 @@ void ggml_cuda_flash_attn_ext_mma_mxfp4_case(ggml_backend_cuda_context & ctx, gg
     const size_t nbytes_V       = nbatch_fa * stride_tile_V * sizeof(half2);
     const size_t nbytes_mask    = ncols1    * (nbatch_fa + 8) * sizeof(half);
 
-    const size_t nbytes_Q_region  = nbytes_Q_qs + nbytes_Q_sc;
-    const size_t nbytes_K_double  = 2 * (nbytes_K_qs + nbytes_K_sc);  // Double-buffered K (A + B).
-    const size_t nbytes_KV_region = nbytes_K_double + nbytes_V + nbytes_mask;
+    const size_t nbytes_Q_region    = nbytes_Q_qs + nbytes_Q_sc;
+    const size_t nbytes_K_double    = 2 * (nbytes_K_qs + nbytes_K_sc);    // Double-buffered K (A + B).
+    const size_t nbytes_mask_double = 2 * nbytes_mask;                     // Double-buffered mask (A + B).
+    const size_t nbytes_KV_region   = nbytes_K_double + nbytes_V + nbytes_mask_double;
 
     const size_t nbytes_shared_combine = nwarps * cols_per_warp * (nbatch_combine + 4) * sizeof(half2);
 
