@@ -533,6 +533,81 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_mxfp4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_mxfp4 * x = (const block_mxfp4 *) vx;
+
+    const int64_t ib    =  i0          /  QK_MXFP4;
+    const int     iqs   =  i0          % (QK_MXFP4/2);
+    const int     shift = (i0 % QK_MXFP4) / (QK_MXFP4/2);
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+    uint8_t qs[ne];
+    // alignment=1: block_mxfp4.qs is at byte offset 1 (after 1-byte e field), so pointers are often odd-aligned.
+    ggml_cuda_memcpy_1<ne, 1>(qs, x[ib].qs + iqs);
+
+    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e) * 0.5f;
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 dh = __float2half2_rn(d);
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            const int q0 = shift ? (qs[l0 + 0] >> 4) : (qs[l0 + 0] & 0xF);
+            const int q1 = shift ? (qs[l0 + 1] >> 4) : (qs[l0 + 1] & 0xF);
+            ((half2 *) dst)[l0/2] = dh * make_half2(kvalues_mxfp4[q0], kvalues_mxfp4[q1]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            const int q = shift ? (qs[l] >> 4) : (qs[l] & 0xF);
+            ((float *) dst)[l] = d * kvalues_mxfp4[q];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_mxfp4 * K_mxfp4 = (const block_mxfp4 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        // 8 k_KQ iterations per MXFP4 block (32 values / 4 values per int)
+        const int ib    = k_KQ / (2*QI_MXFP4);       // block index
+        const int iqs4  = k_KQ % QI_MXFP4;            // int index within qs (0..3)
+        const int shift = (k_KQ / QI_MXFP4) & 1;      // 0=low nibbles, 1=high nibbles
+
+        int v;
+        // alignment=1: block_mxfp4.qs is at byte offset 1 (after 1-byte e field), so pointers are often odd-aligned.
+        ggml_cuda_memcpy_1<sizeof(int), 1>(&v, K_mxfp4[ib].qs + sizeof(int)*iqs4);
+
+        // Use get_int_from_table_16 for efficient LUT lookup of all 8 nibbles,
+        // then select the low or high nibble results based on shift.
+        const int2 lut = get_int_from_table_16(v, kvalues_mxfp4);
+        const int v_lut = shift ? lut.y : lut.x;
+
+        const int u = Q_q8[k_KQ_0/nthreads];
+        const int sumi = ggml_cuda_dp4a(v_lut, u, 0);
+
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        sum += ggml_cuda_e8m0_to_fp32(K_mxfp4[ib].e) * 0.5f * (sumi*Q_ds.x);
+    }
+
+    return sum;
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -547,6 +622,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q5_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_MXFP4) {
+        return vec_dot_fattn_vec_KQ_mxfp4<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -567,6 +644,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q5_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q8_0) {
         return dequantize_V_q8_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_MXFP4) {
+        return dequantize_V_mxfp4<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;
@@ -777,6 +856,36 @@ static __global__ void flash_attn_combine_results(
 
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
+
+// Config options for the MMA kernels (F16, MXFP4, etc.).
+// Should not affect results, only speed/register pressure/shared memory use.
+struct fattn_mma_config {
+    int  nthreads;       // Number of threads per CUDA block.
+    int  occupancy;      // Targeted occupancy for the MMA kernel.
+    int  nbatch_fa;      // Number of KV rows per softmax rescaling of KQ rowsums and VKQ accumulators.
+    int  nbatch_K2;      // Number of K half2 values in direction of DKQ to load in parallel.
+    int  nbatch_V2;      // Number of V half2 values in direction of DV to load in parallel.
+    int  nbatch_combine; // Number of VKQ half2 values in direction of DV to combine in parallel.
+    int  nstages_target; // Number of pipeline stages to use ideally, 1 == always load data synchronously, 2 == preload data if there is hardware support.
+    bool Q_in_reg;       // Whether the Q values should be kept permanently in registers.
+
+    constexpr __host__ __device__ fattn_mma_config(
+            int nthreads, int occupancy, int nbatch_fa, int nbatch_K2, int nbatch_V2, int nbatch_combine, int nstages_target, bool Q_in_reg) :
+        nthreads(nthreads), occupancy(occupancy), nbatch_fa(nbatch_fa), nbatch_K2(nbatch_K2), nbatch_V2(nbatch_V2), nbatch_combine(nbatch_combine),
+        nstages_target(nstages_target), Q_in_reg(Q_in_reg) {}
+};
+
+#define GGML_CUDA_FATTN_MMA_CONFIG_CASE(DKQ_, DV_, ncols_, nthreads_, occupancy_, nbatch_fa_, nbatch_K2_, nbatch_V2_, nbatch_combine_, nstages_target_, Q_in_reg_) \
+    if (DKQ == (DKQ_) && DV == (DV_) && ncols == (ncols_)) {                                                                                                       \
+        static_assert((nthreads_)       % 32 == 0 && (nthreads_)       <= 512, "bad nthreads");                                                                    \
+        static_assert(                               (occupancy_)      <=   8, "bad occupancy");                                                                   \
+        static_assert((nbatch_fa_)      % 32 == 0 && (nbatch_fa_)      <= 256, "bad nbatch_fa");                                                                   \
+        static_assert((nbatch_K2_)      %  4 == 0 && (nbatch_K2_)      <= 512, "bad nbatch_K2");                                                                   \
+        static_assert((nbatch_V2_)      %  4 == 0 && (nbatch_V2_)      <= 256, "bad nbatch_V2");                                                                   \
+        static_assert((nbatch_combine_) %  4 == 0 && (nbatch_combine_) <= 128, "bad nbatch_combine");                                                              \
+        static_assert((nstages_target_)      >= 1 && (nstages_target_) <=   2, "bad nstages_target");                                                              \
+        return fattn_mma_config{(nthreads_), (occupancy_), (nbatch_fa_), (nbatch_K2_), (nbatch_V2_), (nbatch_combine_), (nstages_target_), (Q_in_reg_)};           \
+    }                                                                                                                                                              \
 
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(

@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-mma-mxfp4.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
@@ -197,6 +198,83 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
+// MXFP4 MMA dispatch functions (Blackwell FP4 flash attention):
+
+template <int DKQ, int DV, int ncols2>
+static void ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+
+    if constexpr (ncols2 <= 8) {
+        if (Q->ne[1] <= 8/ncols2) {
+            ggml_cuda_flash_attn_ext_mma_mxfp4_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
+            return;
+        }
+    }
+
+    if (Q->ne[1] <= 16/ncols2) {
+        ggml_cuda_flash_attn_ext_mma_mxfp4_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
+        return;
+    }
+
+    ggml_cuda_flash_attn_ext_mma_mxfp4_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
+}
+
+template <int DKQ, int DV>
+static void ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * KQV  = dst;
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+
+    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    if (use_gqa_opt && gqa_ratio > 4) {
+        ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+        return;
+    }
+
+    if (use_gqa_opt && gqa_ratio > 2) {
+        ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+        return;
+    }
+
+    if (use_gqa_opt && gqa_ratio > 1) {
+        ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+        return;
+    }
+
+    ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols1<DKQ, DV, 1>(ctx, dst);
+}
+
+static void ggml_cuda_flash_attn_ext_mma_mxfp4(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * V = dst->src[2];
+
+    switch (Q->ne[0]) {
+        case 64:
+            GGML_ASSERT(V->ne[0] == 64);
+            ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols2< 64,  64>(ctx, dst);
+            break;
+        case 128:
+            GGML_ASSERT(V->ne[0] == 128);
+            ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols2<128, 128>(ctx, dst);
+            break;
+        case 256:
+            GGML_ASSERT(V->ne[0] == 256);
+            ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols2<256, 256>(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+            break;
+    }
+}
+
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
     {                                                                                                            \
         const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16); \
@@ -259,10 +337,13 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP4, GGML_TYPE_MXFP4)
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP4, GGML_TYPE_MXFP4)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -270,11 +351,12 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
-    BEST_FATTN_KERNEL_NONE     =   0,
-    BEST_FATTN_KERNEL_TILE     = 200,
-    BEST_FATTN_KERNEL_VEC      = 100,
-    BEST_FATTN_KERNEL_WMMA_F16 = 300,
-    BEST_FATTN_KERNEL_MMA_F16  = 400,
+    BEST_FATTN_KERNEL_NONE       =   0,
+    BEST_FATTN_KERNEL_TILE       = 200,
+    BEST_FATTN_KERNEL_VEC        = 100,
+    BEST_FATTN_KERNEL_WMMA_F16   = 300,
+    BEST_FATTN_KERNEL_MMA_F16    = 400,
+    BEST_FATTN_KERNEL_MMA_MXFP4  = 500,
 };
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
@@ -356,6 +438,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
             break;
+        case GGML_TYPE_MXFP4:
+            break;
         default:
             return BEST_FATTN_KERNEL_NONE;
     }
@@ -366,6 +450,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    // MXFP4 flash attention (Blackwell FP4 MMA):
+    if (blackwell_mma_available(cc) && K->type == GGML_TYPE_MXFP4 && K->ne[0] % 64 == 0 && K->ne[0] <= 256) {
+        if (can_use_vector_kernel && Q->ne[1] <= 2) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+        return BEST_FATTN_KERNEL_MMA_MXFP4;
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
@@ -485,6 +577,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MMA_MXFP4:
+            ggml_cuda_flash_attn_ext_mma_mxfp4(ctx, dst);
             break;
     }
 }
