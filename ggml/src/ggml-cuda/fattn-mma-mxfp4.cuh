@@ -47,7 +47,8 @@ static __host__ fattn_mma_config ggml_cuda_fattn_mma_mxfp4_get_config(
 
 // Load K data from global to shared memory. K is stored as block_mxfp4 structs (17 bytes each).
 // We load the packed nibble data (qs) and scales (e) separately into two shared memory regions.
-// cp.async CANNOT be used because block_mxfp4.qs is at offset 1, which is not 16-byte aligned.
+// cp.async CANNOT be used because block_mxfp4.qs is at byte offset 1, which is not 16-byte aligned.
+// Typed loads (int/short) also fail: Blackwell enforces strict natural alignment on global memory.
 template<int DKQ, int nwarps, int nbatch_fa, int stride_k_qs, int stride_k_sc, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
         const block_mxfp4 * const __restrict__ K_mxfp4,
@@ -70,6 +71,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
         }
 
         // Load packed nibble data: each thread loads one int (4 bytes = 8 nibbles) at a time.
+        // alignment=1: block_mxfp4.qs is at byte offset 1 → odd-aligned, Blackwell enforces strict alignment.
 #pragma unroll
         for (int k0 = 0; k0 < ints_per_row; k0 += WARP_SIZE) {
             const int k = k0 + threadIdx.x;
@@ -93,7 +95,8 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
             }
         }
 
-        // Load scales: packed pairs of E8M0 exponents.
+        // Load scales: 4X packing — 4 E8M0 exponents per uint32_t (1 per 16 elements).
+        // Each MXFP4 block has 1 scale for 32 values; duplicate for the 2 halves of 16.
 #pragma unroll
         for (int s0 = 0; s0 < blocks_per_row / 2; s0 += WARP_SIZE) {
             const int s = s0 + threadIdx.x;
@@ -104,10 +107,11 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
             if (oob_check && i >= k_VKQ_sup) {
                 tile_K_sc[i * stride_k_sc + s] = 0;
             } else {
-                // Scale pair: even block scale in low byte, odd block scale in high byte.
                 const uint8_t e0 = K_mxfp4[i * stride_K + 2 * s + 0].e;
                 const uint8_t e1 = K_mxfp4[i * stride_K + 2 * s + 1].e;
-                tile_K_sc[i * stride_k_sc + s] = (uint32_t)e0 | ((uint32_t)e1 << 8);
+                // 4X: duplicate each block's scale for both 16-element halves.
+                tile_K_sc[i * stride_k_sc + s] = (uint32_t)e0 | ((uint32_t)e0 << 8) |
+                                                  ((uint32_t)e1 << 16) | ((uint32_t)e1 << 24);
             }
         }
     }
@@ -348,10 +352,11 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
         const uint8_t e_partner = __shfl_xor_sync(0xFFFFFFFF, e, 1);
 
         // Even block writes both scales as a single uint32 (no atomicOr needed).
-        // Upper 2 bytes are zero since e and e_partner are uint8_t.
+        // 4X packing: duplicate each block's scale for both 16-element halves.
         if (active && block_idx % 2 == 0) {
             const int scale_pair_idx = block_idx / 2;
-            tile_Q_sc[jc * stride_q_sc + scale_pair_idx] = (uint32_t)e | ((uint32_t)e_partner << 8);
+            tile_Q_sc[jc * stride_q_sc + scale_pair_idx] = (uint32_t)e | ((uint32_t)e << 8) |
+                                                            ((uint32_t)e_partner << 16) | ((uint32_t)e_partner << 24);
         }
     }
 }
@@ -462,7 +467,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
             const int q_col = (threadIdx.y / np) * cols_per_warp + (threadIdx.x / 4);
             const uint32_t b_scale = tile_Q_sc[q_col * stride_q_sc + d0];
 
-            mma_block_scaled(KQ_C[i_KQ_00 / (np * T_A_KQ::I)], K_A, Q_B, a_scale, b_scale);
+            mma_block_scaled_4x(KQ_C[i_KQ_00 / (np * T_A_KQ::I)], K_A, Q_B, a_scale, b_scale);
         }
     }
 
