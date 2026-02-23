@@ -110,8 +110,8 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
                 const uint8_t e0 = K_mxfp4[i * stride_K + 2 * s + 0].e;
                 const uint8_t e1 = K_mxfp4[i * stride_K + 2 * s + 1].e;
                 // 4X: duplicate each block's scale for both 16-element halves.
-                tile_K_sc[i * stride_k_sc + s] = (uint32_t)e0 | ((uint32_t)e0 << 8) |
-                                                  ((uint32_t)e1 << 16) | ((uint32_t)e1 << 24);
+                // __byte_perm with selector 0x1100: byte0→byte0, byte0→byte1, byte1→byte2, byte1→byte3.
+                tile_K_sc[i * stride_k_sc + s] = __byte_perm((uint32_t)e0 | ((uint32_t)e1 << 8), 0, 0x1100);
             }
         }
     }
@@ -161,11 +161,11 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_V_f16(
                 // Hardware FP4 dequantization: nibble → float via E2M1 type conversion.
                 // Intrinsic E2M1 values {0,0.5,1,1.5,2,3,4,6} = kvalues_mxfp4 * 0.5,
                 // so scale uses e8m0 directly (no * 0.5f).
-                const float scale = ggml_cuda_e8m0_to_fp32(blk.e);
+                // E8M0 scales are power-of-two → F16 multiply is exact (just exponent add).
+                const half2 scale_h2 = __float2half2_rn(ggml_cuda_e8m0_to_fp32(blk.e));
                 __nv_fp4x2_e2m1 fp4_pair;
                 fp4_pair.__x = nib0 | (nib1 << 4);
-                const float2 f2 = float2(fp4_pair);
-                val = make_half2(f2.x * scale, f2.y * scale);
+                val = __hmul2(__float22half2_rn(float2(fp4_pair)), scale_h2);
             }
             tile_V[t * stride_tile_V + d_h2] = val;
         }
@@ -319,29 +319,41 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
             inv_d = __frcp_rn(ggml_cuda_e8m0_to_fp32(e));
         }
 
-        // Pack 32 values into 16 bytes (8 ints) of nibble data.
+        // Pack 32 values into 16 bytes (4 ints) of nibble data.
         // Layout: low 16 values in low nibbles, high 16 values in high nibbles.
+        // Process pairs of FP4x4 conversions to write full ints (no shared memory RMW).
         if (active) {
 #pragma unroll
-            for (int i = 0; i < vals_per_block / 4; ++i) {
+            for (int i = 0; i < vals_per_block / 4; i += 2) {
                 const int int_idx = block_idx * (vals_per_block / 8) + i / 2;
 
                 // Hardware FP4 conversion: 4 floats → 4 packed nibbles in one operation.
                 // __nv_fp4x4_e2m1 layout: float4(a,b,c,d) → char2(.x = b<<4|a, .y = d<<4|c).
                 // We need byte0 = low_half|high_half<<4, so order: low0, high0, low1, high1.
-                __nv_fp4x4_e2m1 fp4_packed(make_float4(
+
+                // Low pair → bytes 0-1 of the int.
+                __nv_fp4x4_e2m1 fp4_lo(make_float4(
                     vals[0               + 2 * i + 0] * inv_d,
                     vals[vals_per_block/2 + 2 * i + 0] * inv_d,
                     vals[0               + 2 * i + 1] * inv_d,
                     vals[vals_per_block/2 + 2 * i + 1] * inv_d
                 ));
-                const char2 packed = *reinterpret_cast<const char2 *>(&fp4_packed);
+                const char2 lo = *reinterpret_cast<const char2 *>(&fp4_lo);
 
-                if (i % 2 == 0) {
-                    tile_Q_qs[jc * stride_q_qs + int_idx] = (int)(unsigned char)packed.x | ((int)(unsigned char)packed.y << 8);
-                } else {
-                    tile_Q_qs[jc * stride_q_qs + int_idx] |= ((int)(unsigned char)packed.x << 16) | ((int)(unsigned char)packed.y << 24);
-                }
+                // High pair → bytes 2-3 of the int.
+                __nv_fp4x4_e2m1 fp4_hi(make_float4(
+                    vals[0               + 2 * (i + 1) + 0] * inv_d,
+                    vals[vals_per_block/2 + 2 * (i + 1) + 0] * inv_d,
+                    vals[0               + 2 * (i + 1) + 1] * inv_d,
+                    vals[vals_per_block/2 + 2 * (i + 1) + 1] * inv_d
+                ));
+                const char2 hi = *reinterpret_cast<const char2 *>(&fp4_hi);
+
+                // Full int write — no read-modify-write on shared memory.
+                // char2 is {x, y} = 2 bytes; reinterpret as uint16_t for natural packing.
+                const uint32_t lo_u16 = *reinterpret_cast<const uint16_t *>(&lo);
+                const uint32_t hi_u16 = *reinterpret_cast<const uint16_t *>(&hi);
+                tile_Q_qs[jc * stride_q_qs + int_idx] = lo_u16 | (hi_u16 << 16);
             }
         }
 
@@ -355,8 +367,8 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
         // 4X packing: duplicate each block's scale for both 16-element halves.
         if (active && block_idx % 2 == 0) {
             const int scale_pair_idx = block_idx / 2;
-            tile_Q_sc[jc * stride_q_sc + scale_pair_idx] = (uint32_t)e | ((uint32_t)e << 8) |
-                                                            ((uint32_t)e_partner << 16) | ((uint32_t)e_partner << 24);
+            // __byte_perm with selector 0x1100: byte0→byte0, byte0→byte1, byte1→byte2, byte1→byte3.
+            tile_Q_sc[jc * stride_q_sc + scale_pair_idx] = __byte_perm((uint32_t)e | ((uint32_t)e_partner << 8), 0, 0x1100);
         }
     }
 }
