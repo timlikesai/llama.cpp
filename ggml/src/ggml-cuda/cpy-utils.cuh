@@ -211,6 +211,32 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
 }
 
+static __device__ void quantize_f32_mxfp4_block(const float * __restrict__ x, block_mxfp4 * __restrict__ y) {
+    float amax = 0.0f;
+
+    for (int j = 0; j < QK_MXFP4; ++j) {
+        amax = fmaxf(amax, fabsf(x[j]));
+    }
+
+    // Compute E8M0 exponent: biased so that max value maps into the FP4 range
+    // Use round-to-nearest (__float2int_rn) to match reference compute_e8m0_scale in quantize.cu
+    const int e = (amax == 0.0f) ? 0 : __float2int_rn(log2f(amax)) - 2 + 127;
+    y->e = (uint8_t) max(0, min(255, e));
+
+    // inv_d = 1/e8m0_scale — ggml_cuda_float_to_fp4_e2m1 uses actual E2M1 values (not doubled kvalues)
+    const float inv_d = (amax == 0.0f) ? 0.0f : 1.0f / ggml_cuda_e8m0_to_fp32(y->e);
+
+    for (int j = 0; j < QK_MXFP4/2; ++j) {
+        const uint8_t xi0 = ggml_cuda_float_to_fp4_e2m1(x[0          + j], inv_d);
+        const uint8_t xi1 = ggml_cuda_float_to_fp4_e2m1(x[QK_MXFP4/2 + j], inv_d);
+        y->qs[j] = xi0 | (xi1 << 4);
+    }
+}
+
+static __device__ void cpy_blck_f32_mxfp4(const char * cxi, char * cdsti) {
+    quantize_f32_mxfp4_block((const float *)cxi, (block_mxfp4 *)cdsti);
+}
+
 template<typename src_t, typename dst_t>
 static __device__ void cpy_1_scalar(const char * cxi, char * cdsti) {
     *(dst_t *) cdsti = ggml_cuda_cast<dst_t>(*(const src_t *) cxi);

@@ -5,35 +5,7 @@
 
 using namespace ggml_cuda_mma;
 
-// Config options for the MMA kernel.
-// Should not affect results, only speed/register pressure/shared memory use.
-struct fattn_mma_config {
-    int  nthreads;       // Number of threads per CUDA block.
-    int  occupancy;      // Targeted occupancy for the MMA kernel.
-    int  nbatch_fa;      // Number of KV rows per softmax rescaling of KQ rowsums and VKQ accumulators.
-    int  nbatch_K2;      // Number of K half2 values in direction of DKQ to load in parallel.
-    int  nbatch_V2;      // Number of V half2 values in direction of DV to load in parallel.
-    int  nbatch_combine; // Number of VKQ half2 values in direction of DV to combine in parallel.
-    int  nstages_target; // Number of pipeline stages to use ideally, 1 == always load data synchronously, 2 == preload data if there is hardware support.
-    bool Q_in_reg;       // Whether the Q values should be kept permanently in registers.
-
-    constexpr __host__ __device__ fattn_mma_config(
-            int nthreads, int occupancy, int nbatch_fa, int nbatch_K2, int nbatch_V2, int nbatch_combine, int nstages_target, bool Q_in_reg) :
-        nthreads(nthreads), occupancy(occupancy), nbatch_fa(nbatch_fa), nbatch_K2(nbatch_K2), nbatch_V2(nbatch_V2), nbatch_combine(nbatch_combine),
-        nstages_target(nstages_target), Q_in_reg(Q_in_reg) {}
-};
-
-#define GGML_CUDA_FATTN_MMA_CONFIG_CASE(DKQ_, DV_, ncols_, nthreads_, occupancy_, nbatch_fa_, nbatch_K2_, nbatch_V2_, nbatch_combine_, nstages_target_, Q_in_reg_) \
-    if (DKQ == (DKQ_) && DV == (DV_) && ncols == (ncols_)) {                                                                                                       \
-        static_assert((nthreads_)       % 32 == 0 && (nthreads_)       <= 512, "bad nthreads");                                                                    \
-        static_assert(                               (occupancy_)      <=   8, "bad occupancy");                                                                   \
-        static_assert((nbatch_fa_)      % 32 == 0 && (nbatch_fa_)      <= 256, "bad nbatch_fa");                                                                   \
-        static_assert((nbatch_K2_)      %  4 == 0 && (nbatch_K2_)      <= 512, "bad nbatch_K2");                                                                   \
-        static_assert((nbatch_V2_)      %  4 == 0 && (nbatch_V2_)      <= 256, "bad nbatch_V2");                                                                   \
-        static_assert((nbatch_combine_) %  4 == 0 && (nbatch_combine_) <= 128, "bad nbatch_combine");                                                              \
-        static_assert((nstages_target_)      >= 1 && (nstages_target_) <=   2, "bad nstages_target");                                                              \
-        return fattn_mma_config{(nthreads_), (occupancy_), (nbatch_fa_), (nbatch_K2_), (nbatch_V2_), (nbatch_combine_), (nstages_target_), (Q_in_reg_)};           \
-    }                                                                                                                                                              \
+// fattn_mma_config and GGML_CUDA_FATTN_MMA_CONFIG_CASE are defined in fattn-common.cuh.
 
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_ampere(const int DKQ, const int DV, const int ncols) {
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64,  8, 128, 2, 128,  32,  32,  32, 2, true);
