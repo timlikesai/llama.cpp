@@ -576,13 +576,10 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
     constexpr int stride_tile_V = nbatch_V2 + 4;
 
     // Load V for this iteration (always needed).
-#pragma unroll
-    for (int i0_start = 0; i0_start < DV; i0_start += 2 * nbatch_V2) {
-        static_assert(DV % (2 * nbatch_V2) == 0, "bad loop size");
-        flash_attn_ext_mxfp4_load_V_f16<nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
-            (V_mxfp4 + int64_t(k_VKQ_0) * stride_V, tile_V, stride_V,
-             i0_start, k_VKQ_sup);
-    }
+    static_assert(DV == 2 * nbatch_V2, "V outer loop assumption: DV must equal 2*nbatch_V2");
+    flash_attn_ext_mxfp4_load_V_f16<nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
+        (V_mxfp4 + int64_t(k_VKQ_0) * stride_V, tile_V, stride_V,
+         0, k_VKQ_sup);
 
     // Preload K[i+1] and mask[i+1] into the next K buffer (not on last iteration).
     if (!last_iter) {
@@ -602,18 +599,17 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
 
     // ---- Phase 4: VKQ MMA (reads tile_V) ----
 
-#pragma unroll
-    for (int i0_start = 0; i0_start < DV; i0_start += 2 * nbatch_V2) {
+    {
         constexpr int i0_stride = T_C_VKQ::I;  // 16
 #pragma unroll
-        for (int i_VKQ_0 = i0_start; i_VKQ_0 < i0_start + 2 * nbatch_V2; i_VKQ_0 += i0_stride) {
+        for (int i_VKQ_0 = 0; i_VKQ_0 < DV; i_VKQ_0 += i0_stride) {
             static_assert((nbatch_fa / 2) % (np * T_A_VKQ::J) == 0, "bad loop size");
 #pragma unroll
             for (int k00 = 0; k00 < nbatch_fa / 2; k00 += np * T_A_VKQ::J) {
                 const int k0 = k00 + (threadIdx.y % np) * T_A_VKQ::J;
 
                 T_A_VKQ A;
-                load_ldmatrix_trans(A, tile_V + 2 * k0 * stride_tile_V + (i_VKQ_0 - i0_start) / 2, stride_tile_V);
+                load_ldmatrix_trans(A, tile_V + 2 * k0 * stride_tile_V + i_VKQ_0 / 2, stride_tile_V);
                 mma(VKQ_C[i_VKQ_0 / i0_stride], A, B_VKQ[k00 / (np * T_A_VKQ::J)]);
             }
         }
