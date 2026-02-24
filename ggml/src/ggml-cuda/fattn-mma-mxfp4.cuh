@@ -89,7 +89,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
         }
 
         // Load scales: byte loads from contiguous SoA e region.
-        // 4X packing: 4 E8M0 exponents per uint32_t (duplicate each for 2 halves of 16).
+        // 2X packing: 2 E8M0 exponents per uint32_t (one per 32-element MXFP4 block).
 #pragma unroll
         for (int s0 = 0; s0 < blocks_per_head / 2; s0 += WARP_SIZE) {
             const int s = s0 + threadIdx.x;
@@ -102,8 +102,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
             } else {
                 const uint8_t e0 = *(row_i + K_e_head_off + 2 * s);
                 const uint8_t e1 = *(row_i + K_e_head_off + 2 * s + 1);
-                // __byte_perm with selector 0x1100: byte0→byte0, byte0→byte1, byte1→byte2, byte1→byte3.
-                tile_K_sc[i * stride_k_sc + s] = __byte_perm((uint32_t)e0 | ((uint32_t)e1 << 8), 0, 0x1100);
+                tile_K_sc[i * stride_k_sc + s] = (uint32_t)e0 | ((uint32_t)e1 << 8);
             }
         }
     }
@@ -376,11 +375,10 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
         const uint8_t e_partner = __shfl_xor_sync(0xFFFFFFFF, e, 1);
 
         // Even block writes both scales as a single uint32 (no atomicOr needed).
-        // 4X packing: duplicate each block's scale for both 16-element halves.
+        // 2X packing: 2 E8M0 exponents per uint32_t (one per 32-element MXFP4 block).
         if (active && block_idx % 2 == 0) {
             const int scale_pair_idx = block_idx / 2;
-            // __byte_perm with selector 0x1100: byte0→byte0, byte0→byte1, byte1→byte2, byte1→byte3.
-            tile_Q_sc[jc * stride_q_sc + scale_pair_idx] = __byte_perm((uint32_t)e | ((uint32_t)e_partner << 8), 0, 0x1100);
+            tile_Q_sc[jc * stride_q_sc + scale_pair_idx] = (uint32_t)e | ((uint32_t)e_partner << 8);
         }
     }
 }
@@ -475,7 +473,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
             const int q_col = (threadIdx.y / np) * cols_per_warp + (threadIdx.x / 4);
             const uint32_t b_scale = tile_Q_sc[q_col * stride_q_sc + d0];
 
-            mma_block_scaled_4x(KQ_C[i_KQ_00 / (np * T_A_KQ::I)], K_A, Q_B, a_scale, b_scale);
+            mma_block_scaled(KQ_C[i_KQ_00 / (np * T_A_KQ::I)], K_A, Q_B, a_scale, b_scale);
         }
     }
 
