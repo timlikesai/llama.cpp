@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "hadamard.cuh"
 
 #include <cstdint>
 
@@ -266,6 +267,59 @@ static __device__ __forceinline__ void quantize_q8_1_to_shared(
     for (int l = 0; l < int(sizeof(int)); ++l) {
         vals[l] = (ni == WARP_SIZE || threadIdx.x < ni) ? scale * x[4*threadIdx.x + l] : 0.0f;
     }
+
+    float amax = fabsf(vals[0]);
+    float sum  = vals[0];
+#pragma unroll
+    for (int l = 1; l < int(sizeof(int)); ++l) {
+        amax = fmaxf(amax, fabsf(vals[l]));
+        sum += vals[l];
+    }
+#pragma unroll
+    for (int mask = QI8_1/2; mask > 0; mask >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, 32));
+        sum +=             __shfl_xor_sync(0xFFFFFFFF, sum,  mask, 32);
+    }
+
+    const float d = amax / 127;
+    int q32 = 0;
+    int8_t * q8 = (int8_t *) &q32;
+
+    if (d != 0.0f) {
+#pragma unroll
+        for (int l = 0; l < int(sizeof(int)); ++l) {
+            q8[l] = roundf(vals[l] / d);
+        }
+    }
+
+    yq32[threadIdx.x] = q32;
+    if (threadIdx.x % QI8_1 == 0 && (ni == WARP_SIZE || threadIdx.x < ni)) {
+        if (std::is_same<Tds, half2>::value) {
+            ((half2  *) yds)[threadIdx.x/QI8_1] =  make_half2(d, sum);
+        } else {
+            ((float2 *) yds)[threadIdx.x/QI8_1] = make_float2(d, sum);
+        }
+    }
+}
+
+// Hadamard-rotated variant of quantize_q8_1_to_shared for MXFP4 flash attention.
+// Applies a block-32 Walsh-Hadamard rotation to Q before Q8_1 quantization so that
+// Q_rot . K_rot^T = Q . K^T (orthogonality) when K is stored Hadamard-rotated in the cache.
+// Thread mapping: 8 threads (QI8_1) x 4 values = 32 elements = one MXFP4 block.
+// Ref: BRQ (arxiv 2511.04214), MR-GPTQ (arxiv 2509.23202).
+template <typename Tds, int ni>
+static __device__ __forceinline__ void quantize_q8_1_hadamard_to_shared(
+    const float * __restrict__ x, const float scale, int * __restrict__ yq32, void * __restrict__ yds) {
+
+    float vals[sizeof(int)] = {0.0f};
+#pragma unroll
+    for (int l = 0; l < int(sizeof(int)); ++l) {
+        vals[l] = (ni == WARP_SIZE || threadIdx.x < ni) ? scale * x[4*threadIdx.x + l] : 0.0f;
+    }
+
+    // Apply Walsh-Hadamard rotation within each 8-thread Q8_1 block.
+    // 8 threads x 4 values = 32 elements = one MXFP4 quantization block.
+    hadamard_32_q8_1(vals, threadIdx.x % QI8_1);
 
     float amax = fabsf(vals[0]);
     float sum  = vals[0];

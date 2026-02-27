@@ -194,8 +194,15 @@ static __global__ void flash_attn_ext_vec(
                 constexpr int nthreads_quantize = D/sizeof(int) < WARP_SIZE ? D/sizeof(int) : WARP_SIZE;
 #pragma unroll
                 for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_quantize) {
-                    quantize_q8_1_to_shared<float2, nthreads_quantize>
-                        (Q_f + i0*sizeof(int), scale, tmp_q_i32 + i0, tmp_q_ds + i0/QI8_1);
+                    // Use Hadamard-rotated Q8_1 quantization when K is MXFP4 so that
+                    // Q_rot . K_rot^T = Q . K^T.  Ref: BRQ (arxiv 2511.04214).
+                    if constexpr (type_K == GGML_TYPE_MXFP4) {
+                        quantize_q8_1_hadamard_to_shared<float2, nthreads_quantize>
+                            (Q_f + i0*sizeof(int), scale, tmp_q_i32 + i0, tmp_q_ds + i0/QI8_1);
+                    } else {
+                        quantize_q8_1_to_shared<float2, nthreads_quantize>
+                            (Q_f + i0*sizeof(int), scale, tmp_q_i32 + i0, tmp_q_ds + i0/QI8_1);
+                    }
                 }
             }
         }

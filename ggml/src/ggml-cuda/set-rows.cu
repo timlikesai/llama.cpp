@@ -112,7 +112,9 @@ static void set_rows_cuda_quant(
 // MXFP4 SoA set_rows kernel: writes per-row SoA layout [all_qs][all_e] instead of
 // interleaved [e0][qs0][e1][qs1]... AoS layout. This enables aligned int/uint16_t loads
 // in the flash attention kernel on Blackwell (sm_120a).
-template <typename idx_t>
+//
+// When apply_hadamard=true, applies Walsh-Hadamard rotation before quantization (K cache only).
+template <typename idx_t, bool apply_hadamard>
 static __global__ void k_set_rows_mxfp4_soa(
         const float * __restrict__ src0,
         const idx_t * __restrict__ src1,
@@ -170,7 +172,7 @@ static __global__ void k_set_rows_mxfp4_soa(
 
     const int block_in_row = i00 / QK_MXFP4;
 
-    quantize_f32_mxfp4_block_soa(src0_row + i00, dst_row_base, block_in_row, blocks_per_row);
+    quantize_f32_mxfp4_block_soa<apply_hadamard>(src0_row + i00, dst_row_base, block_in_row, blocks_per_row);
 
     GGML_UNUSED(ne10);
     GGML_UNUSED(ne11);
@@ -179,7 +181,7 @@ static __global__ void k_set_rows_mxfp4_soa(
 }
 
 // Dispatch function for MXFP4 SoA set_rows.
-template<typename idx_t>
+template<typename idx_t, bool apply_hadamard>
 static void set_rows_cuda_mxfp4_soa(
         const float * src0_d, const idx_t * src1_d, char * dst_d,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
@@ -214,7 +216,7 @@ static void set_rows_cuda_mxfp4_soa(
         const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
         const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
 
-        k_set_rows_mxfp4_soa<idx_t><<<grid_size, block_size, 0, stream>>>(
+        k_set_rows_mxfp4_soa<idx_t, apply_hadamard><<<grid_size, block_size, 0, stream>>>(
             src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3,
             ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd, blocks_per_row);
     }
@@ -421,15 +423,30 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_MXFP4) {
-        set_rows_cuda_mxfp4_soa<idx_t>(
-            src0_d, src1_d, (char *)dst->data,
-            ne00, ne01, ne02, ne03,
-            ne10, ne11, ne12, ne13,
-            nb01, nb02, nb03,
-            nb10, nb11, nb12,
-            nb1, nb2, nb3,
-            stream
-        );
+        // op_params[0] == 1 signals K cache write: apply Hadamard rotation before quantization.
+        // V cache writes leave op_params[0] == 0 (no rotation).
+        const int32_t hadamard_flag = ((const int32_t *)dst->op_params)[0];
+        if (hadamard_flag) {
+            set_rows_cuda_mxfp4_soa<idx_t, /*apply_hadamard=*/true>(
+                src0_d, src1_d, (char *)dst->data,
+                ne00, ne01, ne02, ne03,
+                ne10, ne11, ne12, ne13,
+                nb01, nb02, nb03,
+                nb10, nb11, nb12,
+                nb1, nb2, nb3,
+                stream
+            );
+        } else {
+            set_rows_cuda_mxfp4_soa<idx_t, /*apply_hadamard=*/false>(
+                src0_d, src1_d, (char *)dst->data,
+                ne00, ne01, ne02, ne03,
+                ne10, ne11, ne12, ne13,
+                nb01, nb02, nb03,
+                nb10, nb11, nb12,
+                nb1, nb2, nb3,
+                stream
+            );
+        }
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }

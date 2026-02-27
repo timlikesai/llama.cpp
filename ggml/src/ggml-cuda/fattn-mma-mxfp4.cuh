@@ -4,6 +4,7 @@
 #include "cp-async.cuh"
 #include "mma.cuh"
 #include "fattn-common.cuh"
+#include "hadamard.cuh"
 
 using namespace ggml_cuda_mma;
 
@@ -306,6 +307,11 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
                 vals[i] = 0.0f;
             }
         }
+
+        // Apply Walsh-Hadamard rotation to match K-side rotation in the KV cache.
+        // This preserves dot-product correctness: H(Q).H(K)^T = Q.K^T (orthogonality).
+        // Ref: BRQ (arxiv 2511.04214), MR-GPTQ (arxiv 2509.23202).
+        hadamard_32_inplace(vals);
 
         // Compute E8M0 scale.
         float amax = 0.0f;
