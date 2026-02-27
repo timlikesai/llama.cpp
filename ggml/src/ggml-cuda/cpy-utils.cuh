@@ -2,6 +2,7 @@
 
 #include "ggml-common.h"
 #include "convert.cuh"
+#include "hadamard.cuh"
 
 static __device__ __forceinline__ int best_index_int8(int n, const int8_t * val, float x) {
     if (x <= val[0]) return 0;
@@ -213,7 +214,6 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
 
 static __device__ void quantize_f32_mxfp4_block(const float * __restrict__ x, block_mxfp4 * __restrict__ y) {
     float amax = 0.0f;
-
     for (int j = 0; j < QK_MXFP4; ++j) {
         amax = fmaxf(amax, fabsf(x[j]));
     }
@@ -236,15 +236,31 @@ static __device__ void quantize_f32_mxfp4_block(const float * __restrict__ x, bl
 // SoA version: writes qs to row_base + block_idx*16, e to row_base + blocks_per_row*16 + block_idx.
 // Same quantization math as quantize_f32_mxfp4_block, different write layout.
 // Per-row SoA: all qs bytes contiguous at offset 0, all e bytes contiguous after qs.
+//
+// When apply_hadamard=true, applies Walsh-Hadamard rotation before quantization to equalize
+// block value magnitudes and reduce MXFP4 quantization error. Used for K cache only —
+// Q is rotated at attention time so H(Q)·H(K)^T = Q·K^T (H is orthogonal).
+// Ref: BRQ (arxiv 2511.04214), MR-GPTQ (arxiv 2509.23202).
+template<bool apply_hadamard>
 static __device__ void quantize_f32_mxfp4_block_soa(
         const float * __restrict__ x,
         char * __restrict__ row_base,
         const int block_idx,
         const int blocks_per_row) {
-    float amax = 0.0f;
+    // Conditionally buffer and rotate, or use input directly.
+    float vals[QK_MXFP4];
+    const float * src = x;
+    if constexpr (apply_hadamard) {
+        for (int j = 0; j < QK_MXFP4; ++j) {
+            vals[j] = x[j];
+        }
+        hadamard_32_inplace(vals);
+        src = vals;
+    }
 
+    float amax = 0.0f;
     for (int j = 0; j < QK_MXFP4; ++j) {
-        amax = fmaxf(amax, fabsf(x[j]));
+        amax = fmaxf(amax, fabsf(src[j]));
     }
 
     const int e = (amax == 0.0f) ? 0 : __float2int_rn(log2f(amax)) - 2 + 127;
@@ -254,8 +270,8 @@ static __device__ void quantize_f32_mxfp4_block_soa(
     // Write qs to SoA qs region (contiguous, starts at offset 0).
     uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * 16);
     for (int j = 0; j < QK_MXFP4/2; ++j) {
-        const uint8_t xi0 = ggml_cuda_float_to_fp4_e2m1(x[0          + j], inv_d);
-        const uint8_t xi1 = ggml_cuda_float_to_fp4_e2m1(x[QK_MXFP4/2 + j], inv_d);
+        const uint8_t xi0 = ggml_cuda_float_to_fp4_e2m1(src[0          + j], inv_d);
+        const uint8_t xi1 = ggml_cuda_float_to_fp4_e2m1(src[QK_MXFP4/2 + j], inv_d);
         qs_dst[j] = xi0 | (xi1 << 4);
     }
 

@@ -1104,7 +1104,16 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     }
 
     // store the current K values into the cache
-    return ggml_set_rows(ctx, k, k_cur, k_idxs);
+    ggml_tensor * result = ggml_set_rows(ctx, k, k_cur, k_idxs);
+
+    // Flag K cache writes for Walsh-Hadamard rotation before MXFP4 quantization.
+    // The flash attention kernel applies matching rotation to Q so H(Q)·H(K)^T = Q·K^T.
+    // V cache writes are NOT rotated (op_params[0] defaults to 0).
+    if (k->type == GGML_TYPE_MXFP4) {
+        ((int32_t *)result->op_params)[0] = 1;
+    }
+
+    return result;
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
