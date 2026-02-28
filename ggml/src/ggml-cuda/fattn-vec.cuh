@@ -99,18 +99,16 @@ static __global__ void flash_attn_ext_vec(
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
     Q += nb03*sequence + nb02* head              + nb01*ic0;
     if constexpr (type_K == GGML_TYPE_MXFP4) {
-        K += nb13*sequence;  // SoA: row base only, head offset computed separately.
+        K += nb13*sequence;
     } else {
         K += nb13*sequence + nb12*(head / gqa_ratio);
     }
     if constexpr (type_V == GGML_TYPE_MXFP4) {
-        V += nb23*sequence;  // SoA: row base only, head offset computed separately.
+        V += nb23*sequence;
     } else {
         V += nb23*sequence + nb22*(head / gqa_ratio);
     }
 
-    // SoA head offsets for MXFP4: qs and e regions within each KV cache row.
-    // These are unused (and optimized away) for non-MXFP4 types.
     int K_qs_head_off = 0, K_e_head_off = 0;
     int K_sign_head_off = 0, K_res_e_head_off = 0;
     int V_qs_head_off = 0, V_e_head_off = 0;
@@ -121,8 +119,6 @@ static __global__ void flash_attn_ext_vec(
         K_qs_head_off = z_KV * blocks_per_head_K * 16;
         K_e_head_off  = stride_K_blocks * 16 + z_KV * blocks_per_head_K;
 
-        // Compact 1-bit sign residual offsets (flat layout after all primary blocks).
-        // Layout: [primary_qs: N×16B] [signs: N×4B] [E8M0: N×1B], N = blocks_per_row_primary.
         const int blocks_per_row_primary = ne12 * blocks_per_head_K;
         const int compact_qs_start = blocks_per_row_primary * 16;
         K_sign_head_off  = compact_qs_start + z_KV * blocks_per_head_K * 4;
@@ -202,8 +198,6 @@ static __global__ void flash_attn_ext_vec(
                 constexpr int nthreads_quantize = D/sizeof(int) < WARP_SIZE ? D/sizeof(int) : WARP_SIZE;
 #pragma unroll
                 for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_quantize) {
-                    // Use Hadamard-rotated Q8_1 quantization when K is MXFP4 so that
-                    // Q_rot . K_rot^T = Q . K^T.  Ref: BRQ (arxiv 2511.04214).
                     if constexpr (type_K == GGML_TYPE_MXFP4) {
                         quantize_q8_1_hadamard_to_shared<float2, nthreads_quantize>
                             (Q_f + i0*sizeof(int), scale, tmp_q_i32 + i0, tmp_q_ds + i0/QI8_1);
@@ -303,10 +297,8 @@ static __global__ void flash_attn_ext_vec(
             for (int j = 0; j < ncols; ++j) {
                 float sum;
                 if constexpr (type_K == GGML_TYPE_MXFP4) {
-                    // Primary K dot product
                     sum = vec_dot_fattn_vec_KQ_mxfp4_soa<D, nthreads_KQ>(
                         K + i_KQ*nb11, Q_i32[j], Q_ds[j], K_qs_head_off, K_e_head_off);
-                    // Compact 1-bit sign residual K dot product
                     sum += vec_dot_fattn_vec_KQ_mxfp4_res_compact<D, nthreads_KQ>(
                         K + i_KQ*nb11, Q_i32[j], Q_ds[j], K_sign_head_off, K_res_e_head_off);
                 } else {

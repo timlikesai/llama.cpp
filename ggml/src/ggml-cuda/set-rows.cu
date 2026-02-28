@@ -109,14 +109,8 @@ static void set_rows_cuda_quant(
     }
 }
 
-// MXFP4 SoA set_rows kernel: writes per-row SoA layout [all_qs][all_e] instead of
-// interleaved [e0][qs0][e1][qs1]... AoS layout. This enables aligned int/uint16_t loads
-// in the flash attention kernel on Blackwell (sm_120a).
-//
-// When apply_hadamard=true (K cache): applies Walsh-Hadamard rotation before quantization,
-// then writes both primary and residual MXFP4 blocks (residual = quantization error of primary).
-// blocks_per_row_total: total SoA blocks in the row (primary + compact residual for K cache).
-// blocks_per_primary: number of primary MXFP4 blocks (derived from destination ne[0] / QK_MXFP4).
+// MXFP4 SoA set_rows: per-row layout [all_qs][all_e] with optional Hadamard rotation
+// and compact 1-bit sign residual for K cache.
 template <typename idx_t, bool apply_hadamard>
 static __global__ void k_set_rows_mxfp4_soa(
         const float * __restrict__ src0,
@@ -184,7 +178,6 @@ static __global__ void k_set_rows_mxfp4_soa(
     GGML_UNUSED(ne13);
 }
 
-// Dispatch function for MXFP4 SoA set_rows.
 template<typename idx_t, bool apply_hadamard>
 static void set_rows_cuda_mxfp4_soa(
         const float * src0_d, const idx_t * src1_d, char * dst_d,
@@ -211,9 +204,6 @@ static void set_rows_cuda_mxfp4_soa(
     const int64_t s2  = nb2;
     const int64_t s3  = nb3;
 
-    // Total blocks in the SoA row (from actual byte stride).
-    // For K cache: includes extra blocks for compact 1-bit sign residual.
-    // For V cache: equals blocks_per_primary.
     const int blocks_per_row_total = nb1 / sizeof(block_mxfp4);
     const int blocks_per_primary   = ne00 / QK_MXFP4;
 

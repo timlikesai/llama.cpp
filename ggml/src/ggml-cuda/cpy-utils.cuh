@@ -212,45 +212,9 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
 }
 
-static __device__ void quantize_f32_mxfp4_block(const float * __restrict__ x, block_mxfp4 * __restrict__ y) {
-    float amax = 0.0f;
-    for (int j = 0; j < QK_MXFP4; ++j) {
-        amax = fmaxf(amax, fabsf(x[j]));
-    }
-
-    // Compute E8M0 exponent: biased so that max value maps into the FP4 range
-    // Use round-to-nearest (__float2int_rn) to match reference compute_e8m0_scale in quantize.cu
-    const int e = (amax == 0.0f) ? 0 : __float2int_rn(log2f(amax)) - 2 + 127;
-    y->e = (uint8_t) max(0, min(255, e));
-
-    // inv_d = 1/e8m0_scale — ggml_cuda_float_to_fp4_e2m1 uses actual E2M1 values (not doubled kvalues)
-    const float inv_d = (amax == 0.0f) ? 0.0f : 1.0f / ggml_cuda_e8m0_to_fp32(y->e);
-
-    for (int j = 0; j < QK_MXFP4/2; ++j) {
-        const uint8_t xi0 = ggml_cuda_float_to_fp4_e2m1(x[0          + j], inv_d);
-        const uint8_t xi1 = ggml_cuda_float_to_fp4_e2m1(x[QK_MXFP4/2 + j], inv_d);
-        y->qs[j] = xi0 | (xi1 << 4);
-    }
-}
-
-// SoA version: writes qs to row_base + block_idx*16, e to row_base + blocks_per_row_total*16 + block_idx.
-// Same quantization math as quantize_f32_mxfp4_block, different write layout.
-// Per-row SoA: all qs bytes contiguous at offset 0, all e bytes contiguous after qs.
-//
-// When apply_hadamard=true (K cache only):
-//   1. Applies Walsh-Hadamard rotation before quantization to equalize block value magnitudes
-//   2. Writes primary MXFP4 quantization at block_idx
-//   3. Dequantizes primary, computes residual (error), quantizes residual to second MXFP4 block
-//      at block_idx + blocks_per_row_total/2. The residual is NOT Hadamard-rotated — it's
-//      already in the Hadamard domain (error of H(K)). The FA kernel accumulates both:
-//      H(Q) · (K_primary + K_residual)^T = H(Q) · H(K)^T ≈ Q · K^T
-//   Ref: BRQ (arxiv 2511.04214), MR-GPTQ (arxiv 2509.23202).
-//
-// blocks_per_row_total: total SoA blocks in the row (includes compact residual blocks for K).
-//   For V cache: equals blocks_per_primary.
-//   For K cache: blocks_per_primary + extra blocks for compact 1-bit sign residual.
-// blocks_per_primary: number of primary MXFP4 blocks (= n_embd_k_gqa / QK_MXFP4 for K).
-//   For V cache: same as blocks_per_row_total (unused, residual path skipped).
+// SoA MXFP4 quantization: per-row layout [all_qs][all_e].
+// When apply_hadamard=true (K cache): rotates, quantizes primary, then writes compact
+// 1-bit sign residual (sign bits + E8M0) in extra blocks after the primary region.
 template<bool apply_hadamard>
 static __device__ void quantize_f32_mxfp4_block_soa(
         const float * __restrict__ x,
@@ -258,7 +222,6 @@ static __device__ void quantize_f32_mxfp4_block_soa(
         const int block_idx,
         const int blocks_per_row_total,
         const int blocks_per_primary) {
-    // Conditionally buffer and rotate, or use input directly.
     float vals[QK_MXFP4];
     const float * src = x;
     if constexpr (apply_hadamard) {
@@ -269,11 +232,7 @@ static __device__ void quantize_f32_mxfp4_block_soa(
         src = vals;
     }
 
-    // --- Primary quantization with MSE-optimal E8M0 search ---
-    // Search E8M0 ± 2 around the amax-based estimate and pick the value
-    // minimizing total block MSE. This is a free lunch: zero extra memory,
-    // just better scale selection. Improves PPL by ~0.05 with full residual.
-
+    // MSE-optimal E8M0 search: test +-2 around amax estimate, pick lowest MSE.
     float amax = 0.0f;
     for (int j = 0; j < QK_MXFP4; ++j) {
         amax = fmaxf(amax, fabsf(src[j]));
@@ -305,7 +264,6 @@ static __device__ void quantize_f32_mxfp4_block_soa(
     const uint8_t e_val = (amax == 0.0f) ? (uint8_t)0 : (uint8_t)best_e;
     const float inv_d = (amax == 0.0f) ? 0.0f : 1.0f / ggml_cuda_e8m0_to_fp32(e_val);
 
-    // Write primary qs to SoA qs region (contiguous, starts at offset 0).
     uint8_t qs_bytes[QK_MXFP4/2];
     uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * 16);
     for (int j = 0; j < QK_MXFP4/2; ++j) {
@@ -314,21 +272,16 @@ static __device__ void quantize_f32_mxfp4_block_soa(
         const uint8_t byte = xi0 | (xi1 << 4);
         qs_dst[j] = byte;
         if constexpr (apply_hadamard) {
-            qs_bytes[j] = byte;  // Save for residual dequant
+            qs_bytes[j] = byte;
         }
     }
 
-    // Write primary e to SoA e region (after all qs bytes in the row).
     *(row_base + blocks_per_row_total * 16 + block_idx) = e_val;
 
-    // --- Compact 1-bit sign residual (K cache only) ---
-    // Dequant primary, compute error, store sign bits + per-block mean_abs E8M0.
-    // Flat layout in compact region after all primary blocks:
-    //   [signs: blocks_per_primary × 4 bytes] [E8M0: blocks_per_primary × 1 byte]
+    // Compact 1-bit sign residual: sign bits + per-block mean_abs E8M0.
     if constexpr (apply_hadamard) {
         const float scale = ggml_cuda_e8m0_to_fp32(e_val);
 
-        // Compute residual: src[j] - dequant(primary[j])
         float res[QK_MXFP4];
         for (int j = 0; j < QK_MXFP4/2; ++j) {
             const uint8_t byte = qs_bytes[j];
@@ -338,7 +291,6 @@ static __device__ void quantize_f32_mxfp4_block_soa(
             res[j + QK_MXFP4/2] = vals[j + QK_MXFP4/2] - recon1;
         }
 
-        // Pack 32 sign bits into uint32_t (bit j = 1 if element j is negative)
         uint32_t sign_bits = 0;
         for (int j = 0; j < QK_MXFP4; ++j) {
             if (res[j] < 0.0f) {
@@ -346,8 +298,7 @@ static __device__ void quantize_f32_mxfp4_block_soa(
             }
         }
 
-        // Mean absolute residual → E8M0 exponent
-        // For ±1.0 FP4 (kvalues_mxfp4[0x2]=2, ×0.5=1.0), E8M0 directly IS the magnitude.
+        // E8M0 for residual: no FP4_E2M1_EMAX offset since sign values are +-1.0.
         float sum_abs = 0.0f;
         for (int j = 0; j < QK_MXFP4; ++j) {
             sum_abs += fabsf(res[j]);
@@ -356,17 +307,10 @@ static __device__ void quantize_f32_mxfp4_block_soa(
         const int res_e = (mean_abs == 0.0f) ? 0 : __float2int_rn(log2f(mean_abs)) + 127;
         const uint8_t res_e_val = (uint8_t) max(0, min(255, res_e));
 
-        // Compact region layout (flat across all heads):
-        //   qs offset: blocks_per_primary * 16 + block_idx * 4  (sign bits)
-        //   e  offset: blocks_per_primary * 16 + blocks_per_primary * 4 + block_idx  (E8M0)
         const int compact_qs_off = blocks_per_primary * 16;
         *reinterpret_cast<uint32_t *>(row_base + compact_qs_off + block_idx * 4) = sign_bits;
         *(row_base + compact_qs_off + blocks_per_primary * 4 + block_idx) = res_e_val;
     }
-}
-
-static __device__ void cpy_blck_f32_mxfp4(const char * cxi, char * cdsti) {
-    quantize_f32_mxfp4_block((const float *)cxi, (block_mxfp4 *)cdsti);
 }
 
 template<typename src_t, typename dst_t>

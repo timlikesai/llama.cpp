@@ -9,19 +9,9 @@
 using namespace ggml_cuda_mma;
 
 // MXFP4 MMA config: Blackwell-only, cols_per_warp = 8 (FP4 B-tile width).
-// Supported: DKQ ∈ {64, 128, 256}, DV = DKQ, ncols ∈ {8, 16, 32}
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_mxfp4_get_config(
         const int DKQ, const int DV, const int ncols) {
-    // Config: DKQ, DV, ncols, nthreads, occupancy, nbatch_fa, nbatch_K2, nbatch_V2, nbatch_combine, nstages_target, Q_in_reg
-    // nbatch_K2 and nbatch_V2 are in half2 units for F16, but for MXFP4 we use them differently.
-    // nbatch_K2 = DKQ/8 (int elements per K row in packed nibble form) - but actually we pass DKQ/2 for consistency.
-    // nbatch_V2 = half2 count for dequantized V tile.
-
-    // For MXFP4: K is loaded as packed nibbles (int), V is dequantized to half2.
-    // nbatch_K2 is not used directly (K stride is computed from DKQ).
-    // nbatch_V2 = number of half2 elements per V row in shared memory.
-
-    // nstages_target=1 is unused by MXFP4 (no cp.async pipeline), but must be >=1 to pass macro validation.
+    // nbatch_V2 = half2 count for dequantized V tile. nstages_target unused (no cp.async).
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64,  8, 128, 2,  64,  32,  32,  32, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 16, 128, 2,  64,  32,  32,  32, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 32, 128, 2,  64,  32,  32,  32, 1, false);
@@ -46,22 +36,19 @@ static __host__ fattn_mma_config ggml_cuda_fattn_mma_mxfp4_get_config(
 // Loading helpers
 // ------------------------------------------------------------------------------------------------------------------
 
-// Load K data from global to shared memory using per-row SoA layout.
-// SoA layout: [qs0_16B][qs1_16B]...[qsN_16B][e0][e1]...[eN] per KV cache row.
-// The qs region starts at offset 0 of each row → NATURALLY ALIGNED for int loads.
-// This eliminates the byte-by-byte copies needed for AoS block_mxfp4.qs (offset 1 = odd).
+// Load K from global to shared memory (SoA layout).
 template<int DKQ, int nwarps, int nbatch_fa, int stride_k_qs, int stride_k_sc, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
-        const char * const __restrict__ K_row_base,  // Base of sequence's K data (no head offset).
-        const int K_qs_head_off,  // Byte offset to this head's qs within a row.
-        const int K_e_head_off,   // Byte offset to this head's e within a row.
-        const int K_pos_stride,   // Bytes between positions (nb11).
+        const char * const __restrict__ K_row_base,
+        const int K_qs_head_off,
+        const int K_e_head_off,
+        const int K_pos_stride,
         int      * const __restrict__ tile_K_qs,
         uint32_t * const __restrict__ tile_K_sc,
-        const int k_VKQ_0,       // First position index for this tile.
+        const int k_VKQ_0,
         const int k_VKQ_sup) {
-    constexpr int ints_per_row = DKQ / 8;        // Packed nibble ints per head row.
-    constexpr int blocks_per_head = DKQ / 32;    // MXFP4 blocks per head.
+    constexpr int ints_per_row = DKQ / 8;
+    constexpr int blocks_per_head = DKQ / 32;
 
 #pragma unroll
     for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps) {
@@ -73,7 +60,6 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
 
         const char * row_i = K_row_base + int64_t(k_VKQ_0 + i) * K_pos_stride;
 
-        // Load packed nibble data: DIRECT INT LOAD from SoA qs region (aligned!).
 #pragma unroll
         for (int k0 = 0; k0 < ints_per_row; k0 += WARP_SIZE) {
             const int k = k0 + threadIdx.x;
@@ -89,8 +75,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
             }
         }
 
-        // Load scales: byte loads from contiguous SoA e region.
-        // 2X packing: 2 E8M0 exponents per uint32_t (one per 32-element MXFP4 block).
+        // Pack 2 E8M0 scales per uint32_t for scale_vec::2X MMA.
 #pragma unroll
         for (int s0 = 0; s0 < blocks_per_head / 2; s0 += WARP_SIZE) {
             const int s = s0 + threadIdx.x;
@@ -109,22 +94,18 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
     }
 }
 
-// Load compact 1-bit sign residual K data: expand sign bits → ±1.0 FP4 nibbles in smem.
-// Compact region layout (flat, after all primary blocks):
-//   signs: blocks_per_primary × 4 bytes (uint32_t per block, bit j = sign of element j)
-//   E8M0:  blocks_per_primary × 1 byte  (per-block mean_abs magnitude)
-// The expanded nibbles use 0x2 = +1.0 and 0xA = -1.0, which the MMA pipeline handles unchanged.
+// Load compact 1-bit sign residual K: expand sign bits to +-1.0 FP4 nibbles in smem.
 template<int DKQ, int nwarps, int nbatch_fa, int stride_k_qs, int stride_k_sc, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K_res_compact(
         const char * const __restrict__ K_row_base,
-        const int K_sign_off,    // Byte offset to this head's sign bits within compact region.
-        const int K_res_e_off,   // Byte offset to this head's residual E8M0 within compact region.
+        const int K_sign_off,
+        const int K_res_e_off,
         const int K_pos_stride,
         int      * const __restrict__ tile_K_qs,
         uint32_t * const __restrict__ tile_K_sc,
         const int k_VKQ_0,
         const int k_VKQ_sup) {
-    constexpr int ints_per_row = DKQ / 8;        // Output: same size as primary K tiles.
+    constexpr int ints_per_row = DKQ / 8;
     constexpr int blocks_per_head = DKQ / 32;
 
 #pragma unroll
@@ -137,9 +118,6 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K_res_compact(
 
         const char * row_i = K_row_base + int64_t(k_VKQ_0 + i) * K_pos_stride;
 
-        // Expand sign bits → ±1.0 FP4 nibbles.
-        // Each int k covers 4 bytes = 8 nibbles (4 lo-half + 4 hi-half elements).
-        // Block b = k / 4, within-block starting element j0 = 4 * (k % 4).
 #pragma unroll
         for (int k0 = 0; k0 < ints_per_row; k0 += WARP_SIZE) {
             const int k = k0 + threadIdx.x;
@@ -150,15 +128,13 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K_res_compact(
             if (oob_check && i >= k_VKQ_sup) {
                 tile_K_qs[i * stride_k_qs + k] = 0;
             } else {
-                const int b  = k / 4;             // block within head
-                const int j0 = 4 * (k % 4);       // starting element in low half
+                const int b  = k / 4;
+                const int j0 = 4 * (k % 4);
 
                 const uint32_t signs = *reinterpret_cast<const uint32_t *>(
                     row_i + K_sign_off + b * 4);
 
-                // Build 4 bytes of ±1.0 nibble pairs.
-                // FP4 E2M1: 0x2 = +1.0, 0xA = -1.0. Byte = lo_nib | (hi_nib << 4).
-                // lo_nib covers element j, hi_nib covers element j+16.
+                // Expand sign bits to +-1.0 FP4 nibbles: 0x2 = +1.0, 0xA = -1.0.
                 uint32_t result = 0;
 #pragma unroll
                 for (int j_off = 0; j_off < 4; ++j_off) {
@@ -189,22 +165,17 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K_res_compact(
     }
 }
 
-// Single-pass V loader: Dequantize MXFP4 → F16 (half2) in shared memory.
-// Uses per-row SoA layout: qs contiguous at offset 0 → uint16_t loads for byte-pairs.
-// Each warp handles a batch of tokens. Each thread processes one byte-pair from qs,
-// extracting both low and high nibble pairs to produce 2 half2 values per byte-pair.
-// Layout matches F16 kernel: tile_V[token * stride_tile_V + dim_h2].
+// Dequantize MXFP4 V to F16 (half2) in shared memory.
 template<int DV, int nwarps, int nbatch_fa, int stride_tile_V, int nbatch_V2, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_V_f16(
-        const char * const __restrict__ V_row_base,  // Base of sequence's V data (no head offset).
-        const int V_qs_head_off,  // Byte offset to this head's qs within a row.
-        const int V_e_head_off,   // Byte offset to this head's e within a row.
-        const int V_pos_stride,   // Bytes between positions (nb21).
+        const char * const __restrict__ V_row_base,
+        const int V_qs_head_off,
+        const int V_e_head_off,
+        const int V_pos_stride,
         half2 * const __restrict__ tile_V,
-        const int k_VKQ_0,       // First position index for this tile.
+        const int k_VKQ_0,
         const int i0_start,
         const int k_VKQ_sup) {
-    // Number of byte-pairs to process: each byte-pair yields 2 half2 values (low + high nibbles).
     constexpr int nbyte_pairs = nbatch_V2 / 2;
 
 #pragma unroll
@@ -223,10 +194,9 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_V_f16(
                 break;
             }
 
-            const int blk_idx   = bp / 8;     // MXFP4 block index within this batch.
-            const int bp_in_blk = bp % 8;     // Byte-pair index within block (0..7).
+            const int blk_idx   = bp / 8;
+            const int bp_in_blk = bp % 8;
 
-            // Output half2 indices: low nibble pair and high nibble pair (8 apart).
             const int d_h2_lo = i0_start / 2 + blk_idx * 16 + bp_in_blk;
             const int d_h2_hi = d_h2_lo + 8;
 
@@ -237,23 +207,18 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_V_f16(
             } else {
                 const int qs_blk_off = (i0_start / 32 + blk_idx) * 16;
 
-                // DIRECT uint16_t LOAD from SoA qs region (aligned — qs starts at even offset).
                 const uint16_t pair = *reinterpret_cast<const uint16_t *>(
                     row_t + V_qs_head_off + qs_blk_off + 2 * bp_in_blk);
                 const uint8_t b0 = pair & 0xFF;
                 const uint8_t b1 = pair >> 8;
 
-                // E8M0 scale from contiguous SoA e region.
-                // Power-of-two → F16 multiply is exact (just exponent add).
                 const uint8_t e_val = *(row_t + V_e_head_off + i0_start / 32 + blk_idx);
                 const half2 scale_h2 = __float2half2_rn(ggml_cuda_e8m0_to_fp32(e_val));
 
-                // Low nibbles (dims 0..15 within the block).
                 __nv_fp4x2_e2m1 fp4_lo;
                 fp4_lo.__x = (b0 & 0x0F) | ((b1 & 0x0F) << 4);
                 val_lo = __hmul2(__float22half2_rn(float2(fp4_lo)), scale_h2);
 
-                // High nibbles (dims 16..31 within the block).
                 __nv_fp4x2_e2m1 fp4_hi;
                 fp4_hi.__x = (b0 >> 4) | (b1 & 0xF0);
                 val_hi = __hmul2(__float22half2_rn(float2(fp4_hi)), scale_h2);
@@ -327,8 +292,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_mask(
 // Q quantization: F32 → MXFP4 in shared memory
 // ------------------------------------------------------------------------------------------------------------------
 
-// Quantize Q from F32 (global memory) to MXFP4 packed nibbles + E8M0 scales in shared memory.
-// Q is scaled by `scale` during quantization.
+// Quantize Q: F32 global -> MXFP4 nibbles + E8M0 scales in shared memory.
 template<int DKQ, int ncols, int nwarps, int stride_q_qs, int stride_q_sc>
 static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
         const float2 * const __restrict__ Q_f2,
@@ -346,9 +310,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
     constexpr int vals_per_block = QK_MXFP4;  // 32
     constexpr int blocks_per_col = DKQ / vals_per_block;
 
-    // Each thread processes one block of 32 values within a Q column.
-    // Threads stay warp-synchronized (no early break) so we can use __shfl_xor_sync
-    // to exchange E8M0 scales between even/odd block partners, eliminating atomicOr.
+    // No early break: all warp threads stay in sync for __shfl_xor_sync scale exchange.
     constexpr int threads_total = nwarps * WARP_SIZE;
     constexpr int total_blocks = ncols * blocks_per_col;
 
@@ -356,21 +318,18 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
     for (int b0 = 0; b0 < total_blocks; b0 += threads_total) {
         const int b = b0 + threadIdx.y * WARP_SIZE + threadIdx.x;
 
-        // Use active flag instead of break to keep all warp threads in sync for shuffle.
         const bool active = (b0 + threads_total <= total_blocks || b < total_blocks);
 
-        const int jc = b / blocks_per_col;       // Column index (0..ncols-1).
-        const int block_idx = b % blocks_per_col; // Block index within column.
+        const int jc = b / blocks_per_col;
+        const int block_idx = b % blocks_per_col;
 
         const int j = jc / ncols2;
         const int c = jc % ncols2;
 
-        // Check bounds. Inactive threads (b >= total_blocks) also get valid=false.
         bool valid = active &&
                      (ncols1 == 1 || jt * ncols1 + j < int(ne01.z)) &&
                      (ncols2 == 1 || zt_gqa * ncols2 + c < gqa_ratio);
 
-        // Load 32 float values for this block from Q.
         float vals[vals_per_block];
         if (valid) {
             const float2 * Q_col = Q_f2 + (jt * ncols1 + j) * stride_Q1 + c * stride_Q2;
@@ -388,19 +347,15 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
             }
         }
 
-        // Apply Walsh-Hadamard rotation to match K-side rotation in the KV cache.
-        // This preserves dot-product correctness: H(Q).H(K)^T = Q.K^T (orthogonality).
-        // Ref: BRQ (arxiv 2511.04214), MR-GPTQ (arxiv 2509.23202).
+        // Walsh-Hadamard rotation to match K-side rotation: H(Q).H(K)^T = Q.K^T.
         hadamard_32_inplace(vals);
 
-        // Compute E8M0 scale.
         float amax = 0.0f;
 #pragma unroll
         for (int i = 0; i < vals_per_block; ++i) {
             amax = fmaxf(amax, fabsf(vals[i]));
         }
 
-        // Compute E8M0 scale for this block (inlined from compute_e8m0_scale in quantize.cu).
         uint8_t e;
         float inv_d;
         if (!(amax > 0.0f)) {
@@ -416,19 +371,13 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
             inv_d = __frcp_rn(ggml_cuda_e8m0_to_fp32(e));
         }
 
-        // Pack 32 values into 16 bytes (4 ints) of nibble data.
-        // Layout: low 16 values in low nibbles, high 16 values in high nibbles.
-        // Process pairs of FP4x4 conversions to write full ints (no shared memory RMW).
+        // Pack 32 values into 4 ints of nibble data (low 16 in low nibbles, high 16 in high).
         if (active) {
 #pragma unroll
             for (int i = 0; i < vals_per_block / 4; i += 2) {
                 const int int_idx = block_idx * (vals_per_block / 8) + i / 2;
 
-                // Hardware FP4 conversion: 4 floats → 4 packed nibbles in one operation.
-                // __nv_fp4x4_e2m1 layout: float4(a,b,c,d) → char2(.x = b<<4|a, .y = d<<4|c).
-                // We need byte0 = low_half|high_half<<4, so order: low0, high0, low1, high1.
-
-                // Low pair → bytes 0-1 of the int.
+                // __nv_fp4x4_e2m1(float4) packs 4 values into 2 nibble-pair bytes.
                 __nv_fp4x4_e2m1 fp4_lo(make_float4(
                     vals[0               + 2 * i + 0] * inv_d,
                     vals[vals_per_block/2 + 2 * i + 0] * inv_d,
@@ -437,7 +386,6 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
                 ));
                 const char2 lo = *reinterpret_cast<const char2 *>(&fp4_lo);
 
-                // High pair → bytes 2-3 of the int.
                 __nv_fp4x4_e2m1 fp4_hi(make_float4(
                     vals[0               + 2 * (i + 1) + 0] * inv_d,
                     vals[vals_per_block/2 + 2 * (i + 1) + 0] * inv_d,
@@ -446,22 +394,15 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_quantize_Q(
                 ));
                 const char2 hi = *reinterpret_cast<const char2 *>(&fp4_hi);
 
-                // Full int write — no read-modify-write on shared memory.
-                // char2 is {x, y} = 2 bytes; reinterpret as uint16_t for natural packing.
                 const uint32_t lo_u16 = *reinterpret_cast<const uint16_t *>(&lo);
                 const uint32_t hi_u16 = *reinterpret_cast<const uint16_t *>(&hi);
                 tile_Q_qs[jc * stride_q_qs + int_idx] = lo_u16 | (hi_u16 << 16);
             }
         }
 
-        // Exchange scales between even/odd block partners via warp shuffle.
-        // XOR-1 pairs adjacent lanes: lane 0↔1, 2↔3, etc.
-        // blocks_per_col is always even (DKQ ∈ {64,128,256} / 32), so adjacent lanes
-        // always process even/odd blocks within the same column.
+        // Exchange scales between even/odd block partners via XOR-1 shuffle.
         const uint8_t e_partner = __shfl_xor_sync(0xFFFFFFFF, e, 1);
 
-        // Even block writes both scales as a single uint32 (no atomicOr needed).
-        // 2X packing: 2 E8M0 exponents per uint32_t (one per 32-element MXFP4 block).
         if (active && block_idx % 2 == 0) {
             const int scale_pair_idx = block_idx / 2;
             tile_Q_sc[jc * stride_q_sc + scale_pair_idx] = (uint32_t)e | ((uint32_t)e_partner << 8);
@@ -515,8 +456,8 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
         const int k_VKQ_sup_next) {
 #ifdef BLACKWELL_MMA_AVAILABLE
     constexpr int ncols          = ncols1 * ncols2;
-    constexpr int cols_per_warp  = 8;  // FP4 B-tile width.
-    constexpr int np             = nwarps * cols_per_warp / ncols; // Parallel warps per Q column.
+    constexpr int cols_per_warp  = 8;
+    constexpr int np             = nwarps * cols_per_warp / ncols;
     constexpr int nbatch_fa      = ggml_cuda_fattn_mma_mxfp4_get_config(DKQ, DV, ncols).nbatch_fa;
     constexpr int nbatch_V2      = ggml_cuda_fattn_mma_mxfp4_get_config(DKQ, DV, ncols).nbatch_V2;
 
@@ -525,22 +466,17 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
     constexpr int stride_k_qs    = DKQ / 8 + 4;
     constexpr int stride_k_sc    = DKQ / 64;
 
-    // FP4 MMA: A=K (tile<16,8,int>), B=Q (tile<8,8,int>), C=KQ (tile<16,8,float>)
-    using T_A_KQ  = tile<16, 8, int>;
+    using T_A_KQ  = tile<16, 8, int>;    // FP4 MMA operands.
     using T_B_KQ  = tile< 8, 8, int>;
     using T_C_KQ  = tile<16, 8, float>;
 
-    // F16 MMA for VKQ: V from shared memory (half2), softmax from registers (half2).
-    using T_A_VKQ = tile<16, 8, half2>;
+    using T_A_VKQ = tile<16, 8, half2>; // F16 MMA for VKQ.
     using T_B_VKQ = tile< 8, 8, half2>;
     using T_C_VKQ = tile<16, 8, float>;
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
 
-    // Compile-time byte offset from primary K tiles to residual K tiles in shared memory.
     constexpr int k_res_byte_offset = 2 * nbatch_fa * (stride_k_qs * (int)sizeof(int) + stride_k_sc * (int)sizeof(uint32_t));
-
-    // K_res tiles computed from primary K tiles + fixed offset (follows buffer swaps implicitly).
     int      * tile_K_res_qs      = (int      *)((char *)tile_K_qs      + k_res_byte_offset);
     uint32_t * tile_K_res_sc      = (uint32_t *)((char *)tile_K_sc      + k_res_byte_offset);
 
@@ -582,7 +518,6 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
     }
 
     // ---- Phase 2a: Preload K[i+1], K_res[i+1], mask[i+1] into alternate buffers ----
-    // Safe before softmax: next buffers are DIFFERENT from curr buffers.
 
     if (!last_iter) {
         const int k_VKQ_next = (kb0 + 1) * nbatch_fa;
@@ -591,7 +526,6 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
             (K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
              tile_K_qs_next, tile_K_sc_next, k_VKQ_next, k_VKQ_sup_next);
 
-        // Load compact 1-bit sign residual K_res[i+1]: expand signs → ±1.0 nibbles.
         flash_attn_ext_mxfp4_load_K_res_compact<DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check>
             (K_row_base, K_sign_head_off, K_res_e_head_off, K_pos_stride,
              (int *)((char *)tile_K_qs_next + k_res_byte_offset),
@@ -689,7 +623,6 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
         }
     }
 
-    // Convert softmax weights to half2 B operand (register-only, no shared memory).
     T_B_VKQ B_VKQ[nbatch_fa / (np * 2 * T_B_VKQ::J)];
     static_assert(nbatch_fa % (np * 2 * T_B_VKQ::J) == 0, "bad loop size");
 #pragma unroll
@@ -697,26 +630,22 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
         B_VKQ[k] = get_transposed(get_half2(KQ_C[k]));
     }
 
-    // ---- sync_A: ensures all warps past previous iter's VKQ MMA before V is overwritten ----
     __syncthreads();
 
-    // ---- Phase 3: Load V[i] only (K_next + mask_next already loaded in Phase 2a) ----
+    // ---- Phase 3: Load V ----
 
     constexpr int stride_tile_V = nbatch_V2 + 4;
-
-    // Load V for this iteration (always needed).
     static_assert(DV == 2 * nbatch_V2, "V outer loop assumption: DV must equal 2*nbatch_V2");
     flash_attn_ext_mxfp4_load_V_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
         (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
          tile_V, k_VKQ_0, 0, k_VKQ_sup);
 
-    // ---- sync_B: V ready ----
     __syncthreads();
 
-    // ---- Phase 4: VKQ MMA (reads tile_V) ----
+    // ---- Phase 4: VKQ MMA ----
 
     {
-        constexpr int i0_stride = T_C_VKQ::I;  // 16
+        constexpr int i0_stride = T_C_VKQ::I;
 #pragma unroll
         for (int i_VKQ_0 = 0; i_VKQ_0 < DV; i_VKQ_0 += i0_stride) {
             static_assert((nbatch_fa / 2) % (np * T_A_VKQ::J) == 0, "bad loop size");
@@ -786,9 +715,9 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
 
     using T_B_KQ      = tile< 8, 8, int>;
     using T_C_KQ      = tile<16, 8, float>;
-    using T_C_VKQ     = tile<16, 8, float>;  // VKQ accumulator in F32.
-    using T_C_VKQ_h2  = tile<16, 4, half2>;  // Half2 version for combine section.
-    using T_B_combine = tile< 8, 8, half2>;  // For output combine: get_transposed(T_C_VKQ_h2) → T_B_combine.
+    using T_C_VKQ     = tile<16, 8, float>;
+    using T_C_VKQ_h2  = tile<16, 4, half2>;
+    using T_B_combine = tile< 8, 8, half2>;
 
     if (cols_per_warp > ncols) {
         NO_DEVICE_CODE;
@@ -802,35 +731,27 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
     constexpr int stride_k_qs    = DKQ / 8 + 4;
     constexpr int stride_k_sc    = DKQ / 64;
 
-    // F16 V layout stride.
-    constexpr int stride_tile_V = nbatch_V2 + 4;  // half2 units
+    constexpr int stride_tile_V = nbatch_V2 + 4;
 
-    // Shared memory layout.
     extern __shared__ char smem_mxfp4[];
 
-    // Q region: Q_qs + Q_sc (persistent across iterations).
     int      * tile_Q_qs = (int      *) smem_mxfp4;
     uint32_t * tile_Q_sc = (uint32_t *)(tile_Q_qs + ncols * stride_q_qs);
 
-    // KV region: K double-buf + K_res double-buf + V_f16 + mask double-buf (reloaded each iteration).
     int      * tile_K_qs_A     = (int      *)(tile_Q_sc + ncols * stride_q_sc);
     uint32_t * tile_K_sc_A     = (uint32_t *)(tile_K_qs_A + nbatch_fa * stride_k_qs);
     int      * tile_K_qs_B     = (int      *)(tile_K_sc_A + nbatch_fa * stride_k_sc);
     uint32_t * tile_K_sc_B     = (uint32_t *)(tile_K_qs_B + nbatch_fa * stride_k_qs);
-    // Residual K double-buffered tiles (same layout as primary K).
     int      * tile_K_res_qs_A = (int      *)(tile_K_sc_B + nbatch_fa * stride_k_sc);
     uint32_t * tile_K_res_sc_A = (uint32_t *)(tile_K_res_qs_A + nbatch_fa * stride_k_qs);
     int      * tile_K_res_qs_B = (int      *)(tile_K_res_sc_A + nbatch_fa * stride_k_sc);
     uint32_t * tile_K_res_sc_B = (uint32_t *)(tile_K_res_qs_B + nbatch_fa * stride_k_qs);
-    // V F16 data comes after K_res_B region.
     half2    * tile_V      = (half2 *)(tile_K_res_sc_B + nbatch_fa * stride_k_sc);
     constexpr int nbytes_V = nbatch_fa * stride_tile_V * (int)sizeof(half2);
-    // Double-buffered mask: allows K_next + mask_next loads to overlap with softmax reading mask_curr.
     constexpr int nbytes_mask = ncols1 * (nbatch_fa + 8) * (int)sizeof(half);
     half     * tile_mask_A = (half *)((char *)tile_V + nbytes_V);
     half     * tile_mask_B = (half *)((char *)tile_mask_A + nbytes_mask);
 
-    // VKQ accumulators in registers.
     T_C_VKQ VKQ_C[DV / T_C_VKQ::I];
 
     float KQ_rowsum[2] = {0.0f};
@@ -838,21 +759,13 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
     KQ_max[0] = -FLT_MAX / 2.0f;
     KQ_max[1] = -FLT_MAX / 2.0f;
 
-    // Quantize Q: F32 → MXFP4 in shared memory.
     flash_attn_ext_mxfp4_quantize_Q<DKQ, ncols, nwarps, stride_q_qs, stride_q_sc>
         (Q_f2, tile_Q_qs, tile_Q_sc, scale, stride_Q1, stride_Q2, ncols1, ncols2, jt, zt_gqa, gqa_ratio, ne01);
 
     __syncthreads();
 
-    // Main iteration loop over K/V tiles with K and mask double buffering.
-    // K[0] and mask[0] are preloaded into buffer A before the loop. Each iteration's
-    // iter function loads K[i+1] and mask[i+1] into the "next" buffers (overlapped with
-    // softmax reading "current" buffers). After each iteration, the buffers are swapped.
+    // Double-buffered iteration: K[i+1] loads overlap with softmax on K[i].
     int kb0 = kb0_start;
-
-    // Alternating K and mask buffer pointers.
-    // K_res tiles are at compile-time offset from primary K tiles, so they
-    // follow primary K swaps implicitly — no separate K_res pointers needed.
     int      * tile_K_qs_curr = tile_K_qs_A;
     uint32_t * tile_K_sc_curr = tile_K_sc_A;
     int      * tile_K_qs_next = tile_K_qs_B;
@@ -860,19 +773,13 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
     half     * tile_mask_curr = tile_mask_A;
     half     * tile_mask_next = tile_mask_B;
 
-    // Compile-time byte offset from primary K tile to corresponding K_res tile.
-    // Layout: K_qs_A, K_sc_A, K_qs_B, K_sc_B, K_res_qs_A, K_res_sc_A, K_res_qs_B, K_res_sc_B
-    // Same offset works for A→res_A and B→res_B.
     constexpr int k_res_byte_offset = 2 * nbatch_fa * (stride_k_qs * (int)sizeof(int) + stride_k_sc * (int)sizeof(uint32_t));
 
-    // Compact 1-bit sign residual offsets.
-    // Flat layout after all primary blocks: [signs: N×4B] [E8M0: N×1B]
-    // where N = blocks_per_row_primary = n_head_kv × blocks_per_head_K.
+    // Compact 1-bit sign residual offsets within SoA row.
     constexpr int blocks_per_head_K_local = DKQ / QK_MXFP4;
     const int n_head_kv_local = ne02 / gqa_ratio;
     const int blocks_per_row_primary = n_head_kv_local * blocks_per_head_K_local;
     const int compact_qs_start = blocks_per_row_primary * 16;
-    // K_qs_head_off / 16 = z_KV * blocks_per_head_K = starting block index for this head.
     const int head_block_start = K_qs_head_off / 16;
     const int K_sign_head_off  = compact_qs_start + head_block_start * 4;
     const int K_res_e_head_off = compact_qs_start + blocks_per_row_primary * 4 + head_block_start;
@@ -880,7 +787,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
     if constexpr (ncols2 == 1) {
         constexpr bool oob_check = true;
 
-        // Pre-loop: load K[0], K_res[0], and mask[0] into buffer A.
+        // Preload K[0], K_res[0], mask[0] into buffer A.
         {
             constexpr int k_VKQ_sup_v = nbatch_fa;
             const int k_VKQ_0 = kb0_start * nbatch_fa;
@@ -902,8 +809,6 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
 
         for (; kb0 < kb0_stop - 1; ++kb0) {
             constexpr int k_VKQ_sup_v = nbatch_fa;
-            // Penultimate for-loop iter preloads K for the post-loop (last) iter.
-            // k_VKQ_sup_next: nbatch_fa normally, actual remainder for the last iter's K.
             const int k_VKQ_sup_next = (kb0 + 1 == kb0_stop - 1) ? (ne11 - (kb0 + 1) * nbatch_fa) : nbatch_fa;
 
             flash_attn_ext_mxfp4_iter
@@ -919,13 +824,12 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
                  VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
                  false, k_VKQ_sup_next);
 
-            // Swap K and mask buffers (K_res follows implicitly via k_res_byte_offset).
+            // Swap double buffers.
             { int      * tmp = tile_K_qs_curr; tile_K_qs_curr = tile_K_qs_next; tile_K_qs_next = tmp; }
             { uint32_t * tmp = tile_K_sc_curr; tile_K_sc_curr = tile_K_sc_next; tile_K_sc_next = tmp; }
             { half     * tmp = tile_mask_curr; tile_mask_curr = tile_mask_next; tile_mask_next = tmp; }
         }
         {
-            // Last iteration: K and mask already loaded by previous iter (or by pre-loop if only 1 iter).
             const int k_VKQ_sup_v = ne11 - kb0 * nbatch_fa;
 
             flash_attn_ext_mxfp4_iter
@@ -944,7 +848,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
     } else {
         constexpr bool oob_check = false;
 
-        // Pre-loop: load K[0], K_res[0], and mask[0] into buffer A.
+        // Preload K[0], K_res[0], mask[0] into buffer A.
         {
             constexpr int k_VKQ_sup_v = nbatch_fa;
             const int k_VKQ_0 = kb0_start * nbatch_fa;
@@ -978,7 +882,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
                  VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
                  false, nbatch_fa);
 
-            // Swap K and mask buffers (K_res follows implicitly via k_res_byte_offset).
+            // Swap double buffers.
             { int      * tmp = tile_K_qs_curr; tile_K_qs_curr = tile_K_qs_next; tile_K_qs_next = tmp; }
             { uint32_t * tmp = tile_K_sc_curr; tile_K_sc_curr = tile_K_sc_next; tile_K_sc_next = tmp; }
             { half     * tmp = tile_mask_curr; tile_mask_curr = tile_mask_next; tile_mask_next = tmp; }
@@ -1001,7 +905,6 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
         }
     }
 
-    // Sum up partial KQ rowsums (spread across 8 threads for cols_per_warp=8).
     {
 #pragma unroll
         for (int col = 0; col < 2; ++col) {
@@ -1012,7 +915,6 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
         }
     }
 
-    // Handle attention sinks.
     if (!is_fixup && (np == 1 || threadIdx.y % np == 0) && sinks_f) {
         float KQ_max_scale[2];
 #pragma unroll
@@ -1037,11 +939,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
         }
     }
 
-    // VKQ_C will be converted F32→half2 incrementally in the combine loop below
-    // to avoid allocating a separate VKQ_C_h2 array (saves ~16 registers).
-
-    // Write results to shared memory and then to global memory.
-    // Re-use Q shared memory region for combining results.
+    // Write results: re-use Q shared memory region for combining.
     constexpr int tile_stride = nbatch_combine + 4;
     static_assert((DV / 2) % nbatch_combine == 0, "bad nbatch_combine");
 
@@ -1128,7 +1026,6 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
         }
     }
 
-    // Write VKQ data to shared memory and then to global memory.
 #pragma unroll
     for (int k00 = 0; k00 < DV / 2; k00 += nbatch_combine) {
         {
@@ -1257,11 +1154,10 @@ static __global__ void flash_attn_ext_mxfp4(
     const int stride_Q2   = nb02 / sizeof(float2);
     const int stride_mask = nb31 / sizeof(half);
 
-    // SoA layout: per-row [qs0..qsN | e0..eN]. Compute head offsets into qs and e regions.
     constexpr int blocks_per_head_K = DKQ / QK_MXFP4;
     constexpr int blocks_per_head_V = DV  / QK_MXFP4;
-    const int stride_K_blocks = nb11 / sizeof(block_mxfp4);  // Total blocks per K row (all heads).
-    const int stride_V_blocks = nb21 / sizeof(block_mxfp4);  // Total blocks per V row (all heads).
+    const int stride_K_blocks = nb11 / sizeof(block_mxfp4);
+    const int stride_V_blocks = nb21 / sizeof(block_mxfp4);
 
     const int iter_k     = (ne11      + (nbatch_fa - 1)) / nbatch_fa;
     const int iter_j     = (ne01.z    + (ncols1    - 1)) / ncols1;
@@ -1287,7 +1183,6 @@ static __global__ void flash_attn_ext_mxfp4(
         float2       * dstk    = ((float2 *)dst) + (sequence * ne01.z * ne02 + zt_Q) * (DV / 2);
         const float  * sinks_f = sinks ? (const float *)sinks + zt_Q : nullptr;
 
-        // SoA KV pointers: row base (sequence only, no head offset) + per-head qs/e offsets.
         const char * K_row_base    = K + nb13 * sequence;
         const int K_qs_head_off    = z_KV * blocks_per_head_K * 16;
         const int K_e_head_off     = stride_K_blocks * 16 + z_KV * blocks_per_head_K;

@@ -135,12 +135,8 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        // MXFP4 K cache: allocate extra width for compact 1-bit sign residual.
-        // Per primary block (32 elements): 4 bytes sign bits + 1 byte E8M0 = 5 bytes.
-        // Stored flat in extra SoA blocks after all primary blocks (16 qs bytes each).
-        // Total blocks must be a multiple of 4 so that nb[1] = 17*N is 4-byte aligned
-        // (required for int loads in SoA layout across rows).
-        // For D=128, n_kv_head=4: 16 primary + 8 extra = 24 blocks (1.5×).
+        // MXFP4 K cache: allocate extra blocks for compact 1-bit sign residual
+        // (5 bytes per primary block: 4 sign bits + 1 E8M0). Align to 4 blocks.
         uint32_t n_embd_k_alloc = n_embd_k_gqa;
         if (type_k == GGML_TYPE_MXFP4) {
             const int qk = (int)ggml_blck_size(GGML_TYPE_MXFP4);   // 32
@@ -1114,14 +1110,13 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
         assert(kv_size == k->ne[1]);
 
         // merge the buffer across all streams because the idxs are global
-        // Use view_2d to preserve nb[1] (which may be doubled for MXFP4 residual)
+        // Use view_2d to preserve nb[1] (which includes MXFP4 compact residual region)
         k = ggml_view_2d(ctx, k, k->ne[0], kv_size*n_stream, k->nb[1], 0);
     }
 
-    // For MXFP4: k->ne[0] = 2*n_embd_gqa (primary + residual regions).
-    // Create view with ne[0]=n_embd_gqa matching k_cur, preserving the full
-    // doubled row stride nb[1]. The set_rows kernel sees the full row via nb[1]
-    // and writes both primary and residual quantizations.
+    // For MXFP4: ne[0] includes compact residual region, but k_cur has n_embd_gqa.
+    // Create view with ne[0]=n_embd_gqa, preserving the larger row stride nb[1]
+    // so the set_rows kernel sees the full row and writes both primary and residual.
     ggml_tensor * k_dst = k;
     if (k->type == GGML_TYPE_MXFP4) {
         k_dst = ggml_view_2d(ctx, k, n_embd_gqa, k->ne[1], k->nb[1], 0);
