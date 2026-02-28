@@ -278,38 +278,69 @@ static __device__ void quantize_f32_mxfp4_block_soa(
 
     *(row_base + blocks_per_row_total * 16 + block_idx) = e_val;
 
-    // Compact 1-bit sign residual: sign bits + per-block mean_abs E8M0.
+    // Compact 2-bit sign+magnitude residual: {-1.0, -0.5, +0.5, +1.0} × E8M0.
     if constexpr (apply_hadamard) {
         const float scale = ggml_cuda_e8m0_to_fp32(e_val);
 
-        float res[QK_MXFP4];
+        float abs_res[QK_MXFP4];
+        uint32_t sign_bits = 0;
         for (int j = 0; j < QK_MXFP4/2; ++j) {
             const uint8_t byte = qs_bytes[j];
             const float recon0 = kvalues_mxfp4[byte & 0xF] * 0.5f * scale;
             const float recon1 = kvalues_mxfp4[byte >> 4]  * 0.5f * scale;
-            res[j]              = vals[j]              - recon0;
-            res[j + QK_MXFP4/2] = vals[j + QK_MXFP4/2] - recon1;
+            const float r0 = vals[j]              - recon0;
+            const float r1 = vals[j + QK_MXFP4/2] - recon1;
+            abs_res[j]              = fabsf(r0);
+            abs_res[j + QK_MXFP4/2] = fabsf(r1);
+            if (r0 < 0.0f) { sign_bits |= (1u << j); }
+            if (r1 < 0.0f) { sign_bits |= (1u << (j + QK_MXFP4/2)); }
         }
 
-        uint32_t sign_bits = 0;
+        // MSE-optimal E8M0 for 2-bit residual: test +-1 around amax estimate.
+        // Residual values are {0.5, 1.0} × scale; magnitude bit selects which.
+        float amax_res = 0.0f;
         for (int j = 0; j < QK_MXFP4; ++j) {
-            if (res[j] < 0.0f) {
-                sign_bits |= (1u << j);
+            amax_res = fmaxf(amax_res, abs_res[j]);
+        }
+
+        const int res_e_base = (amax_res == 0.0f) ? 0 : __float2int_rn(log2f(amax_res)) + 127;
+        const int res_e_lo = max(1, min(255, res_e_base - 1));
+        const int res_e_hi = max(1, min(255, res_e_base + 1));
+
+        int best_res_e = max(0, min(255, res_e_base));
+        float best_mse = 1e30f;
+        uint32_t best_mag_bits = 0;
+
+        for (int test_e = res_e_lo; test_e <= res_e_hi; ++test_e) {
+            const float test_scale = ggml_cuda_e8m0_to_fp32((uint8_t)test_e);
+            const float threshold = 0.75f * test_scale;
+            float mse = 0.0f;
+            uint32_t test_mag_bits = 0;
+            for (int j = 0; j < QK_MXFP4; ++j) {
+                float recon;
+                if (abs_res[j] < threshold) {
+                    recon = 0.5f * test_scale;
+                    test_mag_bits |= (1u << j);  // mag=1 → 0.5
+                } else {
+                    recon = 1.0f * test_scale;    // mag=0 → 1.0
+                }
+                const float err = abs_res[j] - recon;
+                mse += err * err;
+            }
+            if (mse < best_mse) {
+                best_mse = mse;
+                best_res_e = test_e;
+                best_mag_bits = test_mag_bits;
             }
         }
 
-        // E8M0 for residual: no FP4_E2M1_EMAX offset since sign values are +-1.0.
-        float sum_abs = 0.0f;
-        for (int j = 0; j < QK_MXFP4; ++j) {
-            sum_abs += fabsf(res[j]);
-        }
-        const float mean_abs = sum_abs * (1.0f / QK_MXFP4);
-        const int res_e = (mean_abs == 0.0f) ? 0 : __float2int_rn(log2f(mean_abs)) + 127;
-        const uint8_t res_e_val = (uint8_t) max(0, min(255, res_e));
+        const uint8_t res_e_val = (amax_res == 0.0f) ? (uint8_t)0 : (uint8_t)best_res_e;
 
+        // Layout: [signs: blocks×4B][mags: blocks×4B][res_e8m0: blocks×1B]
         const int compact_qs_off = blocks_per_primary * 16;
         *reinterpret_cast<uint32_t *>(row_base + compact_qs_off + block_idx * 4) = sign_bits;
-        *(row_base + compact_qs_off + blocks_per_primary * 4 + block_idx) = res_e_val;
+        *reinterpret_cast<uint32_t *>(row_base + compact_qs_off + blocks_per_primary * 4 + block_idx * 4) = best_mag_bits;
+        *(row_base + compact_qs_off + blocks_per_primary * 8 + block_idx) = res_e_val;
     }
 }
 

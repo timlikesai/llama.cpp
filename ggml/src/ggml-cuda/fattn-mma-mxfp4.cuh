@@ -127,11 +127,13 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
     }
 }
 
-// Load compact 1-bit sign residual K: expand sign bits to +-1.0 FP4 nibbles in smem.
+// Load compact 2-bit sign+magnitude residual K: expand to FP4 nibbles in smem.
+// FP4 values: +1.0 (0x2), +0.5 (0x1), -0.5 (0x9), -1.0 (0xA).
 template<int DKQ, int nwarps, int nbatch_fa, int stride_k_qs, int stride_k_sc, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K_res_compact(
         const char * const __restrict__ K_row_base,
         const int K_sign_off,
+        const int K_mag_off,
         const int K_res_e_off,
         const int K_pos_stride,
         int      * const __restrict__ tile_K_qs,
@@ -166,14 +168,22 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K_res_compact(
 
                 const uint32_t signs = *reinterpret_cast<const uint32_t *>(
                     row_i + K_sign_off + b * 4);
+                const uint32_t mags = *reinterpret_cast<const uint32_t *>(
+                    row_i + K_mag_off + b * 4);
 
-                // Expand sign bits to +-1.0 FP4 nibbles: 0x2 = +1.0, 0xA = -1.0.
+                // Expand 2-bit to FP4: nibble = (2 - mag_bit) | (sign_bit << 3).
+                // sign=0,mag=0 → 0x2 (+1.0)  sign=0,mag=1 → 0x1 (+0.5)
+                // sign=1,mag=0 → 0xA (-1.0)  sign=1,mag=1 → 0x9 (-0.5)
                 uint32_t result = 0;
 #pragma unroll
                 for (int j_off = 0; j_off < 4; ++j_off) {
                     const uint32_t lo_sign = (signs >> (j0 + j_off))      & 1u;
                     const uint32_t hi_sign = (signs >> (j0 + j_off + 16)) & 1u;
-                    result |= (0x22u | (lo_sign << 3) | (hi_sign << 7)) << (j_off * 8);
+                    const uint32_t lo_mag  = (mags  >> (j0 + j_off))      & 1u;
+                    const uint32_t hi_mag  = (mags  >> (j0 + j_off + 16)) & 1u;
+                    const uint32_t lo_nibble = (2u - lo_mag) | (lo_sign << 3);
+                    const uint32_t hi_nibble = (2u - hi_mag) | (hi_sign << 3);
+                    result |= (lo_nibble | (hi_nibble << 4)) << (j_off * 8);
                 }
                 tile_K_qs[i * stride_k_qs + k] = (int)result;
             }
@@ -455,6 +465,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
         const int K_qs_head_off,
         const int K_e_head_off,
         const int K_sign_head_off,
+        const int K_mag_head_off,
         const int K_res_e_head_off,
         const int K_pos_stride,
         const char           * const __restrict__ V_row_base,
@@ -476,7 +487,8 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
         uint32_t * const __restrict__ tile_K_sc,
         int      * const __restrict__ tile_K_qs_next,
         uint32_t * const __restrict__ tile_K_sc_next,
-        half2    * const __restrict__ tile_V,
+        half2    * const __restrict__ tile_V_curr,
+        half2    * const __restrict__ tile_V_next,
         half     * const __restrict__ tile_mask,
         half     * const __restrict__ tile_mask_next,
         tile<16, 8, float>   * const __restrict__ VKQ_C,
@@ -551,7 +563,9 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
         }
     }
 
-    // ---- Phase 2a: Preload K[i+1], K_res[i+1], mask[i+1] + V[curr] ----
+    // ---- Phase 2a: Preload K[i+1], K_res[i+1], mask[i+1], V[i+1] ----
+
+    static_assert(DV == 2 * nbatch_V2, "V outer loop assumption: DV must equal 2*nbatch_V2");
 
     if (!last_iter) {
         const int k_VKQ_next = (kb0 + 1) * nbatch_fa;
@@ -561,7 +575,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
              tile_K_qs_next, tile_K_sc_next, k_VKQ_next, k_VKQ_sup_next);
 
         flash_attn_ext_mxfp4_load_K_res_compact<DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check>
-            (K_row_base, K_sign_head_off, K_res_e_head_off, K_pos_stride,
+            (K_row_base, K_sign_head_off, K_mag_head_off, K_res_e_head_off, K_pos_stride,
              (int *)((char *)tile_K_qs_next + k_res_byte_offset),
              (uint32_t *)((char *)tile_K_sc_next + k_res_byte_offset),
              k_VKQ_next, k_VKQ_sup_next);
@@ -570,13 +584,11 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
             flash_attn_ext_mxfp4_load_mask<ncols1, nwarps, nbatch_fa, oob_check>
                 (mask_h + k_VKQ_next, tile_mask_next, stride_mask, k_VKQ_sup_next, jt * ncols1, ne01);
         }
-    }
 
-    // V load for current iteration: issue memory requests early so softmax hides latency.
-    static_assert(DV == 2 * nbatch_V2, "V outer loop assumption: DV must equal 2*nbatch_V2");
-    flash_attn_ext_mxfp4_load_V_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
-        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-         tile_V, k_VKQ_0, 0, k_VKQ_sup);
+        flash_attn_ext_mxfp4_load_V_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
+            (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+             tile_V_next, k_VKQ_next, 0, k_VKQ_sup_next);
+    }
 
     // ---- Phase 2b: Softmax + VKQ rescale (reads mask_curr, pure register work) ----
 
@@ -685,7 +697,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
                 const int k0 = k00 + (threadIdx.y % np) * T_A_VKQ::J;
 
                 T_A_VKQ A;
-                load_ldmatrix_trans(A, tile_V + 2 * k0 * stride_tile_V + i_VKQ_0 / 2, stride_tile_V);
+                load_ldmatrix_trans(A, tile_V_curr + 2 * k0 * stride_tile_V + i_VKQ_0 / 2, stride_tile_V);
                 mma(VKQ_C[i_VKQ_0 / i0_stride], A, B_VKQ[k00 / (np * T_A_VKQ::J)]);
             }
         }
@@ -695,11 +707,11 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
 
 #else
     GGML_UNUSED_VARS(Q_f2, K_row_base, K_qs_head_off, K_e_head_off,
-        K_sign_head_off, K_res_e_head_off, K_pos_stride,
+        K_sign_head_off, K_mag_head_off, K_res_e_head_off, K_pos_stride,
         V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
         mask_h, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02, stride_mask,
-        tile_Q_qs, tile_Q_sc, tile_K_qs, tile_K_sc, tile_K_qs_next, tile_K_sc_next, tile_V, tile_mask, tile_mask_next,
+        tile_Q_qs, tile_Q_sc, tile_K_qs, tile_K_sc, tile_K_qs_next, tile_K_sc_next, tile_V_curr, tile_V_next, tile_mask, tile_mask_next,
         VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, last_iter, k_VKQ_sup_next);
     NO_DEVICE_CODE;
 #endif // BLACKWELL_MMA_AVAILABLE
@@ -779,10 +791,11 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
     uint32_t * tile_K_res_sc_A = (uint32_t *)(tile_K_res_qs_A + nbatch_fa * stride_k_qs);
     int      * tile_K_res_qs_B = (int      *)(tile_K_res_sc_A + nbatch_fa * stride_k_sc);
     uint32_t * tile_K_res_sc_B = (uint32_t *)(tile_K_res_qs_B + nbatch_fa * stride_k_qs);
-    half2    * tile_V      = (half2 *)(tile_K_res_sc_B + nbatch_fa * stride_k_sc);
     constexpr int nbytes_V = nbatch_fa * stride_tile_V * (int)sizeof(half2);
+    half2    * tile_V_A    = (half2 *)(tile_K_res_sc_B + nbatch_fa * stride_k_sc);
+    half2    * tile_V_B    = (half2 *)((char *)tile_V_A + nbytes_V);
     constexpr int nbytes_mask = ncols1 * (nbatch_fa + 8) * (int)sizeof(half);
-    half     * tile_mask_A = (half *)((char *)tile_V + nbytes_V);
+    half     * tile_mask_A = (half *)((char *)tile_V_B + nbytes_V);
     half     * tile_mask_B = (half *)((char *)tile_mask_A + nbytes_mask);
 
     T_C_VKQ VKQ_C[DV / T_C_VKQ::I];
@@ -797,30 +810,34 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
 
     __syncthreads();
 
-    // Double-buffered iteration: K[i+1] loads overlap with softmax on K[i].
+    // Double-buffered iteration: K[i+1]/V[i+1] loads overlap with softmax on K[i].
     int kb0 = kb0_start;
     int      * tile_K_qs_curr = tile_K_qs_A;
     uint32_t * tile_K_sc_curr = tile_K_sc_A;
     int      * tile_K_qs_next = tile_K_qs_B;
     uint32_t * tile_K_sc_next = tile_K_sc_B;
+    half2    * tile_V_curr    = tile_V_A;
+    half2    * tile_V_next    = tile_V_B;
     half     * tile_mask_curr = tile_mask_A;
     half     * tile_mask_next = tile_mask_B;
 
     constexpr int k_res_byte_offset = 2 * nbatch_fa * (stride_k_qs * (int)sizeof(int) + stride_k_sc * (int)sizeof(uint32_t));
 
-    // Compact 1-bit sign residual offsets within SoA row.
+    // Compact 2-bit sign+magnitude residual offsets within SoA row.
+    // Layout: [signs: blocks×4B][mags: blocks×4B][res_e8m0: blocks×1B]
     constexpr int blocks_per_head_K_local = DKQ / QK_MXFP4;
     const int n_head_kv_local = ne02 / gqa_ratio;
     const int blocks_per_row_primary = n_head_kv_local * blocks_per_head_K_local;
     const int compact_qs_start = blocks_per_row_primary * 16;
     const int head_block_start = K_qs_head_off / 16;
     const int K_sign_head_off  = compact_qs_start + head_block_start * 4;
-    const int K_res_e_head_off = compact_qs_start + blocks_per_row_primary * 4 + head_block_start;
+    const int K_mag_head_off   = compact_qs_start + blocks_per_row_primary * 4 + head_block_start * 4;
+    const int K_res_e_head_off = compact_qs_start + blocks_per_row_primary * 8 + head_block_start;
 
     if constexpr (ncols2 == 1) {
         constexpr bool oob_check = true;
 
-        // Preload K[0], K_res[0], mask[0] into buffer A.
+        // Preload K[0], K_res[0], mask[0], V[0] into buffer A.
         {
             constexpr int k_VKQ_sup_v = nbatch_fa;
             const int k_VKQ_0 = kb0_start * nbatch_fa;
@@ -833,10 +850,13 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
                 (K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
                  tile_K_qs_curr, tile_K_sc_curr, k_VKQ_0, k_VKQ_sup_v);
             flash_attn_ext_mxfp4_load_K_res_compact<DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check>
-                (K_row_base, K_sign_head_off, K_res_e_head_off, K_pos_stride,
+                (K_row_base, K_sign_head_off, K_mag_head_off, K_res_e_head_off, K_pos_stride,
                  (int *)((char *)tile_K_qs_curr + k_res_byte_offset),
                  (uint32_t *)((char *)tile_K_sc_curr + k_res_byte_offset),
                  k_VKQ_0, k_VKQ_sup_v);
+            flash_attn_ext_mxfp4_load_V_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
+                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                 tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
             cp_async_wait_all();
             __syncthreads();
         }
@@ -848,19 +868,20 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
             flash_attn_ext_mxfp4_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check>
                 (Q_f2, K_row_base, K_qs_head_off, K_e_head_off,
-                 K_sign_head_off, K_res_e_head_off, K_pos_stride,
+                 K_sign_head_off, K_mag_head_off, K_res_e_head_off, K_pos_stride,
                  V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
                  mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_mask,
                  tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
                  tile_K_qs_next, tile_K_sc_next,
-                 tile_V, tile_mask_curr, tile_mask_next,
+                 tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
                  VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
                  false, k_VKQ_sup_next);
 
             // Swap double buffers.
             { int      * tmp = tile_K_qs_curr; tile_K_qs_curr = tile_K_qs_next; tile_K_qs_next = tmp; }
             { uint32_t * tmp = tile_K_sc_curr; tile_K_sc_curr = tile_K_sc_next; tile_K_sc_next = tmp; }
+            { half2    * tmp = tile_V_curr;    tile_V_curr    = tile_V_next;    tile_V_next    = tmp; }
             { half     * tmp = tile_mask_curr; tile_mask_curr = tile_mask_next; tile_mask_next = tmp; }
         }
         {
@@ -869,20 +890,20 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
             flash_attn_ext_mxfp4_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check>
                 (Q_f2, K_row_base, K_qs_head_off, K_e_head_off,
-                 K_sign_head_off, K_res_e_head_off, K_pos_stride,
+                 K_sign_head_off, K_mag_head_off, K_res_e_head_off, K_pos_stride,
                  V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
                  mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_mask,
                  tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
                  tile_K_qs_next, tile_K_sc_next,
-                 tile_V, tile_mask_curr, tile_mask_next,
+                 tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
                  VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
                  true, 0);
         }
     } else {
         constexpr bool oob_check = false;
 
-        // Preload K[0], K_res[0], mask[0] into buffer A.
+        // Preload K[0], K_res[0], mask[0], V[0] into buffer A.
         {
             constexpr int k_VKQ_sup_v = nbatch_fa;
             const int k_VKQ_0 = kb0_start * nbatch_fa;
@@ -893,10 +914,13 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
                 (K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
                  tile_K_qs_curr, tile_K_sc_curr, k_VKQ_0, k_VKQ_sup_v);
             flash_attn_ext_mxfp4_load_K_res_compact<DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check>
-                (K_row_base, K_sign_head_off, K_res_e_head_off, K_pos_stride,
+                (K_row_base, K_sign_head_off, K_mag_head_off, K_res_e_head_off, K_pos_stride,
                  (int *)((char *)tile_K_qs_curr + k_res_byte_offset),
                  (uint32_t *)((char *)tile_K_sc_curr + k_res_byte_offset),
                  k_VKQ_0, k_VKQ_sup_v);
+            flash_attn_ext_mxfp4_load_V_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
+                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                 tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
             cp_async_wait_all();
             __syncthreads();
         }
@@ -907,19 +931,20 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
             flash_attn_ext_mxfp4_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check>
                 (Q_f2, K_row_base, K_qs_head_off, K_e_head_off,
-                 K_sign_head_off, K_res_e_head_off, K_pos_stride,
+                 K_sign_head_off, K_mag_head_off, K_res_e_head_off, K_pos_stride,
                  V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
                  mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_mask,
                  tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
                  tile_K_qs_next, tile_K_sc_next,
-                 tile_V, tile_mask_curr, tile_mask_next,
+                 tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
                  VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
                  false, nbatch_fa);
 
             // Swap double buffers.
             { int      * tmp = tile_K_qs_curr; tile_K_qs_curr = tile_K_qs_next; tile_K_qs_next = tmp; }
             { uint32_t * tmp = tile_K_sc_curr; tile_K_sc_curr = tile_K_sc_next; tile_K_sc_next = tmp; }
+            { half2    * tmp = tile_V_curr;    tile_V_curr    = tile_V_next;    tile_V_next    = tmp; }
             { half     * tmp = tile_mask_curr; tile_mask_curr = tile_mask_next; tile_mask_next = tmp; }
         }
         {
@@ -928,13 +953,13 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
             flash_attn_ext_mxfp4_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check>
                 (Q_f2, K_row_base, K_qs_head_off, K_e_head_off,
-                 K_sign_head_off, K_res_e_head_off, K_pos_stride,
+                 K_sign_head_off, K_mag_head_off, K_res_e_head_off, K_pos_stride,
                  V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
                  mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_mask,
                  tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
                  tile_K_qs_next, tile_K_sc_next,
-                 tile_V, tile_mask_curr, tile_mask_next,
+                 tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
                  VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
                  true, 0);
         }
@@ -1346,8 +1371,9 @@ void ggml_cuda_flash_attn_ext_mma_mxfp4_case(ggml_backend_cuda_context & ctx, gg
 
     const size_t nbytes_Q_region    = nbytes_Q_qs + nbytes_Q_sc;
     const size_t nbytes_K_double    = 4 * (nbytes_K_qs + nbytes_K_sc);    // Double-buffered K + K_res (A + B × 2).
+    const size_t nbytes_V_double    = 2 * nbytes_V;                        // Double-buffered V (A + B).
     const size_t nbytes_mask_double = 2 * nbytes_mask;                     // Double-buffered mask (A + B).
-    const size_t nbytes_KV_region   = nbytes_K_double + nbytes_V + nbytes_mask_double;
+    const size_t nbytes_KV_region   = nbytes_K_double + nbytes_V_double + nbytes_mask_double;
 
     const size_t nbytes_shared_combine = nwarps * cols_per_warp * (nbatch_combine + 4) * sizeof(half2);
 

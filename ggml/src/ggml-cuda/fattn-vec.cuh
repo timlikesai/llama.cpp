@@ -110,7 +110,7 @@ static __global__ void flash_attn_ext_vec(
     }
 
     int K_qs_head_off = 0, K_e_head_off = 0;
-    int K_sign_head_off = 0, K_res_e_head_off = 0;
+    int K_sign_head_off = 0, K_mag_head_off = 0, K_res_e_head_off = 0;
     int V_qs_head_off = 0, V_e_head_off = 0;
     if constexpr (type_K == GGML_TYPE_MXFP4) {
         constexpr int blocks_per_head_K = D / QK_MXFP4;
@@ -119,10 +119,12 @@ static __global__ void flash_attn_ext_vec(
         K_qs_head_off = z_KV * blocks_per_head_K * 16;
         K_e_head_off  = stride_K_blocks * 16 + z_KV * blocks_per_head_K;
 
+        // 2-bit residual layout: [signs: blocks×4B][mags: blocks×4B][res_e8m0: blocks×1B]
         const int blocks_per_row_primary = ne12 * blocks_per_head_K;
         const int compact_qs_start = blocks_per_row_primary * 16;
         K_sign_head_off  = compact_qs_start + z_KV * blocks_per_head_K * 4;
-        K_res_e_head_off = compact_qs_start + blocks_per_row_primary * 4 + z_KV * blocks_per_head_K;
+        K_mag_head_off   = compact_qs_start + blocks_per_row_primary * 4 + z_KV * blocks_per_head_K * 4;
+        K_res_e_head_off = compact_qs_start + blocks_per_row_primary * 8 + z_KV * blocks_per_head_K;
     }
     if constexpr (type_V == GGML_TYPE_MXFP4) {
         constexpr int blocks_per_head_V = D / QK_MXFP4;
@@ -300,7 +302,7 @@ static __global__ void flash_attn_ext_vec(
                     sum = vec_dot_fattn_vec_KQ_mxfp4_soa<D, nthreads_KQ>(
                         K + i_KQ*nb11, Q_i32[j], Q_ds[j], K_qs_head_off, K_e_head_off);
                     sum += vec_dot_fattn_vec_KQ_mxfp4_res_compact<D, nthreads_KQ>(
-                        K + i_KQ*nb11, Q_i32[j], Q_ds[j], K_sign_head_off, K_res_e_head_off);
+                        K + i_KQ*nb11, Q_i32[j], Q_ds[j], K_sign_head_off, K_mag_head_off, K_res_e_head_off);
                 } else {
                     sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
                 }
