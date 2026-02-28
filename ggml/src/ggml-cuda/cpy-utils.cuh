@@ -232,15 +232,15 @@ static __device__ void quantize_f32_mxfp4_block_soa(
         src = vals;
     }
 
-    // MSE-optimal E8M0 search: test +-2 around amax estimate, pick lowest MSE.
+    // MSE-optimal E8M0 search: test +-1 around amax estimate, pick lowest MSE.
     float amax = 0.0f;
     for (int j = 0; j < QK_MXFP4; ++j) {
         amax = fmaxf(amax, fabsf(src[j]));
     }
 
     const int e_base = (amax == 0.0f) ? 0 : __float2int_rn(log2f(amax)) - 2 + 127;
-    const int e_lo = max(1, min(255, e_base - 2));
-    const int e_hi = max(1, min(255, e_base + 2));
+    const int e_lo = max(1, min(255, e_base - 1));
+    const int e_hi = max(1, min(255, e_base + 1));
 
     int best_e = max(0, min(255, e_base));
     float best_mse = 1e30f;
