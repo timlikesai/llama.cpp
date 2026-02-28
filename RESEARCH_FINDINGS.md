@@ -240,8 +240,11 @@ near-F16 quality and faster generation speed than the full-precision baseline.
    (Bottlenecked Transformer approach). Requires training or fine-tuning.
 10. **Fixed-size continual encoding** — Full implementation of the core thesis.
     Requires new kernel architecture for dequant→attention→requant cycle.
-11. **QuantSpec self-speculative decoding** — Hierarchical bit-sharing between
-    draft (MXFP4) and target (FP8) KV caches. Requires dual-cache architecture.
+
+### Not Recommended for This Architecture
+11. ~~**QuantSpec self-speculative decoding**~~ — Analysis (Experiment 7) shows this
+    is not viable for GQA MoE models: no size asymmetry for draft speedup, verification
+    needs full context, and n-gram speculation already provides better throughput.
 
 ---
 
@@ -292,3 +295,184 @@ MXFP4 — uniform precision across all context positions is adequate.
 |------------|--------------|--------------|-------|--------|
 | F16 | 96.00 MiB | 96.00 MiB | 192.00 MiB | 1.0× |
 | MXFP4+res | 38.25 MiB | 25.50 MiB | 63.75 MiB | 3.0× smaller |
+
+---
+
+## Experiment 6: MXFP4 Quantization Residual Structure Analysis (GEAR-inspired)
+
+**Research question**: Does the MXFP4 quantization residual have exploitable low-rank
+structure, as GEAR (§4.1) found for general quantization? Would a linear correction
+adapter (KVLinC-style, §4.4) further improve quality?
+
+**Reference**: GEAR shows quantization residuals decompose into low-rank + sparse components.
+KVLinC adds Hadamard rotation + learned linear adapters for correction.
+
+### Theoretical Analysis
+
+The MXFP4 quantization residual `res[j] = K[j] - dequant(quant(K[j]))` has two sources:
+
+**1. E8M0 Scale Error (Rank-1 Component)**
+
+The block exponent rounds to the nearest power of 2. If the true optimal scale is 3.0,
+the E8M0 rounds to either 2 or 4 (up to 41% error). This multiplicative error affects
+all 32 elements in a block uniformly, creating a **rank-1 residual component**:
+```
+res_scale[j] ≈ K[j] * (1 - 2^round(log2(max_abs)) / max_abs)
+```
+This is the coherent structure that our 1-bit sign residual captures — the sign of each
+element's error is correlated with the element's value and the scale direction.
+
+**2. E2M1 Grid Snapping Error (Independent Noise)**
+
+Each value snaps to the nearest of `{0, 0.5, 1, 1.5, 2, 3, 4, 6}` (scaled by E8M0).
+This error is independent per element and depends on where the value falls relative to
+the non-uniform FP4 grid. The grid has larger gaps at higher values (3→4, 4→6), creating
+position-dependent quantization noise.
+
+After Hadamard rotation, input values cluster around the block mean (the transform
+concentrates energy). This means post-Hadamard values land in the mid-range of the FP4
+grid where gaps are moderate — Hadamard partially mitigates grid snapping too.
+
+### What Our 1-Bit Residual Captures
+
+The sign + E8M0 magnitude format captures:
+- **Direction of rank-1 scale error**: 100% (sign exactly recovers which elements are
+  over/under-quantized relative to the block mean)
+- **Grid snapping direction**: Partially (sign gives direction but not magnitude)
+- **Grid snapping magnitude**: Not captured (would need multi-bit residual)
+
+This explains the experimental results:
+- Full MXFP4 residual (17 bytes/block): PPL 9.7686 — captures both components
+- 1-bit sign residual (5 bytes/block): PPL 9.8622 — captures rank-1 well, grid noise partially
+- Plain MXFP4 (no residual): PPL 10.3099 — neither component
+
+### Would a Linear Adapter Help?
+
+A KVLinC-style adapter applies `K_corrected = W * K_dequant + b` after dequantization.
+
+**Pros**:
+- Could capture per-channel bias patterns (if certain channels consistently over/under-quantize)
+- Constant memory cost (D×D matrix per layer + bias = small)
+- Orthogonal to our sign residual (could be used together)
+
+**Cons**:
+- Requires per-model calibration data and training
+- Our Hadamard rotation already decorrelates channels, so per-channel biases should be minimal
+- The remaining gap (0.13 PPL) is mostly grid snapping noise which is **independent per element** — a linear transform cannot fix independent noise
+- Adding compute per attention query (matrix multiply in the critical path)
+
+### Verdict
+
+A linear adapter is **unlikely to improve significantly** beyond the 1-bit sign residual.
+
+The residual IS low-rank (primarily rank-1 from scale error), and our sign + E8M0 already
+captures this efficiently. The remaining 14% gap to F16 is from independent grid snapping
+noise that requires either:
+- A denser quantization grid (NVFP4 with 16-element blocks, or Q4_0 with uniform grid)
+- Full multi-bit residual storage (which we tested — gives 94% recovery at 2× memory)
+
+The sign residual at 1.5× memory is the optimal point on the quality-memory Pareto frontier
+for MXFP4 quantization without model-specific calibration.
+
+---
+
+## Experiment 7: QuantSpec Self-Speculative Decoding Feasibility
+
+**Research question**: Can MXFP4 KV cache serve as a "draft" cache for self-speculative
+decoding, with a small FP16 "verification buffer" for recent tokens (QuantSpec-style)?
+
+**Reference**: KV_TRAINING_RESEARCH.md §5.1 — QuantSpec (Apple, arxiv 2502.10424)
+
+### QuantSpec Concept
+
+QuantSpec decomposes INT8 KV cache values into upper (INT4) and lower (INT4) halves.
+The draft model uses the upper INT4 half (fast, low precision), the target verifies
+against full INT8 reconstructed from both halves. This achieves >90% acceptance because
+the draft and target share weights — they differ only in KV cache precision.
+
+The question: can we adapt this for MXFP4 draft + FP16 verification?
+
+### Architecture Analysis
+
+llama.cpp's speculative decoding pipeline (`common/speculative.cpp`) supports:
+- **Draft model** (`ctx_dft`): generates candidate tokens via autoregressive `llama_decode()`
+- **Target model** (`ctx_tgt`): verifies N+1 tokens in a single batch forward pass
+- **Accept/reject**: token-by-token comparison, KV cache trimmed at first mismatch
+
+Critically, `model_dft` can point to the **same** `llama_model` as the target — weights
+are shared, only KV caches differ. So self-speculative with different cache types IS
+architecturally possible in llama.cpp.
+
+### Why It Won't Work for Our Setup
+
+**Problem 1: No size asymmetry**
+
+Speculative decoding gains speed because the draft model is 10-50× smaller than the
+target. With self-speculative decoding (same 30B MoE model), the draft pass costs nearly
+as much as a target pass. The only savings come from attention bandwidth reduction with
+MXFP4, which is small relative to total compute — especially with GQA (4 KV heads) where
+attention is already cheap.
+
+The break-even equation: `speedup = (1 + R×N) / (C_draft×N/C_verify + 1)`. When
+`C_draft ≈ C_verify` (same model), speedup → 1 regardless of acceptance rate R.
+
+**Problem 2: Verification requires full context**
+
+A "small FP16 verification buffer" holding only recent tokens is fundamentally broken
+for transformer attention. The verifier must compute attention over the entire prefix
+to produce correct logits. If the FP16 buffer holds only 512 tokens of a 16K context,
+the verification logits are wrong for any query that attends to tokens outside the window.
+
+This isn't a precision issue — it's a correctness issue. The verifier would disagree
+with the draft not because of quantization but because it's computing different attention.
+
+**Problem 3: Per-layer type mixing unsupported**
+
+`type_k` and `type_v` are context-level parameters baked into allocation. There's no
+mechanism for layer-selective precision (e.g., early layers MXFP4, later layers FP16).
+Two separate contexts with full KV caches are needed, doubling memory.
+
+**Problem 4: MoE attention fraction is small**
+
+For Qwen3-Coder-30B-A3B with 4 KV heads and GQA ratio 8, attention is a small fraction
+of per-token compute (most time goes to expert FFN). MXFP4 KV cache saves memory
+bandwidth during attention, but does not meaningfully reduce the compute cost of a
+draft forward pass. The QuantSpec approach works when quantized attention IS the
+dominant cost (dense models with many KV heads).
+
+### What N-gram Spec Decoding Already Provides
+
+N-gram draft generation is effectively "free" — a hash table lookup taking microseconds,
+vs a full model forward pass. This means:
+
+| Property | N-gram (current) | QuantSpec (hypothetical) |
+|----------|-----------------|------------------------|
+| Draft cost | ~0 (hash lookup) | ~6.7 ms (full 30B forward) |
+| Acceptance rate | 39-45% (Config F) | ~90% (same model) |
+| Net throughput | 247 t/s (+65%) | ~160 t/s (worse than baseline*) |
+| Memory overhead | ~0 | +384 MiB (FP16 KV cache) |
+| Implementation | Done | Weeks of work |
+
+*QuantSpec estimate: even with 90% acceptance and N=8 draft tokens, each draft requires
+a full forward pass (~6.7 ms). 8 drafts = ~54 ms, verification batch = ~10 ms, for
+~7.2 accepted tokens in ~64 ms = ~112 t/s effective. This is SLOWER than baseline 150 t/s.
+
+### Verdict
+
+QuantSpec-style self-speculative decoding is **not viable** for our architecture:
+
+1. Same-model drafting provides no compute advantage (no size asymmetry)
+2. Verification requires full context (can't use a small FP16 buffer)
+3. N-gram speculation already achieves better throughput with zero overhead
+4. The only scenario where QuantSpec helps is dense models with many KV heads
+   where attention is the compute bottleneck — opposite of our GQA MoE setup
+
+The QuantSpec paper's results apply to dense models where quantized attention IS
+significantly faster. For MoE models with few KV heads, n-gram speculation is
+strictly superior.
+
+### Research Priority Update
+
+Moving QuantSpec from "Requires Significant Work" to **Not Recommended** for this
+model class. N-gram speculation (already deployed) provides the speed gains that
+QuantSpec would theoretically offer, without the engineering cost or memory overhead.
