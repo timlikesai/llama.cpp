@@ -800,25 +800,7 @@ static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
 }
 
 __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e) {
-    const uint8_t sign_bit = (x < 0.0f) << 3;
-    float         ax       = fabsf(x) * e;
-
-    // Positive LUT
-    static constexpr float pos_lut[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
-
-    int   best_i   = 0;
-    float best_err = fabsf(ax - pos_lut[0]);
-
-#pragma unroll
-    for (int i = 1; i < 8; ++i) {
-        const float err = fabsf(ax - pos_lut[i]);
-        if (err < best_err) {
-            best_err = err;
-            best_i   = i;
-        }
-    }
-
-    return static_cast<uint8_t>(best_i | sign_bit);
+    return __nv_cvt_float_to_fp4(x * e, __NV_E2M1, cudaRoundNearest);
 }
 
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.

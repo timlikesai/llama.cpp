@@ -267,9 +267,9 @@ static __device__ void quantize_f32_mxfp4_block_soa(
     uint8_t qs_bytes[QK_MXFP4/2];
     uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * 16);
     for (int j = 0; j < QK_MXFP4/2; ++j) {
-        const uint8_t xi0 = ggml_cuda_float_to_fp4_e2m1(src[0          + j], inv_d);
-        const uint8_t xi1 = ggml_cuda_float_to_fp4_e2m1(src[QK_MXFP4/2 + j], inv_d);
-        const uint8_t byte = xi0 | (xi1 << 4);
+        const uint8_t byte = __nv_cvt_float2_to_fp4x2(
+            make_float2(src[j] * inv_d, src[QK_MXFP4/2 + j] * inv_d),
+            __NV_E2M1, cudaRoundNearest);
         qs_dst[j] = byte;
         if constexpr (apply_hadamard) {
             qs_bytes[j] = byte;
