@@ -113,7 +113,9 @@ static void set_rows_cuda_quant(
 // interleaved [e0][qs0][e1][qs1]... AoS layout. This enables aligned int/uint16_t loads
 // in the flash attention kernel on Blackwell (sm_120a).
 //
-// When apply_hadamard=true, applies Walsh-Hadamard rotation before quantization (K cache only).
+// When apply_hadamard=true (K cache): applies Walsh-Hadamard rotation before quantization,
+// then writes both primary and residual MXFP4 blocks (residual = quantization error of primary).
+// blocks_per_row_total is 2× blocks_per_primary for K cache (derived from nb1 / sizeof(block_mxfp4)).
 template <typename idx_t, bool apply_hadamard>
 static __global__ void k_set_rows_mxfp4_soa(
         const float * __restrict__ src0,
@@ -138,7 +140,7 @@ static __global__ void k_set_rows_mxfp4_soa(
         const uint3   ne02,
         const uint3   ne11_fd,
         const uint3   ne12_fd,
-        const int     blocks_per_row) {
+        const int     blocks_per_row_total) {
     const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
 
     if (i >= ne_total) {
@@ -172,7 +174,7 @@ static __global__ void k_set_rows_mxfp4_soa(
 
     const int block_in_row = i00 / QK_MXFP4;
 
-    quantize_f32_mxfp4_block_soa<apply_hadamard>(src0_row + i00, dst_row_base, block_in_row, blocks_per_row);
+    quantize_f32_mxfp4_block_soa<apply_hadamard>(src0_row + i00, dst_row_base, block_in_row, blocks_per_row_total);
 
     GGML_UNUSED(ne10);
     GGML_UNUSED(ne11);
@@ -207,7 +209,10 @@ static void set_rows_cuda_mxfp4_soa(
     const int64_t s2  = nb2;
     const int64_t s3  = nb3;
 
-    const int blocks_per_row = ne00 / QK_MXFP4;
+    // Total blocks in the SoA row (from actual byte stride).
+    // For K cache with residual: nb1 reflects the doubled K allocation, so
+    // blocks_per_row_total = 2 * blocks_per_primary. For V cache: equals blocks_per_primary.
+    const int blocks_per_row_total = nb1 / sizeof(block_mxfp4);
 
     if (ne_total > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
         const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
@@ -218,7 +223,7 @@ static void set_rows_cuda_mxfp4_soa(
 
         k_set_rows_mxfp4_soa<idx_t, apply_hadamard><<<grid_size, block_size, 0, stream>>>(
             src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3,
-            ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd, blocks_per_row);
+            ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd, blocks_per_row_total);
     }
 }
 
