@@ -62,7 +62,8 @@ static __host__ fattn_mma_config ggml_cuda_fattn_mma_mxfp4_get_config(
 // Loading helpers
 // ------------------------------------------------------------------------------------------------------------------
 
-// Load K from global to shared memory (SoA layout).
+// Load K from global to shared memory (SoA layout) using cp.async for qs blocks.
+// Requires 16-byte aligned row starts (nb[1] % 16 == 0, ensured by block count alignment).
 template<int DKQ, int nwarps, int nbatch_fa, int stride_k_qs, int stride_k_sc, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
         const char * const __restrict__ K_row_base,
@@ -73,9 +74,32 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
         uint32_t * const __restrict__ tile_K_sc,
         const int k_VKQ_0,
         const int k_VKQ_sup) {
-    constexpr int ints_per_row = DKQ / 8;
     constexpr int blocks_per_head = DKQ / 32;
 
+    const unsigned int tile_K_qs_32 = ggml_cuda_cvta_generic_to_shared(tile_K_qs);
+
+    // K qs via cp.async: each thread handles one (row, block) pair = 16 bytes.
+#pragma unroll
+    for (int flat0 = 0; flat0 < nbatch_fa * blocks_per_head; flat0 += nwarps * WARP_SIZE) {
+        const int flat = flat0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+
+        if (flat0 + nwarps * WARP_SIZE > nbatch_fa * blocks_per_head && flat >= nbatch_fa * blocks_per_head) {
+            break;
+        }
+
+        const int i = flat / blocks_per_head;
+        const int b = flat % blocks_per_head;
+
+        if (oob_check && i >= k_VKQ_sup) {
+            *reinterpret_cast<int4 *>(&tile_K_qs[i * stride_k_qs + b * 4]) = make_int4(0, 0, 0, 0);
+        } else {
+            const char * row_i = K_row_base + int64_t(k_VKQ_0 + i) * K_pos_stride;
+            const unsigned int smem_dst = tile_K_qs_32 + (i * stride_k_qs + b * 4) * (int)sizeof(int);
+            cp_async_cg_16<128>(smem_dst, row_i + K_qs_head_off + b * 16);
+        }
+    }
+
+    // E8M0 scales: synchronous byte reads + pair packing (only 4 bytes per head per row).
 #pragma unroll
     for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps) {
         const int i = i0 + threadIdx.y;
@@ -84,24 +108,6 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
             break;
         }
 
-        const char * row_i = K_row_base + int64_t(k_VKQ_0 + i) * K_pos_stride;
-
-#pragma unroll
-        for (int k0 = 0; k0 < ints_per_row; k0 += WARP_SIZE) {
-            const int k = k0 + threadIdx.x;
-            if (k0 + WARP_SIZE > ints_per_row && k >= ints_per_row) {
-                break;
-            }
-
-            if (oob_check && i >= k_VKQ_sup) {
-                tile_K_qs[i * stride_k_qs + k] = 0;
-            } else {
-                tile_K_qs[i * stride_k_qs + k] =
-                    *reinterpret_cast<const int *>(row_i + K_qs_head_off + k * 4);
-            }
-        }
-
-        // Pack 2 E8M0 scales per uint32_t for scale_vec::2X MMA.
 #pragma unroll
         for (int s0 = 0; s0 < blocks_per_head / 2; s0 += WARP_SIZE) {
             const int s = s0 + threadIdx.x;
@@ -112,6 +118,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
             if (oob_check && i >= k_VKQ_sup) {
                 tile_K_sc[i * stride_k_sc + s] = 0;
             } else {
+                const char * row_i = K_row_base + int64_t(k_VKQ_0 + i) * K_pos_stride;
                 const uint8_t e0 = *(row_i + K_e_head_off + 2 * s);
                 const uint8_t e1 = *(row_i + K_e_head_off + 2 * s + 1);
                 tile_K_sc[i * stride_k_sc + s] = (uint32_t)e0 | ((uint32_t)e1 << 8);
@@ -663,6 +670,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
         B_VKQ[k] = get_transposed(get_half2(KQ_C[k]));
     }
 
+    cp_async_wait_all(); // Ensures K[next] cp.async transfers complete.
     __syncthreads(); // Ensures K[next], mask[next], V writes complete.
 
     // ---- Phase 3: VKQ MMA ----
@@ -829,6 +837,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
                  (int *)((char *)tile_K_qs_curr + k_res_byte_offset),
                  (uint32_t *)((char *)tile_K_sc_curr + k_res_byte_offset),
                  k_VKQ_0, k_VKQ_sup_v);
+            cp_async_wait_all();
             __syncthreads();
         }
 
@@ -888,6 +897,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
                  (int *)((char *)tile_K_qs_curr + k_res_byte_offset),
                  (uint32_t *)((char *)tile_K_sc_curr + k_res_byte_offset),
                  k_VKQ_0, k_VKQ_sup_v);
+            cp_async_wait_all();
             __syncthreads();
         }
 

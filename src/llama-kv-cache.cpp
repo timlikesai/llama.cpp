@@ -136,14 +136,15 @@ llama_kv_cache::llama_kv_cache(
         const bool has_v = !is_mla;
 
         // MXFP4 K cache: allocate extra blocks for compact 1-bit sign residual
-        // (5 bytes per primary block: 4 sign bits + 1 E8M0). Align to 4 blocks.
+        // (5 bytes per primary block: 4 sign bits + 1 E8M0). Align to 16 blocks
+        // so that nb[1] = total_blocks * 17 is divisible by 16, enabling cp.async.
         uint32_t n_embd_k_alloc = n_embd_k_gqa;
         if (type_k == GGML_TYPE_MXFP4) {
             const int qk = (int)ggml_blck_size(GGML_TYPE_MXFP4);   // 32
             const int blocks_primary  = (int)n_embd_k_gqa / qk;     // total primary blocks
             const int compact_bytes   = blocks_primary * 5;          // sign bits + E8M0 per block
             const int extra_blocks    = (compact_bytes + 15) / 16;   // ceil to 16-byte qs slots
-            const int total_blocks    = ((blocks_primary + extra_blocks) + 3) & ~3;  // align to 4
+            const int total_blocks    = ((blocks_primary + extra_blocks) + 15) & ~15;  // align to 16
             n_embd_k_alloc = (uint32_t)(total_blocks * qk);
         }
 
