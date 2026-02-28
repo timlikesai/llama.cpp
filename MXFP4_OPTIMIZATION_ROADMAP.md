@@ -11,7 +11,7 @@ Date: 2026-02-28
 | GPU | 2x RTX 5070 Ti (sm_120, consumer Blackwell) |
 | PPL (59-chunk) | 9.8622 (+0.13 vs F16) |
 | KV memory | 63.75 MiB (6x reduction vs F16 384 MiB) |
-| pp512 | ~5,916 t/s |
+| pp512 | ~7,200 t/s (was ~5,916 before fast_expf) |
 | tg128 | ~150 t/s (no spec), ~247 t/s (n-gram spec) |
 
 ## Instruction Selection (Already Optimal)
@@ -27,34 +27,28 @@ the correct instruction for MXFP4 data (32-element E8M0-scaled blocks). Key deci
 - **Scalar butterfly Hadamard** — correct for 32 values in registers; HadaCore tensor
   core Hadamard only helps for large batched transforms in shared memory.
 
-## Phase 1: Low-Effort Optimizations
+## Phase 1: Low-Effort Optimizations (COMPLETED)
 
-### 1a. cp.async for K Tile Loads
-**Impact: Medium | Effort: Low**
+### 1a. cp.async for K Tile Loads — NOT VIABLE
+**Impact: N/A | Effort: Low | Status: Investigated, not viable**
 
-K quantized data (FP4 nibbles) goes directly to shared memory without dequantization,
-making it a perfect candidate for `cp.async.cg.shared.global`. Currently all K loads are
-synchronous (every thread participates in `reinterpret_cast` loads from global memory).
+MXFP4 SoA compact layout has row stride = 24 blocks × 17 bytes = 408 bytes. Since
+408 % 16 = 8, odd-numbered KV rows are only 8-byte aligned. Both `cp_async_cg_16`
+and `int4` vectorized loads require 16-byte alignment. Would require padding
+`block_mxfp4` to 32 bytes (doubling memory), defeating the purpose.
 
-Benefits:
-- Frees warp threads from load participation during K tile fetch
-- Hardware-managed async pipeline overlaps loads with prior computation
-- The kernel already includes `cp-async.cuh` but does not use it for MXFP4
+TMA (Phase 2b) has the same alignment constraint and is also not viable.
 
-Does NOT apply to V loads (V requires FP4→F16 dequantization before shared memory).
+### 1b. Reduce MSE E8M0 Search Range (±2 → ±1) — DONE ✓
+**Commit: 18598686 | PPL impact: negligible**
 
-### 1b. Reduce MSE E8M0 Search Range (±2 → ±1)
-**Impact: Low | Effort: Low**
+Reduced from 5 candidates to 3. Hadamard pre-rotation makes the amax estimate reliable.
 
-The KV cache quantization tests 5 E8M0 candidates (±2 around amax estimate). With
-Hadamard pre-rotation equalizing block values, the amax estimate is already reliable.
-Reducing to 3 candidates (±1) halves the search cost with likely negligible PPL impact.
+### 1c. Approximate exp() in Softmax — DONE ✓
+**Commit: db7ee2b6 | pp512: 5,916 → 7,200 t/s (+21.7%) | PPL: +0.021**
 
-### 1c. Approximate exp() in Softmax
-**Impact: Low-Medium | Effort: Low**
-
-Replace `expf()` calls in softmax (which serialize on the SFU) with a polynomial
-approximation of 2^x. Flash Attention 4 uses a cubic polynomial for this.
+Cubic polynomial approximation of 2^x (from Flash Attention 4) with IEEE 754 bit
+manipulation. Added underflow guard for `xi < -126` to prevent garbage floats.
 
 ## Phase 2: Medium-Effort Optimizations
 
@@ -69,17 +63,12 @@ Requires additional shared memory for a second V buffer (~17 KB for D=128, nbatc
 Current total smem is ~41 KB; adding a second V buffer brings it to ~58 KB, still under
 Blackwell's 128 KB limit.
 
-### 2b. TMA for K/V/Mask Loads
-**Impact: Medium-High | Effort: Medium**
+### 2b. TMA for K/V/Mask Loads — NOT VIABLE
+**Impact: N/A | Effort: Medium | Status: Same alignment issue as cp.async**
 
-Tensor Memory Accelerator provides hardware-accelerated bulk transfers with automatic
-address generation and OOB handling. Would replace the entire `flash_attn_ext_mxfp4_load_K`
-function with a tensor map descriptor + `cp.async.bulk`.
-
-Benefits:
-- Eliminates all thread participation in address calculation and OOB checks
-- Hardware handles multi-dimensional tensor addressing
-- Available on sm_90+ (works on our sm_120)
+TMA's `cp.async.bulk` also requires 16-byte aligned addresses. The 17-byte
+`block_mxfp4` stride makes row bases non-16-byte-aligned for odd KV positions.
+Same fundamental constraint as Phase 1a.
 
 ## Not Viable for sm_120
 

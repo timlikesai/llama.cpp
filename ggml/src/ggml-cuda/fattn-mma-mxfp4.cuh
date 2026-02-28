@@ -491,6 +491,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
     constexpr int stride_q_sc    = DKQ / 64;
     constexpr int stride_k_qs    = DKQ / 8 + 4;
     constexpr int stride_k_sc    = DKQ / 64;
+    constexpr int stride_tile_V  = nbatch_V2 + 4;
 
     using T_A_KQ  = tile<16, 8, int>;    // FP4 MMA operands.
     using T_B_KQ  = tile< 8, 8, int>;
@@ -543,7 +544,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
         }
     }
 
-    // ---- Phase 2a: Preload K[i+1], K_res[i+1], mask[i+1] into alternate buffers ----
+    // ---- Phase 2a: Preload K[i+1], K_res[i+1], mask[i+1] + V[curr] ----
 
     if (!last_iter) {
         const int k_VKQ_next = (kb0 + 1) * nbatch_fa;
@@ -563,6 +564,12 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
                 (mask_h + k_VKQ_next, tile_mask_next, stride_mask, k_VKQ_sup_next, jt * ncols1, ne01);
         }
     }
+
+    // V load for current iteration: issue memory requests early so softmax hides latency.
+    static_assert(DV == 2 * nbatch_V2, "V outer loop assumption: DV must equal 2*nbatch_V2");
+    flash_attn_ext_mxfp4_load_V_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
+        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+         tile_V, k_VKQ_0, 0, k_VKQ_sup);
 
     // ---- Phase 2b: Softmax + VKQ rescale (reads mask_curr, pure register work) ----
 
@@ -656,19 +663,9 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
         B_VKQ[k] = get_transposed(get_half2(KQ_C[k]));
     }
 
-    __syncthreads();
+    __syncthreads(); // Ensures K[next], mask[next], V writes complete.
 
-    // ---- Phase 3: Load V ----
-
-    constexpr int stride_tile_V = nbatch_V2 + 4;
-    static_assert(DV == 2 * nbatch_V2, "V outer loop assumption: DV must equal 2*nbatch_V2");
-    flash_attn_ext_mxfp4_load_V_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
-        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-         tile_V, k_VKQ_0, 0, k_VKQ_sup);
-
-    __syncthreads();
-
-    // ---- Phase 4: VKQ MMA ----
+    // ---- Phase 3: VKQ MMA ----
 
     {
         constexpr int i0_stride = T_C_VKQ::I;
@@ -685,6 +682,8 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
             }
         }
     }
+
+    __syncthreads(); // Ensures V reads complete before next iteration overwrites tile_V.
 
 #else
     GGML_UNUSED_VARS(Q_f2, K_row_base, K_qs_head_off, K_e_head_off,
