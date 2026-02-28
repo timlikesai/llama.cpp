@@ -246,15 +246,18 @@ static __device__ void quantize_f32_mxfp4_block(const float * __restrict__ x, bl
 //      H(Q) · (K_primary + K_residual)^T = H(Q) · H(K)^T ≈ Q · K^T
 //   Ref: BRQ (arxiv 2511.04214), MR-GPTQ (arxiv 2509.23202).
 //
-// blocks_per_row_total: total SoA blocks in the row (doubled for K cache with residual).
-//   For V cache: equals blocks_per_primary (no doubling).
-//   For K cache: equals 2 * blocks_per_primary (primary + residual regions).
+// blocks_per_row_total: total SoA blocks in the row (includes compact residual blocks for K).
+//   For V cache: equals blocks_per_primary.
+//   For K cache: blocks_per_primary + extra blocks for compact 1-bit sign residual.
+// blocks_per_primary: number of primary MXFP4 blocks (= n_embd_k_gqa / QK_MXFP4 for K).
+//   For V cache: same as blocks_per_row_total (unused, residual path skipped).
 template<bool apply_hadamard>
 static __device__ void quantize_f32_mxfp4_block_soa(
         const float * __restrict__ x,
         char * __restrict__ row_base,
         const int block_idx,
-        const int blocks_per_row_total) {
+        const int blocks_per_row_total,
+        const int blocks_per_primary) {
     // Conditionally buffer and rotate, or use input directly.
     float vals[QK_MXFP4];
     const float * src = x;
@@ -318,15 +321,14 @@ static __device__ void quantize_f32_mxfp4_block_soa(
     // Write primary e to SoA e region (after all qs bytes in the row).
     *(row_base + blocks_per_row_total * 16 + block_idx) = e_val;
 
-    // --- Residual quantization (K cache only) ---
-    // Dequant primary, compute error, re-quantize to second MXFP4 block.
-    // The residual is NOT Hadamard-rotated (it's already in Hadamard domain).
+    // --- Compact 1-bit sign residual (K cache only) ---
+    // Dequant primary, compute error, store sign bits + per-block mean_abs E8M0.
+    // Flat layout in compact region after all primary blocks:
+    //   [signs: blocks_per_primary × 4 bytes] [E8M0: blocks_per_primary × 1 byte]
     if constexpr (apply_hadamard) {
-        const int blocks_per_primary = blocks_per_row_total / 2;
         const float scale = ggml_cuda_e8m0_to_fp32(e_val);
 
         // Compute residual: src[j] - dequant(primary[j])
-        // kvalues_mxfp4 values are doubled, so dequant = kvalues_mxfp4[nibble] * 0.5f * scale
         float res[QK_MXFP4];
         for (int j = 0; j < QK_MXFP4/2; ++j) {
             const uint8_t byte = qs_bytes[j];
@@ -336,26 +338,30 @@ static __device__ void quantize_f32_mxfp4_block_soa(
             res[j + QK_MXFP4/2] = vals[j + QK_MXFP4/2] - recon1;
         }
 
-        // Quantize residual with its own E8M0 scale
-        float res_amax = 0.0f;
+        // Pack 32 sign bits into uint32_t (bit j = 1 if element j is negative)
+        uint32_t sign_bits = 0;
         for (int j = 0; j < QK_MXFP4; ++j) {
-            res_amax = fmaxf(res_amax, fabsf(res[j]));
+            if (res[j] < 0.0f) {
+                sign_bits |= (1u << j);
+            }
         }
 
-        const int res_e = (res_amax == 0.0f) ? 0 : __float2int_rn(log2f(res_amax)) - 2 + 127;
+        // Mean absolute residual → E8M0 exponent
+        // For ±1.0 FP4 (kvalues_mxfp4[0x2]=2, ×0.5=1.0), E8M0 directly IS the magnitude.
+        float sum_abs = 0.0f;
+        for (int j = 0; j < QK_MXFP4; ++j) {
+            sum_abs += fabsf(res[j]);
+        }
+        const float mean_abs = sum_abs * (1.0f / QK_MXFP4);
+        const int res_e = (mean_abs == 0.0f) ? 0 : __float2int_rn(log2f(mean_abs)) + 127;
         const uint8_t res_e_val = (uint8_t) max(0, min(255, res_e));
-        const float res_inv_d = (res_amax == 0.0f) ? 0.0f : 1.0f / ggml_cuda_e8m0_to_fp32(res_e_val);
 
-        // Write residual qs at block_idx + blocks_per_primary
-        uint8_t * res_qs_dst = (uint8_t *)(row_base + (blocks_per_primary + block_idx) * 16);
-        for (int j = 0; j < QK_MXFP4/2; ++j) {
-            const uint8_t xi0 = ggml_cuda_float_to_fp4_e2m1(res[0          + j], res_inv_d);
-            const uint8_t xi1 = ggml_cuda_float_to_fp4_e2m1(res[QK_MXFP4/2 + j], res_inv_d);
-            res_qs_dst[j] = xi0 | (xi1 << 4);
-        }
-
-        // Write residual e at blocks_per_primary + block_idx in the e region
-        *(row_base + blocks_per_row_total * 16 + blocks_per_primary + block_idx) = res_e_val;
+        // Compact region layout (flat across all heads):
+        //   qs offset: blocks_per_primary * 16 + block_idx * 4  (sign bits)
+        //   e  offset: blocks_per_primary * 16 + blocks_per_primary * 4 + block_idx  (E8M0)
+        const int compact_qs_off = blocks_per_primary * 16;
+        *reinterpret_cast<uint32_t *>(row_base + compact_qs_off + block_idx * 4) = sign_bits;
+        *(row_base + compact_qs_off + blocks_per_primary * 4 + block_idx) = res_e_val;
     }
 }
 

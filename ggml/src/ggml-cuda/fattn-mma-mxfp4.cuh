@@ -109,6 +109,86 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K(
     }
 }
 
+// Load compact 1-bit sign residual K data: expand sign bits → ±1.0 FP4 nibbles in smem.
+// Compact region layout (flat, after all primary blocks):
+//   signs: blocks_per_primary × 4 bytes (uint32_t per block, bit j = sign of element j)
+//   E8M0:  blocks_per_primary × 1 byte  (per-block mean_abs magnitude)
+// The expanded nibbles use 0x2 = +1.0 and 0xA = -1.0, which the MMA pipeline handles unchanged.
+template<int DKQ, int nwarps, int nbatch_fa, int stride_k_qs, int stride_k_sc, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_mxfp4_load_K_res_compact(
+        const char * const __restrict__ K_row_base,
+        const int K_sign_off,    // Byte offset to this head's sign bits within compact region.
+        const int K_res_e_off,   // Byte offset to this head's residual E8M0 within compact region.
+        const int K_pos_stride,
+        int      * const __restrict__ tile_K_qs,
+        uint32_t * const __restrict__ tile_K_sc,
+        const int k_VKQ_0,
+        const int k_VKQ_sup) {
+    constexpr int ints_per_row = DKQ / 8;        // Output: same size as primary K tiles.
+    constexpr int blocks_per_head = DKQ / 32;
+
+#pragma unroll
+    for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps) {
+        const int i = i0 + threadIdx.y;
+
+        if (i0 + nwarps > nbatch_fa && i >= nbatch_fa) {
+            break;
+        }
+
+        const char * row_i = K_row_base + int64_t(k_VKQ_0 + i) * K_pos_stride;
+
+        // Expand sign bits → ±1.0 FP4 nibbles.
+        // Each int k covers 4 bytes = 8 nibbles (4 lo-half + 4 hi-half elements).
+        // Block b = k / 4, within-block starting element j0 = 4 * (k % 4).
+#pragma unroll
+        for (int k0 = 0; k0 < ints_per_row; k0 += WARP_SIZE) {
+            const int k = k0 + threadIdx.x;
+            if (k0 + WARP_SIZE > ints_per_row && k >= ints_per_row) {
+                break;
+            }
+
+            if (oob_check && i >= k_VKQ_sup) {
+                tile_K_qs[i * stride_k_qs + k] = 0;
+            } else {
+                const int b  = k / 4;             // block within head
+                const int j0 = 4 * (k % 4);       // starting element in low half
+
+                const uint32_t signs = *reinterpret_cast<const uint32_t *>(
+                    row_i + K_sign_off + b * 4);
+
+                // Build 4 bytes of ±1.0 nibble pairs.
+                // FP4 E2M1: 0x2 = +1.0, 0xA = -1.0. Byte = lo_nib | (hi_nib << 4).
+                // lo_nib covers element j, hi_nib covers element j+16.
+                uint32_t result = 0;
+#pragma unroll
+                for (int j_off = 0; j_off < 4; ++j_off) {
+                    const uint32_t lo_sign = (signs >> (j0 + j_off))      & 1u;
+                    const uint32_t hi_sign = (signs >> (j0 + j_off + 16)) & 1u;
+                    result |= (0x22u | (lo_sign << 3) | (hi_sign << 7)) << (j_off * 8);
+                }
+                tile_K_qs[i * stride_k_qs + k] = (int)result;
+            }
+        }
+
+        // Load residual E8M0 scales (2 per uint32_t, same as primary).
+#pragma unroll
+        for (int s0 = 0; s0 < blocks_per_head / 2; s0 += WARP_SIZE) {
+            const int s = s0 + threadIdx.x;
+            if (s0 + WARP_SIZE > blocks_per_head / 2 && s >= blocks_per_head / 2) {
+                break;
+            }
+
+            if (oob_check && i >= k_VKQ_sup) {
+                tile_K_sc[i * stride_k_sc + s] = 0;
+            } else {
+                const uint8_t e0 = *(row_i + K_res_e_off + 2 * s);
+                const uint8_t e1 = *(row_i + K_res_e_off + 2 * s + 1);
+                tile_K_sc[i * stride_k_sc + s] = (uint32_t)e0 | ((uint32_t)e1 << 8);
+            }
+        }
+    }
+}
+
 // Single-pass V loader: Dequantize MXFP4 → F16 (half2) in shared memory.
 // Uses per-row SoA layout: qs contiguous at offset 0 → uint16_t loads for byte-pairs.
 // Each warp handles a batch of tokens. Each thread processes one byte-pair from qs,
@@ -400,7 +480,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
         const char           * const __restrict__ K_row_base,
         const int K_qs_head_off,
         const int K_e_head_off,
-        const int K_res_qs_head_off,
+        const int K_sign_head_off,
         const int K_res_e_head_off,
         const int K_pos_stride,
         const char           * const __restrict__ V_row_base,
@@ -511,9 +591,9 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
             (K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
              tile_K_qs_next, tile_K_sc_next, k_VKQ_next, k_VKQ_sup_next);
 
-        // Load residual K_res[i+1] into next K_res buffers.
-        flash_attn_ext_mxfp4_load_K<DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check>
-            (K_row_base, K_res_qs_head_off, K_res_e_head_off, K_pos_stride,
+        // Load compact 1-bit sign residual K_res[i+1]: expand signs → ±1.0 nibbles.
+        flash_attn_ext_mxfp4_load_K_res_compact<DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check>
+            (K_row_base, K_sign_head_off, K_res_e_head_off, K_pos_stride,
              (int *)((char *)tile_K_qs_next + k_res_byte_offset),
              (uint32_t *)((char *)tile_K_sc_next + k_res_byte_offset),
              k_VKQ_next, k_VKQ_sup_next);
@@ -653,7 +733,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
 
 #else
     GGML_UNUSED_VARS(Q_f2, K_row_base, K_qs_head_off, K_e_head_off,
-        K_res_qs_head_off, K_res_e_head_off, K_pos_stride,
+        K_sign_head_off, K_res_e_head_off, K_pos_stride,
         V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
         mask_h, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02, stride_mask,
@@ -785,11 +865,17 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
     // Same offset works for A→res_A and B→res_B.
     constexpr int k_res_byte_offset = 2 * nbatch_fa * (stride_k_qs * (int)sizeof(int) + stride_k_sc * (int)sizeof(uint32_t));
 
-    // Residual K head offsets: primary blocks 0..N/2-1, residual blocks N/2..N-1.
-    const int stride_K_blocks_local = K_pos_stride / (int)sizeof(block_mxfp4);
-    const int res_block_offset      = stride_K_blocks_local / 2;
-    const int K_res_qs_head_off     = K_qs_head_off + res_block_offset * 16;
-    const int K_res_e_head_off      = K_e_head_off  + res_block_offset;
+    // Compact 1-bit sign residual offsets.
+    // Flat layout after all primary blocks: [signs: N×4B] [E8M0: N×1B]
+    // where N = blocks_per_row_primary = n_head_kv × blocks_per_head_K.
+    constexpr int blocks_per_head_K_local = DKQ / QK_MXFP4;
+    const int n_head_kv_local = ne02 / gqa_ratio;
+    const int blocks_per_row_primary = n_head_kv_local * blocks_per_head_K_local;
+    const int compact_qs_start = blocks_per_row_primary * 16;
+    // K_qs_head_off / 16 = z_KV * blocks_per_head_K = starting block index for this head.
+    const int head_block_start = K_qs_head_off / 16;
+    const int K_sign_head_off  = compact_qs_start + head_block_start * 4;
+    const int K_res_e_head_off = compact_qs_start + blocks_per_row_primary * 4 + head_block_start;
 
     if constexpr (ncols2 == 1) {
         constexpr bool oob_check = true;
@@ -806,8 +892,8 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
             flash_attn_ext_mxfp4_load_K<DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check>
                 (K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
                  tile_K_qs_curr, tile_K_sc_curr, k_VKQ_0, k_VKQ_sup_v);
-            flash_attn_ext_mxfp4_load_K<DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check>
-                (K_row_base, K_res_qs_head_off, K_res_e_head_off, K_pos_stride,
+            flash_attn_ext_mxfp4_load_K_res_compact<DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check>
+                (K_row_base, K_sign_head_off, K_res_e_head_off, K_pos_stride,
                  (int *)((char *)tile_K_qs_curr + k_res_byte_offset),
                  (uint32_t *)((char *)tile_K_sc_curr + k_res_byte_offset),
                  k_VKQ_0, k_VKQ_sup_v);
@@ -823,7 +909,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
             flash_attn_ext_mxfp4_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check>
                 (Q_f2, K_row_base, K_qs_head_off, K_e_head_off,
-                 K_res_qs_head_off, K_res_e_head_off, K_pos_stride,
+                 K_sign_head_off, K_res_e_head_off, K_pos_stride,
                  V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
                  mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_mask,
@@ -845,7 +931,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
             flash_attn_ext_mxfp4_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check>
                 (Q_f2, K_row_base, K_qs_head_off, K_e_head_off,
-                 K_res_qs_head_off, K_res_e_head_off, K_pos_stride,
+                 K_sign_head_off, K_res_e_head_off, K_pos_stride,
                  V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
                  mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_mask,
@@ -868,8 +954,8 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
             flash_attn_ext_mxfp4_load_K<DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check>
                 (K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
                  tile_K_qs_curr, tile_K_sc_curr, k_VKQ_0, k_VKQ_sup_v);
-            flash_attn_ext_mxfp4_load_K<DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check>
-                (K_row_base, K_res_qs_head_off, K_res_e_head_off, K_pos_stride,
+            flash_attn_ext_mxfp4_load_K_res_compact<DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check>
+                (K_row_base, K_sign_head_off, K_res_e_head_off, K_pos_stride,
                  (int *)((char *)tile_K_qs_curr + k_res_byte_offset),
                  (uint32_t *)((char *)tile_K_sc_curr + k_res_byte_offset),
                  k_VKQ_0, k_VKQ_sup_v);
@@ -882,7 +968,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
             flash_attn_ext_mxfp4_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check>
                 (Q_f2, K_row_base, K_qs_head_off, K_e_head_off,
-                 K_res_qs_head_off, K_res_e_head_off, K_pos_stride,
+                 K_sign_head_off, K_res_e_head_off, K_pos_stride,
                  V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
                  mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_mask,
@@ -903,7 +989,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_process_tile(
             flash_attn_ext_mxfp4_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check>
                 (Q_f2, K_row_base, K_qs_head_off, K_e_head_off,
-                 K_res_qs_head_off, K_res_e_head_off, K_pos_stride,
+                 K_sign_head_off, K_res_e_head_off, K_pos_stride,
                  V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
                  mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_mask,

@@ -135,12 +135,21 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        // MXFP4 K cache: allocate 2× width to store primary + residual quantization.
-        // The residual (error of primary) is quantized to a second MXFP4 block region
-        // within the same row, halving the quantization error at 2× K memory cost.
-        // Still 5× smaller than F16 KV cache overall (K=2×MXFP4, V=1×MXFP4).
-        const uint32_t n_embd_k_alloc = (type_k == GGML_TYPE_MXFP4)
-            ? 2 * n_embd_k_gqa : n_embd_k_gqa;
+        // MXFP4 K cache: allocate extra width for compact 1-bit sign residual.
+        // Per primary block (32 elements): 4 bytes sign bits + 1 byte E8M0 = 5 bytes.
+        // Stored flat in extra SoA blocks after all primary blocks (16 qs bytes each).
+        // Total blocks must be a multiple of 4 so that nb[1] = 17*N is 4-byte aligned
+        // (required for int loads in SoA layout across rows).
+        // For D=128, n_kv_head=4: 16 primary + 8 extra = 24 blocks (1.5×).
+        uint32_t n_embd_k_alloc = n_embd_k_gqa;
+        if (type_k == GGML_TYPE_MXFP4) {
+            const int qk = (int)ggml_blck_size(GGML_TYPE_MXFP4);   // 32
+            const int blocks_primary  = (int)n_embd_k_gqa / qk;     // total primary blocks
+            const int compact_bytes   = blocks_primary * 5;          // sign bits + E8M0 per block
+            const int extra_blocks    = (compact_bytes + 15) / 16;   // ceil to 16-byte qs slots
+            const int total_blocks    = ((blocks_primary + extra_blocks) + 3) & ~3;  // align to 4
+            n_embd_k_alloc = (uint32_t)(total_blocks * qk);
+        }
 
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_alloc, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
@@ -1032,11 +1041,11 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * k = layers[ikv].k;
 
-    // For MXFP4: k->ne[0] = 2*n_embd_k_gqa (primary + residual). The head stride
-    // is unchanged (heads are packed within the primary region), but the row stride
-    // (k->nb[1]) and stream stride (k->nb[2]) reflect the doubled allocation.
-    // After permute(0,2,1,3) in build_attn_mha, k->nb[1] becomes the FA kernel's nb11
-    // which gives stride_K_blocks — doubled for MXFP4 so the kernel can find the residual.
+    // For MXFP4: k->ne[0] includes extra blocks for compact 1-bit sign residual.
+    // Head stride is unchanged (primary blocks packed at blocks_per_head_K spacing).
+    // The row stride (k->nb[1]) reflects the extra allocation. After permute(0,2,1,3),
+    // nb[1] becomes the FA kernel's nb11 → stride_K_blocks, which the kernel uses to
+    // locate the compact residual region after all primary blocks.
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     return ggml_view_4d(ctx, k,
