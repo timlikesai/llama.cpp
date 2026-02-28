@@ -8,6 +8,32 @@
 
 using namespace ggml_cuda_mma;
 
+// Fast exp(x) via cubic polynomial approximation of 2^x (Flash Attention 4 technique).
+// Splits into 2^floor(x*log2e) (bit manipulation) * poly(frac) (3 FMAs).
+// Reduces SFU contention by using CUDA cores instead of the Special Function Unit.
+// Max relative error ~0.3% over the softmax-relevant range (x <= 0).
+static __device__ __forceinline__ float fast_expf(const float x) {
+    const float x_log2e = x * 1.4426950408889634f; // x * log2(e)
+    const float xi = floorf(x_log2e);
+
+    // Clamp: exponent below -126 would underflow IEEE 754 normal range.
+    if (xi < -126.0f) {
+        return 0.0f;
+    }
+
+    const float r  = x_log2e - xi;
+
+    // Cubic polynomial: 2^r ≈ ((0.07711909*r + 0.22756439)*r + 0.69514614)*r + 1.0
+    const float poly = fmaf(fmaf(fmaf(0.07711909f, r, 0.22756439f), r, 0.69514614f), r, 1.0f);
+
+    // 2^floor via IEEE 754 exponent field manipulation.
+    const int exp_bits = ((int)xi + 127) << 23;
+    float pow2_floor;
+    memcpy(&pow2_floor, &exp_bits, sizeof(float));
+
+    return pow2_floor * poly;
+}
+
 // MXFP4 MMA config: Blackwell-only, cols_per_warp = 8 (FP4 B-tile width).
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_mxfp4_get_config(
         const int DKQ, const int DV, const int ncols) {
@@ -595,7 +621,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp4_iter(
         for (int l = 0; l < T_C_KQ::ne; ++l) {
             if (!oob_check || k0 + (threadIdx.y % np) * T_C_KQ::I + T_C_KQ::get_i(l) < k_VKQ_sup) {
                 const int KQ_idx = l % 2;
-                KQ_C[k0 / (np * T_C_KQ::I)].x[l] = expf(KQ_C[k0 / (np * T_C_KQ::I)].x[l] - KQ_max_new[KQ_idx]);
+                KQ_C[k0 / (np * T_C_KQ::I)].x[l] = fast_expf(KQ_C[k0 / (np * T_C_KQ::I)].x[l] - KQ_max_new[KQ_idx]);
                 KQ_rowsum_add[KQ_idx] += KQ_C[k0 / (np * T_C_KQ::I)].x[l];
             } else {
                 KQ_C[k0 / (np * T_C_KQ::I)].x[l] = 0.0f;
