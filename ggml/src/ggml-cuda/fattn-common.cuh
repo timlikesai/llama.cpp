@@ -696,6 +696,51 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4_soa(
     return sum;
 }
 
+// Compact 1-bit sign residual dot product for MXFP4 VEC kernel.
+// Expands sign bits → ±1.0 FP4 nibbles, then uses the same LUT+dp4a path as the primary.
+// Compact region layout (flat, after primary blocks): signs (N×4B), E8M0 (N×1B).
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4_res_compact(
+        const char * __restrict__ K_row, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+        const int sign_head_off, const int res_e_head_off) {
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int ib    = k_KQ / (2*QI_MXFP4);   // block within head
+        const int iqs4  = k_KQ % QI_MXFP4;        // int index within block half (0..3)
+        const int shift = (k_KQ / QI_MXFP4) & 1;  // 0 = low half, 1 = high half
+
+        // Read 32 sign bits for this block (one bit per element).
+        const uint32_t signs = *reinterpret_cast<const uint32_t *>(K_row + sign_head_off + ib * 4);
+
+        // Expand 4 sign bits × 2 halves → ±1.0 nibble pairs packed in one int.
+        // FP4 E2M1: 0x2 = +1.0, 0xA = -1.0. Byte = lo_nib | (hi_nib << 4).
+        const int j0 = 4 * iqs4;
+        uint32_t result = 0;
+#pragma unroll
+        for (int j_off = 0; j_off < 4; ++j_off) {
+            const uint32_t lo_sign = (signs >> (j0 + j_off))      & 1u;
+            const uint32_t hi_sign = (signs >> (j0 + j_off + 16)) & 1u;
+            result |= (0x22u | (lo_sign << 3) | (hi_sign << 7)) << (j_off * 8);
+        }
+
+        const int2 lut = get_int_from_table_16((int)result, kvalues_mxfp4);
+        const int v_lut = shift ? lut.y : lut.x;
+
+        const int u = Q_q8[k_KQ_0/nthreads];
+        const int sumi = ggml_cuda_dp4a(v_lut, u, 0);
+
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        sum += ggml_cuda_e8m0_to_fp32(*reinterpret_cast<const uint8_t *>(K_row + res_e_head_off + ib)) * 0.5f * (sumi*Q_ds.x);
+    }
+
+    return sum;
+}
+
 // SoA version of MXFP4 V dequantization for VEC kernel.
 // Takes row base pointer + per-head qs/e offsets instead of block_mxfp4 *.
 // Enables direct aligned loads from contiguous SoA qs region.
