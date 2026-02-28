@@ -135,7 +135,14 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        // MXFP4 K cache: allocate 2× width to store primary + residual quantization.
+        // The residual (error of primary) is quantized to a second MXFP4 block region
+        // within the same row, halving the quantization error at 2× K memory cost.
+        // Still 5× smaller than F16 KV cache overall (K=2×MXFP4, V=1×MXFP4).
+        const uint32_t n_embd_k_alloc = (type_k == GGML_TYPE_MXFP4)
+            ? 2 * n_embd_k_gqa : n_embd_k_gqa;
+
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_alloc, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
@@ -1025,19 +1032,19 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * k = layers[ikv].k;
 
-    const uint64_t kv_size      = get_size();
-    const uint64_t n_embd_k_gqa = k->ne[0];
-
-    assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
-
+    // For MXFP4: k->ne[0] = 2*n_embd_k_gqa (primary + residual). The head stride
+    // is unchanged (heads are packed within the primary region), but the row stride
+    // (k->nb[1]) and stream stride (k->nb[2]) reflect the doubled allocation.
+    // After permute(0,2,1,3) in build_attn_mha, k->nb[1] becomes the FA kernel's nb11
+    // which gives stride_K_blocks — doubled for MXFP4 so the kernel can find the residual.
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k, hparams.n_head_kv(il), n_kv, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k),
-            ggml_row_size(k->type, n_embd_k_gqa),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            k->nb[1],
+            k->nb[2],
+            k->nb[2]*sinfo.s0);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1092,21 +1099,29 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
 
     const int64_t n_stream = k->ne[2];
+    const int64_t kv_size = get_size();
 
     if (n_stream > 1) {
-        const int64_t kv_size = get_size();
-
-        assert(n_embd_gqa == k->ne[0]);
-        assert(kv_size    == k->ne[1]);
+        assert(kv_size == k->ne[1]);
 
         // merge the buffer across all streams because the idxs are global
-        k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
+        // Use view_2d to preserve nb[1] (which may be doubled for MXFP4 residual)
+        k = ggml_view_2d(ctx, k, k->ne[0], kv_size*n_stream, k->nb[1], 0);
+    }
+
+    // For MXFP4: k->ne[0] = 2*n_embd_gqa (primary + residual regions).
+    // Create view with ne[0]=n_embd_gqa matching k_cur, preserving the full
+    // doubled row stride nb[1]. The set_rows kernel sees the full row via nb[1]
+    // and writes both primary and residual quantizations.
+    ggml_tensor * k_dst = k;
+    if (k->type == GGML_TYPE_MXFP4) {
+        k_dst = ggml_view_2d(ctx, k, n_embd_gqa, k->ne[1], k->nb[1], 0);
     }
 
     // store the current K values into the cache
-    ggml_tensor * result = ggml_set_rows(ctx, k, k_cur, k_idxs);
+    ggml_tensor * result = ggml_set_rows(ctx, k_dst, k_cur, k_idxs);
 
-    // Flag K cache writes for Walsh-Hadamard rotation before MXFP4 quantization.
+    // Flag K cache writes for Walsh-Hadamard rotation + residual quantization.
     // The flash attention kernel applies matching rotation to Q so H(Q)·H(K)^T = Q·K^T.
     // V cache writes are NOT rotated (op_params[0] defaults to 0).
     if (k->type == GGML_TYPE_MXFP4) {

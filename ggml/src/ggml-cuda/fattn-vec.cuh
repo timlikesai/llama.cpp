@@ -112,6 +112,7 @@ static __global__ void flash_attn_ext_vec(
     // SoA head offsets for MXFP4: qs and e regions within each KV cache row.
     // These are unused (and optimized away) for non-MXFP4 types.
     int K_qs_head_off = 0, K_e_head_off = 0;
+    int K_res_qs_head_off = 0, K_res_e_head_off = 0;
     int V_qs_head_off = 0, V_e_head_off = 0;
     if constexpr (type_K == GGML_TYPE_MXFP4) {
         constexpr int blocks_per_head_K = D / QK_MXFP4;
@@ -119,6 +120,11 @@ static __global__ void flash_attn_ext_vec(
         const int z_KV = head / gqa_ratio;
         K_qs_head_off = z_KV * blocks_per_head_K * 16;
         K_e_head_off  = stride_K_blocks * 16 + z_KV * blocks_per_head_K;
+
+        // Residual K offsets: primary blocks are 0..N/2-1, residual are N/2..N-1
+        const int res_block_offset = stride_K_blocks / 2;
+        K_res_qs_head_off = K_qs_head_off + res_block_offset * 16;
+        K_res_e_head_off  = K_e_head_off  + res_block_offset;
     }
     if constexpr (type_V == GGML_TYPE_MXFP4) {
         constexpr int blocks_per_head_V = D / QK_MXFP4;
@@ -295,8 +301,12 @@ static __global__ void flash_attn_ext_vec(
             for (int j = 0; j < ncols; ++j) {
                 float sum;
                 if constexpr (type_K == GGML_TYPE_MXFP4) {
+                    // Primary K dot product
                     sum = vec_dot_fattn_vec_KQ_mxfp4_soa<D, nthreads_KQ>(
                         K + i_KQ*nb11, Q_i32[j], Q_ds[j], K_qs_head_off, K_e_head_off);
+                    // Residual K dot product (same Q, same K row, different offsets)
+                    sum += vec_dot_fattn_vec_KQ_mxfp4_soa<D, nthreads_KQ>(
+                        K + i_KQ*nb11, Q_i32[j], Q_ds[j], K_res_qs_head_off, K_res_e_head_off);
                 } else {
                     sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
                 }
