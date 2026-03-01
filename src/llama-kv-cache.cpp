@@ -136,15 +136,13 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        // MXFP4/MXFP8 K cache: align block count to 16 for cp.async.
+        // MXFP K cache: align block count to 16 for cp.async.
         uint32_t n_embd_k_alloc = n_embd_k_gqa;
-        if (type_k == GGML_TYPE_MXFP4) {
-            const int qk = (int)ggml_blck_size(GGML_TYPE_MXFP4);   // 32
-            const int blocks = (int)n_embd_k_gqa / qk;
-            const int blocks_aligned = (blocks + 15) & ~15;          // align to 16
-            n_embd_k_alloc = (uint32_t)(blocks_aligned * qk);
-        } else if (type_k == GGML_TYPE_MXFP8) {
-            const int qk = (int)ggml_blck_size(GGML_TYPE_MXFP8);   // 32
+        const bool is_mxfp_k = (type_k == GGML_TYPE_MXFP4 || type_k == GGML_TYPE_MXFP8 ||
+                                 type_k == GGML_TYPE_MXFP8_E5M2 ||
+                                 type_k == GGML_TYPE_MXFP6_E2M3 || type_k == GGML_TYPE_MXFP6_E3M2);
+        if (is_mxfp_k) {
+            const int qk = (int)ggml_blck_size(type_k);              // 32 for all MXFP types
             const int blocks = (int)n_embd_k_gqa / qk;
             const int blocks_aligned = (blocks + 15) & ~15;          // align to 16
             n_embd_k_alloc = (uint32_t)(blocks_aligned * qk);
@@ -1114,10 +1112,14 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
         k = ggml_view_2d(ctx, k, k->ne[0], kv_size*n_stream, k->nb[1], 0);
     }
 
-    // For MXFP4/MXFP8: ne[0] may be padded for block alignment, but k_cur has n_embd_gqa.
+    const bool is_mxfp = (k->type == GGML_TYPE_MXFP4 || k->type == GGML_TYPE_MXFP8 ||
+                          k->type == GGML_TYPE_MXFP8_E5M2 ||
+                          k->type == GGML_TYPE_MXFP6_E2M3 || k->type == GGML_TYPE_MXFP6_E3M2);
+
+    // For MXFP: ne[0] may be padded for block alignment, but k_cur has n_embd_gqa.
     // Create view with ne[0]=n_embd_gqa, preserving the larger row stride nb[1].
     ggml_tensor * k_dst = k;
-    if (k->type == GGML_TYPE_MXFP4 || k->type == GGML_TYPE_MXFP8) {
+    if (is_mxfp) {
         k_dst = ggml_view_2d(ctx, k, n_embd_gqa, k->ne[1], k->nb[1], 0);
     }
 
@@ -1129,9 +1131,6 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     // V cache writes are NOT rotated (op_params[0] defaults to 0).
     // MLA exception: V is a view of K, so rotating K would also rotate V.
     // Since V is not un-rotated in the attention output, skip Hadamard for MLA.
-    const bool is_mxfp = (k->type == GGML_TYPE_MXFP4 || k->type == GGML_TYPE_MXFP8 ||
-                          k->type == GGML_TYPE_MXFP8_E5M2 ||
-                          k->type == GGML_TYPE_MXFP6_E2M3 || k->type == GGML_TYPE_MXFP6_E3M2);
     const bool skip_hadamard = hparams.is_mla() && is_mxfp;
     if (!skip_hadamard && is_mxfp) {
         ((int32_t *)result->op_params)[0] = 1;

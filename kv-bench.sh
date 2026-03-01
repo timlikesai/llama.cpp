@@ -174,6 +174,17 @@ docker_run() {
         "$@"
 }
 
+# MLA models: V shares K buffer, so V type = K type (V arg is ignored by the model).
+# For these models, MXFP configs use matched K/V instead of V=mxfp4.
+MLA_MODELS=("glm-4.7-flash")
+
+is_mla_model() {
+    for m in "${MLA_MODELS[@]}"; do
+        [[ "$MODEL_NAME" == "$m" ]] && return 0
+    done
+    return 1
+}
+
 # Map config name → display names (TYPE_K/TYPE_V) and CLI args (CLI_K/CLI_V).
 config_types() {
     case "$1" in
@@ -191,6 +202,12 @@ config_types() {
             exit 1
             ;;
     esac
+
+    # MLA models: V shares K buffer, override V to match K.
+    if is_mla_model; then
+        TYPE_V="$TYPE_K"
+        CLI_V="$CLI_K"
+    fi
 }
 
 # Build cache-type flags for llama-perplexity (--cache-type-k/v, skip if f16).
@@ -256,21 +273,8 @@ declare -A RESULT_TG128
 
 # ── Run Tests ────────────────────────────────────────────────────────────────
 
-# Models with D > 256 cannot use V=mxfp4 (VEC kernel limitation).
-# All MXFP configs use V=mxfp4 so they're all skipped for these models.
-MXFP_UNSUPPORTED_MODELS=("glm-4.7-flash")
-
 is_config_supported() {
-    local config="$1"
-    case "$config" in
-        mxfp4|mxfp6_e2m3|mxfp6_e3m2|mxfp8_e4m3|mxfp8_e5m2)
-            for m in "${MXFP_UNSUPPORTED_MODELS[@]}"; do
-                if [[ "$MODEL_NAME" == "$m" ]]; then
-                    return 1
-                fi
-            done
-            ;;
-    esac
+    # All configs are supported for all models now (MLA uses matched K/V).
     return 0
 }
 

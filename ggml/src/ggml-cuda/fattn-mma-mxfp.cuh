@@ -22,7 +22,6 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP4> {
     static constexpr int smem_k_sc_div  = 64;    // stride_k_sc = DKQ/64 (paired scales)
     static constexpr int emax           = 2;     // ceil(log2(6.0))
     static constexpr bool can_cp_async_k = true;
-    static constexpr bool supports_mla  = false;
 
     static __device__ __forceinline__ void mma_kq(
             tile<16, 8, float> & D, const tile<16, 8, int> & A,
@@ -37,7 +36,6 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP6_E2M3> {
     static constexpr int smem_k_sc_div  = 32;    // stride_k_sc = DKQ/32 (individual)
     static constexpr int emax           = 3;     // ceil(log2(7.5))
     static constexpr bool can_cp_async_k = false; // 24-byte blocks not 16-aligned
-    static constexpr bool supports_mla  = false;
 
     static __device__ __forceinline__ void mma_kq(
             tile<16, 8, float> & D, const tile<16, 8, int> & A,
@@ -52,7 +50,6 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP6_E3M2> {
     static constexpr int smem_k_sc_div  = 32;
     static constexpr int emax           = 5;     // ceil(log2(28.0))
     static constexpr bool can_cp_async_k = false;
-    static constexpr bool supports_mla  = false;
 
     static __device__ __forceinline__ void mma_kq(
             tile<16, 8, float> & D, const tile<16, 8, int> & A,
@@ -67,7 +64,6 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP8> {
     static constexpr int smem_k_sc_div  = 32;    // stride_k_sc = DKQ/32 (individual)
     static constexpr int emax           = 8;     // ceil(log2(448))
     static constexpr bool can_cp_async_k = true;  // 32-byte blocks = 2x 16B cp.async
-    static constexpr bool supports_mla  = true;   // Supports D=576 (MLA models)
 
     static __device__ __forceinline__ void mma_kq(
             tile<16, 8, float> & D, const tile<16, 8, int> & A,
@@ -82,7 +78,6 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP8_E5M2> {
     static constexpr int smem_k_sc_div  = 32;
     static constexpr int emax           = 15;    // floor(log2(57344))
     static constexpr bool can_cp_async_k = true;
-    static constexpr bool supports_mla  = false;
 
     static __device__ __forceinline__ void mma_kq(
             tile<16, 8, float> & D, const tile<16, 8, int> & A,
@@ -126,19 +121,16 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_mxfp_g
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  32, 128, 128, 128, 1, false);
 
     // Computed fallback for arbitrary D values (e.g. D=576 for MLA models).
-    // Only enabled for types that support MLA.
-    if constexpr (mxfp_mma_traits<mxfp_type>::supports_mla) {
-        if (DKQ % 32 == 0 && DV % 32 == 0 && DKQ > 0 && DV > 0 && ncols > 0) {
-            const int nwarps_min      = (ncols + 7) / 8;
-            const int nthreads_       = nwarps_min * 32;
-            const int nbatch_fa_      = (DKQ > 256 || DV > 256) ? 16 : 32;
-            const int nbatch_V2_      = DV / 2;
-            const int nbatch_K2_      = DKQ / 2;
-            const int nbatch_combine_ = DV / 2 <= 128 ? DV / 2 : 128;
-            const int occupancy_      = (DKQ > 256 || DV > 256) ? 4 : 2;
-            return fattn_mma_config{nthreads_, occupancy_, nbatch_fa_, nbatch_K2_, nbatch_V2_,
-                                    nbatch_combine_, 1, false};
-        }
+    if (DKQ % 32 == 0 && DV % 32 == 0 && DKQ > 0 && DV > 0 && ncols > 0) {
+        const int nwarps_min      = (ncols + 7) / 8;
+        const int nthreads_       = nwarps_min * 32;
+        const int nbatch_fa_      = (DKQ > 256 || DV > 256) ? 16 : 32;
+        const int nbatch_V2_      = DV / 2;
+        const int nbatch_K2_      = DKQ / 2;
+        const int nbatch_combine_ = DV / 2 <= 128 ? DV / 2 : 128;
+        const int occupancy_      = (DKQ > 256 || DV > 256) ? 4 : 2;
+        return fattn_mma_config{nthreads_, occupancy_, nbatch_fa_, nbatch_K2_, nbatch_V2_,
+                                nbatch_combine_, 1, false};
     }
     return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
 }
@@ -1860,7 +1852,14 @@ DECL_FATTN_MMA_MXFP_STANDARD(GGML_TYPE_MXFP6_E3M2)
 DECL_FATTN_MMA_MXFP_STANDARD(GGML_TYPE_MXFP8)
 DECL_FATTN_MMA_MXFP_STANDARD(GGML_TYPE_MXFP8_E5M2)
 
-// MLA D=576 (FP8 E4M3 only — supports_mla=true)
-DECL_FATTN_MMA_MXFP_ALL_NCOLS2(GGML_TYPE_MXFP8, 576, 512,  8)
-DECL_FATTN_MMA_MXFP_ALL_NCOLS2(GGML_TYPE_MXFP8, 576, 512, 16)
-DECL_FATTN_MMA_MXFP_ALL_NCOLS2(GGML_TYPE_MXFP8, 576, 512, 32)
+// MLA D=576/512 — all MXFP types support MLA
+#define DECL_FATTN_MMA_MXFP_MLA(MXFP_TYPE) \
+    DECL_FATTN_MMA_MXFP_ALL_NCOLS2(MXFP_TYPE, 576, 512,  8) \
+    DECL_FATTN_MMA_MXFP_ALL_NCOLS2(MXFP_TYPE, 576, 512, 16) \
+    DECL_FATTN_MMA_MXFP_ALL_NCOLS2(MXFP_TYPE, 576, 512, 32)
+
+DECL_FATTN_MMA_MXFP_MLA(GGML_TYPE_MXFP4)
+DECL_FATTN_MMA_MXFP_MLA(GGML_TYPE_MXFP6_E2M3)
+DECL_FATTN_MMA_MXFP_MLA(GGML_TYPE_MXFP6_E3M2)
+DECL_FATTN_MMA_MXFP_MLA(GGML_TYPE_MXFP8)
+DECL_FATTN_MMA_MXFP_MLA(GGML_TYPE_MXFP8_E5M2)

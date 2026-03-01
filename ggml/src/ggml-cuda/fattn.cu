@@ -271,18 +271,14 @@ static void ggml_cuda_flash_attn_ext_mma_mxfp_switch_d(ggml_backend_cuda_context
         case 256:
             ggml_cuda_flash_attn_ext_mma_mxfp_switch_ncols2<mxfp_type, 256, 256>(ctx, dst);
             break;
+        case 576: {
+            // MLA: D_K=576, D_V=512
+            const int DV = V->ne[0];
+            GGML_ASSERT(DV == 512);
+            ggml_cuda_flash_attn_ext_mma_mxfp_switch_ncols2<mxfp_type, 576, 512>(ctx, dst);
+            break;
+        }
         default:
-            if constexpr (mxfp_mma_traits<mxfp_type>::supports_mla) {
-                // MLA: D_K != D_V, both must be multiples of 32
-                const int DKQ = Q->ne[0];
-                const int DV  = V->ne[0];
-                GGML_ASSERT(DKQ % 32 == 0 && DV % 32 == 0);
-                // Only D=576/512 is currently supported for MLA
-                if (DKQ == 576 && DV == 512) {
-                    ggml_cuda_flash_attn_ext_mma_mxfp_switch_ncols2<mxfp_type, 576, 512>(ctx, dst);
-                    return;
-                }
-            }
             GGML_ABORT("Unsupported D for MXFP MMA");
     }
 
@@ -508,10 +504,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_MXFP6_E2M3:
         case GGML_TYPE_MXFP6_E3M2:
         case GGML_TYPE_MXFP8_E5M2:
-            if (K->ne[0] > 256) {
-                return BEST_FATTN_KERNEL_NONE; // Only D <= 256 (no MLA support)
-            }
-            break;
         case GGML_TYPE_MXFP8:
             break;
         default:
@@ -531,15 +523,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                               K->type == GGML_TYPE_MXFP8_E5M2 ||
                               K->type == GGML_TYPE_MXFP6_E2M3 || K->type == GGML_TYPE_MXFP6_E3M2);
         if (is_mxfp && K->ne[0] % 32 == 0) {
-            // FP4/FP6/E5M2: D <= 256 only. MXFP8 E4M3: any D%32==0 (MLA support)
-            if (K->type != GGML_TYPE_MXFP8 && K->ne[0] > 256) {
-                // Fall through to non-MXFP paths
-            } else {
-                if (can_use_vector_kernel && Q->ne[1] <= 2) {
-                    return BEST_FATTN_KERNEL_VEC;
-                }
-                return BEST_FATTN_KERNEL_MMA_MXFP;
+            if (can_use_vector_kernel && Q->ne[1] <= 2) {
+                return BEST_FATTN_KERNEL_VEC;
             }
+            return BEST_FATTN_KERNEL_MMA_MXFP;
         }
     }
 
