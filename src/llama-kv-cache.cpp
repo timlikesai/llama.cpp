@@ -135,21 +135,30 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        // MXFP4 K cache: allocate extra blocks for compact 2-bit sign+magnitude residual
-        // (9 bytes per primary block: 4 sign + 4 magnitude + 1 E8M0). Align to 16 blocks
-        // so that nb[1] = total_blocks * 17 is divisible by 16, enabling cp.async.
+        // MXFP4/MXFP8 K cache: align block count to 16 for cp.async.
         uint32_t n_embd_k_alloc = n_embd_k_gqa;
         if (type_k == GGML_TYPE_MXFP4) {
             const int qk = (int)ggml_blck_size(GGML_TYPE_MXFP4);   // 32
-            const int blocks_primary  = (int)n_embd_k_gqa / qk;     // total primary blocks
-            const int compact_bytes   = blocks_primary * 9;          // sign + magnitude + E8M0
-            const int extra_blocks    = (compact_bytes + 15) / 16;   // ceil to 16-byte qs slots
-            const int total_blocks    = ((blocks_primary + extra_blocks) + 15) & ~15;  // align to 16
-            n_embd_k_alloc = (uint32_t)(total_blocks * qk);
+            const int blocks = (int)n_embd_k_gqa / qk;
+            const int blocks_aligned = (blocks + 15) & ~15;          // align to 16
+            n_embd_k_alloc = (uint32_t)(blocks_aligned * qk);
+        } else if (type_k == GGML_TYPE_MXFP8) {
+            const int qk = (int)ggml_blck_size(GGML_TYPE_MXFP8);   // 32
+            const int blocks = (int)n_embd_k_gqa / qk;
+            const int blocks_aligned = (blocks + 15) & ~15;          // align to 16
+            n_embd_k_alloc = (uint32_t)(blocks_aligned * qk);
         }
 
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_alloc, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+
+        // 1-bit sign residual for MXFP4 K cache: 1 sign bit per element, packed as bytes.
+        ggml_tensor * k_res = nullptr;
+        if (has_k && type_k == GGML_TYPE_MXFP4) {
+            const int64_t n_res_bytes = n_embd_k_gqa / 8;
+            k_res = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, n_res_bytes, kv_size, n_stream);
+            ggml_format_name(k_res, "cache_k_res_l%d", il);
+        }
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
@@ -164,7 +173,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_res, k_stream, v_stream, });
     }
 
     if (reuse) {
@@ -1038,11 +1047,8 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * k = layers[ikv].k;
 
-    // For MXFP4: k->ne[0] includes extra blocks for compact 1-bit sign residual.
-    // Head stride is unchanged (primary blocks packed at blocks_per_head_K spacing).
-    // The row stride (k->nb[1]) reflects the extra allocation. After permute(0,2,1,3),
-    // nb[1] becomes the FA kernel's nb11 → stride_K_blocks, which the kernel uses to
-    // locate the compact residual region after all primary blocks.
+    // For MXFP4/MXFP8: k->ne[0] may include alignment padding (blocks aligned to 16).
+    // The row stride (k->nb[1]) reflects the padded allocation.
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     return ggml_view_4d(ctx, k,
@@ -1051,6 +1057,26 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             k->nb[1],
             k->nb[2],
             k->nb[2]*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_k_res(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    auto * k_res = layers[ikv].k_res;
+    if (!k_res) {
+        return nullptr;
+    }
+
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+
+    // k_res is I8 with ne[0] = n_embd_k_gqa / 8 (packed sign bits per row).
+    // Return a flat 3D view: [n_res_bytes, n_kv * ns, 1].
+    // The CUDA kernel computes per-head byte offsets itself.
+    return ggml_view_3d(ctx, k_res,
+            k_res->ne[0], n_kv, ns,
+            k_res->nb[1],
+            k_res->nb[2],
+            k_res->nb[2]*sinfo.s0);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1111,26 +1137,39 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
         assert(kv_size == k->ne[1]);
 
         // merge the buffer across all streams because the idxs are global
-        // Use view_2d to preserve nb[1] (which includes MXFP4 compact residual region)
+        // Use view_2d to preserve nb[1] (which includes alignment padding for MXFP4/MXFP8)
         k = ggml_view_2d(ctx, k, k->ne[0], kv_size*n_stream, k->nb[1], 0);
     }
 
-    // For MXFP4: ne[0] includes compact residual region, but k_cur has n_embd_gqa.
-    // Create view with ne[0]=n_embd_gqa, preserving the larger row stride nb[1]
-    // so the set_rows kernel sees the full row and writes both primary and residual.
+    // For MXFP4/MXFP8: ne[0] may be padded for block alignment, but k_cur has n_embd_gqa.
+    // Create view with ne[0]=n_embd_gqa, preserving the larger row stride nb[1].
     ggml_tensor * k_dst = k;
-    if (k->type == GGML_TYPE_MXFP4) {
+    if (k->type == GGML_TYPE_MXFP4 || k->type == GGML_TYPE_MXFP8) {
         k_dst = ggml_view_2d(ctx, k, n_embd_gqa, k->ne[1], k->nb[1], 0);
     }
 
     // store the current K values into the cache
     ggml_tensor * result = ggml_set_rows(ctx, k_dst, k_cur, k_idxs);
 
-    // Flag K cache writes for Walsh-Hadamard rotation + residual quantization.
+    // Flag K cache writes for Walsh-Hadamard rotation.
     // The flash attention kernel applies matching rotation to Q so H(Q)·H(K)^T = Q·K^T.
     // V cache writes are NOT rotated (op_params[0] defaults to 0).
-    if (k->type == GGML_TYPE_MXFP4) {
+    // MLA exception: V is a view of K, so rotating K would also rotate V.
+    // Since V is not un-rotated in the attention output, skip Hadamard for MLA.
+    // MXFP8 has enough precision (8 bits) that Hadamard provides minimal benefit.
+    const bool skip_hadamard = hparams.is_mla() && k->type == GGML_TYPE_MXFP8;
+    if (!skip_hadamard && (k->type == GGML_TYPE_MXFP4 || k->type == GGML_TYPE_MXFP8)) {
         ((int32_t *)result->op_params)[0] = 1;
+    }
+
+    // Attach k_res tensor for MXFP4 1-bit sign residual write.
+    // The set_rows CUDA kernel will write sign bits to k_res alongside the MXFP4 quantization.
+    ggml_tensor * k_res = layers[ikv].k_res;
+    if (k_res) {
+        if (n_stream > 1) {
+            k_res = ggml_view_2d(ctx, k_res, k_res->ne[0], kv_size*n_stream, k_res->nb[1], 0);
+        }
+        result->src[3] = k_res;
     }
 
     return result;
@@ -1551,6 +1590,9 @@ size_t llama_kv_cache::size_k_bytes() const {
 
     for (const auto & layer : layers) {
         size_k_bytes += ggml_nbytes(layer.k);
+        if (layer.k_res) {
+            size_k_bytes += ggml_nbytes(layer.k_res);
+        }
     }
 
     return size_k_bytes;
@@ -2269,6 +2311,10 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_res(ggml_context * ctx, int32_t il) const {
+    return kv->get_k_res(ctx, il, n_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

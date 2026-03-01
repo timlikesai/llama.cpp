@@ -213,15 +213,15 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
 }
 
 // SoA MXFP4 quantization: per-row layout [all_qs][all_e].
-// When apply_hadamard=true (K cache): rotates, quantizes primary, then writes compact
-// 1-bit sign residual (sign bits + E8M0) in extra blocks after the primary region.
+// When apply_hadamard=true (K cache): rotates before quantizing.
+// If res_row_base is non-null, writes 1-bit sign residual (32 bits per block).
 template<bool apply_hadamard>
 static __device__ void quantize_f32_mxfp4_block_soa(
         const float * __restrict__ x,
         char * __restrict__ row_base,
         const int block_idx,
         const int blocks_per_row_total,
-        const int blocks_per_primary) {
+        char * __restrict__ res_row_base = nullptr) {
     float vals[QK_MXFP4];
     const float * src = x;
     if constexpr (apply_hadamard) {
@@ -264,84 +264,93 @@ static __device__ void quantize_f32_mxfp4_block_soa(
     const uint8_t e_val = (amax == 0.0f) ? (uint8_t)0 : (uint8_t)best_e;
     const float inv_d = (amax == 0.0f) ? 0.0f : 1.0f / ggml_cuda_e8m0_to_fp32(e_val);
 
-    uint8_t qs_bytes[QK_MXFP4/2];
     uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * 16);
     for (int j = 0; j < QK_MXFP4/2; ++j) {
-        const uint8_t byte = __nv_cvt_float2_to_fp4x2(
+        qs_dst[j] = __nv_cvt_float2_to_fp4x2(
             make_float2(src[j] * inv_d, src[QK_MXFP4/2 + j] * inv_d),
             __NV_E2M1, cudaRoundNearest);
-        qs_dst[j] = byte;
-        if constexpr (apply_hadamard) {
-            qs_bytes[j] = byte;
-        }
     }
 
     *(row_base + blocks_per_row_total * 16 + block_idx) = e_val;
 
-    // Compact 2-bit sign+magnitude residual: {-1.0, -0.5, +0.5, +1.0} × E8M0.
-    if constexpr (apply_hadamard) {
+    // Compute 1-bit sign residual: sign_bit[j] = 1 if original > dequantized, else 0.
+    if (res_row_base) {
         const float scale = ggml_cuda_e8m0_to_fp32(e_val);
-
-        float abs_res[QK_MXFP4];
         uint32_t sign_bits = 0;
-        for (int j = 0; j < QK_MXFP4/2; ++j) {
-            const uint8_t byte = qs_bytes[j];
-            const float recon0 = kvalues_mxfp4[byte & 0xF] * 0.5f * scale;
-            const float recon1 = kvalues_mxfp4[byte >> 4]  * 0.5f * scale;
-            const float r0 = vals[j]              - recon0;
-            const float r1 = vals[j + QK_MXFP4/2] - recon1;
-            abs_res[j]              = fabsf(r0);
-            abs_res[j + QK_MXFP4/2] = fabsf(r1);
-            if (r0 < 0.0f) { sign_bits |= (1u << j); }
-            if (r1 < 0.0f) { sign_bits |= (1u << (j + QK_MXFP4/2)); }
-        }
-
-        // MSE-optimal E8M0 for 2-bit residual: test +-1 around amax estimate.
-        // Residual values are {0.5, 1.0} × scale; magnitude bit selects which.
-        float amax_res = 0.0f;
         for (int j = 0; j < QK_MXFP4; ++j) {
-            amax_res = fmaxf(amax_res, abs_res[j]);
-        }
-
-        const int res_e_base = (amax_res == 0.0f) ? 0 : __float2int_rn(log2f(amax_res)) + 127;
-        const int res_e_lo = max(1, min(255, res_e_base - 1));
-        const int res_e_hi = max(1, min(255, res_e_base + 1));
-
-        int best_res_e = max(0, min(255, res_e_base));
-        float best_mse = 1e30f;
-        uint32_t best_mag_bits = 0;
-
-        for (int test_e = res_e_lo; test_e <= res_e_hi; ++test_e) {
-            const float test_scale = ggml_cuda_e8m0_to_fp32((uint8_t)test_e);
-            const float threshold = 0.75f * test_scale;
-            float mse = 0.0f;
-            uint32_t test_mag_bits = 0;
-            for (int j = 0; j < QK_MXFP4; ++j) {
-                float recon;
-                if (abs_res[j] < threshold) {
-                    recon = 0.5f * test_scale;
-                    test_mag_bits |= (1u << j);  // mag=1 → 0.5
-                } else {
-                    recon = 1.0f * test_scale;    // mag=0 → 1.0
-                }
-                const float err = abs_res[j] - recon;
-                mse += err * err;
-            }
-            if (mse < best_mse) {
-                best_mse = mse;
-                best_res_e = test_e;
-                best_mag_bits = test_mag_bits;
+            const uint8_t nibble = ggml_cuda_float_to_fp4_e2m1(src[j], inv_d);
+            const float recon = kvalues_mxfp4[nibble] * 0.5f * scale;
+            if (src[j] > recon) {
+                sign_bits |= (1u << j);
             }
         }
-
-        const uint8_t res_e_val = (amax_res == 0.0f) ? (uint8_t)0 : (uint8_t)best_res_e;
-
-        // Layout: [signs: blocks×4B][mags: blocks×4B][res_e8m0: blocks×1B]
-        const int compact_qs_off = blocks_per_primary * 16;
-        *reinterpret_cast<uint32_t *>(row_base + compact_qs_off + block_idx * 4) = sign_bits;
-        *reinterpret_cast<uint32_t *>(row_base + compact_qs_off + blocks_per_primary * 4 + block_idx * 4) = best_mag_bits;
-        *(row_base + compact_qs_off + blocks_per_primary * 8 + block_idx) = res_e_val;
+        *reinterpret_cast<uint32_t *>(res_row_base + block_idx * 4) = sign_bits;
     }
+}
+
+// SoA MXFP8 quantization: per-row layout [all_qs][all_e].
+// When apply_hadamard=true (K cache): rotates before quantizing.
+// No residual — FP8 E4M3 has enough precision.
+template<bool apply_hadamard>
+static __device__ void quantize_f32_mxfp8_block_soa(
+        const float * __restrict__ x,
+        char * __restrict__ row_base,
+        const int block_idx,
+        const int blocks_per_row_total) {
+    float vals[QK_MXFP8];
+    const float * src = x;
+    if constexpr (apply_hadamard) {
+        for (int j = 0; j < QK_MXFP8; ++j) {
+            vals[j] = x[j];
+        }
+        hadamard_32_inplace(vals);
+        src = vals;
+    }
+
+    // MSE-optimal E8M0 search: test +-1 around amax estimate, pick lowest MSE.
+    float amax = 0.0f;
+    for (int j = 0; j < QK_MXFP8; ++j) {
+        amax = fmaxf(amax, fabsf(src[j]));
+    }
+
+    // FP8 E4M3 max finite = 448 ≈ 2^8.8. E8M0 scale = 2^(e-127).
+    // Want: amax <= 448 * 2^(e-127), so e ≈ floor(log2(amax)) - 8 + 127
+    const int e_base = (amax == 0.0f) ? 0 : __float2int_rn(log2f(amax)) - 8 + 127;
+    const int e_lo = max(1, min(255, e_base - 1));
+    const int e_hi = max(1, min(255, e_base + 1));
+
+    int best_e = max(0, min(255, e_base));
+    float best_mse = 1e30f;
+
+    for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
+        const float test_scale = ggml_cuda_e8m0_to_fp32((uint8_t)test_e);
+        const float test_inv = 1.0f / test_scale;
+        float mse = 0.0f;
+        for (int j = 0; j < QK_MXFP8; ++j) {
+            // Convert to FP8 and back to compute reconstruction error.
+            const uint8_t fp8 = __nv_cvt_float_to_fp8(src[j] * test_inv, __NV_SATFINITE, __NV_E4M3);
+            const __nv_fp8_e4m3 fp8_val = *reinterpret_cast<const __nv_fp8_e4m3 *>(&fp8);
+            const float recon = float(fp8_val) * test_scale;
+            const float err = src[j] - recon;
+            mse += err * err;
+        }
+        if (mse < best_mse) {
+            best_mse = mse;
+            best_e = test_e;
+        }
+    }
+
+    const uint8_t e_val = (amax == 0.0f) ? (uint8_t)0 : (uint8_t)best_e;
+    const float inv_d = (amax == 0.0f) ? 0.0f : 1.0f / ggml_cuda_e8m0_to_fp32(e_val);
+
+    // Write 32 FP8 bytes per block in SoA qs region.
+    uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * QK_MXFP8);
+    for (int j = 0; j < QK_MXFP8; ++j) {
+        qs_dst[j] = __nv_cvt_float_to_fp8(src[j] * inv_d, __NV_SATFINITE, __NV_E4M3);
+    }
+
+    // Write E8M0 scale byte in SoA E8M0 region.
+    *(row_base + blocks_per_row_total * QK_MXFP8 + block_idx) = e_val;
 }
 
 template<typename src_t, typename dst_t>

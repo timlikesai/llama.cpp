@@ -873,6 +873,7 @@ struct llm_graph_context {
             ggml_tensor * kq_mask,
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+            ggml_tensor * k_res,   // MXFP4 1-bit sign residual for K (may be nullptr)
                   float   kq_scale,
                     int   il) const;
 

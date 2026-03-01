@@ -40,7 +40,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const char * __restrict__ K_res, const int64_t K_res_nb1);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -591,7 +592,8 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4_soa(
         const char * __restrict__ K_row, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
-        const int qs_head_off, const int e_head_off) {
+        const int qs_head_off, const int e_head_off,
+        const char * __restrict__ K_res_row = nullptr, const int res_head_off = 0) {
 
     float sum = 0.0f;
 
@@ -603,63 +605,46 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4_soa(
         const int iqs4  = k_KQ % QI_MXFP4;
         const int shift = (k_KQ / QI_MXFP4) & 1;
 
-        const int v = *reinterpret_cast<const int *>(K_row + qs_head_off + ib * 16 + sizeof(int) * iqs4);
+        const int u = Q_q8[k_KQ_0/nthreads];
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
 
+        const int v = *reinterpret_cast<const int *>(K_row + qs_head_off + ib*16 + sizeof(int)*iqs4);
         const int2 lut = get_int_from_table_16(v, kvalues_mxfp4);
-        const int v_lut = shift ? lut.y : lut.x;
+        const int sumi = ggml_cuda_dp4a(shift ? lut.y : lut.x, u, 0);
 
-        const int u = Q_q8[k_KQ_0/nthreads];
-        const int sumi = ggml_cuda_dp4a(v_lut, u, 0);
+        const float e = ggml_cuda_e8m0_to_fp32(*reinterpret_cast<const uint8_t *>(K_row + e_head_off + ib)) * 0.5f;
+        sum += e * sumi * Q_ds.x;
 
-        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
-        sum += ggml_cuda_e8m0_to_fp32(*reinterpret_cast<const uint8_t *>(K_row + e_head_off + ib)) * 0.5f * (sumi*Q_ds.x);
-    }
+        // 1-bit sign residual correction: each element gets nudged by +/- halfstep * scale.
+        if (K_res_row) {
+            const uint32_t signs = *reinterpret_cast<const uint32_t *>(K_res_row + res_head_off + ib * 4);
+            const int8_t * q8_vals = reinterpret_cast<const int8_t *>(&u);
+            const uint8_t * v_bytes = reinterpret_cast<const uint8_t *>(&v);
 
-    return sum;
-}
+            // Element indices within the 32-element block:
+            // Each byte has 2 nibbles (low=even element, high=odd element).
+            // iqs4 selects which 4-byte group (0-3), shift selects low(0)/high(1) nibbles.
+            // base_elem = iqs4*8 + shift, stride = 2.
+            const int base_elem = iqs4*8 + shift;
 
-// Compact 2-bit sign+magnitude residual K dot product for VEC kernel.
-// FP4 values: +1.0 (0x2), +0.5 (0x1), -0.5 (0x9), -1.0 (0xA).
-template <int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4_res_compact(
-        const char * __restrict__ K_row, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
-        const int sign_head_off, const int mag_head_off, const int res_e_head_off) {
-
-    float sum = 0.0f;
-
+            float correction = 0.0f;
 #pragma unroll
-    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
-        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+            for (int j = 0; j < 4; ++j) {
+                const int elem = base_elem + j*2;
+                const int sign_bit = (signs >> elem) & 1;
 
-        const int ib    = k_KQ / (2*QI_MXFP4);
-        const int iqs4  = k_KQ % QI_MXFP4;
-        const int shift = (k_KQ / QI_MXFP4) & 1;
+                // Extract unsigned magnitude from already-loaded v (4 bytes = 8 nibbles).
+                // shift=0 → low nibbles, shift=1 → high nibbles.
+                const int magnitude = (v_bytes[j] >> (shift * 4)) & 0x7;
 
-        const uint32_t signs = *reinterpret_cast<const uint32_t *>(K_row + sign_head_off + ib * 4);
-        const uint32_t mags  = *reinterpret_cast<const uint32_t *>(K_row + mag_head_off  + ib * 4);
+                // Halfstep: half the distance to the next representable FP4 value.
+                // Magnitudes 0-3: 0.25, 4-5: 0.5, 6-7: 1.0.
+                const float hs = 0.25f * float(1 << max(0, (magnitude >> 1) - 1));
 
-        // Expand 2-bit to FP4: nibble = (2 - mag_bit) | (sign_bit << 3).
-        const int j0 = 4 * iqs4;
-        uint32_t result = 0;
-#pragma unroll
-        for (int j_off = 0; j_off < 4; ++j_off) {
-            const uint32_t lo_sign = (signs >> (j0 + j_off))      & 1u;
-            const uint32_t hi_sign = (signs >> (j0 + j_off + 16)) & 1u;
-            const uint32_t lo_mag  = (mags  >> (j0 + j_off))      & 1u;
-            const uint32_t hi_mag  = (mags  >> (j0 + j_off + 16)) & 1u;
-            const uint32_t lo_nibble = (2u - lo_mag) | (lo_sign << 3);
-            const uint32_t hi_nibble = (2u - hi_mag) | (hi_sign << 3);
-            result |= (lo_nibble | (hi_nibble << 4)) << (j_off * 8);
+                correction += float(2*sign_bit - 1) * hs * float(q8_vals[j]);
+            }
+            sum += correction * e * Q_ds.x;
         }
-
-        const int2 lut = get_int_from_table_16((int)result, kvalues_mxfp4);
-        const int v_lut = shift ? lut.y : lut.x;
-
-        const int u = Q_q8[k_KQ_0/nthreads];
-        const int sumi = ggml_cuda_dp4a(v_lut, u, 0);
-
-        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
-        sum += ggml_cuda_e8m0_to_fp32(*reinterpret_cast<const uint8_t *>(K_row + res_e_head_off + ib)) * 0.5f * (sumi*Q_ds.x);
     }
 
     return sum;
@@ -709,6 +694,91 @@ static __device__ __forceinline__ void dequantize_V_mxfp4_soa(
     }
 }
 
+// SoA MXFP8 K dot product for VEC kernel. Single pass, no residual.
+// FP8 E4M3 values dequantized to float, dot with Q int8.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp8_soa(
+        const char * __restrict__ K_row, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+        const int qs_head_off, const int e_head_off) {
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        // 4 FP8 values = 4 bytes = 1 int. Each MXFP8 block has 32 bytes of qs.
+        const int ib  = (k_KQ * 4) / QK_MXFP8;  // block index
+        const int iqs = (k_KQ * 4) % QK_MXFP8;  // byte offset within block qs
+
+        // Load 4 FP8 bytes and Q int8×4.
+        const uint32_t fp8x4 = *reinterpret_cast<const uint32_t *>(K_row + qs_head_off + ib * QK_MXFP8 + iqs);
+        const int u = Q_q8[k_KQ_0/nthreads];
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+
+        // E8M0 scale (no 0.5× — FP8 values are already proper floats).
+        const float e = ggml_cuda_e8m0_to_fp32(*reinterpret_cast<const uint8_t *>(K_row + e_head_off + ib));
+
+        // Dequant FP8→float, dot with Q int8 values.
+        float dot = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint8_t fp8_byte = (fp8x4 >> (i*8)) & 0xFF;
+            const __nv_fp8_e4m3 fp8_val = *reinterpret_cast<const __nv_fp8_e4m3 *>(&fp8_byte);
+            const int8_t q_val = reinterpret_cast<const int8_t *>(&u)[i];
+            dot += float(fp8_val) * float(q_val);
+        }
+
+        sum += e * dot * Q_ds.x;
+    }
+
+    return sum;
+}
+
+// SoA MXFP8 V dequantization for VEC kernel. FP8→F16/F32.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_mxfp8_soa(
+        const char * __restrict__ V_row, void * __restrict__ dst, const int64_t i0,
+        const int qs_head_off, const int e_head_off) {
+
+    const int64_t ib  = i0 / QK_MXFP8;
+    const int     iqs = i0 % QK_MXFP8;
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+
+    uint8_t qs[ne];
+    if constexpr (ne == 4) {
+        *reinterpret_cast<int *>(qs) = *reinterpret_cast<const int *>(V_row + qs_head_off + ib * QK_MXFP8 + iqs);
+    } else {
+        *reinterpret_cast<uint16_t *>(qs) = *reinterpret_cast<const uint16_t *>(V_row + qs_head_off + ib * QK_MXFP8 + iqs);
+    }
+
+    // E8M0 scale (no 0.5× for FP8).
+    const float d = ggml_cuda_e8m0_to_fp32(*reinterpret_cast<const uint8_t *>(V_row + e_head_off + ib));
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 dh = __float2half2_rn(d);
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            const __nv_fp8_e4m3 v0 = *reinterpret_cast<const __nv_fp8_e4m3 *>(&qs[l0 + 0]);
+            const __nv_fp8_e4m3 v1 = *reinterpret_cast<const __nv_fp8_e4m3 *>(&qs[l0 + 1]);
+            ((half2 *) dst)[l0/2] = dh * make_half2(__half(v0), __half(v1));
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            const __nv_fp8_e4m3 v = *reinterpret_cast<const __nv_fp8_e4m3 *>(&qs[l]);
+            ((float *) dst)[l] = d * float(v);
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -724,6 +794,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_MXFP4) {
+        return nullptr; // SoA path called explicitly, not via function pointer
+    } else if constexpr (type_K == GGML_TYPE_MXFP8) {
         return nullptr; // SoA path called explicitly, not via function pointer
     } else {
         static_assert(type_K == -1, "bad type");
@@ -746,6 +818,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
     } else if constexpr (type_V == GGML_TYPE_Q8_0) {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_MXFP4) {
+        return nullptr; // SoA path called explicitly, not via function pointer
+    } else if constexpr (type_V == GGML_TYPE_MXFP8) {
         return nullptr; // SoA path called explicitly, not via function pointer
     } else {
         static_assert(type_V == -1, "bad type");
@@ -1003,6 +1077,7 @@ void launch_fattn(
 
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * K_res = dst->src[5]; // MXFP4 1-bit sign residual (may be nullptr)
 
     ggml_tensor * KQV = dst;
 
@@ -1220,7 +1295,8 @@ void launch_fattn(
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        K_res ? (const char *) K_res->data : nullptr, K_res ? K_res->nb[1] : 0
     );
     CUDA_CHECK(cudaGetLastError());
 

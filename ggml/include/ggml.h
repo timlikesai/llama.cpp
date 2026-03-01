@@ -428,7 +428,8 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
-        GGML_TYPE_COUNT   = 41,
+        GGML_TYPE_MXFP8   = 41, // MXFP8 (1 block)
+        GGML_TYPE_COUNT   = 42,
     };
 
     // precision
@@ -2342,6 +2343,10 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    GGML_API void ggml_flash_attn_ext_set_k_res(
+            struct ggml_tensor * a,
+            struct ggml_tensor * k_res);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
