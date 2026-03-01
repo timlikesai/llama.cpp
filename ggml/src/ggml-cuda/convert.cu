@@ -1,5 +1,6 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "mxfp-traits.cuh"
 
 #include <cstdint>
 
@@ -617,6 +618,112 @@ static void dequantize_row_mxfp4_cuda(const void * vx, dst_t * y, const int64_t 
     dequantize_block_mxfp4<<<nb, 32, 0, stream>>>(vx, y);
 }
 
+// ── SoA dequantization for MXFP6 (E2M3 and E3M2) ──────────────────────
+// SoA layout per row: [all_qs_blocks | all_e8m0_bytes]
+// Each block: 24 bytes qs (32 six-bit values packed) + 1 byte e8m0
+
+template<ggml_type mxfp6_type, typename dst_t>
+static __global__ void dequantize_block_mxfp6_soa(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    constexpr int qs_per_block = 24;  // 32 * 6 / 8
+
+    const int64_t i   = blockIdx.x;   // super-block index (QK_K=256 elements each)
+    const int64_t tid = threadIdx.x;  // 0..31
+    // 8 blocks of 32 elements per super-block
+    const int64_t ib = tid % 8;       // block within super-block
+    const int64_t il = tid / 8;       // group of 4 within block (0..3)
+
+    const int64_t blocks_per_superblock = QK_K / QK_MXFP6;  // 8
+    const int64_t block_idx = i * blocks_per_superblock + ib;
+
+    const char * base = (const char *)vx;
+    const int64_t total_superblocks = gridDim.x;
+    const int64_t total_blocks = total_superblocks * blocks_per_superblock;
+
+    // SoA: qs at offset block_idx * qs_per_block, e8m0 at total_blocks * qs_per_block + block_idx
+    const uint8_t * qs = (const uint8_t *)(base + block_idx * qs_per_block);
+    const uint8_t   e  = *((const uint8_t *)(base + total_blocks * qs_per_block + block_idx));
+    const float     d  = ggml_cuda_e8m0_to_fp32(e);
+
+    dst_t * y = yy + i * QK_K + 32 * ib + 4 * il;
+
+    // Unpack 4 six-bit values from 3 bytes at offset il*3
+    const uint8_t * packed = qs + il * 3;
+    uint8_t vals[4];
+    mxfp_detail::unpack_fp6x4(packed, vals);
+
+    if constexpr (mxfp6_type == GGML_TYPE_MXFP6_E2M3) {
+        for (int j = 0; j < 4; ++j) {
+            y[j] = d * mxfp_detail::fp6_e2m3_to_float(vals[j]);
+        }
+    } else {
+        for (int j = 0; j < 4; ++j) {
+            y[j] = d * mxfp_detail::fp6_e3m2_to_float(vals[j]);
+        }
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_mxfp6_e2m3_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = (k + QK_K - 1) / QK_K;
+    dequantize_block_mxfp6_soa<GGML_TYPE_MXFP6_E2M3><<<nb, 32, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
+static void dequantize_row_mxfp6_e3m2_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = (k + QK_K - 1) / QK_K;
+    dequantize_block_mxfp6_soa<GGML_TYPE_MXFP6_E3M2><<<nb, 32, 0, stream>>>(vx, y);
+}
+
+// ── SoA dequantization for MXFP8 (E4M3 and E5M2) ──────────────────────
+// SoA layout per row: [all_qs_blocks | all_e8m0_bytes]
+// Each block: 32 bytes qs (32 eight-bit values) + 1 byte e8m0
+
+template<ggml_type mxfp8_type, typename dst_t>
+static __global__ void dequantize_block_mxfp8_soa(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    constexpr int qs_per_block = 32;  // 32 * 8 / 8
+
+    const int64_t i   = blockIdx.x;   // super-block index (QK_K=256 elements each)
+    const int64_t tid = threadIdx.x;  // 0..31
+    const int64_t ib = tid % 8;       // block within super-block
+    const int64_t il = tid / 8;       // group of 4 within block (0..3)
+
+    const int64_t blocks_per_superblock = QK_K / QK_MXFP8;  // 8
+    const int64_t block_idx = i * blocks_per_superblock + ib;
+
+    const char * base = (const char *)vx;
+    const int64_t total_superblocks = gridDim.x;
+    const int64_t total_blocks = total_superblocks * blocks_per_superblock;
+
+    const uint8_t * qs = (const uint8_t *)(base + block_idx * qs_per_block);
+    const uint8_t   e  = *((const uint8_t *)(base + total_blocks * qs_per_block + block_idx));
+    const float     d  = ggml_cuda_e8m0_to_fp32(e);
+
+    dst_t * y = yy + i * QK_K + 32 * ib + 4 * il;
+
+    for (int j = 0; j < 4; ++j) {
+        const uint8_t raw = qs[il * 4 + j];
+        if constexpr (mxfp8_type == GGML_TYPE_MXFP8) {
+            const __nv_fp8_e4m3 v = *reinterpret_cast<const __nv_fp8_e4m3 *>(&raw);
+            y[j] = d * float(v);
+        } else {
+            const __nv_fp8_e5m2 v = *reinterpret_cast<const __nv_fp8_e5m2 *>(&raw);
+            y[j] = d * float(v);
+        }
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_mxfp8_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = (k + QK_K - 1) / QK_K;
+    dequantize_block_mxfp8_soa<GGML_TYPE_MXFP8><<<nb, 32, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
+static void dequantize_row_mxfp8_e5m2_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = (k + QK_K - 1) / QK_K;
+    dequantize_block_mxfp8_soa<GGML_TYPE_MXFP8_E5M2><<<nb, 32, 0, stream>>>(vx, y);
+}
+
 template <typename src_t, typename dst_t>
 static __global__ void convert_unary(
         const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t ne00, const int64_t ne01,
@@ -715,6 +822,14 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_iq3_s_cuda;
         case GGML_TYPE_MXFP4:
             return dequantize_row_mxfp4_cuda;
+        case GGML_TYPE_MXFP8:
+            return dequantize_row_mxfp8_cuda;
+        case GGML_TYPE_MXFP6_E2M3:
+            return dequantize_row_mxfp6_e2m3_cuda;
+        case GGML_TYPE_MXFP6_E3M2:
+            return dequantize_row_mxfp6_e3m2_cuda;
+        case GGML_TYPE_MXFP8_E5M2:
+            return dequantize_row_mxfp8_e5m2_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -766,6 +881,14 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_iq3_s_cuda;
         case GGML_TYPE_MXFP4:
             return dequantize_row_mxfp4_cuda;
+        case GGML_TYPE_MXFP8:
+            return dequantize_row_mxfp8_cuda;
+        case GGML_TYPE_MXFP6_E2M3:
+            return dequantize_row_mxfp6_e2m3_cuda;
+        case GGML_TYPE_MXFP6_E3M2:
+            return dequantize_row_mxfp6_e3m2_cuda;
+        case GGML_TYPE_MXFP8_E5M2:
+            return dequantize_row_mxfp8_e5m2_cuda;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:

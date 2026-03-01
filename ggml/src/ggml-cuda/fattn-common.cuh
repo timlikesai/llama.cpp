@@ -4,6 +4,7 @@
 #include "convert.cuh"
 #include "vecdotq.cuh"
 #include "hadamard.cuh"
+#include "mxfp-traits.cuh"
 
 #include <cstdint>
 
@@ -40,8 +41,7 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
-        const char * __restrict__ K_res, const int64_t K_res_nb1);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -588,12 +588,32 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+// Per-element dequantization helpers for MXFP VEC kernels.
+template<ggml_type type>
+static __device__ __forceinline__ float mxfp_elem_to_float(uint8_t raw);
+
+template<> __device__ __forceinline__ float mxfp_elem_to_float<GGML_TYPE_MXFP8>(uint8_t raw) {
+    const __nv_fp8_e4m3 v = *reinterpret_cast<const __nv_fp8_e4m3 *>(&raw);
+    return float(v);
+}
+template<> __device__ __forceinline__ float mxfp_elem_to_float<GGML_TYPE_MXFP8_E5M2>(uint8_t raw) {
+    const __nv_fp8_e5m2 v = *reinterpret_cast<const __nv_fp8_e5m2 *>(&raw);
+    return float(v);
+}
+template<> __device__ __forceinline__ float mxfp_elem_to_float<GGML_TYPE_MXFP6_E2M3>(uint8_t raw) {
+    const __half_raw h = __nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)raw, __NV_E2M3);
+    return __half2float(*reinterpret_cast<const __half *>(&h));
+}
+template<> __device__ __forceinline__ float mxfp_elem_to_float<GGML_TYPE_MXFP6_E3M2>(uint8_t raw) {
+    const __half_raw h = __nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)raw, __NV_E3M2);
+    return __half2float(*reinterpret_cast<const __half *>(&h));
+}
+
 // SoA MXFP4 K dot product for VEC kernel.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4_soa(
         const char * __restrict__ K_row, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
-        const int qs_head_off, const int e_head_off,
-        const char * __restrict__ K_res_row = nullptr, const int res_head_off = 0) {
+        const int qs_head_off, const int e_head_off) {
 
     float sum = 0.0f;
 
@@ -614,37 +634,6 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4_soa(
 
         const float e = ggml_cuda_e8m0_to_fp32(*reinterpret_cast<const uint8_t *>(K_row + e_head_off + ib)) * 0.5f;
         sum += e * sumi * Q_ds.x;
-
-        // 1-bit sign residual correction: each element gets nudged by +/- halfstep * scale.
-        if (K_res_row) {
-            const uint32_t signs = *reinterpret_cast<const uint32_t *>(K_res_row + res_head_off + ib * 4);
-            const int8_t * q8_vals = reinterpret_cast<const int8_t *>(&u);
-            const uint8_t * v_bytes = reinterpret_cast<const uint8_t *>(&v);
-
-            // Element indices within the 32-element block:
-            // Each byte has 2 nibbles (low=even element, high=odd element).
-            // iqs4 selects which 4-byte group (0-3), shift selects low(0)/high(1) nibbles.
-            // base_elem = iqs4*8 + shift, stride = 2.
-            const int base_elem = iqs4*8 + shift;
-
-            float correction = 0.0f;
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int elem = base_elem + j*2;
-                const int sign_bit = (signs >> elem) & 1;
-
-                // Extract unsigned magnitude from already-loaded v (4 bytes = 8 nibbles).
-                // shift=0 → low nibbles, shift=1 → high nibbles.
-                const int magnitude = (v_bytes[j] >> (shift * 4)) & 0x7;
-
-                // Halfstep: half the distance to the next representable FP4 value.
-                // Magnitudes 0-3: 0.25, 4-5: 0.5, 6-7: 1.0.
-                const float hs = 0.25f * float(1 << max(0, (magnitude >> 1) - 1));
-
-                correction += float(2*sign_bit - 1) * hs * float(q8_vals[j]);
-            }
-            sum += correction * e * Q_ds.x;
-        }
     }
 
     return sum;
@@ -695,12 +684,13 @@ static __device__ __forceinline__ void dequantize_V_mxfp4_soa(
 }
 
 // SoA MXFP8 K dot product for VEC kernel. Single pass, no residual.
-// FP8 E4M3 values dequantized to float, dot with Q int8.
-template <int D, int nthreads>
+// FP8 values dequantized to float, dot with Q int8. Works for E4M3 and E5M2.
+template <ggml_type mxfp_type, int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp8_soa(
         const char * __restrict__ K_row, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
         const int qs_head_off, const int e_head_off) {
 
+    static_assert(mxfp_type == GGML_TYPE_MXFP8 || mxfp_type == GGML_TYPE_MXFP8_E5M2, "bad mxfp8 type");
     float sum = 0.0f;
 
 #pragma unroll
@@ -724,9 +714,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp8_soa(
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const uint8_t fp8_byte = (fp8x4 >> (i*8)) & 0xFF;
-            const __nv_fp8_e4m3 fp8_val = *reinterpret_cast<const __nv_fp8_e4m3 *>(&fp8_byte);
             const int8_t q_val = reinterpret_cast<const int8_t *>(&u)[i];
-            dot += float(fp8_val) * float(q_val);
+            dot += mxfp_elem_to_float<mxfp_type>(fp8_byte) * float(q_val);
         }
 
         sum += e * dot * Q_ds.x;
@@ -735,12 +724,65 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp8_soa(
     return sum;
 }
 
-// SoA MXFP8 V dequantization for VEC kernel. FP8→F16/F32.
-template <typename T, int ne>
+// SoA MXFP6 K dot product for VEC kernel. Unpacks 6-bit values, converts to float.
+template <ggml_type mxfp_type, int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp6_soa(
+        const char * __restrict__ K_row, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+        const int qs_head_off, const int e_head_off) {
+
+    static_assert(mxfp_type == GGML_TYPE_MXFP6_E2M3 || mxfp_type == GGML_TYPE_MXFP6_E3M2, "bad mxfp6 type");
+    constexpr int QK = 32;
+    constexpr int qs_per_block = 24;  // 32 * 6 / 8
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        // Each iteration processes 4 Q int8 values = 4 K FP6 values = 3 bytes.
+        const int elem_start = k_KQ * 4;
+        const int ib = elem_start / QK;
+        const int elem_in_block = elem_start % QK;
+        const int byte_in_block = elem_in_block * 3 / 4;  // 4 elements = 3 bytes
+
+        // Load 3 packed FP6 bytes.
+        uint8_t packed[3];
+        packed[0] = *(const uint8_t *)(K_row + qs_head_off + ib * qs_per_block + byte_in_block + 0);
+        packed[1] = *(const uint8_t *)(K_row + qs_head_off + ib * qs_per_block + byte_in_block + 1);
+        packed[2] = *(const uint8_t *)(K_row + qs_head_off + ib * qs_per_block + byte_in_block + 2);
+
+        // Unpack 3 bytes → 4 six-bit values.
+        uint8_t vals[4];
+        mxfp_detail::unpack_fp6x4(packed, vals);
+
+        const int u = Q_q8[k_KQ_0/nthreads];
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+
+        // E8M0 scale (no extra factor for FP6).
+        const float e = ggml_cuda_e8m0_to_fp32(*reinterpret_cast<const uint8_t *>(K_row + e_head_off + ib));
+
+        // Per-element dequant and dot product with Q int8.
+        float dot = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int8_t q_val = reinterpret_cast<const int8_t *>(&u)[i];
+            dot += mxfp_elem_to_float<mxfp_type>(vals[i]) * float(q_val);
+        }
+
+        sum += e * dot * Q_ds.x;
+    }
+
+    return sum;
+}
+
+// SoA MXFP8 V dequantization for VEC kernel. FP8→F16/F32. Works for E4M3 and E5M2.
+template <ggml_type mxfp_type, typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_mxfp8_soa(
         const char * __restrict__ V_row, void * __restrict__ dst, const int64_t i0,
         const int qs_head_off, const int e_head_off) {
 
+    static_assert(mxfp_type == GGML_TYPE_MXFP8 || mxfp_type == GGML_TYPE_MXFP8_E5M2, "bad mxfp8 type");
     const int64_t ib  = i0 / QK_MXFP8;
     const int     iqs = i0 % QK_MXFP8;
 
@@ -762,17 +804,70 @@ static __device__ __forceinline__ void dequantize_V_mxfp8_soa(
 
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
-            const __nv_fp8_e4m3 v0 = *reinterpret_cast<const __nv_fp8_e4m3 *>(&qs[l0 + 0]);
-            const __nv_fp8_e4m3 v1 = *reinterpret_cast<const __nv_fp8_e4m3 *>(&qs[l0 + 1]);
-            ((half2 *) dst)[l0/2] = dh * make_half2(__half(v0), __half(v1));
+            ((half2 *) dst)[l0/2] = dh * make_half2(
+                __float2half(mxfp_elem_to_float<mxfp_type>(qs[l0 + 0])),
+                __float2half(mxfp_elem_to_float<mxfp_type>(qs[l0 + 1])));
         }
     } else
 #endif // FP16_AVAILABLE
     if constexpr (std::is_same_v<T, float>) {
 #pragma unroll
         for (int l = 0; l < ne; ++l) {
-            const __nv_fp8_e4m3 v = *reinterpret_cast<const __nv_fp8_e4m3 *>(&qs[l]);
-            ((float *) dst)[l] = d * float(v);
+            ((float *) dst)[l] = d * mxfp_elem_to_float<mxfp_type>(qs[l]);
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
+// SoA MXFP6 V dequantization for VEC kernel. FP6→F16/F32.
+template <ggml_type mxfp_type, typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_mxfp6_soa(
+        const char * __restrict__ V_row, void * __restrict__ dst, const int64_t i0,
+        const int qs_head_off, const int e_head_off) {
+
+    static_assert(mxfp_type == GGML_TYPE_MXFP6_E2M3 || mxfp_type == GGML_TYPE_MXFP6_E3M2, "bad mxfp6 type");
+    constexpr int QK = 32;
+    constexpr int qs_per_block = 24;
+
+    const int64_t ib = i0 / QK;
+    const int elem_in_block = i0 % QK;
+    const int byte_in_block = elem_in_block * 3 / 4;
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+
+    // Load and unpack FP6 values. ne elements = ne*3/4 bytes.
+    uint8_t vals[ne];
+    if constexpr (ne == 4) {
+        uint8_t packed[3];
+        packed[0] = *(const uint8_t *)(V_row + qs_head_off + ib * qs_per_block + byte_in_block + 0);
+        packed[1] = *(const uint8_t *)(V_row + qs_head_off + ib * qs_per_block + byte_in_block + 1);
+        packed[2] = *(const uint8_t *)(V_row + qs_head_off + ib * qs_per_block + byte_in_block + 2);
+        mxfp_detail::unpack_fp6x4(packed, vals);
+    } else {
+        // ne == 2: read 12 bits = 1.5 bytes. Read 2 bytes and extract.
+        uint16_t raw = *reinterpret_cast<const uint16_t *>(V_row + qs_head_off + ib * qs_per_block + byte_in_block);
+        vals[0] = raw & 0x3F;
+        vals[1] = (raw >> 6) & 0x3F;
+    }
+
+    const float d = ggml_cuda_e8m0_to_fp32(*reinterpret_cast<const uint8_t *>(V_row + e_head_off + ib));
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 dh = __float2half2_rn(d);
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = dh * make_half2(
+                __float2half(mxfp_elem_to_float<mxfp_type>(vals[l0 + 0])),
+                __float2half(mxfp_elem_to_float<mxfp_type>(vals[l0 + 1])));
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = d * mxfp_elem_to_float<mxfp_type>(vals[l]);
         }
     } else {
         static_assert(std::is_same_v<T, void>, "unsupported type");
@@ -797,6 +892,12 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return nullptr; // SoA path called explicitly, not via function pointer
     } else if constexpr (type_K == GGML_TYPE_MXFP8) {
         return nullptr; // SoA path called explicitly, not via function pointer
+    } else if constexpr (type_K == GGML_TYPE_MXFP6_E2M3) {
+        return nullptr;
+    } else if constexpr (type_K == GGML_TYPE_MXFP6_E3M2) {
+        return nullptr;
+    } else if constexpr (type_K == GGML_TYPE_MXFP8_E5M2) {
+        return nullptr;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -821,6 +922,12 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return nullptr; // SoA path called explicitly, not via function pointer
     } else if constexpr (type_V == GGML_TYPE_MXFP8) {
         return nullptr; // SoA path called explicitly, not via function pointer
+    } else if constexpr (type_V == GGML_TYPE_MXFP6_E2M3) {
+        return nullptr;
+    } else if constexpr (type_V == GGML_TYPE_MXFP6_E3M2) {
+        return nullptr;
+    } else if constexpr (type_V == GGML_TYPE_MXFP8_E5M2) {
+        return nullptr;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;
@@ -1077,8 +1184,6 @@ void launch_fattn(
 
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
-    const ggml_tensor * K_res = dst->src[5]; // MXFP4 1-bit sign residual (may be nullptr)
-
     ggml_tensor * KQV = dst;
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
@@ -1295,8 +1400,7 @@ void launch_fattn(
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
-        K_res ? (const char *) K_res->data : nullptr, K_res ? K_res->nb[1] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
     );
     CUDA_CHECK(cudaGetLastError());
 

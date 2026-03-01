@@ -108,6 +108,9 @@ typedef sycl::half2 ggml_half2;
 #define QI_MXFP8 (QK_MXFP8 / (4 * QR_MXFP8))
 #define QR_MXFP8 1
 
+#define QI_MXFP6 (QK_MXFP6 / (4 * QR_MXFP6))
+#define QR_MXFP6 1
+
 #define QI5_0 (QK5_0 / (4 * QR5_0))
 #define QR5_0 2
 
@@ -214,6 +217,13 @@ typedef struct {
     uint8_t qs[QK_MXFP8];  // 32 FP8 E4M3 values (1 byte each)
 } block_mxfp8;
 static_assert(sizeof(block_mxfp8) == sizeof(uint8_t) + QK_MXFP8, "wrong mxfp8 block size/padding");
+
+#define QK_MXFP6 32
+typedef struct {
+    uint8_t e;                     // E8M0 shared exponent
+    uint8_t qs[QK_MXFP6 * 6 / 8]; // 24 bytes: 32 six-bit values tightly packed
+} block_mxfp6;
+static_assert(sizeof(block_mxfp6) == sizeof(uint8_t) + QK_MXFP6 * 6 / 8, "wrong mxfp6 block size/padding");
 
 #define QK5_0 32
 typedef struct {

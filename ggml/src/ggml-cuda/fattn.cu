@@ -1,8 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
-#include "fattn-mma-mxfp4.cuh"
-#include "fattn-mma-mxfp8.cuh"
+#include "fattn-mma-mxfp.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
@@ -203,29 +202,29 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
-// MXFP4 MMA dispatch functions (Blackwell FP4 flash attention):
+// ── Unified MXFP MMA dispatch ───────────────────────────────────────
 
-template <int DKQ, int DV, int ncols2>
-static void ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+template <ggml_type mxfp_type, int DKQ, int DV, int ncols2>
+static void ggml_cuda_flash_attn_ext_mma_mxfp_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
 
     if constexpr (ncols2 <= 8) {
         if (Q->ne[1] <= 8/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_mxfp4_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_mxfp_case<mxfp_type, DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
             return;
         }
     }
 
     if (Q->ne[1] <= 16/ncols2) {
-        ggml_cuda_flash_attn_ext_mma_mxfp4_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_mxfp_case<mxfp_type, DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
         return;
     }
 
-    ggml_cuda_flash_attn_ext_mma_mxfp4_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
+    ggml_cuda_flash_attn_ext_mma_mxfp_case<mxfp_type, DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
 }
 
-template <int DKQ, int DV>
-static void ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+template <ggml_type mxfp_type, int DKQ, int DV>
+static void ggml_cuda_flash_attn_ext_mma_mxfp_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV  = dst;
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -240,124 +239,77 @@ static void ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols2(ggml_backend_cuda_c
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
     if (use_gqa_opt && gqa_ratio > 4) {
-        ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_mxfp_switch_ncols1<mxfp_type, DKQ, DV, 8>(ctx, dst);
         return;
     }
 
     if (use_gqa_opt && gqa_ratio > 2) {
-        ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_mxfp_switch_ncols1<mxfp_type, DKQ, DV, 4>(ctx, dst);
         return;
     }
 
     if (use_gqa_opt && gqa_ratio > 1) {
-        ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_mxfp_switch_ncols1<mxfp_type, DKQ, DV, 2>(ctx, dst);
         return;
     }
 
-    ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols1<DKQ, DV, 1>(ctx, dst);
+    ggml_cuda_flash_attn_ext_mma_mxfp_switch_ncols1<mxfp_type, DKQ, DV, 1>(ctx, dst);
 }
 
-static void ggml_cuda_flash_attn_ext_mma_mxfp4(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+template <ggml_type mxfp_type>
+static void ggml_cuda_flash_attn_ext_mma_mxfp_switch_d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * V = dst->src[2];
 
     switch (Q->ne[0]) {
         case 64:
-            GGML_ASSERT(V->ne[0] == 64);
-            ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols2< 64,  64>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_mxfp_switch_ncols2<mxfp_type, 64, 64>(ctx, dst);
             break;
         case 128:
-            GGML_ASSERT(V->ne[0] == 128);
-            ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols2<128, 128>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_mxfp_switch_ncols2<mxfp_type, 128, 128>(ctx, dst);
             break;
         case 256:
-            GGML_ASSERT(V->ne[0] == 256);
-            ggml_cuda_flash_attn_ext_mma_mxfp4_switch_ncols2<256, 256>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_mxfp_switch_ncols2<mxfp_type, 256, 256>(ctx, dst);
             break;
         default:
-            GGML_ABORT("fatal error");
-            break;
+            if constexpr (mxfp_mma_traits<mxfp_type>::supports_mla) {
+                // MLA: D_K != D_V, both must be multiples of 32
+                const int DKQ = Q->ne[0];
+                const int DV  = V->ne[0];
+                GGML_ASSERT(DKQ % 32 == 0 && DV % 32 == 0);
+                // Only D=576/512 is currently supported for MLA
+                if (DKQ == 576 && DV == 512) {
+                    ggml_cuda_flash_attn_ext_mma_mxfp_switch_ncols2<mxfp_type, 576, 512>(ctx, dst);
+                    return;
+                }
+            }
+            GGML_ABORT("Unsupported D for MXFP MMA");
     }
+
+    GGML_UNUSED(V);
 }
 
-// MXFP8 MMA dispatch functions (Blackwell FP8 flash attention):
+static void ggml_cuda_flash_attn_ext_mma_mxfp(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * K = dst->src[1];
 
-template <int DKQ, int DV, int ncols2>
-static void ggml_cuda_flash_attn_ext_mma_mxfp8_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * Q = dst->src[0];
-
-    if constexpr (ncols2 <= 8) {
-        if (Q->ne[1] <= 8/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_mxfp8_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
-            return;
-        }
-    }
-
-    if (Q->ne[1] <= 16/ncols2) {
-        ggml_cuda_flash_attn_ext_mma_mxfp8_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
-        return;
-    }
-
-    ggml_cuda_flash_attn_ext_mma_mxfp8_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
-}
-
-template <int DKQ, int DV>
-static void ggml_cuda_flash_attn_ext_mma_mxfp8_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * KQV  = dst;
-    const ggml_tensor * Q    = dst->src[0];
-    const ggml_tensor * K    = dst->src[1];
-    const ggml_tensor * mask = dst->src[3];
-
-    float max_bias = 0.0f;
-    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
-
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
-
-    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
-    const int gqa_ratio = Q->ne[2] / K->ne[2];
-
-    if (use_gqa_opt && gqa_ratio > 4) {
-        ggml_cuda_flash_attn_ext_mma_mxfp8_switch_ncols1<DKQ, DV, 8>(ctx, dst);
-        return;
-    }
-
-    if (use_gqa_opt && gqa_ratio > 2) {
-        ggml_cuda_flash_attn_ext_mma_mxfp8_switch_ncols1<DKQ, DV, 4>(ctx, dst);
-        return;
-    }
-
-    if (use_gqa_opt && gqa_ratio > 1) {
-        ggml_cuda_flash_attn_ext_mma_mxfp8_switch_ncols1<DKQ, DV, 2>(ctx, dst);
-        return;
-    }
-
-    ggml_cuda_flash_attn_ext_mma_mxfp8_switch_ncols1<DKQ, DV, 1>(ctx, dst);
-}
-
-static void ggml_cuda_flash_attn_ext_mma_mxfp8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * Q = dst->src[0];
-    const ggml_tensor * V = dst->src[2];
-
-    switch (Q->ne[0]) {
-        case 64:
-            GGML_ASSERT(V->ne[0] == 64);
-            ggml_cuda_flash_attn_ext_mma_mxfp8_switch_ncols2< 64,  64>(ctx, dst);
+    switch (K->type) {
+        case GGML_TYPE_MXFP4:
+            ggml_cuda_flash_attn_ext_mma_mxfp_switch_d<GGML_TYPE_MXFP4>(ctx, dst);
             break;
-        case 128:
-            GGML_ASSERT(V->ne[0] == 128);
-            ggml_cuda_flash_attn_ext_mma_mxfp8_switch_ncols2<128, 128>(ctx, dst);
+        case GGML_TYPE_MXFP6_E2M3:
+            ggml_cuda_flash_attn_ext_mma_mxfp_switch_d<GGML_TYPE_MXFP6_E2M3>(ctx, dst);
             break;
-        case 256:
-            GGML_ASSERT(V->ne[0] == 256);
-            ggml_cuda_flash_attn_ext_mma_mxfp8_switch_ncols2<256, 256>(ctx, dst);
+        case GGML_TYPE_MXFP6_E3M2:
+            ggml_cuda_flash_attn_ext_mma_mxfp_switch_d<GGML_TYPE_MXFP6_E3M2>(ctx, dst);
             break;
-        case 576:
-            GGML_ASSERT(V->ne[0] == 512);
-            ggml_cuda_flash_attn_ext_mma_mxfp8_switch_ncols2<576, 512>(ctx, dst);
+        case GGML_TYPE_MXFP8:
+            ggml_cuda_flash_attn_ext_mma_mxfp_switch_d<GGML_TYPE_MXFP8>(ctx, dst);
+            break;
+        case GGML_TYPE_MXFP8_E5M2:
+            ggml_cuda_flash_attn_ext_mma_mxfp_switch_d<GGML_TYPE_MXFP8_E5M2>(ctx, dst);
             break;
         default:
-            GGML_ABORT("fatal error");
-            break;
+            GGML_ABORT("Unsupported K type for MXFP MMA");
     }
 }
 
@@ -428,14 +380,29 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8, GGML_TYPE_MXFP4)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8, GGML_TYPE_MXFP8)
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP6_E2M3)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP6_E3M2)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP8_E5M2)
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP4, GGML_TYPE_MXFP4)
 
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8, GGML_TYPE_MXFP4)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8, GGML_TYPE_MXFP8)
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP6_E2M3)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP6_E3M2)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP8_E5M2)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -448,8 +415,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_VEC        = 100,
     BEST_FATTN_KERNEL_WMMA_F16   = 300,
     BEST_FATTN_KERNEL_MMA_F16    = 400,
-    BEST_FATTN_KERNEL_MMA_MXFP4  = 500,
-    BEST_FATTN_KERNEL_MMA_MXFP8  = 600,
+    BEST_FATTN_KERNEL_MMA_MXFP   = 500,
 };
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
@@ -511,8 +477,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
     if (K->type != V->type) {
-        // MXFP8 K + MXFP4 V is always supported (dedicated kernel, not gated by FA_ALL_QUANTS):
-        if (!(K->type == GGML_TYPE_MXFP8 && V->type == GGML_TYPE_MXFP4)) {
+        // Mixed-type combos always supported (not gated by FA_ALL_QUANTS):
+        const bool is_q8_q4 = (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0);
+        const bool is_mxfp_k = (K->type == GGML_TYPE_MXFP4 || K->type == GGML_TYPE_MXFP8 ||
+                                K->type == GGML_TYPE_MXFP6_E2M3 || K->type == GGML_TYPE_MXFP6_E3M2 ||
+                                K->type == GGML_TYPE_MXFP8_E5M2);
+        const bool is_mxfp_v = (V->type == GGML_TYPE_MXFP4 || V->type == GGML_TYPE_MXFP8 ||
+                                V->type == GGML_TYPE_MXFP6_E2M3 || V->type == GGML_TYPE_MXFP6_E3M2 ||
+                                V->type == GGML_TYPE_MXFP8_E5M2);
+        if (!is_q8_q4 && !(is_mxfp_k && is_mxfp_v)) {
             return BEST_FATTN_KERNEL_NONE;
         }
     }
@@ -532,8 +505,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q8_0:
             break;
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP6_E2M3:
+        case GGML_TYPE_MXFP6_E3M2:
+        case GGML_TYPE_MXFP8_E5M2:
             if (K->ne[0] > 256) {
-                return BEST_FATTN_KERNEL_NONE; // MXFP4 kernels only support D <= 256
+                return BEST_FATTN_KERNEL_NONE; // Only D <= 256 (no MLA support)
             }
             break;
         case GGML_TYPE_MXFP8:
@@ -549,22 +525,22 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
-    // MXFP4 flash attention (Blackwell FP4 MMA):
-    if (blackwell_mma_available(cc) && K->type == GGML_TYPE_MXFP4 && K->ne[0] % 64 == 0 && K->ne[0] <= 256) {
-        if (can_use_vector_kernel && Q->ne[1] <= 2) {
-            return BEST_FATTN_KERNEL_VEC;
+    // Unified MXFP flash attention (Blackwell MMA for FP4/FP6/FP8):
+    if (blackwell_mma_available(cc)) {
+        const bool is_mxfp = (K->type == GGML_TYPE_MXFP4 || K->type == GGML_TYPE_MXFP8 ||
+                              K->type == GGML_TYPE_MXFP8_E5M2 ||
+                              K->type == GGML_TYPE_MXFP6_E2M3 || K->type == GGML_TYPE_MXFP6_E3M2);
+        if (is_mxfp && K->ne[0] % 32 == 0) {
+            // FP4/FP6/E5M2: D <= 256 only. MXFP8 E4M3: any D%32==0 (MLA support)
+            if (K->type != GGML_TYPE_MXFP8 && K->ne[0] > 256) {
+                // Fall through to non-MXFP paths
+            } else {
+                if (can_use_vector_kernel && Q->ne[1] <= 2) {
+                    return BEST_FATTN_KERNEL_VEC;
+                }
+                return BEST_FATTN_KERNEL_MMA_MXFP;
+            }
         }
-        return BEST_FATTN_KERNEL_MMA_MXFP4;
-    }
-
-    // MXFP8 flash attention (Blackwell FP8 MMA, V=MXFP4 or V=MXFP8):
-    if (blackwell_mma_available(cc) && K->type == GGML_TYPE_MXFP8 &&
-            (V->type == GGML_TYPE_MXFP4 || V->type == GGML_TYPE_MXFP8) &&
-            K->ne[0] % 32 == 0) {
-        if (can_use_vector_kernel && Q->ne[1] <= 2) {
-            return BEST_FATTN_KERNEL_VEC;
-        }
-        return BEST_FATTN_KERNEL_MMA_MXFP8;
     }
 
     // If Turing tensor cores are available, use them:
@@ -686,11 +662,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
-        case BEST_FATTN_KERNEL_MMA_MXFP4:
-            ggml_cuda_flash_attn_ext_mma_mxfp4(ctx, dst);
-            break;
-        case BEST_FATTN_KERNEL_MMA_MXFP8:
-            ggml_cuda_flash_attn_ext_mma_mxfp8(ctx, dst);
+        case BEST_FATTN_KERNEL_MMA_MXFP:
+            ggml_cuda_flash_attn_ext_mma_mxfp(ctx, dst);
             break;
     }
 }

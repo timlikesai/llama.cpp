@@ -51,8 +51,8 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                // 2 base tensors (K+V) + 2*n_stream view tensors + 1 k_res tensor if MXFP4
-                /*.mem_size   =*/ size_t((2u*(1 + n_stream) + (type_k == GGML_TYPE_MXFP4 ? 1u : 0u))*n_layer_kv*ggml_tensor_overhead()),
+                // 2 base tensors (K+V) + 2*n_stream view tensors
+                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer_kv*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -153,14 +153,6 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_alloc, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
-        // 1-bit sign residual for MXFP4 K cache: 1 sign bit per element, packed as bytes.
-        ggml_tensor * k_res = nullptr;
-        if (has_k && type_k == GGML_TYPE_MXFP4) {
-            const int64_t n_res_bytes = n_embd_k_gqa / 8;
-            k_res = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, n_res_bytes, kv_size, n_stream);
-            ggml_format_name(k_res, "cache_k_res_l%d", il);
-        }
-
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
 
@@ -174,7 +166,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_res, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_stream, v_stream, });
     }
 
     if (reuse) {
@@ -1060,26 +1052,6 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             k->nb[2]*sinfo.s0);
 }
 
-ggml_tensor * llama_kv_cache::get_k_res(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
-    const int32_t ikv = map_layer_ids.at(il);
-
-    auto * k_res = layers[ikv].k_res;
-    if (!k_res) {
-        return nullptr;
-    }
-
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
-
-    // k_res is I8 with ne[0] = n_embd_k_gqa / 8 (packed sign bits per row).
-    // Return a flat 3D view: [n_res_bytes, n_kv * ns, 1].
-    // The CUDA kernel computes per-head byte offsets itself.
-    return ggml_view_3d(ctx, k_res,
-            k_res->ne[0], n_kv, ns,
-            k_res->nb[1],
-            k_res->nb[2],
-            k_res->nb[2]*sinfo.s0);
-}
-
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -1157,20 +1129,12 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     // V cache writes are NOT rotated (op_params[0] defaults to 0).
     // MLA exception: V is a view of K, so rotating K would also rotate V.
     // Since V is not un-rotated in the attention output, skip Hadamard for MLA.
-    // MXFP8 has enough precision (8 bits) that Hadamard provides minimal benefit.
-    const bool skip_hadamard = hparams.is_mla() && k->type == GGML_TYPE_MXFP8;
-    if (!skip_hadamard && (k->type == GGML_TYPE_MXFP4 || k->type == GGML_TYPE_MXFP8)) {
+    const bool is_mxfp = (k->type == GGML_TYPE_MXFP4 || k->type == GGML_TYPE_MXFP8 ||
+                          k->type == GGML_TYPE_MXFP8_E5M2 ||
+                          k->type == GGML_TYPE_MXFP6_E2M3 || k->type == GGML_TYPE_MXFP6_E3M2);
+    const bool skip_hadamard = hparams.is_mla() && is_mxfp;
+    if (!skip_hadamard && is_mxfp) {
         ((int32_t *)result->op_params)[0] = 1;
-    }
-
-    // Attach k_res tensor for MXFP4 1-bit sign residual write.
-    // The set_rows CUDA kernel will write sign bits to k_res alongside the MXFP4 quantization.
-    ggml_tensor * k_res = layers[ikv].k_res;
-    if (k_res) {
-        if (n_stream > 1) {
-            k_res = ggml_view_2d(ctx, k_res, k_res->ne[0], kv_size*n_stream, k_res->nb[1], 0);
-        }
-        result->src[3] = k_res;
     }
 
     return result;
@@ -1591,9 +1555,6 @@ size_t llama_kv_cache::size_k_bytes() const {
 
     for (const auto & layer : layers) {
         size_k_bytes += ggml_nbytes(layer.k);
-        if (layer.k_res) {
-            size_k_bytes += ggml_nbytes(layer.k_res);
-        }
     }
 
     return size_k_bytes;
@@ -2312,10 +2273,6 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
-}
-
-ggml_tensor * llama_kv_cache_context::get_k_res(ggml_context * ctx, int32_t il) const {
-    return kv->get_k_res(ctx, il, n_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

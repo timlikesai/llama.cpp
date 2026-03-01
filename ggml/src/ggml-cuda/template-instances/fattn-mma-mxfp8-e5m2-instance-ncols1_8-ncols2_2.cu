@@ -1,0 +1,7 @@
+// MXFP8 E5M2 MMA flash attention template instances.
+
+#include "../fattn-mma-mxfp.cuh"
+
+DECL_FATTN_MMA_MXFP_CASE(GGML_TYPE_MXFP8_E5M2, 64, 64, 8, 2);
+DECL_FATTN_MMA_MXFP_CASE(GGML_TYPE_MXFP8_E5M2, 128, 128, 8, 2);
+DECL_FATTN_MMA_MXFP_CASE(GGML_TYPE_MXFP8_E5M2, 256, 256, 8, 2);

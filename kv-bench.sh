@@ -55,8 +55,20 @@ resolve_model() {
 DO_BUILD=true
 DO_PERPLEXITY=true
 DO_BENCH=true
-CHUNKS_LIST=(100)
-CONFIGS=("f16" "q8_0" "q4_0" "mxfp4" "mxfp8" "mxfp8_mxfp8")
+CHUNKS_LIST=(16)
+# All MXFP configs use V=mxfp4 (K dominates quality; avoids cartesian explosion).
+# Variant names are spelled out: mxfp8_e4m3, mxfp6_e2m3, etc.
+CONFIGS=(
+    "f16"
+    "q8_0"
+    "q4_0"
+    "q8_0+q4_0"
+    "mxfp8_e4m3"
+    "mxfp8_e5m2"
+    "mxfp6_e2m3"
+    "mxfp6_e3m2"
+    "mxfp4"
+)
 MODEL_INPUT="$DEFAULT_MODEL"
 
 # ── Argument Parsing ─────────────────────────────────────────────────────────
@@ -96,8 +108,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-build        Skip Docker build step"
             echo "  --skip-perplexity   Skip perplexity runs (no PPL or memory data)"
             echo "  --skip-bench        Skip throughput benchmarks"
-            echo "  --chunks N[,M]      Chunk counts for perplexity, comma-separated (default: 100)"
-            echo "  --config NAME       Single config: f16, q8_0, q4_0, mxfp4, mxfp8, mxfp8_mxfp8 (default: all)"
+            echo "  --chunks N[,M]      Chunk counts for perplexity, comma-separated (default: 16)"
+            echo "  --config NAME       Single config (default: all). Available:"
+            echo "                        f16, q8_0, q4_0, q8_0+q4_0"
+            echo "                        mxfp8_e4m3, mxfp8_e5m2, mxfp6_e2m3, mxfp6_e3m2, mxfp4"
             echo "  --model NAME|PATH   Model preset or path (default: $DEFAULT_MODEL)"
             echo "  --help              Show this help"
             echo ""
@@ -107,11 +121,18 @@ while [[ $# -gt 0 ]]; do
             done
             echo "  (or pass a raw GGUF path)"
             echo ""
-            echo "Configs:"
-            echo "  f16     F16 K+V with flash attention (baseline)"
-            echo "  q8_0    Q8_0 K+V with flash attention"
-            echo "  q4_0    Q4_0 K+V with flash attention"
-            echo "  mxfp4   MXFP4 K+V with flash attention and Hadamard rotation"
+            echo "Configs (baselines):"
+            echo "  f16         F16 K+V (baseline)"
+            echo "  q8_0        Q8_0 K+V"
+            echo "  q4_0        Q4_0 K+V"
+            echo "  q8_0+q4_0   Q8_0 K + Q4_0 V"
+            echo ""
+            echo "Configs (MXFP — all use V=mxfp4, K determines quality):"
+            echo "  mxfp8_e4m3  MXFP8 E4M3 K + MXFP4 V (8-bit, Hadamard)"
+            echo "  mxfp8_e5m2  MXFP8 E5M2 K + MXFP4 V (8-bit, Hadamard)"
+            echo "  mxfp6_e2m3  MXFP6 E2M3 K + MXFP4 V (6-bit, Hadamard)"
+            echo "  mxfp6_e3m2  MXFP6 E3M2 K + MXFP4 V (6-bit, Hadamard)"
+            echo "  mxfp4       MXFP4 E2M1 K+V          (4-bit, Hadamard)"
             exit 0
             ;;
         *)
@@ -153,15 +174,18 @@ docker_run() {
         "$@"
 }
 
-# Map config name to K/V cache types → sets TYPE_K, TYPE_V.
+# Map config name → display names (TYPE_K/TYPE_V) and CLI args (CLI_K/CLI_V).
 config_types() {
     case "$1" in
-        f16)   TYPE_K="f16";   TYPE_V="f16"   ;;
-        q8_0)  TYPE_K="q8_0";  TYPE_V="q8_0"  ;;
-        q4_0)  TYPE_K="q4_0";  TYPE_V="q4_0"  ;;
-        mxfp4) TYPE_K="mxfp4"; TYPE_V="mxfp4" ;;
-        mxfp8) TYPE_K="mxfp8"; TYPE_V="mxfp4" ;;
-        mxfp8_mxfp8) TYPE_K="mxfp8"; TYPE_V="mxfp8" ;;
+        f16)          TYPE_K="f16";         TYPE_V="f16";    CLI_K="f16";       CLI_V="f16"       ;;
+        q8_0)         TYPE_K="q8_0";        TYPE_V="q8_0";   CLI_K="q8_0";      CLI_V="q8_0"      ;;
+        q4_0)         TYPE_K="q4_0";        TYPE_V="q4_0";   CLI_K="q4_0";      CLI_V="q4_0"      ;;
+        q8_0+q4_0)    TYPE_K="q8_0";        TYPE_V="q4_0";   CLI_K="q8_0";      CLI_V="q4_0"      ;;
+        mxfp8_e4m3)   TYPE_K="mxfp8_e4m3";  TYPE_V="mxfp4";  CLI_K="mxfp8";     CLI_V="mxfp4"     ;;
+        mxfp8_e5m2)   TYPE_K="mxfp8_e5m2";  TYPE_V="mxfp4";  CLI_K="mxfp8e5m2"; CLI_V="mxfp4"     ;;
+        mxfp6_e2m3)   TYPE_K="mxfp6_e2m3";  TYPE_V="mxfp4";  CLI_K="mxfp6e2m3"; CLI_V="mxfp4"     ;;
+        mxfp6_e3m2)   TYPE_K="mxfp6_e3m2";  TYPE_V="mxfp4";  CLI_K="mxfp6e3m2"; CLI_V="mxfp4"     ;;
+        mxfp4)        TYPE_K="mxfp4";        TYPE_V="mxfp4";  CLI_K="mxfp4";     CLI_V="mxfp4"     ;;
         *)
             echo "Unknown config: $1"
             exit 1
@@ -172,11 +196,11 @@ config_types() {
 # Build cache-type flags for llama-perplexity (--cache-type-k/v, skip if f16).
 cache_flags_perplexity() {
     local flags=()
-    if [[ "$TYPE_K" != "f16" ]]; then
-        flags+=(--cache-type-k "$TYPE_K")
+    if [[ "$CLI_K" != "f16" ]]; then
+        flags+=(--cache-type-k "$CLI_K")
     fi
-    if [[ "$TYPE_V" != "f16" ]]; then
-        flags+=(--cache-type-v "$TYPE_V")
+    if [[ "$CLI_V" != "f16" ]]; then
+        flags+=(--cache-type-v "$CLI_V")
     fi
     echo "${flags[@]+"${flags[@]}"}"
 }
@@ -184,11 +208,11 @@ cache_flags_perplexity() {
 # Build cache-type flags for llama-bench (-ctk/-ctv, skip if f16).
 cache_flags_bench() {
     local flags=()
-    if [[ "$TYPE_K" != "f16" ]]; then
-        flags+=(-ctk "$TYPE_K")
+    if [[ "$CLI_K" != "f16" ]]; then
+        flags+=(-ctk "$CLI_K")
     fi
-    if [[ "$TYPE_V" != "f16" ]]; then
-        flags+=(-ctv "$TYPE_V")
+    if [[ "$CLI_V" != "f16" ]]; then
+        flags+=(-ctv "$CLI_V")
     fi
     echo "${flags[@]+"${flags[@]}"}"
 }
@@ -232,15 +256,15 @@ declare -A RESULT_TG128
 
 # ── Run Tests ────────────────────────────────────────────────────────────────
 
-# Models with D_K > 256 cannot use MXFP4 (residual K needs too much shared memory).
-# MXFP8 supports arbitrary D via computed config fallback.
-MXFP4_UNSUPPORTED_MODELS=("glm-4.7-flash")
+# Models with D > 256 cannot use V=mxfp4 (VEC kernel limitation).
+# All MXFP configs use V=mxfp4 so they're all skipped for these models.
+MXFP_UNSUPPORTED_MODELS=("glm-4.7-flash")
 
 is_config_supported() {
     local config="$1"
     case "$config" in
-        mxfp4)
-            for m in "${MXFP4_UNSUPPORTED_MODELS[@]}"; do
+        mxfp4|mxfp6_e2m3|mxfp6_e3m2|mxfp8_e4m3|mxfp8_e5m2)
+            for m in "${MXFP_UNSUPPORTED_MODELS[@]}"; do
                 if [[ "$MODEL_NAME" == "$m" ]]; then
                     return 1
                 fi
@@ -250,24 +274,30 @@ is_config_supported() {
     return 0
 }
 
+# Count supported configs for progress display.
+total_configs=0
+for config in "${CONFIGS[@]}"; do
+    is_config_supported "$config" && (( total_configs++ )) || true
+done
+config_num=0
+
 for config in "${CONFIGS[@]}"; do
     if ! is_config_supported "$config"; then
-        echo ""
-        echo "  ⚠ Skipping $config — not supported for $MODEL_NAME (D_K > 256)"
-        echo ""
+        echo "  Skipping $config — not supported for $MODEL_NAME (D > 256, V=mxfp4 unsupported)"
         continue
     fi
+    (( ++config_num ))
     config_types "$config"
+    progress="[${config_num}/${total_configs}]"
 
     # ── Perplexity ───────────────────────────────────────────────────────
     if $DO_PERPLEXITY; then
         for chunks in "${CHUNKS_LIST[@]}"; do
-            header "PERPLEXITY: $config (K=$TYPE_K, V=$TYPE_V) — $chunks chunks"
+            echo "${progress} K=${TYPE_K} V=${TYPE_V} — perplexity (${chunks} chunks)..."
 
             local_log="$RESULTS_DIR/${config}-perplexity-${chunks}ch.log"
 
-            # Run perplexity, capture all output (stdout + stderr).
-            docker_run \
+            if ! docker_run \
                 /app/llama-perplexity \
                 --model "$MODEL_PATH" \
                 --file "/datasets/$DATASET_FILE" \
@@ -275,15 +305,18 @@ for config in "${CONFIGS[@]}"; do
                 --flash-attn on \
                 --gpu-layers 99 \
                 $(cache_flags_perplexity) \
-                2>&1 | tee "$local_log"
+                > "$local_log" 2>&1; then
+                echo "ERROR: perplexity failed for ${config}. Log:"
+                cat "$local_log"
+                exit 1
+            fi
 
             # Parse PPL from "Final estimate: PPL = X.XXXX".
             ppl=$(grep --perl-regexp --only-matching 'Final estimate: PPL = \K[\d.]+' "$local_log" || echo "N/A")
             RESULT_PPL["${config}:${chunks}"]="$ppl"
 
-            # Parse KV cache memory (only need once per config — same for all chunk counts).
+            # Parse KV cache memory (only need once per config).
             if [[ -z "${RESULT_CELLS[$config]:-}" ]]; then
-                # Format: "llama_kv_cache: size =  192.00 MiB (   512 cells,  48 layers, ...), K (f16):   96.00 MiB, V (f16):   96.00 MiB"
                 kv_line=$(grep 'llama_kv_cache: size' "$local_log" | tail --lines 1 || echo "")
                 if [[ -n "$kv_line" ]]; then
                     cells_per_seq=$(echo "$kv_line" | grep --perl-regexp --only-matching '\(\s*\K\d+(?=\s+cells)')
@@ -294,23 +327,17 @@ for config in "${CONFIGS[@]}"; do
                 fi
             fi
 
-            echo ""
-            echo "  PPL ($chunks chunks): $ppl"
-            echo "  KV cache: K=${RESULT_K_MIB[$config]:-?} MiB, V=${RESULT_V_MIB[$config]:-?} MiB, cells=${RESULT_CELLS[$config]:-?}"
-            echo ""
+            echo "        PPL: ${ppl} | K: ${RESULT_K_MIB[$config]:-?} MiB | V: ${RESULT_V_MIB[$config]:-?} MiB"
         done
     fi
 
     # ── Throughput ───────────────────────────────────────────────────────
     if $DO_BENCH; then
-        header "BENCH: $config (K=$TYPE_K, V=$TYPE_V) — pp512 + tg128"
+        echo "${progress} K=${TYPE_K} V=${TYPE_V} — bench (pp512 + tg128)..."
 
         local_log="$RESULTS_DIR/${config}-bench.jsonl"
 
-        # Run llama-bench with JSONL output for reliable parsing.
-        # Note: llama-bench uses short flags (-ngl, -fa, -p, -n, -o)
-        # not --gpu-layers/--flash-attn/--test/--output.
-        docker_run \
+        if ! docker_run \
             /app/llama-bench \
             -m "$MODEL_PATH" \
             -fa 1 \
@@ -319,132 +346,109 @@ for config in "${CONFIGS[@]}"; do
             -n 128 \
             -o jsonl \
             $(cache_flags_bench) \
-            > "$local_log" 2>&1
+            > "$local_log" 2>&1; then
+            echo "ERROR: bench failed for ${config}. Log:"
+            cat "$local_log"
+            exit 1
+        fi
 
-        # Show the raw output.
-        cat "$local_log"
-
-        # Parse JSONL: lines with "n_prompt": 512 are pp, "n_gen": 128 are tg.
-        # Field: "avg_ts" is average tokens/second.
+        # Parse JSONL: "n_prompt": 512 → pp, "n_gen": 128 → tg. Field: "avg_ts".
         pp_ts=$(grep --perl-regexp --only-matching '"n_prompt": 512.*?"avg_ts": \K[\d.]+' "$local_log" || echo "N/A")
         tg_ts=$(grep --perl-regexp --only-matching '"n_gen": 128.*?"avg_ts": \K[\d.]+' "$local_log" || echo "N/A")
 
         RESULT_PP512[$config]="$pp_ts"
         RESULT_TG128[$config]="$tg_ts"
 
-        echo ""
-        echo "  pp512: ${pp_ts} t/s"
-        echo "  tg128: ${tg_ts} t/s"
-        echo ""
+        echo "        pp512: ${pp_ts} t/s | tg128: ${tg_ts} t/s"
     fi
 done
 
-# ── Comparison Tables ────────────────────────────────────────────────────────
+# ── Results Table ────────────────────────────────────────────────────────────
 
-header "RESULTS SUMMARY"
-
-echo "  Model:   $MODEL_NAME"
-echo "  Date:    $(timestamp)"
-echo "  Chunks:  ${CHUNKS_LIST[*]}"
+echo ""
+echo "  $MODEL_NAME — ${CHUNKS_LIST[*]} chunks — $(timestamp)"
 echo ""
 
-# ── Memory Table ─────────────────────────────────────────────────────────────
+# Column widths: K(10) V(7) K_GiB(6) V_GiB(6) Total(6) PPL(6) delta(6) pp512(6) tg128(6)
+table_top()  { echo "  ┌────────────┬─────────┬────────┬────────┬────────┬────────┬────────┬────────┬────────┐"; }
+table_hdr()  { printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │\n" \
+                      "K type" "V type" "K GiB" "V GiB" "Total" "PPL" "Δ F16" "pp512" "tg128"; }
+table_sep()  { echo "  ├────────────┼─────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤"; }
+table_row()  { printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │\n" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"; }
+table_bot()  { echo "  └────────────┴─────────┴────────┴────────┴────────┴────────┴────────┴────────┴────────┘"; }
 
-if $DO_PERPLEXITY && [[ -n "${RESULT_CELLS[f16]:-}" ]]; then
-    echo "Memory per 100K tokens:"
-    echo ""
-    printf "  %-8s  %10s  %10s  %10s\n" "Type" "K cache" "V cache" "Total"
-    printf "  %-8s  %10s  %10s  %10s\n" "────────" "──────────" "──────────" "──────────"
+# Build rows with sortable PPL prefix, then sort by PPL ascending.
+declare -a TABLE_ROWS=()
 
-    for config in "${CONFIGS[@]}"; do
-        if [[ -z "${RESULT_CELLS[$config]:-}" ]]; then
-            printf "  %-8s  %10s  %10s  %10s\n" "$config" "—" "—" "—"
-            continue
-        fi
+for config in "${CONFIGS[@]}"; do
+    # Only include configs that actually produced results (PPL or bench).
+    last_chunks="${CHUNKS_LIST[${#CHUNKS_LIST[@]}-1]}"
+    has_ppl="${RESULT_PPL["${config}:${last_chunks}"]:-}"
+    has_bench="${RESULT_PP512[$config]:-}"
+    if [[ -z "$has_ppl" && -z "$has_bench" ]]; then
+        continue
+    fi
+    config_types "$config"
 
+    # Memory per 100K tokens (K, V, total — all in GiB).
+    k_gib_fmt="-"
+    v_gib_fmt="-"
+    total_fmt="-"
+    if [[ -n "${RESULT_CELLS[$config]:-}" ]]; then
         k_gib=$(awk "BEGIN { printf \"%.2f\", ${RESULT_K_MIB[$config]} / ${RESULT_CELLS[$config]} * 100000 / 1024 }")
         v_gib=$(awk "BEGIN { printf \"%.2f\", ${RESULT_V_MIB[$config]} / ${RESULT_CELLS[$config]} * 100000 / 1024 }")
         total=$(awk "BEGIN { printf \"%.2f\", $k_gib + $v_gib }")
-
-        printf "  %-8s  %7s GiB  %7s GiB  %7s GiB\n" \
-            "$config" "$k_gib" "$v_gib" "$total"
-    done
-    echo ""
-fi
-
-# ── Perplexity Table ─────────────────────────────────────────────────────────
-
-if $DO_PERPLEXITY; then
-    # Check if we have any PPL results at all.
-    has_ppl=false
-    for chunks in "${CHUNKS_LIST[@]}"; do
-        [[ -n "${RESULT_PPL["f16:${chunks}"]:-}" ]] && has_ppl=true
-    done
-
-    if $has_ppl; then
-        echo "Perplexity (wikitext-2-raw):"
-        echo ""
-
-        # Build header: Type | PPL@ch1 | delta | PPL@ch2 | delta | ...
-        printf "  %-12s" "Type"
-        for chunks in "${CHUNKS_LIST[@]}"; do
-            printf "  %12s  %10s" "${chunks}ch PPL" "vs F16"
-        done
-        printf "\n"
-        printf "  %-12s" "────────────"
-        for chunks in "${CHUNKS_LIST[@]}"; do
-            printf "  %12s  %10s" "────────────" "──────────"
-        done
-        printf "\n"
-
-        for config in "${CONFIGS[@]}"; do
-            printf "  %-12s" "$config"
-            for chunks in "${CHUNKS_LIST[@]}"; do
-                ppl="${RESULT_PPL["${config}:${chunks}"]:-N/A}"
-                f16_ppl="${RESULT_PPL["f16:${chunks}"]:-N/A}"
-                if [[ "$ppl" == "N/A" ]]; then
-                    printf "  %12s  %10s" "—" "—"
-                elif [[ "$config" == "f16" ]]; then
-                    printf "  %12s  %10s" "$ppl" "—"
-                elif [[ "$f16_ppl" == "N/A" ]]; then
-                    printf "  %12s  %10s" "$ppl" "—"
-                else
-                    delta=$(awk "BEGIN { d = $ppl - $f16_ppl; printf \"%+.4f\", d }")
-                    printf "  %12s  %10s" "$ppl" "$delta"
-                fi
-            done
-            printf "\n"
-        done
-        echo ""
+        k_gib_fmt="$k_gib"
+        v_gib_fmt="$v_gib"
+        total_fmt="$total"
     fi
-fi
 
-# ── Throughput Table ─────────────────────────────────────────────────────────
-
-if $DO_BENCH; then
-    echo "Throughput (tokens/sec):"
-    echo ""
-    printf "  %-8s  %12s  %12s\n" "Type" "pp512" "tg128"
-    printf "  %-8s  %12s  %12s\n" "────────" "────────────" "────────────"
-
-    for config in "${CONFIGS[@]}"; do
-        pp="${RESULT_PP512[$config]:-N/A}"
-        tg="${RESULT_TG128[$config]:-N/A}"
-
-        # Format with comma separators if numeric.
-        if [[ "$pp" != "N/A" ]]; then
-            pp=$(printf "%'.0f" "${pp%.*}" 2>/dev/null || echo "$pp")
+    # PPL (use last chunk count for the table).
+    ppl_fmt="-"
+    delta_fmt="-"
+    sort_key="9999.9999"
+    ppl_raw="${RESULT_PPL["${config}:${last_chunks}"]:-}"
+    f16_raw="${RESULT_PPL["f16:${last_chunks}"]:-}"
+    if [[ -n "$ppl_raw" && "$ppl_raw" != "N/A" ]]; then
+        ppl_fmt=$(awk "BEGIN { printf \"%.2f\", $ppl_raw }")
+        sort_key=$(printf "%010.4f" "$ppl_raw")
+        if [[ "$config" != "f16" && -n "$f16_raw" && "$f16_raw" != "N/A" ]]; then
+            delta_fmt=$(awk "BEGIN { printf \"%+.2f\", $ppl_raw - $f16_raw }")
         fi
-        if [[ "$tg" != "N/A" ]]; then
-            tg=$(printf "%'.1f" "$tg" 2>/dev/null || echo "$tg")
-        fi
+    fi
 
-        printf "  %-8s  %12s  %12s\n" "$config" "$pp" "$tg"
-    done
-    echo ""
-fi
+    # Throughput.
+    pp_fmt="-"
+    tg_fmt="-"
+    pp_raw="${RESULT_PP512[$config]:-}"
+    tg_raw="${RESULT_TG128[$config]:-}"
+    if [[ -n "$pp_raw" && "$pp_raw" != "N/A" ]]; then
+        pp_fmt=$(printf "%'.0f" "${pp_raw%.*}")
+    fi
+    if [[ -n "$tg_raw" && "$tg_raw" != "N/A" ]]; then
+        tg_fmt=$(printf "%'.1f" "$tg_raw")
+    fi
 
-# ── Footer ───────────────────────────────────────────────────────────────────
+    # Store with sort key prefix (pipe-separated).
+    TABLE_ROWS+=("${sort_key}|${TYPE_K}|${TYPE_V}|${k_gib_fmt}|${v_gib_fmt}|${total_fmt}|${ppl_fmt}|${delta_fmt}|${pp_fmt}|${tg_fmt}")
+done
 
-echo "Raw results saved to: $RESULTS_DIR/"
+# Sort rows by PPL (first field) ascending.
+IFS=$'\n' SORTED_ROWS=($(printf '%s\n' "${TABLE_ROWS[@]}" | sort -t'|' -k1,1n)); unset IFS
+
+table_top
+table_hdr
+table_sep
+first=true
+for entry in "${SORTED_ROWS[@]}"; do
+    if $first; then first=false; else table_sep; fi
+    # Strip sort key, split fields.
+    IFS='|' read -r _sort_key tk tv k_gib v_gib total ppl delta pp tg <<< "$entry"
+    table_row "$tk" "$tv" "$k_gib" "$v_gib" "$total" "$ppl" "$delta" "$pp" "$tg"
+done
+table_bot
+
+echo ""
+echo "  Memory: GiB per 100K tokens (K + V cache)"
+echo "  Raw logs: $RESULTS_DIR/"
 echo ""

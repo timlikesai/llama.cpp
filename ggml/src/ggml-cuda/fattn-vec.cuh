@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "mxfp-traits.cuh"
 
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
     return 128;
@@ -39,8 +40,7 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
-        const char * __restrict__ K_res, const int64_t K_res_nb1) {
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
 #ifdef FLASH_ATTN_AVAILABLE
 
     // Skip unused kernel variants for faster compilation:
@@ -53,8 +53,7 @@ static __global__ void flash_attn_ext_vec(
                   nb11, nb12, nb13,
                   nb21, nb22, nb23,
                   ne31, ne32, ne33,
-                  nb31, nb32, nb33,
-            K_res, K_res_nb1);
+                  nb31, nb32, nb33);
         NO_DEVICE_CODE;
         return;
     }
@@ -100,12 +99,14 @@ static __global__ void flash_attn_ext_vec(
     const int head = blockIdx.z - sequence*ne02;
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
     Q += nb03*sequence + nb02* head              + nb01*ic0;
-    if constexpr (type_K == GGML_TYPE_MXFP4 || type_K == GGML_TYPE_MXFP8) {
+    if constexpr (type_K == GGML_TYPE_MXFP4 || type_K == GGML_TYPE_MXFP8 ||
+                   type_K == GGML_TYPE_MXFP6_E2M3 || type_K == GGML_TYPE_MXFP6_E3M2 || type_K == GGML_TYPE_MXFP8_E5M2) {
         K += nb13*sequence;
     } else {
         K += nb13*sequence + nb12*(head / gqa_ratio);
     }
-    if constexpr (type_V == GGML_TYPE_MXFP4 || type_V == GGML_TYPE_MXFP8) {
+    if constexpr (type_V == GGML_TYPE_MXFP4 || type_V == GGML_TYPE_MXFP8 ||
+                   type_V == GGML_TYPE_MXFP6_E2M3 || type_V == GGML_TYPE_MXFP6_E3M2 || type_V == GGML_TYPE_MXFP8_E5M2) {
         V += nb23*sequence;
     } else {
         V += nb23*sequence + nb22*(head / gqa_ratio);
@@ -113,16 +114,29 @@ static __global__ void flash_attn_ext_vec(
 
     int K_qs_head_off = 0, K_e_head_off = 0;
     int V_qs_head_off = 0, V_e_head_off = 0;
-    int K_res_head_off = 0;
     if constexpr (type_K == GGML_TYPE_MXFP4) {
         constexpr int blocks_per_head_K = D / QK_MXFP4;
         const int stride_K_blocks = nb11 / sizeof(block_mxfp4);
         const int z_KV = head / gqa_ratio;
         K_qs_head_off = z_KV * blocks_per_head_K * 16;
         K_e_head_off  = stride_K_blocks * 16 + z_KV * blocks_per_head_K;
-        K_res_head_off = z_KV * blocks_per_head_K * 4; // 4 bytes (32 sign bits) per block
     }
     if constexpr (type_K == GGML_TYPE_MXFP8) {
+        constexpr int blocks_per_head_K = D / QK_MXFP8;
+        const int stride_K_blocks = nb11 / sizeof(block_mxfp8);
+        const int z_KV = head / gqa_ratio;
+        K_qs_head_off = z_KV * blocks_per_head_K * QK_MXFP8;
+        K_e_head_off  = stride_K_blocks * QK_MXFP8 + z_KV * blocks_per_head_K;
+    }
+    if constexpr (type_K == GGML_TYPE_MXFP6_E2M3 || type_K == GGML_TYPE_MXFP6_E3M2) {
+        constexpr int qs_per_blk = 24;
+        constexpr int blocks_per_head_K = D / QK_MXFP6;
+        const int stride_K_blocks = nb11 / sizeof(block_mxfp6);
+        const int z_KV = head / gqa_ratio;
+        K_qs_head_off = z_KV * blocks_per_head_K * qs_per_blk;
+        K_e_head_off  = stride_K_blocks * qs_per_blk + z_KV * blocks_per_head_K;
+    }
+    if constexpr (type_K == GGML_TYPE_MXFP8_E5M2) {
         constexpr int blocks_per_head_K = D / QK_MXFP8;
         const int stride_K_blocks = nb11 / sizeof(block_mxfp8);
         const int z_KV = head / gqa_ratio;
@@ -143,13 +157,20 @@ static __global__ void flash_attn_ext_vec(
         V_qs_head_off = z_KV * blocks_per_head_V * QK_MXFP8;
         V_e_head_off  = stride_V_blocks * QK_MXFP8 + z_KV * blocks_per_head_V;
     }
-
-    // K_res: advance to the right stream (mirrors K += nb13*sequence).
-    // K_res layout: [n_res_bytes, kv_size, n_stream], kv_size = nb13/nb11.
-    const char * K_res_local = nullptr;
-    if (K_res && nb11 > 0) {
-        const int64_t K_res_nb2 = K_res_nb1 * (nb13 / int64_t(nb11));
-        K_res_local = K_res + K_res_nb2 * sequence;
+    if constexpr (type_V == GGML_TYPE_MXFP6_E2M3 || type_V == GGML_TYPE_MXFP6_E3M2) {
+        constexpr int qs_per_blk = 24;
+        constexpr int blocks_per_head_V = D / QK_MXFP6;
+        const int stride_V_blocks = nb21 / sizeof(block_mxfp6);
+        const int z_KV = head / gqa_ratio;
+        V_qs_head_off = z_KV * blocks_per_head_V * qs_per_blk;
+        V_e_head_off  = stride_V_blocks * qs_per_blk + z_KV * blocks_per_head_V;
+    }
+    if constexpr (type_V == GGML_TYPE_MXFP8_E5M2) {
+        constexpr int blocks_per_head_V = D / QK_MXFP8;
+        const int stride_V_blocks = nb21 / sizeof(block_mxfp8);
+        const int z_KV = head / gqa_ratio;
+        V_qs_head_off = z_KV * blocks_per_head_V * QK_MXFP8;
+        V_e_head_off  = stride_V_blocks * QK_MXFP8 + z_KV * blocks_per_head_V;
     }
 
     const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
@@ -218,7 +239,8 @@ static __global__ void flash_attn_ext_vec(
                 constexpr int nthreads_quantize = D/sizeof(int) < WARP_SIZE ? D/sizeof(int) : WARP_SIZE;
 #pragma unroll
                 for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_quantize) {
-                    if constexpr (type_K == GGML_TYPE_MXFP4 || type_K == GGML_TYPE_MXFP8) {
+                    if constexpr (type_K == GGML_TYPE_MXFP4 || type_K == GGML_TYPE_MXFP8 ||
+                                   type_K == GGML_TYPE_MXFP6_E2M3 || type_K == GGML_TYPE_MXFP6_E3M2 || type_K == GGML_TYPE_MXFP8_E5M2) {
                         quantize_q8_1_hadamard_to_shared<float2, nthreads_quantize>
                             (Q_f + i0*sizeof(int), scale, tmp_q_i32 + i0, tmp_q_ds + i0/QI8_1);
                     } else {
@@ -317,13 +339,23 @@ static __global__ void flash_attn_ext_vec(
             for (int j = 0; j < ncols; ++j) {
                 float sum;
                 if constexpr (type_K == GGML_TYPE_MXFP4) {
-                    const char * K_res_row = K_res_local ? K_res_local + (k_VKQ_0 + i_KQ) * K_res_nb1 : nullptr;
                     sum = vec_dot_fattn_vec_KQ_mxfp4_soa<D, nthreads_KQ>(
                         K + i_KQ*nb11, Q_i32[j], Q_ds[j],
-                        K_qs_head_off, K_e_head_off,
-                        K_res_row, K_res_head_off);
+                        K_qs_head_off, K_e_head_off);
                 } else if constexpr (type_K == GGML_TYPE_MXFP8) {
-                    sum = vec_dot_fattn_vec_KQ_mxfp8_soa<D, nthreads_KQ>(
+                    sum = vec_dot_fattn_vec_KQ_mxfp8_soa<GGML_TYPE_MXFP8, D, nthreads_KQ>(
+                        K + i_KQ*nb11, Q_i32[j], Q_ds[j],
+                        K_qs_head_off, K_e_head_off);
+                } else if constexpr (type_K == GGML_TYPE_MXFP6_E2M3) {
+                    sum = vec_dot_fattn_vec_KQ_mxfp6_soa<GGML_TYPE_MXFP6_E2M3, D, nthreads_KQ>(
+                        K + i_KQ*nb11, Q_i32[j], Q_ds[j],
+                        K_qs_head_off, K_e_head_off);
+                } else if constexpr (type_K == GGML_TYPE_MXFP6_E3M2) {
+                    sum = vec_dot_fattn_vec_KQ_mxfp6_soa<GGML_TYPE_MXFP6_E3M2, D, nthreads_KQ>(
+                        K + i_KQ*nb11, Q_i32[j], Q_ds[j],
+                        K_qs_head_off, K_e_head_off);
+                } else if constexpr (type_K == GGML_TYPE_MXFP8_E5M2) {
+                    sum = vec_dot_fattn_vec_KQ_mxfp8_soa<GGML_TYPE_MXFP8_E5M2, D, nthreads_KQ>(
                         K + i_KQ*nb11, Q_i32[j], Q_ds[j],
                         K_qs_head_off, K_e_head_off);
                 } else {
@@ -396,7 +428,13 @@ static __global__ void flash_attn_ext_vec(
                 if constexpr (type_V == GGML_TYPE_MXFP4) {
                     dequantize_V_mxfp4_soa<half, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
                 } else if constexpr (type_V == GGML_TYPE_MXFP8) {
-                    dequantize_V_mxfp8_soa<half, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
+                    dequantize_V_mxfp8_soa<GGML_TYPE_MXFP8, half, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
+                } else if constexpr (type_V == GGML_TYPE_MXFP6_E2M3) {
+                    dequantize_V_mxfp6_soa<GGML_TYPE_MXFP6_E2M3, half, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
+                } else if constexpr (type_V == GGML_TYPE_MXFP6_E3M2) {
+                    dequantize_V_mxfp6_soa<GGML_TYPE_MXFP6_E3M2, half, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
+                } else if constexpr (type_V == GGML_TYPE_MXFP8_E5M2) {
+                    dequantize_V_mxfp8_soa<GGML_TYPE_MXFP8_E5M2, half, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
                 } else {
                     dequantize_V(V + k*nb21, tmp, v_i0);
                 }
@@ -421,7 +459,13 @@ static __global__ void flash_attn_ext_vec(
                 if constexpr (type_V == GGML_TYPE_MXFP4) {
                     dequantize_V_mxfp4_soa<float, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
                 } else if constexpr (type_V == GGML_TYPE_MXFP8) {
-                    dequantize_V_mxfp8_soa<float, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
+                    dequantize_V_mxfp8_soa<GGML_TYPE_MXFP8, float, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
+                } else if constexpr (type_V == GGML_TYPE_MXFP6_E2M3) {
+                    dequantize_V_mxfp6_soa<GGML_TYPE_MXFP6_E2M3, float, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
+                } else if constexpr (type_V == GGML_TYPE_MXFP6_E3M2) {
+                    dequantize_V_mxfp6_soa<GGML_TYPE_MXFP6_E3M2, float, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
+                } else if constexpr (type_V == GGML_TYPE_MXFP8_E5M2) {
+                    dequantize_V_mxfp8_soa<GGML_TYPE_MXFP8_E5M2, float, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
                 } else {
                     dequantize_V(V + k*nb21, tmp, v_i0);
                 }
@@ -582,8 +626,7 @@ static __global__ void flash_attn_ext_vec(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33,
-        K_res, K_res_nb1);
+              nb31, nb32, nb33);
     NO_DEVICE_CODE;
 #endif // FLASH_ATTN_AVAILABLE
 }
@@ -679,3 +722,27 @@ extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_MXFP8, GGML_TYPE_MXFP4);
 extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_MXFP8, GGML_TYPE_MXFP8);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_MXFP8, GGML_TYPE_MXFP8);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_MXFP8, GGML_TYPE_MXFP8);
+
+// MXFP6 E2M3: K=mxfp6_e2m3 with V=mxfp4 (default) or V=mxfp6_e2m3 (max quality)
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP4);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP4);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP4);
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP6_E2M3);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP6_E2M3);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP6_E2M3);
+
+// MXFP6 E3M2: K=mxfp6_e3m2 with V=mxfp4 (default) or V=mxfp6_e3m2 (max quality)
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP4);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP4);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP4);
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP6_E3M2);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP6_E3M2);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP6_E3M2);
+
+// MXFP8 E5M2: K=mxfp8_e5m2 with V=mxfp4 (default) or V=mxfp8_e5m2 (max quality)
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP4);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP4);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP4);
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP8_E5M2);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP8_E5M2);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP8_E5M2);

@@ -3,6 +3,7 @@
 #include "ggml-common.h"
 #include "convert.cuh"
 #include "hadamard.cuh"
+#include "mxfp-traits.cuh"
 
 static __device__ __forceinline__ int best_index_int8(int n, const int8_t * val, float x) {
     if (x <= val[0]) return 0;
@@ -212,145 +213,20 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
 }
 
-// SoA MXFP4 quantization: per-row layout [all_qs][all_e].
-// When apply_hadamard=true (K cache): rotates before quantizing.
-// If res_row_base is non-null, writes 1-bit sign residual (32 bits per block).
+// Unified MXFP quantization is now in mxfp-traits.cuh (quantize_f32_mxfp_block_soa).
+// Keep these aliases for existing callers in set-rows.cu.
 template<bool apply_hadamard>
-static __device__ void quantize_f32_mxfp4_block_soa(
-        const float * __restrict__ x,
-        char * __restrict__ row_base,
-        const int block_idx,
-        const int blocks_per_row_total,
-        char * __restrict__ res_row_base = nullptr) {
-    float vals[QK_MXFP4];
-    const float * src = x;
-    if constexpr (apply_hadamard) {
-        for (int j = 0; j < QK_MXFP4; ++j) {
-            vals[j] = x[j];
-        }
-        hadamard_32_inplace(vals);
-        src = vals;
-    }
-
-    // MSE-optimal E8M0 search: test +-1 around amax estimate, pick lowest MSE.
-    float amax = 0.0f;
-    for (int j = 0; j < QK_MXFP4; ++j) {
-        amax = fmaxf(amax, fabsf(src[j]));
-    }
-
-    const int e_base = (amax == 0.0f) ? 0 : __float2int_rn(log2f(amax)) - 2 + 127;
-    const int e_lo = max(1, min(255, e_base - 1));
-    const int e_hi = max(1, min(255, e_base + 1));
-
-    int best_e = max(0, min(255, e_base));
-    float best_mse = 1e30f;
-
-    for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
-        const float test_scale = ggml_cuda_e8m0_to_fp32((uint8_t)test_e);
-        const float test_inv = 1.0f / test_scale;
-        float mse = 0.0f;
-        for (int j = 0; j < QK_MXFP4; ++j) {
-            const uint8_t nibble = ggml_cuda_float_to_fp4_e2m1(src[j], test_inv);
-            const float recon = kvalues_mxfp4[nibble] * 0.5f * test_scale;
-            const float err = src[j] - recon;
-            mse += err * err;
-        }
-        if (mse < best_mse) {
-            best_mse = mse;
-            best_e = test_e;
-        }
-    }
-
-    const uint8_t e_val = (amax == 0.0f) ? (uint8_t)0 : (uint8_t)best_e;
-    const float inv_d = (amax == 0.0f) ? 0.0f : 1.0f / ggml_cuda_e8m0_to_fp32(e_val);
-
-    uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * 16);
-    for (int j = 0; j < QK_MXFP4/2; ++j) {
-        qs_dst[j] = __nv_cvt_float2_to_fp4x2(
-            make_float2(src[j] * inv_d, src[QK_MXFP4/2 + j] * inv_d),
-            __NV_E2M1, cudaRoundNearest);
-    }
-
-    *(row_base + blocks_per_row_total * 16 + block_idx) = e_val;
-
-    // Compute 1-bit sign residual: sign_bit[j] = 1 if original > dequantized, else 0.
-    if (res_row_base) {
-        const float scale = ggml_cuda_e8m0_to_fp32(e_val);
-        uint32_t sign_bits = 0;
-        for (int j = 0; j < QK_MXFP4; ++j) {
-            const uint8_t nibble = ggml_cuda_float_to_fp4_e2m1(src[j], inv_d);
-            const float recon = kvalues_mxfp4[nibble] * 0.5f * scale;
-            if (src[j] > recon) {
-                sign_bits |= (1u << j);
-            }
-        }
-        *reinterpret_cast<uint32_t *>(res_row_base + block_idx * 4) = sign_bits;
-    }
+static __device__ __forceinline__ void quantize_f32_mxfp4_block_soa(
+        const float * __restrict__ x, char * __restrict__ row_base,
+        const int block_idx, const int blocks_per_row_total) {
+    quantize_f32_mxfp_block_soa<GGML_TYPE_MXFP4, apply_hadamard>(x, row_base, block_idx, blocks_per_row_total);
 }
 
-// SoA MXFP8 quantization: per-row layout [all_qs][all_e].
-// When apply_hadamard=true (K cache): rotates before quantizing.
-// No residual — FP8 E4M3 has enough precision.
 template<bool apply_hadamard>
-static __device__ void quantize_f32_mxfp8_block_soa(
-        const float * __restrict__ x,
-        char * __restrict__ row_base,
-        const int block_idx,
-        const int blocks_per_row_total) {
-    float vals[QK_MXFP8];
-    const float * src = x;
-    if constexpr (apply_hadamard) {
-        for (int j = 0; j < QK_MXFP8; ++j) {
-            vals[j] = x[j];
-        }
-        hadamard_32_inplace(vals);
-        src = vals;
-    }
-
-    // MSE-optimal E8M0 search: test +-1 around amax estimate, pick lowest MSE.
-    float amax = 0.0f;
-    for (int j = 0; j < QK_MXFP8; ++j) {
-        amax = fmaxf(amax, fabsf(src[j]));
-    }
-
-    // FP8 E4M3 max finite = 448 ≈ 2^8.8. E8M0 scale = 2^(e-127).
-    // Want: amax <= 448 * 2^(e-127), so e ≈ floor(log2(amax)) - 8 + 127
-    const int e_base = (amax == 0.0f) ? 0 : __float2int_rn(log2f(amax)) - 8 + 127;
-    const int e_lo = max(1, min(255, e_base - 1));
-    const int e_hi = max(1, min(255, e_base + 1));
-
-    int best_e = max(0, min(255, e_base));
-    float best_mse = 1e30f;
-
-    for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
-        const float test_scale = ggml_cuda_e8m0_to_fp32((uint8_t)test_e);
-        const float test_inv = 1.0f / test_scale;
-        float mse = 0.0f;
-        for (int j = 0; j < QK_MXFP8; ++j) {
-            // Convert to FP8 and back to compute reconstruction error.
-            const uint8_t fp8 = __nv_cvt_float_to_fp8(src[j] * test_inv, __NV_SATFINITE, __NV_E4M3);
-            const __nv_fp8_e4m3 fp8_val = *reinterpret_cast<const __nv_fp8_e4m3 *>(&fp8);
-            const float recon = float(fp8_val) * test_scale;
-            const float err = src[j] - recon;
-            mse += err * err;
-        }
-        if (mse < best_mse) {
-            best_mse = mse;
-            best_e = test_e;
-        }
-    }
-
-    const uint8_t e_val = (amax == 0.0f) ? (uint8_t)0 : (uint8_t)best_e;
-    const float inv_d = (amax == 0.0f) ? 0.0f : 1.0f / ggml_cuda_e8m0_to_fp32(e_val);
-
-    // Write 32 FP8 bytes per block in SoA qs region.
-    uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * QK_MXFP8);
-    for (int j = 0; j < QK_MXFP8; ++j) {
-        qs_dst[j] = __nv_cvt_float_to_fp8(src[j] * inv_d, __NV_SATFINITE, __NV_E4M3);
-    }
-
-    // Write E8M0 scale byte in SoA E8M0 region.
-    *(row_base + blocks_per_row_total * QK_MXFP8 + block_idx) = e_val;
+static __device__ __forceinline__ void quantize_f32_mxfp8_block_soa(
+        const float * __restrict__ x, char * __restrict__ row_base,
+        const int block_idx, const int blocks_per_row_total) {
+    quantize_f32_mxfp_block_soa<GGML_TYPE_MXFP8, apply_hadamard>(x, row_base, block_idx, blocks_per_row_total);
 }
 
 template<typename src_t, typename dst_t>
