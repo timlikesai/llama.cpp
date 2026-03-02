@@ -1776,7 +1776,6 @@ static __global__ void flash_attn_ext_mxfp(
     // V type detection from stride. Block sizes: mxfp4=17, mxfp6=25, mxfp8=33.
     const int expected_mxfp4_stride = ne12 * blocks_per_head_V * 17;
     const int expected_mxfp6_stride = ne12 * blocks_per_head_V * 25;
-    // const int expected_mxfp8_stride = ne12 * blocks_per_head_V * 33;
 
     int v_type;
     if (V_is_K_view) {

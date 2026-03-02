@@ -35,73 +35,14 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP4> {
     }
 };
 
-// ── FP6 E2M3 ────────────────────────────────────────────────────────
-// Software FP6 conversion — hardware intrinsics require cuda_fp6.h (CUDA 13.0+)
+// ── FP6 helpers ─────────────────────────────────────────────────────
 namespace mxfp_detail {
-    static __device__ __forceinline__ uint8_t float_to_fp6_e2m3(float x) {
-        uint8_t sign = 0;
-        if (x < 0) { sign = 0x20; x = -x; }
-        if (x == 0) return sign;
-        if (x >= 7.5f) return sign | 0x1F;  // saturate to max finite
-
-        // E2M3: bias=1. Subnormal when biased_exp=0: val = mant * 2^(-3)
-        int exp = 0;
-        float frac = frexpf(x, &exp);
-        exp -= 1;  // x = (1+m) * 2^exp
-        int biased_exp = exp + 1;
-
-        if (biased_exp <= 0) {
-            // Subnormal: val = mant/8
-            int mant = __float2int_rn(x * 8.0f);
-            mant = min(mant, 7);
-            return sign | (uint8_t)mant;
-        }
-        if (biased_exp > 3) biased_exp = 3;
-
-        float mantf = (x / (float)(1 << exp)) - 1.0f;
-        int mant = __float2int_rn(mantf * 8.0f);
-        if (mant > 7) { mant = 0; biased_exp++; }
-        if (biased_exp > 3) return sign | 0x1F;
-        return sign | (uint8_t)((biased_exp << 3) | mant);
-
-        GGML_UNUSED(frac);
-    }
-
     static __device__ __forceinline__ float fp6_e2m3_to_float(uint8_t v) {
         const float sign = (v & 0x20) ? -1.0f : 1.0f;
         const int exp  = (v >> 3) & 0x3;
         const int mant = v & 0x7;
         if (exp == 0) return sign * (float)mant * 0.125f;
         return sign * (1.0f + mant * 0.125f) * (float)(1 << (exp - 1));
-    }
-
-    static __device__ __forceinline__ uint8_t float_to_fp6_e3m2(float x) {
-        uint8_t sign = 0;
-        if (x < 0) { sign = 0x20; x = -x; }
-        if (x == 0) return sign;
-        if (x >= 28.0f) return sign | 0x1F;  // saturate to max finite (exp=7, mant=3)
-
-        // E3M2: bias=3. Subnormal when biased_exp=0: val = mant * 2^(-4)
-        int exp = 0;
-        float frac = frexpf(x, &exp);
-        exp -= 1;  // x = (1+m) * 2^exp
-        int biased_exp = exp + 3;
-
-        if (biased_exp <= 0) {
-            // Subnormal: val = mant/16
-            int mant = __float2int_rn(x * 16.0f);
-            mant = min(mant, 3);
-            return sign | (uint8_t)mant;
-        }
-        if (biased_exp > 7) biased_exp = 7;
-
-        float mantf = (x / (float)(1 << exp)) - 1.0f;
-        int mant = __float2int_rn(mantf * 4.0f);
-        if (mant > 3) { mant = 0; biased_exp++; }
-        if (biased_exp > 7) return sign | 0x1F;
-        return sign | (uint8_t)((biased_exp << 2) | mant);
-
-        GGML_UNUSED(frac);
     }
 
     static __device__ __forceinline__ float fp6_e3m2_to_float(uint8_t v) {
