@@ -22,6 +22,7 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP4> {
     static constexpr int smem_k_sc_div  = 64;    // stride_k_sc = DKQ/64 (paired scales)
     static constexpr int emax           = 2;     // ceil(log2(6.0))
     static constexpr bool can_cp_async_k = true;
+    static constexpr bool needs_smem_expand_k = false;
 
     static __device__ __forceinline__ void mma_kq(
             tile<16, 8, float> & D, const tile<16, 8, int> & A,
@@ -35,7 +36,8 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP6_E2M3> {
     static constexpr int smem_k_qs_div  = 4;     // stride_k_qs = DKQ/4 + 4
     static constexpr int smem_k_sc_div  = 32;    // stride_k_sc = DKQ/32 (individual)
     static constexpr int emax           = 3;     // ceil(log2(7.5))
-    static constexpr bool can_cp_async_k = false; // 24-byte blocks not 16-aligned
+    static constexpr bool can_cp_async_k = true;  // raw packed bytes loaded as 16B chunks
+    static constexpr bool needs_smem_expand_k = true; // packed→expanded in-place after async load
 
     static __device__ __forceinline__ void mma_kq(
             tile<16, 8, float> & D, const tile<16, 8, int> & A,
@@ -49,7 +51,8 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP6_E3M2> {
     static constexpr int smem_k_qs_div  = 4;
     static constexpr int smem_k_sc_div  = 32;
     static constexpr int emax           = 5;     // ceil(log2(28.0))
-    static constexpr bool can_cp_async_k = false;
+    static constexpr bool can_cp_async_k = true;  // raw packed bytes loaded as 16B chunks
+    static constexpr bool needs_smem_expand_k = true; // packed→expanded in-place after async load
 
     static __device__ __forceinline__ void mma_kq(
             tile<16, 8, float> & D, const tile<16, 8, int> & A,
@@ -64,6 +67,7 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP8> {
     static constexpr int smem_k_sc_div  = 32;    // stride_k_sc = DKQ/32 (individual)
     static constexpr int emax           = 8;     // ceil(log2(448))
     static constexpr bool can_cp_async_k = true;  // 32-byte blocks = 2x 16B cp.async
+    static constexpr bool needs_smem_expand_k = false;
 
     static __device__ __forceinline__ void mma_kq(
             tile<16, 8, float> & D, const tile<16, 8, int> & A,
@@ -78,6 +82,7 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP8_E5M2> {
     static constexpr int smem_k_sc_div  = 32;
     static constexpr int emax           = 15;    // floor(log2(57344))
     static constexpr bool can_cp_async_k = true;
+    static constexpr bool needs_smem_expand_k = false;
 
     static __device__ __forceinline__ void mma_kq(
             tile<16, 8, float> & D, const tile<16, 8, int> & A,
@@ -120,15 +125,22 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_mxfp_g
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16, 128, 2,  32, 128, 128, 128, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  32, 128, 128, 128, 1, false);
 
-    // Computed fallback for arbitrary D values (e.g. D=576 for MLA models).
+    // MLA: D_K=576, D_V=512. Single-buffered (K/V share smem), nbatch_fa=32.
+    // K and V share the same physical smem region, loaded sequentially.
+    // smem ≈ 55 KB → occupancy=2 on 128 KB SM (vs occupancy=1 with double-buffer).
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8,  32, 3,  32, 288, 256, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 16,  64, 2,  32, 288, 256, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 128, 2,  32, 288, 256, 128, 1, false);
+
+    // Computed fallback for arbitrary D values.
     if (DKQ % 32 == 0 && DV % 32 == 0 && DKQ > 0 && DV > 0 && ncols > 0) {
         const int nwarps_min      = (ncols + 7) / 8;
         const int nthreads_       = nwarps_min * 32;
-        const int nbatch_fa_      = (DKQ > 256 || DV > 256) ? 16 : 32;
+        const int nbatch_fa_      = 32;
         const int nbatch_V2_      = DV / 2;
         const int nbatch_K2_      = DKQ / 2;
         const int nbatch_combine_ = DV / 2 <= 128 ? DV / 2 : 128;
-        const int occupancy_      = (DKQ > 256 || DV > 256) ? 4 : 2;
+        const int occupancy_      = 2;
         return fattn_mma_config{nthreads_, occupancy_, nbatch_fa_, nbatch_K2_, nbatch_V2_,
                                 nbatch_combine_, 1, false};
     }
@@ -145,9 +157,9 @@ static __host__ fattn_mma_config ggml_cuda_fattn_mma_mxfp_get_config(
 // K loading helpers
 // ------------------------------------------------------------------------------------------------------------------
 
-// Load K from global to shared memory (SoA layout).
+// Load K from global to shared memory (SoA layout). All types use cp.async.
 // FP4: 16 bytes/block, 1x cp.async per block, paired scales.
-// FP6: 24 bytes/block, synchronous load + expand to 32 bytes (8 fp6x4 words), individual scales.
+// FP6: 24 bytes/block, cp.async 16B chunks (packed), expand later via expand_K_fp6, individual scales.
 // FP8: 32 bytes/block, 2x 16B cp.async per block, individual scales.
 template<ggml_type mxfp_type, int DKQ, int nwarps, int nbatch_fa, int stride_k_qs, int stride_k_sc, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_mxfp_load_K(
@@ -210,61 +222,33 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_load_K(
             }
         }
     } else if constexpr (mxfp_type == GGML_TYPE_MXFP6_E2M3 || mxfp_type == GGML_TYPE_MXFP6_E3M2) {
-        // FP6: 24 bytes/block in VRAM, expand to 8 fp6x4 words (32 bytes) in smem.
-        // Wide uint32_t loads (6 per block) instead of 24 individual byte reads.
-        // The 24-byte block decomposes into two 12-byte cycles of 3 uint32_t each,
-        // where each cycle yields 4 groups of 3 bytes (= 4 fp6x4 words).
+        // FP6: cp.async 16-byte chunks of packed data. Total qs per row = blocks_per_head * 24 bytes,
+        // always a multiple of 16. Expansion to fp6x4 words happens later via expand_K_fp6.
+        const unsigned int tile_K_qs_32 = ggml_cuda_cvta_generic_to_shared(tile_K_qs);
+
+        constexpr int chunks_per_row = blocks_per_head * 24 / 16;  // = 3*DKQ/64
+        constexpr int total_chunks = nbatch_fa * chunks_per_row;
+
 #pragma unroll
-        for (int flat0 = 0; flat0 < nbatch_fa * blocks_per_head; flat0 += nwarps * WARP_SIZE) {
+        for (int flat0 = 0; flat0 < total_chunks; flat0 += nwarps * WARP_SIZE) {
             const int flat = flat0 + threadIdx.y * WARP_SIZE + threadIdx.x;
-            if (flat0 + nwarps * WARP_SIZE > nbatch_fa * blocks_per_head && flat >= nbatch_fa * blocks_per_head) {
+            if (flat0 + nwarps * WARP_SIZE > total_chunks && flat >= total_chunks) {
                 break;
             }
 
-            const int i = flat / blocks_per_head;
-            const int blk = flat % blocks_per_head;
+            const int i = flat / chunks_per_row;
+            const int c = flat % chunks_per_row;
 
             if (oob_check && i >= k_VKQ_sup) {
-#pragma unroll
-                for (int w = 0; w < 8; ++w) {
-                    tile_K_qs[i * stride_k_qs + blk * 8 + w] = 0;
-                }
+                *reinterpret_cast<int4 *>((char *)tile_K_qs + i * stride_k_qs * (int)sizeof(int) + c * 16) = make_int4(0, 0, 0, 0);
             } else {
                 const char * row_i = K_row_base + int64_t(k_VKQ_0 + i) * K_pos_stride;
-                const uint32_t * qs32 = (const uint32_t *)(row_i + K_qs_head_off + blk * 24);
-
-                // Load 24 bytes as 6 × uint32_t (qs_src is 4-byte aligned: 24 divides 4).
-                // Process in two 12-byte cycles (3 uint32_t → 4 fp6x4 words each).
-#pragma unroll
-                for (int cycle = 0; cycle < 2; ++cycle) {
-                    const uint32_t a = qs32[cycle * 3 + 0];
-                    const uint32_t b = qs32[cycle * 3 + 1];
-                    const uint32_t c = qs32[cycle * 3 + 2];
-
-                    // 12 bytes = 4 groups of 3 bytes at offsets 0,3,6,9.
-                    // Group 0: bytes  [0:2]  → a[0:23]
-                    // Group 1: bytes  [3:5]  → a[24:31] | b[0:15]
-                    // Group 2: bytes  [6:8]  → b[16:31] | c[0:7]
-                    // Group 3: bytes [9:11]  → c[8:31]
-                    const uint32_t raws[4] = {
-                         a                      & 0xFFFFFF,
-                        ((a >> 24) | (b <<  8)) & 0xFFFFFF,
-                        ((b >> 16) | (c << 16)) & 0xFFFFFF,
-                         (c >>  8)              & 0xFFFFFF,
-                    };
-
-#pragma unroll
-                    for (int g = 0; g < 4; ++g) {
-                        const uint32_t r = raws[g];
-                        tile_K_qs[i * stride_k_qs + blk * 8 + cycle * 4 + g] =
-                            (r & 0x3F) | (((r >> 6) & 0x3F) << 8) |
-                            (((r >> 12) & 0x3F) << 16) | (((r >> 18) & 0x3F) << 24);
-                    }
-                }
+                const unsigned int smem_dst = tile_K_qs_32 + i * stride_k_qs * (int)sizeof(int) + c * 16;
+                cp_async_cg_16<128>(smem_dst, row_i + K_qs_head_off + c * 16);
             }
         }
 
-        // E8M0 scales: individual (scale_vec::1X).
+        // E8M0 scales: individual (scale_vec::1X), loaded synchronously.
 #pragma unroll
         for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps) {
             const int i = i0 + threadIdx.y;
@@ -332,6 +316,78 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_load_K(
                     const uint8_t e = *(row_i + K_e_head_off + s);
                     tile_K_sc[i * stride_k_sc + s] = (uint32_t)e;
                 }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------------------------
+// FP6 in-place smem expansion: packed 24B/block → expanded 32B/block (8 fp6x4 words)
+// ------------------------------------------------------------------------------------------------------------------
+
+// After cp.async loads raw packed FP6 bytes into the first (blocks_per_head * 24) bytes of each
+// smem row, this function expands them in-place to the (blocks_per_head * 32) bytes of fp6x4 words
+// that ldmatrix/MMA expects. Uses __syncthreads between read and write phases for cross-warp safety,
+// since expanded blocks partially overlap packed blocks within each row.
+template<int DKQ, int nwarps, int nbatch_fa, int stride_k_qs>
+static __device__ __forceinline__ void flash_attn_ext_mxfp_expand_K_fp6(
+        int * const __restrict__ tile_K_qs) {
+    constexpr int blocks_per_head = DKQ / 32;
+    constexpr int total_blocks = nbatch_fa * blocks_per_head;
+    constexpr int nthreads = nwarps * WARP_SIZE;
+    constexpr int max_bpt = (total_blocks + nthreads - 1) / nthreads;
+
+    // Phase 1: Read packed bytes (6 × uint32_t per block = 24 bytes) from smem into registers.
+    uint32_t raw[6 * max_bpt];
+
+#pragma unroll
+    for (int iter = 0; iter < max_bpt; ++iter) {
+        const int flat = iter * nthreads + threadIdx.y * WARP_SIZE + threadIdx.x;
+        if (flat < total_blocks) {
+            const int i   = flat / blocks_per_head;
+            const int blk = flat % blocks_per_head;
+            const uint32_t * packed = (const uint32_t *)((const char *)tile_K_qs
+                + i * stride_k_qs * (int)sizeof(int) + blk * 24);
+            raw[iter * 6 + 0] = packed[0];
+            raw[iter * 6 + 1] = packed[1];
+            raw[iter * 6 + 2] = packed[2];
+            raw[iter * 6 + 3] = packed[3];
+            raw[iter * 6 + 4] = packed[4];
+            raw[iter * 6 + 5] = packed[5];
+        }
+    }
+
+    __syncthreads();  // All reads done before any writes (cross-warp safety).
+
+    // Phase 2: Expand 24 packed bytes → 8 fp6x4 words (32 bytes) and write to final locations.
+    // Two 12-byte cycles per block, each yielding 4 fp6x4 words.
+#pragma unroll
+    for (int iter = 0; iter < max_bpt; ++iter) {
+        const int flat = iter * nthreads + threadIdx.y * WARP_SIZE + threadIdx.x;
+        if (flat < total_blocks) {
+            const int i   = flat / blocks_per_head;
+            const int blk = flat % blocks_per_head;
+
+#pragma unroll
+            for (int cycle = 0; cycle < 2; ++cycle) {
+                const uint32_t a = raw[iter * 6 + cycle * 3 + 0];
+                const uint32_t b = raw[iter * 6 + cycle * 3 + 1];
+                const uint32_t c = raw[iter * 6 + cycle * 3 + 2];
+
+                const uint32_t r0 =  a                      & 0xFFFFFF;
+                const uint32_t r1 = ((a >> 24) | (b <<  8)) & 0xFFFFFF;
+                const uint32_t r2 = ((b >> 16) | (c << 16)) & 0xFFFFFF;
+                const uint32_t r3 =  (c >>  8)              & 0xFFFFFF;
+
+                const int base = i * stride_k_qs + blk * 8 + cycle * 4;
+                tile_K_qs[base + 0] = (r0 & 0x3F) | (((r0 >>  6) & 0x3F) << 8)
+                                    | (((r0 >> 12) & 0x3F) << 16) | (((r0 >> 18) & 0x3F) << 24);
+                tile_K_qs[base + 1] = (r1 & 0x3F) | (((r1 >>  6) & 0x3F) << 8)
+                                    | (((r1 >> 12) & 0x3F) << 16) | (((r1 >> 18) & 0x3F) << 24);
+                tile_K_qs[base + 2] = (r2 & 0x3F) | (((r2 >>  6) & 0x3F) << 8)
+                                    | (((r2 >> 12) & 0x3F) << 16) | (((r2 >> 18) & 0x3F) << 24);
+                tile_K_qs[base + 3] = (r3 & 0x3F) | (((r3 >>  6) & 0x3F) << 8)
+                                    | (((r3 >> 12) & 0x3F) << 16) | (((r3 >> 18) & 0x3F) << 24);
             }
         }
     }
@@ -695,12 +751,20 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
             inv_d = 0.0f;
         } else {
             constexpr int EMAX = traits::emax;
-            const int e_int = __float2int_rn(log2f(amax));
+            // Extract IEEE-754 exponent via integer bit ops (avoids SFU-bound log2f).
+            // round(log2(x)) = floor(log2(x)) + (mantissa >= sqrt(2)-1 ? 1 : 0).
+            // sqrt(2)-1 = 0.41421356... → mantissa threshold 0x3504F3 (23-bit field).
+            uint32_t amax_bits;
+            memcpy(&amax_bits, &amax, sizeof(uint32_t));
+            const int e_floor = (int)((amax_bits >> 23) & 0xFF) - 127;
+            const int e_int = e_floor + ((amax_bits & 0x7FFFFF) >= 0x3504F3 ? 1 : 0);
             int biased = e_int - EMAX + 127;
             biased = max(biased, 0);
             biased = min(biased, 254);
             e = static_cast<uint8_t>(biased);
-            inv_d = __frcp_rn(ggml_cuda_e8m0_to_fp32(e));
+            // Construct reciprocal power-of-2 via integer bit ops (avoids SFU-bound __frcp_rn).
+            const uint32_t inv_bits = (uint32_t)(254 - biased) << 23;
+            memcpy(&inv_d, &inv_bits, sizeof(float));
         }
 
         // Type-specific packing.
@@ -798,7 +862,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
 // ------------------------------------------------------------------------------------------------------------------
 
 template<ggml_type mxfp_type, int DKQ, int DV, int ncols1, int ncols2, int nwarps,
-    bool use_logit_softcap, bool needs_fixup, bool is_fixup, bool oob_check>
+    bool use_logit_softcap, bool needs_fixup, bool is_fixup, bool oob_check, bool single_buf = false>
 static __device__ __forceinline__ void flash_attn_ext_mxfp_iter(
         const float2         * const __restrict__ Q_f2,
         const char           * const __restrict__ K_row_base,
@@ -860,6 +924,13 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_iter(
     using T_B_VKQ = tile< 8, 8, half2>;
     using T_C_VKQ = tile<16, 8, float>;
 
+    // ---- Phase 0: Expand FP6 packed data in smem (if loaded via cp.async) ----
+
+    if constexpr (mma_traits::needs_smem_expand_k) {
+        flash_attn_ext_mxfp_expand_K_fp6<DKQ, nwarps, nbatch_fa, stride_k_qs>(tile_K_qs);
+        __syncthreads();
+    }
+
     // ---- Phase 1: KQ MMA ----
 
     T_C_KQ KQ_C[nbatch_fa / (np * T_C_KQ::I)];
@@ -888,11 +959,36 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_iter(
         }
     }
 
-    // ---- Phase 2a: Preload K[i+1], mask[i+1], V[i+1] ----
+    // ---- Phase 2a: Load V (single-buffer) or preload next K/V/mask (double-buffer) ----
 
-    static_assert(DV == 2 * nbatch_V2, "V outer loop assumption: DV must equal 2*nbatch_V2");
+    if constexpr (single_buf) {
+        // Single-buffer: K was consumed by KQ MMA. Barrier before V overwrites K.
+        __syncthreads();
 
-    if (!last_iter) {
+        // Load V for the current iteration into tile_V_curr (which aliases tile_K_qs memory).
+        const int k_VKQ_curr = kb0 * nbatch_fa;
+        if (v_type == 0) {
+            flash_attn_ext_mxfp_load_V_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
+                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                 tile_V_curr, k_VKQ_curr, 0, k_VKQ_sup);
+        } else if (v_type == 1) {
+            flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check, 0>
+                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                 tile_V_curr, k_VKQ_curr, 0, k_VKQ_sup);
+        } else if (v_type == 2) {
+            flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check, 1>
+                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                 tile_V_curr, k_VKQ_curr, 0, k_VKQ_sup);
+        } else if (v_type == 3) {
+            flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E2M3, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
+                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                 tile_V_curr, k_VKQ_curr, 0, k_VKQ_sup);
+        } else {
+            flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E3M2, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
+                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                 tile_V_curr, k_VKQ_curr, 0, k_VKQ_sup);
+        }
+    } else if (!last_iter) {
         const int k_VKQ_next = (kb0 + 1) * nbatch_fa;
 
         flash_attn_ext_mxfp_load_K<mxfp_type, DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check>
@@ -1020,9 +1116,10 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_iter(
         B_VKQ[k] = get_transposed(get_half2(KQ_C[k]));
     }
 
-    // For FP6 (no cp.async), we only need __syncthreads.
-    // For FP4/FP8 (with cp.async), wait for pipeline then sync.
-    if constexpr (mma_traits::can_cp_async_k) {
+    // Barrier before VKQ MMA reads tile_V_curr.
+    // Single-buffer: V was loaded in Phase 2a above (no cp.async for V).
+    // Double-buffer: wait for cp.async pipeline from K preloading.
+    if constexpr (!single_buf && mma_traits::can_cp_async_k) {
         cp_async_wait_all();
     }
     __syncthreads();
@@ -1127,16 +1224,44 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_process_tile(
     int      * tile_Q_qs = (int      *) smem_mxfp;
     uint32_t * tile_Q_sc = (uint32_t *)(tile_Q_qs + ncols * stride_q_qs);
 
-    int      * tile_K_qs_A     = (int      *)(tile_Q_sc + ncols * stride_q_sc);
-    uint32_t * tile_K_sc_A     = (uint32_t *)(tile_K_qs_A + nbatch_fa * stride_k_qs);
-    int      * tile_K_qs_B     = (int      *)(tile_K_sc_A + nbatch_fa * stride_k_sc);
-    uint32_t * tile_K_sc_B     = (uint32_t *)(tile_K_qs_B + nbatch_fa * stride_k_qs);
+    // Single-buffer: K and V share smem, halving usage (for large D like MLA D=576).
+    // Double-buffer: separate A/B buffers for overlap (for D <= 256).
+    constexpr bool single_buf = (DKQ > 256 || DV > 256);
+
+    constexpr int nbytes_K = nbatch_fa * stride_k_qs * (int)sizeof(int)
+                           + nbatch_fa * stride_k_sc * (int)sizeof(uint32_t);
     constexpr int nbytes_V = nbatch_fa * stride_tile_V * (int)sizeof(half2);
-    half2    * tile_V_A    = (half2 *)(tile_K_sc_B + nbatch_fa * stride_k_sc);
-    half2    * tile_V_B    = (half2 *)((char *)tile_V_A + nbytes_V);
+    constexpr int nbytes_KV_shared = nbytes_K > nbytes_V ? nbytes_K : nbytes_V;
     constexpr int nbytes_mask = ncols1 * (nbatch_fa + 8) * (int)sizeof(half);
-    half     * tile_mask_A = (half *)((char *)tile_V_B + nbytes_V);
-    half     * tile_mask_B = (half *)((char *)tile_mask_A + nbytes_mask);
+
+    char * kv_region = (char *)(tile_Q_sc + ncols * stride_q_sc);
+
+    int      * tile_K_qs_A, * tile_K_qs_B;
+    uint32_t * tile_K_sc_A, * tile_K_sc_B;
+    half2    * tile_V_A, * tile_V_B;
+    half     * tile_mask_A, * tile_mask_B;
+
+    if constexpr (single_buf) {
+        // K and V aliased at same physical address; loaded sequentially.
+        tile_K_qs_A = (int *)kv_region;
+        tile_K_sc_A = (uint32_t *)(tile_K_qs_A + nbatch_fa * stride_k_qs);
+        tile_V_A    = (half2 *)kv_region;
+        tile_mask_A = (half *)(kv_region + nbytes_KV_shared);
+        tile_K_qs_B = tile_K_qs_A;
+        tile_K_sc_B = tile_K_sc_A;
+        tile_V_B    = tile_V_A;
+        tile_mask_B = tile_mask_A;
+    } else {
+        // Separate A/B buffers for pipelining.
+        tile_K_qs_A = (int *)kv_region;
+        tile_K_sc_A = (uint32_t *)(tile_K_qs_A + nbatch_fa * stride_k_qs);
+        tile_K_qs_B = (int      *)(tile_K_sc_A + nbatch_fa * stride_k_sc);
+        tile_K_sc_B = (uint32_t *)(tile_K_qs_B + nbatch_fa * stride_k_qs);
+        tile_V_A    = (half2 *)(tile_K_sc_B + nbatch_fa * stride_k_sc);
+        tile_V_B    = (half2 *)((char *)tile_V_A + nbytes_V);
+        tile_mask_A = (half *)((char *)tile_V_B + nbytes_V);
+        tile_mask_B = (half *)((char *)tile_mask_A + nbytes_mask);
+    }
 
     T_C_VKQ VKQ_C[DV / T_C_VKQ::I];
 
@@ -1152,170 +1277,236 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_process_tile(
 
     __syncthreads();
 
-    // Double-buffered iteration.
-    int kb0 = kb0_start;
-    int      * tile_K_qs_curr = tile_K_qs_A;
-    uint32_t * tile_K_sc_curr = tile_K_sc_A;
-    int      * tile_K_qs_next = tile_K_qs_B;
-    uint32_t * tile_K_sc_next = tile_K_sc_B;
-    half2    * tile_V_curr    = tile_V_A;
-    half2    * tile_V_next    = tile_V_B;
-    half     * tile_mask_curr = tile_mask_A;
-    half     * tile_mask_next = tile_mask_B;
+    if constexpr (single_buf) {
+        // ---- Single-buffer iteration ----
+        // Each iteration: load K+mask → sync → iter (KQ MMA → sync → load V → softmax → sync → VKQ MMA → sync).
+        // V is loaded inside iter after KQ MMA consumes K (they share smem).
 
-    if constexpr (ncols2 == 1) {
-        constexpr bool oob_check_v = true;
+        if constexpr (ncols2 == 1) {
+            constexpr bool oob_check_v = true;
 
-        // Preload K[0], mask[0], V[0] into buffer A.
-        {
-            constexpr int k_VKQ_sup_v = nbatch_fa;
-            const int k_VKQ_0 = kb0_start * nbatch_fa;
+            for (int kb0 = kb0_start; kb0 < kb0_stop; ++kb0) {
+                const int k_VKQ_0 = kb0 * nbatch_fa;
+                const int k_VKQ_sup_v = (kb0 == kb0_stop - 1) ? (ne11 - kb0 * nbatch_fa) : nbatch_fa;
 
-            if (mask_h) {
+                flash_attn_ext_mxfp_load_K<mxfp_type, DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check_v>
+                    (K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
+                     tile_K_qs_A, tile_K_sc_A, k_VKQ_0, k_VKQ_sup_v);
+                if (mask_h) {
+                    flash_attn_ext_mxfp_load_mask<ncols1, nwarps, nbatch_fa, oob_check_v>
+                        (mask_h + k_VKQ_0, tile_mask_A, stride_mask, k_VKQ_sup_v, jt * ncols1, ne01);
+                }
+                if constexpr (mma_traits::can_cp_async_k) {
+                    cp_async_wait_all();
+                }
+                __syncthreads();
+
+                flash_attn_ext_mxfp_iter
+                    <mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check_v, /*single_buf=*/true>
+                    (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
+                     V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                     mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
+                     ne01, ne02, stride_mask,
+                     tile_Q_qs, tile_Q_sc, tile_K_qs_A, tile_K_sc_A,
+                     tile_K_qs_A, tile_K_sc_A,
+                     tile_V_A, tile_V_A, tile_mask_A, tile_mask_A,
+                     VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
+                     true, 0, v_type);
+            }
+        } else {
+            constexpr bool oob_check_v = false;
+
+            for (int kb0 = kb0_start; kb0 < kb0_stop; ++kb0) {
+                const int k_VKQ_0 = kb0 * nbatch_fa;
+
+                flash_attn_ext_mxfp_load_K<mxfp_type, DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check_v>
+                    (K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
+                     tile_K_qs_A, tile_K_sc_A, k_VKQ_0, nbatch_fa);
                 flash_attn_ext_mxfp_load_mask<ncols1, nwarps, nbatch_fa, oob_check_v>
-                    (mask_h + k_VKQ_0, tile_mask_curr, stride_mask, k_VKQ_sup_v, jt * ncols1, ne01);
+                    (mask_h + k_VKQ_0, tile_mask_A, stride_mask, nbatch_fa, jt * ncols1, ne01);
+                if constexpr (mma_traits::can_cp_async_k) {
+                    cp_async_wait_all();
+                }
+                __syncthreads();
+
+                flash_attn_ext_mxfp_iter
+                    <mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check_v, /*single_buf=*/true>
+                    (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
+                     V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                     mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
+                     ne01, ne02, stride_mask,
+                     tile_Q_qs, tile_Q_sc, tile_K_qs_A, tile_K_sc_A,
+                     tile_K_qs_A, tile_K_sc_A,
+                     tile_V_A, tile_V_A, tile_mask_A, tile_mask_A,
+                     VKQ_C, KQ_max, KQ_rowsum, jt, kb0, nbatch_fa,
+                     true, 0, v_type);
             }
-            flash_attn_ext_mxfp_load_K<mxfp_type, DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check_v>
-                (K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
-                 tile_K_qs_curr, tile_K_sc_curr, k_VKQ_0, k_VKQ_sup_v);
-            // V: dispatch on type.
-            if (v_type == 0) {
-                flash_attn_ext_mxfp_load_V_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
-                    (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                     tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-            } else if (v_type == 1) {
-                flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v, 0>
-                    (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                     tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-            } else if (v_type == 2) {
-                flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v, 1>
-                    (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                     tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-            } else if (v_type == 3) {
-                flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E2M3, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
-                    (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                     tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-            } else {
-                flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E3M2, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
-                    (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                     tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-            }
-            if constexpr (mma_traits::can_cp_async_k) {
-                cp_async_wait_all();
-            }
-            __syncthreads();
-        }
-
-        for (; kb0 < kb0_stop - 1; ++kb0) {
-            constexpr int k_VKQ_sup_v = nbatch_fa;
-            const int k_VKQ_sup_next = (kb0 + 1 == kb0_stop - 1) ? (ne11 - (kb0 + 1) * nbatch_fa) : nbatch_fa;
-
-            flash_attn_ext_mxfp_iter
-                <mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check_v>
-                (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
-                 V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                 mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-                 ne01, ne02, stride_mask,
-                 tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
-                 tile_K_qs_next, tile_K_sc_next,
-                 tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
-                 VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
-                 false, k_VKQ_sup_next, v_type);
-
-            { int      * tmp = tile_K_qs_curr; tile_K_qs_curr = tile_K_qs_next; tile_K_qs_next = tmp; }
-            { uint32_t * tmp = tile_K_sc_curr; tile_K_sc_curr = tile_K_sc_next; tile_K_sc_next = tmp; }
-            { half2    * tmp = tile_V_curr;    tile_V_curr    = tile_V_next;    tile_V_next    = tmp; }
-            { half     * tmp = tile_mask_curr; tile_mask_curr = tile_mask_next; tile_mask_next = tmp; }
-        }
-        {
-            const int k_VKQ_sup_v = ne11 - kb0 * nbatch_fa;
-
-            flash_attn_ext_mxfp_iter
-                <mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check_v>
-                (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
-                 V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                 mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-                 ne01, ne02, stride_mask,
-                 tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
-                 tile_K_qs_next, tile_K_sc_next,
-                 tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
-                 VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
-                 true, 0, v_type);
         }
     } else {
-        constexpr bool oob_check_v = false;
+        // ---- Double-buffered iteration ----
+        int kb0 = kb0_start;
+        int      * tile_K_qs_curr = tile_K_qs_A;
+        uint32_t * tile_K_sc_curr = tile_K_sc_A;
+        int      * tile_K_qs_next = tile_K_qs_B;
+        uint32_t * tile_K_sc_next = tile_K_sc_B;
+        half2    * tile_V_curr    = tile_V_A;
+        half2    * tile_V_next    = tile_V_B;
+        half     * tile_mask_curr = tile_mask_A;
+        half     * tile_mask_next = tile_mask_B;
 
-        // Preload K[0], mask[0], V[0] into buffer A.
-        {
-            constexpr int k_VKQ_sup_v = nbatch_fa;
-            const int k_VKQ_0 = kb0_start * nbatch_fa;
+        if constexpr (ncols2 == 1) {
+            constexpr bool oob_check_v = true;
 
-            flash_attn_ext_mxfp_load_mask<ncols1, nwarps, nbatch_fa, oob_check_v>
-                (mask_h + k_VKQ_0, tile_mask_curr, stride_mask, k_VKQ_sup_v, jt * ncols1, ne01);
-            flash_attn_ext_mxfp_load_K<mxfp_type, DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check_v>
-                (K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
-                 tile_K_qs_curr, tile_K_sc_curr, k_VKQ_0, k_VKQ_sup_v);
-            if (v_type == 0) {
-                flash_attn_ext_mxfp_load_V_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
-                    (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                     tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-            } else if (v_type == 1) {
-                flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v, 0>
-                    (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                     tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-            } else if (v_type == 2) {
-                flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v, 1>
-                    (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                     tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-            } else if (v_type == 3) {
-                flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E2M3, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
-                    (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                     tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-            } else {
-                flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E3M2, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
-                    (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                     tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
+            // Preload K[0], mask[0], V[0] into buffer A.
+            {
+                constexpr int k_VKQ_sup_v = nbatch_fa;
+                const int k_VKQ_0 = kb0_start * nbatch_fa;
+
+                if (mask_h) {
+                    flash_attn_ext_mxfp_load_mask<ncols1, nwarps, nbatch_fa, oob_check_v>
+                        (mask_h + k_VKQ_0, tile_mask_curr, stride_mask, k_VKQ_sup_v, jt * ncols1, ne01);
+                }
+                flash_attn_ext_mxfp_load_K<mxfp_type, DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check_v>
+                    (K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
+                     tile_K_qs_curr, tile_K_sc_curr, k_VKQ_0, k_VKQ_sup_v);
+                if (v_type == 0) {
+                    flash_attn_ext_mxfp_load_V_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
+                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
+                } else if (v_type == 1) {
+                    flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v, 0>
+                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
+                } else if (v_type == 2) {
+                    flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v, 1>
+                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
+                } else if (v_type == 3) {
+                    flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E2M3, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
+                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
+                } else {
+                    flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E3M2, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
+                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
+                }
+                if constexpr (mma_traits::can_cp_async_k) {
+                    cp_async_wait_all();
+                }
+                __syncthreads();
             }
-            if constexpr (mma_traits::can_cp_async_k) {
-                cp_async_wait_all();
+
+            for (; kb0 < kb0_stop - 1; ++kb0) {
+                constexpr int k_VKQ_sup_v = nbatch_fa;
+                const int k_VKQ_sup_next = (kb0 + 1 == kb0_stop - 1) ? (ne11 - (kb0 + 1) * nbatch_fa) : nbatch_fa;
+
+                flash_attn_ext_mxfp_iter
+                    <mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check_v>
+                    (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
+                     V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                     mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
+                     ne01, ne02, stride_mask,
+                     tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
+                     tile_K_qs_next, tile_K_sc_next,
+                     tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
+                     VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
+                     false, k_VKQ_sup_next, v_type);
+
+                { int      * tmp = tile_K_qs_curr; tile_K_qs_curr = tile_K_qs_next; tile_K_qs_next = tmp; }
+                { uint32_t * tmp = tile_K_sc_curr; tile_K_sc_curr = tile_K_sc_next; tile_K_sc_next = tmp; }
+                { half2    * tmp = tile_V_curr;    tile_V_curr    = tile_V_next;    tile_V_next    = tmp; }
+                { half     * tmp = tile_mask_curr; tile_mask_curr = tile_mask_next; tile_mask_next = tmp; }
             }
-            __syncthreads();
-        }
+            {
+                const int k_VKQ_sup_v = ne11 - kb0 * nbatch_fa;
 
-        for (; kb0 < kb0_stop - 1; ++kb0) {
-            constexpr int k_VKQ_sup_v = nbatch_fa;
+                flash_attn_ext_mxfp_iter
+                    <mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check_v>
+                    (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
+                     V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                     mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
+                     ne01, ne02, stride_mask,
+                     tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
+                     tile_K_qs_next, tile_K_sc_next,
+                     tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
+                     VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
+                     true, 0, v_type);
+            }
+        } else {
+            constexpr bool oob_check_v = false;
 
-            flash_attn_ext_mxfp_iter
-                <mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check_v>
-                (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
-                 V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                 mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-                 ne01, ne02, stride_mask,
-                 tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
-                 tile_K_qs_next, tile_K_sc_next,
-                 tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
-                 VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
-                 false, nbatch_fa, v_type);
+            // Preload K[0], mask[0], V[0] into buffer A.
+            {
+                constexpr int k_VKQ_sup_v = nbatch_fa;
+                const int k_VKQ_0 = kb0_start * nbatch_fa;
 
-            { int      * tmp = tile_K_qs_curr; tile_K_qs_curr = tile_K_qs_next; tile_K_qs_next = tmp; }
-            { uint32_t * tmp = tile_K_sc_curr; tile_K_sc_curr = tile_K_sc_next; tile_K_sc_next = tmp; }
-            { half2    * tmp = tile_V_curr;    tile_V_curr    = tile_V_next;    tile_V_next    = tmp; }
-            { half     * tmp = tile_mask_curr; tile_mask_curr = tile_mask_next; tile_mask_next = tmp; }
-        }
-        {
-            constexpr int k_VKQ_sup_v = nbatch_fa;
+                flash_attn_ext_mxfp_load_mask<ncols1, nwarps, nbatch_fa, oob_check_v>
+                    (mask_h + k_VKQ_0, tile_mask_curr, stride_mask, k_VKQ_sup_v, jt * ncols1, ne01);
+                flash_attn_ext_mxfp_load_K<mxfp_type, DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check_v>
+                    (K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
+                     tile_K_qs_curr, tile_K_sc_curr, k_VKQ_0, k_VKQ_sup_v);
+                if (v_type == 0) {
+                    flash_attn_ext_mxfp_load_V_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
+                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
+                } else if (v_type == 1) {
+                    flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v, 0>
+                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
+                } else if (v_type == 2) {
+                    flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v, 1>
+                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
+                } else if (v_type == 3) {
+                    flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E2M3, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
+                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
+                } else {
+                    flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E3M2, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
+                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
+                }
+                if constexpr (mma_traits::can_cp_async_k) {
+                    cp_async_wait_all();
+                }
+                __syncthreads();
+            }
 
-            flash_attn_ext_mxfp_iter
-                <mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check_v>
-                (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
-                 V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                 mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-                 ne01, ne02, stride_mask,
-                 tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
-                 tile_K_qs_next, tile_K_sc_next,
-                 tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
-                 VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
-                 true, 0, v_type);
+            for (; kb0 < kb0_stop - 1; ++kb0) {
+                constexpr int k_VKQ_sup_v = nbatch_fa;
+
+                flash_attn_ext_mxfp_iter
+                    <mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check_v>
+                    (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
+                     V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                     mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
+                     ne01, ne02, stride_mask,
+                     tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
+                     tile_K_qs_next, tile_K_sc_next,
+                     tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
+                     VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
+                     false, nbatch_fa, v_type);
+
+                { int      * tmp = tile_K_qs_curr; tile_K_qs_curr = tile_K_qs_next; tile_K_qs_next = tmp; }
+                { uint32_t * tmp = tile_K_sc_curr; tile_K_sc_curr = tile_K_sc_next; tile_K_sc_next = tmp; }
+                { half2    * tmp = tile_V_curr;    tile_V_curr    = tile_V_next;    tile_V_next    = tmp; }
+                { half     * tmp = tile_mask_curr; tile_mask_curr = tile_mask_next; tile_mask_next = tmp; }
+            }
+            {
+                constexpr int k_VKQ_sup_v = nbatch_fa;
+
+                flash_attn_ext_mxfp_iter
+                    <mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check_v>
+                    (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
+                     V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                     mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
+                     ne01, ne02, stride_mask,
+                     tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
+                     tile_K_qs_next, tile_K_sc_next,
+                     tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
+                     VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
+                     true, 0, v_type);
+            }
         }
     }
 
@@ -1522,7 +1713,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_process_tile(
     GGML_UNUSED_VARS(Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
         V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
         mask_h, sinks_f, dstk, dstk_fixup,
-        scale, slope, logit_softcap, ne01, ne02, gqa_ratio,
+        scale, slope, logit_softcap, ne01, ne02, gqa_ratio, ne11,
         stride_Q1, stride_Q2, stride_mask,
         jt, zt_gqa, kb0_start, kb0_stop, v_type);
     NO_DEVICE_CODE;
@@ -1785,11 +1976,19 @@ void ggml_cuda_flash_attn_ext_mma_mxfp_case(ggml_backend_cuda_context & ctx, ggm
     const size_t nbytes_mask    = ncols1    * (nbatch_fa + 8) * sizeof(half);
 
     const size_t nbytes_Q_region    = nbytes_Q_qs + nbytes_Q_sc;
-    const size_t nbytes_K_double    = 2 * (nbytes_K_qs + nbytes_K_sc);
-    const size_t nbytes_V_double    = 2 * nbytes_V;
-    const size_t nbytes_mask_double = 2 * nbytes_mask;
 
-    const size_t nbytes_KV_region   = nbytes_K_double + nbytes_V_double + nbytes_mask_double;
+    // Single-buffer: K and V share smem (only one loaded at a time). For large D (MLA).
+    // Double-buffer: separate A/B buffers for K, V, mask pipelining.
+    constexpr bool single_buf = (DKQ > 256 || DV > 256);
+
+    size_t nbytes_KV_region;
+    if constexpr (single_buf) {
+        const size_t nbytes_K_single = nbytes_K_qs + nbytes_K_sc;
+        const size_t nbytes_KV_shared = std::max(nbytes_K_single, nbytes_V);
+        nbytes_KV_region = nbytes_KV_shared + nbytes_mask;
+    } else {
+        nbytes_KV_region = 2 * (nbytes_K_qs + nbytes_K_sc) + 2 * nbytes_V + 2 * nbytes_mask;
+    }
 
     const size_t nbytes_shared_combine = nwarps * cols_per_warp * (nbatch_combine + 4) * sizeof(half2);
 
