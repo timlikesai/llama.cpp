@@ -70,15 +70,15 @@ DO_PERPLEXITY=true
 DO_BENCH=true
 CHUNKS_LIST=(16)
 # All MXFP configs use V=mxfp4 (K dominates quality; avoids cartesian explosion).
-# Variant names are spelled out: mxfp8_e4m3, mxfp6_e2m3, etc.
+# "mxfp8" = E4M3 (default), "mxfp6" = E2M3 (default). Full names also accepted.
 CONFIGS=(
     "f16"
     "q8_0"
     "q4_0"
     "q8_0+q4_0"
-    "mxfp8_e4m3"
+    "mxfp8"
     "mxfp8_e5m2"
-    "mxfp6_e2m3"
+    "mxfp6"
     "mxfp6_e3m2"
     "mxfp4"
 )
@@ -124,7 +124,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --chunks N[,M]      Chunk counts for perplexity, comma-separated (default: 16)"
             echo "  --config NAME       Single config (default: all). Available:"
             echo "                        f16, q8_0, q4_0, q8_0+q4_0"
-            echo "                        mxfp8_e4m3, mxfp8_e5m2, mxfp6_e2m3, mxfp6_e3m2, mxfp4"
+            echo "                        mxfp8, mxfp8_e5m2, mxfp6, mxfp6_e3m2, mxfp4"
             echo "  --model NAME|PATH   Model preset or path (default: $DEFAULT_MODEL)"
             echo "  --help              Show this help"
             echo ""
@@ -141,9 +141,9 @@ while [[ $# -gt 0 ]]; do
             echo "  q8_0+q4_0   Q8_0 K + Q4_0 V"
             echo ""
             echo "Configs (MXFP — all use V=mxfp4, K determines quality):"
-            echo "  mxfp8_e4m3  MXFP8 E4M3 K + MXFP4 V (8-bit, Hadamard)"
+            echo "  mxfp8       MXFP8 E4M3 K + MXFP4 V (8-bit, Hadamard) [default mxfp8]"
             echo "  mxfp8_e5m2  MXFP8 E5M2 K + MXFP4 V (8-bit, Hadamard)"
-            echo "  mxfp6_e2m3  MXFP6 E2M3 K + MXFP4 V (6-bit, Hadamard)"
+            echo "  mxfp6       MXFP6 E2M3 K + MXFP4 V (6-bit, Hadamard) [default mxfp6]"
             echo "  mxfp6_e3m2  MXFP6 E3M2 K + MXFP4 V (6-bit, Hadamard)"
             echo "  mxfp4       MXFP4 E2M1 K+V          (4-bit, Hadamard)"
             exit 0
@@ -205,10 +205,10 @@ config_types() {
         q8_0)         TYPE_K="q8_0";        TYPE_V="q8_0";   CLI_K="q8_0";      CLI_V="q8_0"      ;;
         q4_0)         TYPE_K="q4_0";        TYPE_V="q4_0";   CLI_K="q4_0";      CLI_V="q4_0"      ;;
         q8_0+q4_0)    TYPE_K="q8_0";        TYPE_V="q4_0";   CLI_K="q8_0";      CLI_V="q4_0"      ;;
-        mxfp8_e4m3)   TYPE_K="mxfp8_e4m3";  TYPE_V="mxfp4";  CLI_K="mxfp8";     CLI_V="mxfp4"     ;;
-        mxfp8_e5m2)   TYPE_K="mxfp8_e5m2";  TYPE_V="mxfp4";  CLI_K="mxfp8e5m2"; CLI_V="mxfp4"     ;;
-        mxfp6_e2m3)   TYPE_K="mxfp6_e2m3";  TYPE_V="mxfp4";  CLI_K="mxfp6e2m3"; CLI_V="mxfp4"     ;;
-        mxfp6_e3m2)   TYPE_K="mxfp6_e3m2";  TYPE_V="mxfp4";  CLI_K="mxfp6e3m2"; CLI_V="mxfp4"     ;;
+        mxfp8|mxfp8_e4m3)   TYPE_K="mxfp8";       TYPE_V="mxfp4";  CLI_K="mxfp8";     CLI_V="mxfp4"     ;;
+        mxfp8_e5m2)         TYPE_K="mxfp8_e5m2";  TYPE_V="mxfp4";  CLI_K="mxfp8e5m2"; CLI_V="mxfp4"     ;;
+        mxfp6|mxfp6_e2m3)   TYPE_K="mxfp6";       TYPE_V="mxfp4";  CLI_K="mxfp6";     CLI_V="mxfp4"     ;;
+        mxfp6_e3m2)         TYPE_K="mxfp6_e3m2";  TYPE_V="mxfp4";  CLI_K="mxfp6e3m2"; CLI_V="mxfp4"     ;;
         mxfp4)        TYPE_K="mxfp4";        TYPE_V="mxfp4";  CLI_K="mxfp4";     CLI_V="mxfp4"     ;;
         *)
             echo "Unknown config: $1"

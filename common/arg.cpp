@@ -406,6 +406,11 @@ const std::vector<ggml_type> kv_cache_types = {
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
+    // Shortcut: "mxfp6" defaults to E2M3 (best PPL across models).
+    // "mxfp8" already maps to E4M3 via ggml_type_name.
+    if (s == "mxfp6") {
+        return GGML_TYPE_MXFP6_E2M3;
+    }
     for (const auto & type : kv_cache_types) {
         if (ggml_type_name(type) == s) {
             return type;
