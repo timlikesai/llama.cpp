@@ -25,11 +25,24 @@ DATASET_FILE="wikitext-2-raw/wiki.test.raw"
 
 # Model presets: "name|/path/to/model.gguf"
 MODELS=(
+    # ── MXFP4 MOE models (primary targets) ──
     "qwen3-coder|/models/spectralyst/Qwen3-Coder-30B-A3B-Instruct-MXFP4_MOE-GGUF/Qwen3-Coder-30B-A3B-Instruct-MXFP4_MOE.gguf"
-    "gpt-oss-20b|/models/lmstudio-community/gpt-oss-20b-GGUF/gpt-oss-20b-MXFP4.gguf"
+    "qwen3-coder-next|/models/noctrex/Qwen3-Coder-Next-MXFP4_MOE-GGUF/Qwen3-Coder-Next-MXFP4_MOE.gguf"
     "qwen35|/models/noctrex/Qwen3.5-35B-A3B-MXFP4_MOE-GGUF/Qwen3.5-35B-A3B-MXFP4_MOE_F16.gguf"
-    "glm-4.7-flash|/models/noctrex/GLM-4.7-Flash-MXFP4_MOE-GGUF/GLM-4.7-Flash-MXFP4_MOE.gguf"
+    "gpt-oss-20b|/models/lmstudio-community/gpt-oss-20b-GGUF/gpt-oss-20b-MXFP4.gguf"
     "nemotron-nano|/models/noctrex/Nemotron-3-Nano-30B-A3B-MXFP4_MOE-GGUF/NVIDIA-Nemotron-3-Nano-30B-A3B-MXFP4_MOE.gguf"
+    "glm-4.7-flash|/models/noctrex/GLM-4.7-Flash-MXFP4_MOE-GGUF/GLM-4.7-Flash-MXFP4_MOE.gguf"
+    "glm-4.7-flash-i1-xl|/models/noctrex/GLM-4.7-Flash-i1-MXFP4_MOE_XL-exp-GGUF/GLM-4.7-Flash-i1-MXFP4_MOE_XL-exp.gguf"
+    # ── Standard quant models ──
+    "nemotron-nano-q4|/models/unsloth/Nemotron-3-Nano-30B-A3B-GGUF/Nemotron-3-Nano-30B-A3B-Q4_1.gguf"
+    "glm-4.7-flash-q8|/models/lmstudio-community/GLM-4.7-Flash-GGUF/GLM-4.7-Flash-Q8_0.gguf"
+    "glm-4.7-flash-q4|/models/unsloth/GLM-4.7-Flash-GGUF/GLM-4.7-Flash-Q4_1.gguf"
+    "devstral-24b|/models/unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF/Devstral-Small-2-24B-Instruct-2512-Q4_1.gguf"
+    "granite-tiny|/models/lmstudio-community/granite-4.0-h-tiny-GGUF/granite-4.0-h-tiny-Q8_0.gguf"
+    "gemma-3n|/models/unsloth/gemma-3n-E4B-it-GGUF/gemma-3n-E4B-it-Q8_0.gguf"
+    "qwen3-4b-math|/models/mradermacher/Qwen3-4B-math-GGUF/Qwen3-4B-math.Q8_0.gguf"
+    "lfm2.5-thinking|/models/unsloth/LFM2.5-1.2B-Thinking-GGUF/LFM2.5-1.2B-Thinking-Q8_0.gguf"
+    "lfm2.5-instruct|/models/unsloth/LFM2.5-1.2B-Instruct-GGUF/LFM2.5-1.2B-Instruct-Q8_0.gguf"
 )
 DEFAULT_MODEL="qwen3-coder"
 
@@ -176,7 +189,7 @@ docker_run() {
 
 # MLA models: V shares K buffer, so V type = K type (V arg is ignored by the model).
 # For these models, MXFP configs use matched K/V instead of V=mxfp4.
-MLA_MODELS=("glm-4.7-flash")
+MLA_MODELS=("glm-4.7-flash" "glm-4.7-flash-i1-xl" "glm-4.7-flash-q8" "glm-4.7-flash-q4")
 
 is_mla_model() {
     for m in "${MLA_MODELS[@]}"; do
