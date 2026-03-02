@@ -213,22 +213,6 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
 }
 
-// Unified MXFP quantization is now in mxfp-traits.cuh (quantize_f32_mxfp_block_soa).
-// Keep these aliases for existing callers in set-rows.cu.
-template<bool apply_hadamard>
-static __device__ __forceinline__ void quantize_f32_mxfp4_block_soa(
-        const float * __restrict__ x, char * __restrict__ row_base,
-        const int block_idx, const int blocks_per_row_total) {
-    quantize_f32_mxfp_block_soa<GGML_TYPE_MXFP4, apply_hadamard>(x, row_base, block_idx, blocks_per_row_total);
-}
-
-template<bool apply_hadamard>
-static __device__ __forceinline__ void quantize_f32_mxfp8_block_soa(
-        const float * __restrict__ x, char * __restrict__ row_base,
-        const int block_idx, const int blocks_per_row_total) {
-    quantize_f32_mxfp_block_soa<GGML_TYPE_MXFP8, apply_hadamard>(x, row_base, block_idx, blocks_per_row_total);
-}
-
 template<typename src_t, typename dst_t>
 static __device__ void cpy_1_scalar(const char * cxi, char * cdsti) {
     *(dst_t *) cdsti = ggml_cuda_cast<dst_t>(*(const src_t *) cxi);

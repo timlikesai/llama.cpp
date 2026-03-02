@@ -475,12 +475,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     if (K->type != V->type) {
         // Mixed-type combos always supported (not gated by FA_ALL_QUANTS):
         const bool is_q8_q4 = (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0);
-        const bool is_mxfp_k = (K->type == GGML_TYPE_MXFP4 || K->type == GGML_TYPE_MXFP8 ||
-                                K->type == GGML_TYPE_MXFP6_E2M3 || K->type == GGML_TYPE_MXFP6_E3M2 ||
-                                K->type == GGML_TYPE_MXFP8_E5M2);
-        const bool is_mxfp_v = (V->type == GGML_TYPE_MXFP4 || V->type == GGML_TYPE_MXFP8 ||
-                                V->type == GGML_TYPE_MXFP6_E2M3 || V->type == GGML_TYPE_MXFP6_E3M2 ||
-                                V->type == GGML_TYPE_MXFP8_E5M2);
+        const bool is_mxfp_k = ggml_is_type_mxfp(K->type);
+        const bool is_mxfp_v = ggml_is_type_mxfp(V->type);
         if (!is_q8_q4 && !(is_mxfp_k && is_mxfp_v)) {
             return BEST_FATTN_KERNEL_NONE;
         }
@@ -519,9 +515,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // Unified MXFP flash attention (Blackwell MMA for FP4/FP6/FP8):
     if (blackwell_mma_available(cc)) {
-        const bool is_mxfp = (K->type == GGML_TYPE_MXFP4 || K->type == GGML_TYPE_MXFP8 ||
-                              K->type == GGML_TYPE_MXFP8_E5M2 ||
-                              K->type == GGML_TYPE_MXFP6_E2M3 || K->type == GGML_TYPE_MXFP6_E3M2);
+        const bool is_mxfp = ggml_is_type_mxfp(K->type);
         if (is_mxfp && K->ne[0] % 32 == 0) {
             if (can_use_vector_kernel && Q->ne[1] <= 2) {
                 return BEST_FATTN_KERNEL_VEC;

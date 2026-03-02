@@ -426,13 +426,13 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_4_4 = 36,
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
-        GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
-        GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
-        GGML_TYPE_MXFP8   = 41, // MXFP8 (1 block)
-        GGML_TYPE_MXFP6_E2M3 = 42,
-        GGML_TYPE_MXFP6_E3M2 = 43,
-        GGML_TYPE_MXFP8_E5M2 = 44,
-        GGML_TYPE_COUNT   = 45,
+        GGML_TYPE_MXFP4       = 39, // MX FP4 E2M1
+        GGML_TYPE_NVFP4       = 40, // NVFP4 (4 blocks, E4M3 scale)
+        GGML_TYPE_MXFP8       = 41, // MX FP8 E4M3
+        GGML_TYPE_MXFP6_E2M3  = 42, // MX FP6 E2M3
+        GGML_TYPE_MXFP6_E3M2  = 43, // MX FP6 E3M2
+        GGML_TYPE_MXFP8_E5M2  = 44, // MX FP8 E5M2
+        GGML_TYPE_COUNT        = 45,
     };
 
     // precision

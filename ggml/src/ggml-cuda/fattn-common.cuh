@@ -874,6 +874,36 @@ static __device__ __forceinline__ void dequantize_V_mxfp6_soa(
     }
 }
 
+// ── Unified MXFP VEC dispatch wrappers ──────────────────────────────
+// Single entry point for all 5 MXFP types. Dispatches to the type-specific
+// implementations above based on compile-time type_K/type_V.
+
+template <ggml_type type_K, int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp_soa(
+        const char * __restrict__ K_row, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+        const int qs_head_off, const int e_head_off) {
+    if constexpr (type_K == GGML_TYPE_MXFP4) {
+        return vec_dot_fattn_vec_KQ_mxfp4_soa<D, nthreads>(K_row, Q_q8, Q_ds_v, qs_head_off, e_head_off);
+    } else if constexpr (type_K == GGML_TYPE_MXFP6_E2M3 || type_K == GGML_TYPE_MXFP6_E3M2) {
+        return vec_dot_fattn_vec_KQ_mxfp6_soa<type_K, D, nthreads>(K_row, Q_q8, Q_ds_v, qs_head_off, e_head_off);
+    } else {
+        return vec_dot_fattn_vec_KQ_mxfp8_soa<type_K, D, nthreads>(K_row, Q_q8, Q_ds_v, qs_head_off, e_head_off);
+    }
+}
+
+template <ggml_type type_V, typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_mxfp_soa(
+        const char * __restrict__ V_row, void * __restrict__ dst, const int64_t i0,
+        const int qs_head_off, const int e_head_off) {
+    if constexpr (type_V == GGML_TYPE_MXFP4) {
+        dequantize_V_mxfp4_soa<T, ne>(V_row, dst, i0, qs_head_off, e_head_off);
+    } else if constexpr (type_V == GGML_TYPE_MXFP6_E2M3 || type_V == GGML_TYPE_MXFP6_E3M2) {
+        dequantize_V_mxfp6_soa<type_V, T, ne>(V_row, dst, i0, qs_head_off, e_head_off);
+    } else {
+        dequantize_V_mxfp8_soa<type_V, T, ne>(V_row, dst, i0, qs_head_off, e_head_off);
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {

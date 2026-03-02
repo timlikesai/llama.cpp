@@ -109,222 +109,6 @@ static void set_rows_cuda_quant(
     }
 }
 
-// MXFP4 SoA set_rows: per-row layout [all_qs][all_e] with optional Hadamard rotation.
-template <typename idx_t, bool apply_hadamard>
-static __global__ void k_set_rows_mxfp4_soa(
-        const float * __restrict__ src0,
-        const idx_t * __restrict__ src1,
-        char        * __restrict__ dst,
-        const int64_t ne_total,
-        const int64_t ne10,
-        const int64_t ne11,
-        const int64_t ne12,
-        const int64_t ne13,
-        const int64_t s01,
-        const int64_t s02,
-        const int64_t s03,
-        const int64_t s10,
-        const int64_t s11,
-        const int64_t s12,
-        const int64_t s1,
-        const int64_t s2,
-        const int64_t s3,
-        const uint3   ne00,
-        const uint3   ne01,
-        const uint3   ne02,
-        const uint3   ne11_fd,
-        const uint3   ne12_fd,
-        const int     blocks_per_row_total) {
-    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
-
-    if (i >= ne_total) {
-        return;
-    }
-
-    const int64_t i_base = i * QK_MXFP4;
-    uint32_t      tmp    = (uint32_t) i_base;
-    uint2         div_mod;
-
-    div_mod           = fast_div_modulo(tmp, ne00);
-    const int64_t i00 = div_mod.y;
-    tmp               = div_mod.x;
-
-    div_mod           = fast_div_modulo(tmp, ne01);
-    const int64_t i01 = div_mod.y;
-    tmp               = div_mod.x;
-
-    div_mod           = fast_div_modulo(tmp, ne02);
-    const int64_t i02 = div_mod.y;
-    const int64_t i03 = div_mod.x;
-
-    const int64_t i12 = fastmodulo((uint32_t) i03, ne12_fd);
-    const int64_t i11 = fastmodulo((uint32_t) i02, ne11_fd);
-    const int64_t i10 = i01;
-
-    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
-
-    const float * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
-    char * dst_row_base = dst + dst_row*s1 + i02*s2 + i03*s3;
-
-    const int block_in_row = i00 / QK_MXFP4;
-
-    quantize_f32_mxfp4_block_soa<apply_hadamard>(src0_row + i00, dst_row_base, block_in_row, blocks_per_row_total);
-
-    GGML_UNUSED(ne10);
-    GGML_UNUSED(ne11);
-    GGML_UNUSED(ne12);
-    GGML_UNUSED(ne13);
-}
-
-template<typename idx_t, bool apply_hadamard>
-static void set_rows_cuda_mxfp4_soa(
-        const float * src0_d, const idx_t * src1_d, char * dst_d,
-        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
-        const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
-        const size_t nb01, const size_t nb02, const size_t nb03,
-        const size_t nb10, const size_t nb11, const size_t nb12,
-        const size_t nb1, const size_t nb2, const size_t nb3,
-        cudaStream_t stream) {
-
-    GGML_ASSERT(ne00 % QK_MXFP4 == 0);
-    const int64_t ne_total = (ne00 * ne01 * ne02 * ne03) / QK_MXFP4;
-    const int num_blocks = (ne_total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;
-    const dim3 block_size(CUDA_SET_ROWS_BLOCK_SIZE);
-    const dim3 grid_size(num_blocks);
-
-    const int64_t s01 = nb01/sizeof(float);
-    const int64_t s02 = nb02/sizeof(float);
-    const int64_t s03 = nb03/sizeof(float);
-    const int64_t s10 = nb10/sizeof(idx_t);
-    const int64_t s11 = nb11/sizeof(idx_t);
-    const int64_t s12 = nb12/sizeof(idx_t);
-    const int64_t s1  = nb1;
-    const int64_t s2  = nb2;
-    const int64_t s3  = nb3;
-
-    const int blocks_per_row_total = nb1 / sizeof(block_mxfp4);
-
-    if (ne_total > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
-        const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
-        const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
-        const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
-        const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
-        const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
-
-        k_set_rows_mxfp4_soa<idx_t, apply_hadamard><<<grid_size, block_size, 0, stream>>>(
-            src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3,
-            ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd, blocks_per_row_total);
-    }
-}
-
-// MXFP8 SoA set_rows: per-row layout [all_qs][all_e] with optional Hadamard rotation.
-template <typename idx_t, bool apply_hadamard>
-static __global__ void k_set_rows_mxfp8_soa(
-        const float * __restrict__ src0,
-        const idx_t * __restrict__ src1,
-        char        * __restrict__ dst,
-        const int64_t ne_total,
-        const int64_t ne10,
-        const int64_t ne11,
-        const int64_t ne12,
-        const int64_t ne13,
-        const int64_t s01,
-        const int64_t s02,
-        const int64_t s03,
-        const int64_t s10,
-        const int64_t s11,
-        const int64_t s12,
-        const int64_t s1,
-        const int64_t s2,
-        const int64_t s3,
-        const uint3   ne00,
-        const uint3   ne01,
-        const uint3   ne02,
-        const uint3   ne11_fd,
-        const uint3   ne12_fd,
-        const int     blocks_per_row_total) {
-    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
-
-    if (i >= ne_total) {
-        return;
-    }
-
-    const int64_t i_base = i * QK_MXFP8;
-    uint32_t      tmp    = (uint32_t) i_base;
-    uint2         div_mod;
-
-    div_mod           = fast_div_modulo(tmp, ne00);
-    const int64_t i00 = div_mod.y;
-    tmp               = div_mod.x;
-
-    div_mod           = fast_div_modulo(tmp, ne01);
-    const int64_t i01 = div_mod.y;
-    tmp               = div_mod.x;
-
-    div_mod           = fast_div_modulo(tmp, ne02);
-    const int64_t i02 = div_mod.y;
-    const int64_t i03 = div_mod.x;
-
-    const int64_t i12 = fastmodulo((uint32_t) i03, ne12_fd);
-    const int64_t i11 = fastmodulo((uint32_t) i02, ne11_fd);
-    const int64_t i10 = i01;
-
-    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
-
-    const float * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
-    char * dst_row_base = dst + dst_row*s1 + i02*s2 + i03*s3;
-
-    const int block_in_row = i00 / QK_MXFP8;
-
-    quantize_f32_mxfp8_block_soa<apply_hadamard>(src0_row + i00, dst_row_base, block_in_row, blocks_per_row_total);
-
-    GGML_UNUSED(ne10);
-    GGML_UNUSED(ne11);
-    GGML_UNUSED(ne12);
-    GGML_UNUSED(ne13);
-}
-
-template<typename idx_t, bool apply_hadamard>
-static void set_rows_cuda_mxfp8_soa(
-        const float * src0_d, const idx_t * src1_d, char * dst_d,
-        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
-        const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
-        const size_t nb01, const size_t nb02, const size_t nb03,
-        const size_t nb10, const size_t nb11, const size_t nb12,
-        const size_t nb1, const size_t nb2, const size_t nb3,
-        cudaStream_t stream) {
-
-    GGML_ASSERT(ne00 % QK_MXFP8 == 0);
-    const int64_t ne_total = (ne00 * ne01 * ne02 * ne03) / QK_MXFP8;
-    const int num_blocks = (ne_total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;
-    const dim3 block_size(CUDA_SET_ROWS_BLOCK_SIZE);
-    const dim3 grid_size(num_blocks);
-
-    const int64_t s01 = nb01/sizeof(float);
-    const int64_t s02 = nb02/sizeof(float);
-    const int64_t s03 = nb03/sizeof(float);
-    const int64_t s10 = nb10/sizeof(idx_t);
-    const int64_t s11 = nb11/sizeof(idx_t);
-    const int64_t s12 = nb12/sizeof(idx_t);
-    const int64_t s1  = nb1;
-    const int64_t s2  = nb2;
-    const int64_t s3  = nb3;
-
-    const int blocks_per_row_total = nb1 / sizeof(block_mxfp8);
-
-    if (ne_total > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
-        const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
-        const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
-        const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
-        const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
-        const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
-
-        k_set_rows_mxfp8_soa<idx_t, apply_hadamard><<<grid_size, block_size, 0, stream>>>(
-            src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3,
-            ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd, blocks_per_row_total);
-    }
-}
-
 // Unified MXFP SoA set_rows — works for any MX format via mxfp_traits.
 template <ggml_type mxfp_type, typename idx_t, bool apply_hadamard>
 static __global__ void k_set_rows_mxfp_soa(
@@ -628,93 +412,36 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
-    } else if (dst->type == GGML_TYPE_MXFP4) {
+    } else if (dst->type == GGML_TYPE_MXFP4 || dst->type == GGML_TYPE_MXFP8 ||
+               dst->type == GGML_TYPE_MXFP6_E2M3 || dst->type == GGML_TYPE_MXFP6_E3M2 ||
+               dst->type == GGML_TYPE_MXFP8_E5M2) {
         // op_params[0] == 1 signals K cache write: apply Hadamard rotation before quantization.
         // V cache writes leave op_params[0] == 0 (no rotation).
         const int32_t hadamard_flag = ((const int32_t *)dst->op_params)[0];
-        if (hadamard_flag) {
-            set_rows_cuda_mxfp4_soa<idx_t, /*apply_hadamard=*/true>(
-                src0_d, src1_d, (char *)dst->data,
-                ne00, ne01, ne02, ne03,
-                ne10, ne11, ne12, ne13,
-                nb01, nb02, nb03,
-                nb10, nb11, nb12,
-                nb1, nb2, nb3,
-                stream
-            );
-        } else {
-            set_rows_cuda_mxfp4_soa<idx_t, /*apply_hadamard=*/false>(
-                src0_d, src1_d, (char *)dst->data,
-                ne00, ne01, ne02, ne03,
-                ne10, ne11, ne12, ne13,
-                nb01, nb02, nb03,
-                nb10, nb11, nb12,
-                nb1, nb2, nb3,
-                stream
-            );
+
+        #define DISPATCH_MXFP_SOA(MXFP_TYPE) \
+            if (hadamard_flag) { \
+                set_rows_cuda_mxfp_soa<MXFP_TYPE, idx_t, true>( \
+                    src0_d, src1_d, (char *)dst->data, \
+                    ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, \
+                    nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream); \
+            } else { \
+                set_rows_cuda_mxfp_soa<MXFP_TYPE, idx_t, false>( \
+                    src0_d, src1_d, (char *)dst->data, \
+                    ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, \
+                    nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream); \
+            }
+
+        switch (dst->type) {
+            case GGML_TYPE_MXFP4:      DISPATCH_MXFP_SOA(GGML_TYPE_MXFP4);      break;
+            case GGML_TYPE_MXFP8:      DISPATCH_MXFP_SOA(GGML_TYPE_MXFP8);      break;
+            case GGML_TYPE_MXFP6_E2M3: DISPATCH_MXFP_SOA(GGML_TYPE_MXFP6_E2M3); break;
+            case GGML_TYPE_MXFP6_E3M2: DISPATCH_MXFP_SOA(GGML_TYPE_MXFP6_E3M2); break;
+            case GGML_TYPE_MXFP8_E5M2: DISPATCH_MXFP_SOA(GGML_TYPE_MXFP8_E5M2); break;
+            default: GGML_ABORT("unreachable");
         }
-    } else if (dst->type == GGML_TYPE_MXFP8) {
-        const int32_t hadamard_flag = ((const int32_t *)dst->op_params)[0];
-        if (hadamard_flag) {
-            set_rows_cuda_mxfp8_soa<idx_t, /*apply_hadamard=*/true>(
-                src0_d, src1_d, (char *)dst->data,
-                ne00, ne01, ne02, ne03,
-                ne10, ne11, ne12, ne13,
-                nb01, nb02, nb03,
-                nb10, nb11, nb12,
-                nb1, nb2, nb3,
-                stream
-            );
-        } else {
-            set_rows_cuda_mxfp8_soa<idx_t, /*apply_hadamard=*/false>(
-                src0_d, src1_d, (char *)dst->data,
-                ne00, ne01, ne02, ne03,
-                ne10, ne11, ne12, ne13,
-                nb01, nb02, nb03,
-                nb10, nb11, nb12,
-                nb1, nb2, nb3,
-                stream
-            );
-        }
-    } else if (dst->type == GGML_TYPE_MXFP6_E2M3) {
-        const int32_t hadamard_flag = ((const int32_t *)dst->op_params)[0];
-        if (hadamard_flag) {
-            set_rows_cuda_mxfp_soa<GGML_TYPE_MXFP6_E2M3, idx_t, true>(
-                src0_d, src1_d, (char *)dst->data,
-                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
-                nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-        } else {
-            set_rows_cuda_mxfp_soa<GGML_TYPE_MXFP6_E2M3, idx_t, false>(
-                src0_d, src1_d, (char *)dst->data,
-                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
-                nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-        }
-    } else if (dst->type == GGML_TYPE_MXFP6_E3M2) {
-        const int32_t hadamard_flag = ((const int32_t *)dst->op_params)[0];
-        if (hadamard_flag) {
-            set_rows_cuda_mxfp_soa<GGML_TYPE_MXFP6_E3M2, idx_t, true>(
-                src0_d, src1_d, (char *)dst->data,
-                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
-                nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-        } else {
-            set_rows_cuda_mxfp_soa<GGML_TYPE_MXFP6_E3M2, idx_t, false>(
-                src0_d, src1_d, (char *)dst->data,
-                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
-                nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-        }
-    } else if (dst->type == GGML_TYPE_MXFP8_E5M2) {
-        const int32_t hadamard_flag = ((const int32_t *)dst->op_params)[0];
-        if (hadamard_flag) {
-            set_rows_cuda_mxfp_soa<GGML_TYPE_MXFP8_E5M2, idx_t, true>(
-                src0_d, src1_d, (char *)dst->data,
-                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
-                nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-        } else {
-            set_rows_cuda_mxfp_soa<GGML_TYPE_MXFP8_E5M2, idx_t, false>(
-                src0_d, src1_d, (char *)dst->data,
-                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
-                nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-        }
+
+        #undef DISPATCH_MXFP_SOA
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }

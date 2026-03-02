@@ -16,20 +16,32 @@ RUN apt-get update && \
 
 WORKDIR /app
 
+# Copy CMake build files first for better layer caching.
+# These rarely change, so cmake configure can be cached across source edits.
+COPY CMakeLists.txt CMakePresets.json ./
+COPY ggml/CMakeLists.txt ggml/
+COPY ggml/include/ ggml/include/
+COPY ggml/src/CMakeLists.txt ggml/src/
+COPY ggml/src/ggml-cuda/CMakeLists.txt ggml/src/ggml-cuda/
+COPY cmake/ cmake/
+
+# Copy all source files (this layer invalidates on any source change).
 COPY . .
 
-RUN if [ "${CUDA_DOCKER_ARCH}" != "default" ]; then \
+# Use BuildKit cache mount for the build directory so incremental compilation
+# works across rebuilds — only recompiles changed translation units.
+RUN --mount=type=cache,target=/app/build \
+    if [ "${CUDA_DOCKER_ARCH}" != "default" ]; then \
     export CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=${CUDA_DOCKER_ARCH}"; \
     fi && \
     cmake -B build -DGGML_NATIVE=OFF -DGGML_CUDA=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF ${CMAKE_ARGS} -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined . && \
-    cmake --build build --config Release -j$(nproc)
+    cmake --build build --config Release -j$(nproc) && \
+    mkdir -p /app/lib && \
+    find build -name "*.so*" -exec cp -P {} /app/lib \; && \
+    mkdir -p /app/full && \
+    cp build/bin/* /app/full
 
-RUN mkdir -p /app/lib && \
-    find build -name "*.so*" -exec cp -P {} /app/lib \;
-
-RUN mkdir -p /app/full \
-    && cp build/bin/* /app/full \
-    && cp *.py /app/full \
+RUN cp *.py /app/full \
     && cp -r gguf-py /app/full \
     && cp -r requirements /app/full \
     && cp requirements.txt /app/full \

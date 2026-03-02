@@ -10,10 +10,25 @@
 
 template<ggml_type type> struct mxfp_traits;
 
+// Compile-time check: is this an MXFP SoA type?
+template<ggml_type type>
+static constexpr bool is_mxfp_soa_v =
+    type == GGML_TYPE_MXFP4 || type == GGML_TYPE_MXFP8 ||
+    type == GGML_TYPE_MXFP6_E2M3 || type == GGML_TYPE_MXFP6_E3M2 ||
+    type == GGML_TYPE_MXFP8_E5M2;
+
+// Runtime check: is this an MXFP SoA type?
+static __host__ __device__ __forceinline__ bool ggml_is_type_mxfp(ggml_type type) {
+    return type == GGML_TYPE_MXFP4 || type == GGML_TYPE_MXFP8 ||
+           type == GGML_TYPE_MXFP6_E2M3 || type == GGML_TYPE_MXFP6_E3M2 ||
+           type == GGML_TYPE_MXFP8_E5M2;
+}
+
 // ── FP4 E2M1 ────────────────────────────────────────────────────────
 template<> struct mxfp_traits<GGML_TYPE_MXFP4> {
     static constexpr int bits_per_elem = 4;
     static constexpr int qs_per_block  = 16;   // 32 * 4 / 8
+    static constexpr int block_size    = sizeof(block_mxfp4);
     static constexpr int e8m0_offset   = 2;    // ceil(log2(6.0))
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
@@ -76,6 +91,7 @@ namespace mxfp_detail {
 template<> struct mxfp_traits<GGML_TYPE_MXFP6_E2M3> {
     static constexpr int bits_per_elem = 6;
     static constexpr int qs_per_block  = 24;   // 32 * 6 / 8
+    static constexpr int block_size    = sizeof(block_mxfp6);
     static constexpr int e8m0_offset   = 3;    // ceil(log2(7.5))
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
@@ -104,6 +120,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E2M3> {
 template<> struct mxfp_traits<GGML_TYPE_MXFP6_E3M2> {
     static constexpr int bits_per_elem = 6;
     static constexpr int qs_per_block  = 24;
+    static constexpr int block_size    = sizeof(block_mxfp6);
     static constexpr int e8m0_offset   = 5;    // ceil(log2(28.0))
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
@@ -132,6 +149,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E3M2> {
 template<> struct mxfp_traits<GGML_TYPE_MXFP8> {
     static constexpr int bits_per_elem = 8;
     static constexpr int qs_per_block  = 32;   // 32 * 8 / 8
+    static constexpr int block_size    = sizeof(block_mxfp8);
     static constexpr int e8m0_offset   = 8;    // ceil(log2(448))
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
@@ -156,6 +174,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8> {
 template<> struct mxfp_traits<GGML_TYPE_MXFP8_E5M2> {
     static constexpr int bits_per_elem = 8;
     static constexpr int qs_per_block  = 32;
+    static constexpr int block_size    = sizeof(block_mxfp8);
     static constexpr int e8m0_offset   = 16;   // ceil(log2(57344))
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
@@ -175,6 +194,21 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E5M2> {
         }
     }
 };
+
+// ── SoA head offset calculation ─────────────────────────────────────
+// Computes qs and E8M0 byte offsets for a given head in a SoA-layout MXFP row.
+// Layout: [qs_block0 | qs_block1 | ... | e_block0 | e_block1 | ...]
+template<ggml_type type, int D>
+static __device__ __forceinline__ void mxfp_soa_head_offsets(
+        const int nb_row, const int head, const int gqa_ratio,
+        int & qs_off, int & e_off) {
+    using traits = mxfp_traits<type>;
+    constexpr int blocks_per_head = D / 32;
+    const int stride_blocks = nb_row / traits::block_size;
+    const int z = head / gqa_ratio;
+    qs_off = z * blocks_per_head * traits::qs_per_block;
+    e_off  = stride_blocks * traits::qs_per_block + z * blocks_per_head;
+}
 
 // ── Unified SoA quantization ────────────────────────────────────────
 // Shared Hadamard rotation + MSE-optimal E8M0 search + type-specific writes.

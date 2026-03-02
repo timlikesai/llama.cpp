@@ -99,14 +99,12 @@ static __global__ void flash_attn_ext_vec(
     const int head = blockIdx.z - sequence*ne02;
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
     Q += nb03*sequence + nb02* head              + nb01*ic0;
-    if constexpr (type_K == GGML_TYPE_MXFP4 || type_K == GGML_TYPE_MXFP8 ||
-                   type_K == GGML_TYPE_MXFP6_E2M3 || type_K == GGML_TYPE_MXFP6_E3M2 || type_K == GGML_TYPE_MXFP8_E5M2) {
+    if constexpr (is_mxfp_soa_v<type_K>) {
         K += nb13*sequence;
     } else {
         K += nb13*sequence + nb12*(head / gqa_ratio);
     }
-    if constexpr (type_V == GGML_TYPE_MXFP4 || type_V == GGML_TYPE_MXFP8 ||
-                   type_V == GGML_TYPE_MXFP6_E2M3 || type_V == GGML_TYPE_MXFP6_E3M2 || type_V == GGML_TYPE_MXFP8_E5M2) {
+    if constexpr (is_mxfp_soa_v<type_V>) {
         V += nb23*sequence;
     } else {
         V += nb23*sequence + nb22*(head / gqa_ratio);
@@ -114,63 +112,11 @@ static __global__ void flash_attn_ext_vec(
 
     int K_qs_head_off = 0, K_e_head_off = 0;
     int V_qs_head_off = 0, V_e_head_off = 0;
-    if constexpr (type_K == GGML_TYPE_MXFP4) {
-        constexpr int blocks_per_head_K = D / QK_MXFP4;
-        const int stride_K_blocks = nb11 / sizeof(block_mxfp4);
-        const int z_KV = head / gqa_ratio;
-        K_qs_head_off = z_KV * blocks_per_head_K * 16;
-        K_e_head_off  = stride_K_blocks * 16 + z_KV * blocks_per_head_K;
+    if constexpr (is_mxfp_soa_v<type_K>) {
+        mxfp_soa_head_offsets<type_K, D>(nb11, head, gqa_ratio, K_qs_head_off, K_e_head_off);
     }
-    if constexpr (type_K == GGML_TYPE_MXFP8) {
-        constexpr int blocks_per_head_K = D / QK_MXFP8;
-        const int stride_K_blocks = nb11 / sizeof(block_mxfp8);
-        const int z_KV = head / gqa_ratio;
-        K_qs_head_off = z_KV * blocks_per_head_K * QK_MXFP8;
-        K_e_head_off  = stride_K_blocks * QK_MXFP8 + z_KV * blocks_per_head_K;
-    }
-    if constexpr (type_K == GGML_TYPE_MXFP6_E2M3 || type_K == GGML_TYPE_MXFP6_E3M2) {
-        constexpr int qs_per_blk = 24;
-        constexpr int blocks_per_head_K = D / QK_MXFP6;
-        const int stride_K_blocks = nb11 / sizeof(block_mxfp6);
-        const int z_KV = head / gqa_ratio;
-        K_qs_head_off = z_KV * blocks_per_head_K * qs_per_blk;
-        K_e_head_off  = stride_K_blocks * qs_per_blk + z_KV * blocks_per_head_K;
-    }
-    if constexpr (type_K == GGML_TYPE_MXFP8_E5M2) {
-        constexpr int blocks_per_head_K = D / QK_MXFP8;
-        const int stride_K_blocks = nb11 / sizeof(block_mxfp8);
-        const int z_KV = head / gqa_ratio;
-        K_qs_head_off = z_KV * blocks_per_head_K * QK_MXFP8;
-        K_e_head_off  = stride_K_blocks * QK_MXFP8 + z_KV * blocks_per_head_K;
-    }
-    if constexpr (type_V == GGML_TYPE_MXFP4) {
-        constexpr int blocks_per_head_V = D / QK_MXFP4;
-        const int stride_V_blocks = nb21 / sizeof(block_mxfp4);
-        const int z_KV = head / gqa_ratio;
-        V_qs_head_off = z_KV * blocks_per_head_V * 16;
-        V_e_head_off  = stride_V_blocks * 16 + z_KV * blocks_per_head_V;
-    }
-    if constexpr (type_V == GGML_TYPE_MXFP8) {
-        constexpr int blocks_per_head_V = D / QK_MXFP8;
-        const int stride_V_blocks = nb21 / sizeof(block_mxfp8);
-        const int z_KV = head / gqa_ratio;
-        V_qs_head_off = z_KV * blocks_per_head_V * QK_MXFP8;
-        V_e_head_off  = stride_V_blocks * QK_MXFP8 + z_KV * blocks_per_head_V;
-    }
-    if constexpr (type_V == GGML_TYPE_MXFP6_E2M3 || type_V == GGML_TYPE_MXFP6_E3M2) {
-        constexpr int qs_per_blk = 24;
-        constexpr int blocks_per_head_V = D / QK_MXFP6;
-        const int stride_V_blocks = nb21 / sizeof(block_mxfp6);
-        const int z_KV = head / gqa_ratio;
-        V_qs_head_off = z_KV * blocks_per_head_V * qs_per_blk;
-        V_e_head_off  = stride_V_blocks * qs_per_blk + z_KV * blocks_per_head_V;
-    }
-    if constexpr (type_V == GGML_TYPE_MXFP8_E5M2) {
-        constexpr int blocks_per_head_V = D / QK_MXFP8;
-        const int stride_V_blocks = nb21 / sizeof(block_mxfp8);
-        const int z_KV = head / gqa_ratio;
-        V_qs_head_off = z_KV * blocks_per_head_V * QK_MXFP8;
-        V_e_head_off  = stride_V_blocks * QK_MXFP8 + z_KV * blocks_per_head_V;
+    if constexpr (is_mxfp_soa_v<type_V>) {
+        mxfp_soa_head_offsets<type_V, D>(nb21, head, gqa_ratio, V_qs_head_off, V_e_head_off);
     }
 
     const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
@@ -239,8 +185,7 @@ static __global__ void flash_attn_ext_vec(
                 constexpr int nthreads_quantize = D/sizeof(int) < WARP_SIZE ? D/sizeof(int) : WARP_SIZE;
 #pragma unroll
                 for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_quantize) {
-                    if constexpr (type_K == GGML_TYPE_MXFP4 || type_K == GGML_TYPE_MXFP8 ||
-                                   type_K == GGML_TYPE_MXFP6_E2M3 || type_K == GGML_TYPE_MXFP6_E3M2 || type_K == GGML_TYPE_MXFP8_E5M2) {
+                    if constexpr (is_mxfp_soa_v<type_K>) {
                         quantize_q8_1_hadamard_to_shared<float2, nthreads_quantize>
                             (Q_f + i0*sizeof(int), scale, tmp_q_i32 + i0, tmp_q_ds + i0/QI8_1);
                     } else {
@@ -338,24 +283,8 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 float sum;
-                if constexpr (type_K == GGML_TYPE_MXFP4) {
-                    sum = vec_dot_fattn_vec_KQ_mxfp4_soa<D, nthreads_KQ>(
-                        K + i_KQ*nb11, Q_i32[j], Q_ds[j],
-                        K_qs_head_off, K_e_head_off);
-                } else if constexpr (type_K == GGML_TYPE_MXFP8) {
-                    sum = vec_dot_fattn_vec_KQ_mxfp8_soa<GGML_TYPE_MXFP8, D, nthreads_KQ>(
-                        K + i_KQ*nb11, Q_i32[j], Q_ds[j],
-                        K_qs_head_off, K_e_head_off);
-                } else if constexpr (type_K == GGML_TYPE_MXFP6_E2M3) {
-                    sum = vec_dot_fattn_vec_KQ_mxfp6_soa<GGML_TYPE_MXFP6_E2M3, D, nthreads_KQ>(
-                        K + i_KQ*nb11, Q_i32[j], Q_ds[j],
-                        K_qs_head_off, K_e_head_off);
-                } else if constexpr (type_K == GGML_TYPE_MXFP6_E3M2) {
-                    sum = vec_dot_fattn_vec_KQ_mxfp6_soa<GGML_TYPE_MXFP6_E3M2, D, nthreads_KQ>(
-                        K + i_KQ*nb11, Q_i32[j], Q_ds[j],
-                        K_qs_head_off, K_e_head_off);
-                } else if constexpr (type_K == GGML_TYPE_MXFP8_E5M2) {
-                    sum = vec_dot_fattn_vec_KQ_mxfp8_soa<GGML_TYPE_MXFP8_E5M2, D, nthreads_KQ>(
+                if constexpr (is_mxfp_soa_v<type_K>) {
+                    sum = vec_dot_fattn_vec_KQ_mxfp_soa<type_K, D, nthreads_KQ>(
                         K + i_KQ*nb11, Q_i32[j], Q_ds[j],
                         K_qs_head_off, K_e_head_off);
                 } else {
@@ -425,16 +354,8 @@ static __global__ void flash_attn_ext_vec(
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 half2 tmp[V_rows_per_thread/2];
                 const int64_t v_i0 = 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread;
-                if constexpr (type_V == GGML_TYPE_MXFP4) {
-                    dequantize_V_mxfp4_soa<half, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
-                } else if constexpr (type_V == GGML_TYPE_MXFP8) {
-                    dequantize_V_mxfp8_soa<GGML_TYPE_MXFP8, half, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
-                } else if constexpr (type_V == GGML_TYPE_MXFP6_E2M3) {
-                    dequantize_V_mxfp6_soa<GGML_TYPE_MXFP6_E2M3, half, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
-                } else if constexpr (type_V == GGML_TYPE_MXFP6_E3M2) {
-                    dequantize_V_mxfp6_soa<GGML_TYPE_MXFP6_E3M2, half, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
-                } else if constexpr (type_V == GGML_TYPE_MXFP8_E5M2) {
-                    dequantize_V_mxfp8_soa<GGML_TYPE_MXFP8_E5M2, half, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
+                if constexpr (is_mxfp_soa_v<type_V>) {
+                    dequantize_V_mxfp_soa<type_V, half, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
                 } else {
                     dequantize_V(V + k*nb21, tmp, v_i0);
                 }
@@ -456,16 +377,8 @@ static __global__ void flash_attn_ext_vec(
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 float2 tmp[V_rows_per_thread/2];
                 const int64_t v_i0 = 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread;
-                if constexpr (type_V == GGML_TYPE_MXFP4) {
-                    dequantize_V_mxfp4_soa<float, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
-                } else if constexpr (type_V == GGML_TYPE_MXFP8) {
-                    dequantize_V_mxfp8_soa<GGML_TYPE_MXFP8, float, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
-                } else if constexpr (type_V == GGML_TYPE_MXFP6_E2M3) {
-                    dequantize_V_mxfp6_soa<GGML_TYPE_MXFP6_E2M3, float, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
-                } else if constexpr (type_V == GGML_TYPE_MXFP6_E3M2) {
-                    dequantize_V_mxfp6_soa<GGML_TYPE_MXFP6_E3M2, float, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
-                } else if constexpr (type_V == GGML_TYPE_MXFP8_E5M2) {
-                    dequantize_V_mxfp8_soa<GGML_TYPE_MXFP8_E5M2, float, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
+                if constexpr (is_mxfp_soa_v<type_V>) {
+                    dequantize_V_mxfp_soa<type_V, float, V_rows_per_thread>(V + k*nb21, tmp, v_i0, V_qs_head_off, V_e_head_off);
                 } else {
                     dequantize_V(V + k*nb21, tmp, v_i0);
                 }

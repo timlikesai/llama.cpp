@@ -735,7 +735,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp8_ref,
     },
     [GGML_TYPE_MXFP6_E2M3] = {
-        .type_name                = "mxfp6e2m3",
+        .type_name                = "mxfp6_e2m3",
         .blck_size                = QK_MXFP6,
         .type_size                = sizeof(block_mxfp6),
         .is_quantized             = true,
@@ -743,7 +743,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp6_e2m3_ref,
     },
     [GGML_TYPE_MXFP6_E3M2] = {
-        .type_name                = "mxfp6e3m2",
+        .type_name                = "mxfp6_e3m2",
         .blck_size                = QK_MXFP6,
         .type_size                = sizeof(block_mxfp6),
         .is_quantized             = true,
@@ -751,7 +751,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp6_e3m2_ref,
     },
     [GGML_TYPE_MXFP8_E5M2] = {
-        .type_name                = "mxfp8e5m2",
+        .type_name                = "mxfp8_e5m2",
         .blck_size                = QK_MXFP8,
         .type_size                = sizeof(block_mxfp8),
         .is_quantized             = true,

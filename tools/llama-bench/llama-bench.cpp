@@ -489,13 +489,13 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "mxfp8") {
         return GGML_TYPE_MXFP8;
     }
-    if (s == "mxfp6" || s == "mxfp6e2m3") {
+    if (s == "mxfp6" || s == "mxfp6_e2m3") {
         return GGML_TYPE_MXFP6_E2M3;
     }
-    if (s == "mxfp6e3m2") {
+    if (s == "mxfp6_e3m2") {
         return GGML_TYPE_MXFP6_E3M2;
     }
-    if (s == "mxfp8e5m2") {
+    if (s == "mxfp8_e5m2") {
         return GGML_TYPE_MXFP8_E5M2;
     }
 

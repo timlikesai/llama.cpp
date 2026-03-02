@@ -13,6 +13,12 @@
 #include <map>
 #include <stdexcept>
 
+static inline bool ggml_is_type_mxfp(ggml_type type) {
+    return type == GGML_TYPE_MXFP4 || type == GGML_TYPE_MXFP8 ||
+           type == GGML_TYPE_MXFP6_E2M3 || type == GGML_TYPE_MXFP6_E3M2 ||
+           type == GGML_TYPE_MXFP8_E5M2;
+}
+
 //
 // llama_kv_cache
 //
@@ -138,9 +144,7 @@ llama_kv_cache::llama_kv_cache(
 
         // MXFP K cache: align block count to 16 for cp.async.
         uint32_t n_embd_k_alloc = n_embd_k_gqa;
-        const bool is_mxfp_k = (type_k == GGML_TYPE_MXFP4 || type_k == GGML_TYPE_MXFP8 ||
-                                 type_k == GGML_TYPE_MXFP8_E5M2 ||
-                                 type_k == GGML_TYPE_MXFP6_E2M3 || type_k == GGML_TYPE_MXFP6_E3M2);
+        const bool is_mxfp_k = ggml_is_type_mxfp(type_k);
         if (is_mxfp_k) {
             const int qk = (int)ggml_blck_size(type_k);              // 32 for all MXFP types
             const int blocks = (int)n_embd_k_gqa / qk;
@@ -1112,9 +1116,7 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
         k = ggml_view_2d(ctx, k, k->ne[0], kv_size*n_stream, k->nb[1], 0);
     }
 
-    const bool is_mxfp = (k->type == GGML_TYPE_MXFP4 || k->type == GGML_TYPE_MXFP8 ||
-                          k->type == GGML_TYPE_MXFP8_E5M2 ||
-                          k->type == GGML_TYPE_MXFP6_E2M3 || k->type == GGML_TYPE_MXFP6_E3M2);
+    const bool is_mxfp = ggml_is_type_mxfp(k->type);
 
     // For MXFP: ne[0] may be padded for block alignment, but k_cur has n_embd_gqa.
     // Create view with ne[0]=n_embd_gqa, preserving the larger row stride nb[1].
