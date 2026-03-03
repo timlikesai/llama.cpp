@@ -30,7 +30,6 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP4> {
     static constexpr int qs_per_block  = 16;   // 32 * 4 / 8
     static constexpr int block_size    = sizeof(block_mxfp4);
     static constexpr int e8m0_offset   = 2;    // ceil(log2(6.0))
-    static constexpr bool needs_mse_search = false;
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
         const uint8_t nibble = ggml_cuda_float_to_fp4_e2m1(val, inv_scale);
@@ -94,7 +93,6 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E2M3> {
     static constexpr int qs_per_block  = 24;   // 32 * 6 / 8
     static constexpr int block_size    = sizeof(block_mxfp6);
     static constexpr int e8m0_offset   = 3;    // ceil(log2(7.5))
-    static constexpr bool needs_mse_search = true;
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
         const __nv_fp6_storage_t fp6 = __nv_cvt_float_to_fp6(val * inv_scale, __NV_E2M3, cudaRoundNearest);
@@ -124,7 +122,6 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E3M2> {
     static constexpr int qs_per_block  = 24;
     static constexpr int block_size    = sizeof(block_mxfp6);
     static constexpr int e8m0_offset   = 5;    // ceil(log2(28.0))
-    static constexpr bool needs_mse_search = true;
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
         const __nv_fp6_storage_t fp6 = __nv_cvt_float_to_fp6(val * inv_scale, __NV_E3M2, cudaRoundNearest);
@@ -154,7 +151,6 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8> {
     static constexpr int qs_per_block  = 32;   // 32 * 8 / 8
     static constexpr int block_size    = sizeof(block_mxfp8);
     static constexpr int e8m0_offset   = 8;    // ceil(log2(448))
-    static constexpr bool needs_mse_search = false;
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
         const uint8_t fp8 = __nv_cvt_float_to_fp8(val * inv_scale, __NV_SATFINITE, __NV_E4M3);
@@ -180,7 +176,6 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E5M2> {
     static constexpr int qs_per_block  = 32;
     static constexpr int block_size    = sizeof(block_mxfp8);
     static constexpr int e8m0_offset   = 16;   // ceil(log2(57344))
-    static constexpr bool needs_mse_search = true;
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
         const uint8_t fp8 = __nv_cvt_float_to_fp8(val * inv_scale, __NV_SATFINITE, __NV_E5M2);
@@ -251,32 +246,26 @@ static __device__ void quantize_f32_mxfp_block_soa(
         const int round_log2 = floor_log2 + ((amax_bits & 0x7FFFFF) >= 0x3504F3 ? 1 : 0);
         const int e_base = round_log2 - traits::e8m0_offset + 127;
 
-        if constexpr (traits::needs_mse_search) {
-            // MSE-optimal search: test ±1 around estimate, pick lowest MSE.
-            // Required for FP6/E5M2 where few mantissa bits make scale choice critical.
-            const int e_lo = max(1, min(255, e_base - 1));
-            const int e_hi = max(1, min(255, e_base + 1));
-            int best_e = max(0, min(255, e_base));
-            float best_mse = 1e30f;
+        // MSE-optimal search: test ±1 around estimate, pick lowest MSE.
+        const int e_lo = max(1, min(255, e_base - 1));
+        const int e_hi = max(1, min(255, e_base + 1));
+        int best_e = max(0, min(255, e_base));
+        float best_mse = 1e30f;
 
-            for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
-                const float test_scale = ggml_cuda_e8m0_to_fp32((uint8_t)test_e);
-                const float test_inv = 1.0f / test_scale;
-                float mse = 0.0f;
-                for (int j = 0; j < QK; ++j) {
-                    mse += traits::mse_error(src[j], test_inv, test_scale);
-                }
-                if (mse < best_mse) {
-                    best_mse = mse;
-                    best_e = test_e;
-                }
+        for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
+            const float test_scale = ggml_cuda_e8m0_to_fp32((uint8_t)test_e);
+            const float test_inv = 1.0f / test_scale;
+            float mse = 0.0f;
+            for (int j = 0; j < QK; ++j) {
+                mse += traits::mse_error(src[j], test_inv, test_scale);
             }
-
-            e_val = (uint8_t)best_e;
-        } else {
-            // Direct bit extraction — sufficient for FP4/E4M3 (enough mantissa bits).
-            e_val = (uint8_t)max(0, min(255, e_base));
+            if (mse < best_mse) {
+                best_mse = mse;
+                best_e = test_e;
+            }
         }
+
+        e_val = (uint8_t)best_e;
 
         inv_d = 1.0f / ggml_cuda_e8m0_to_fp32(e_val);
     }
