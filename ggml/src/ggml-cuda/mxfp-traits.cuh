@@ -211,7 +211,7 @@ static __device__ __forceinline__ void mxfp_soa_head_offsets(
 }
 
 // ── Unified SoA quantization ────────────────────────────────────────
-// Shared Hadamard rotation + MSE-optimal E8M0 search + type-specific writes.
+// Shared Hadamard rotation + direct E8M0 scale + type-specific writes.
 template<ggml_type mxfp_type, bool apply_hadamard>
 static __device__ void quantize_f32_mxfp_block_soa(
         const float * __restrict__ x,
@@ -231,34 +231,24 @@ static __device__ void quantize_f32_mxfp_block_soa(
         src = vals;
     }
 
-    // MSE-optimal E8M0 search: test +-1 around amax estimate, pick lowest MSE.
+    // Compute E8M0 scale from amax via integer bit extraction (no SFU, no MSE search).
     float amax = 0.0f;
     for (int j = 0; j < QK; ++j) {
         amax = fmaxf(amax, fabsf(src[j]));
     }
 
-    const int e_base = (amax == 0.0f) ? 0 : __float2int_rn(log2f(amax)) - traits::e8m0_offset + 127;
-    const int e_lo = max(1, min(255, e_base - 1));
-    const int e_hi = max(1, min(255, e_base + 1));
-
-    int best_e = max(0, min(255, e_base));
-    float best_mse = 1e30f;
-
-    for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
-        const float test_scale = ggml_cuda_e8m0_to_fp32((uint8_t)test_e);
-        const float test_inv = 1.0f / test_scale;
-        float mse = 0.0f;
-        for (int j = 0; j < QK; ++j) {
-            mse += traits::mse_error(src[j], test_inv, test_scale);
-        }
-        if (mse < best_mse) {
-            best_mse = mse;
-            best_e = test_e;
-        }
+    uint8_t e_val = 0;
+    float inv_d = 0.0f;
+    if (amax != 0.0f) {
+        // round(log2(amax)) via IEEE-754 bit extraction:
+        // floor = exponent field - 127, round up if mantissa >= sqrt(2)-1.
+        uint32_t amax_bits;
+        memcpy(&amax_bits, &amax, sizeof(uint32_t));
+        const int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
+        const int round_log2 = floor_log2 + ((amax_bits & 0x7FFFFF) >= 0x3504F3 ? 1 : 0);
+        e_val = (uint8_t)max(0, min(255, round_log2 - traits::e8m0_offset + 127));
+        inv_d = 1.0f / ggml_cuda_e8m0_to_fp32(e_val);
     }
-
-    const uint8_t e_val = (amax == 0.0f) ? (uint8_t)0 : (uint8_t)best_e;
-    const float inv_d = (amax == 0.0f) ? 0.0f : 1.0f / ggml_cuda_e8m0_to_fp32(e_val);
 
     // Write quantized values to SoA qs region.
     traits::write_qs(src, row_base, block_idx, blocks_per_row_total, inv_d);
