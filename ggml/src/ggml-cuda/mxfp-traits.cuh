@@ -231,7 +231,9 @@ static __device__ void quantize_f32_mxfp_block_soa(
         src = vals;
     }
 
-    // Compute E8M0 scale from amax via integer bit extraction (no SFU, no MSE search).
+    // MSE-optimal E8M0 search: test ±1 around amax estimate, pick lowest MSE.
+    // The round(log2) shortcut is insufficient for FP6/E5M2 (few mantissa bits),
+    // where scale choice significantly affects quantization quality.
     float amax = 0.0f;
     for (int j = 0; j < QK; ++j) {
         amax = fmaxf(amax, fabsf(src[j]));
@@ -240,13 +242,33 @@ static __device__ void quantize_f32_mxfp_block_soa(
     uint8_t e_val = 0;
     float inv_d = 0.0f;
     if (amax != 0.0f) {
-        // round(log2(amax)) via IEEE-754 bit extraction:
-        // floor = exponent field - 127, round up if mantissa >= sqrt(2)-1.
+        // Base estimate via integer bit extraction (no SFU).
         uint32_t amax_bits;
         memcpy(&amax_bits, &amax, sizeof(uint32_t));
         const int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
         const int round_log2 = floor_log2 + ((amax_bits & 0x7FFFFF) >= 0x3504F3 ? 1 : 0);
-        e_val = (uint8_t)max(0, min(255, round_log2 - traits::e8m0_offset + 127));
+        const int e_base = round_log2 - traits::e8m0_offset + 127;
+
+        // Test e_base ±1, pick scale with lowest quantization MSE.
+        const int e_lo = max(1, min(255, e_base - 1));
+        const int e_hi = max(1, min(255, e_base + 1));
+        int best_e = max(0, min(255, e_base));
+        float best_mse = 1e30f;
+
+        for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
+            const float test_scale = ggml_cuda_e8m0_to_fp32((uint8_t)test_e);
+            const float test_inv = 1.0f / test_scale;
+            float mse = 0.0f;
+            for (int j = 0; j < QK; ++j) {
+                mse += traits::mse_error(src[j], test_inv, test_scale);
+            }
+            if (mse < best_mse) {
+                best_mse = mse;
+                best_e = test_e;
+            }
+        }
+
+        e_val = (uint8_t)best_e;
         inv_d = 1.0f / ggml_cuda_e8m0_to_fp32(e_val);
     }
 

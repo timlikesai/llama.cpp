@@ -83,6 +83,7 @@ CONFIGS=(
     "mxfp4"
 )
 MODEL_INPUT="$DEFAULT_MODEL"
+_config_overridden=false
 
 # ── Argument Parsing ─────────────────────────────────────────────────────────
 
@@ -105,7 +106,19 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --config)
-            CONFIGS=("$2")
+            # First --config replaces defaults; subsequent ones accumulate.
+            # f16 is always included as the baseline for Δ F16 column.
+            if [[ "$_config_overridden" != "true" ]]; then
+                CONFIGS=("f16")
+                _config_overridden=true
+            fi
+            case "$2" in
+                f16)   ;;  # already included
+                mxfp)  CONFIGS+=("mxfp8" "mxfp8_e5m2" "mxfp6" "mxfp6_e3m2" "mxfp4") ;;
+                mxfp8) CONFIGS+=("mxfp8" "mxfp8_e5m2") ;;
+                mxfp6) CONFIGS+=("mxfp6" "mxfp6_e3m2") ;;
+                *)     CONFIGS+=("$2") ;;
+            esac
             shift 2
             ;;
         --model)
@@ -122,9 +135,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-perplexity   Skip perplexity runs (no PPL or memory data)"
             echo "  --skip-bench        Skip throughput benchmarks"
             echo "  --chunks N[,M]      Chunk counts for perplexity, comma-separated (default: 16)"
-            echo "  --config NAME       Single config (default: all). Available:"
+            echo "  --config NAME       Config to test (repeatable, default: all). Available:"
             echo "                        f16, q8_0, q4_0, q8_0+q4_0"
-            echo "                        mxfp8, mxfp8_e5m2, mxfp6, mxfp6_e3m2, mxfp4"
+            echo "                        mxfp8_e4m3, mxfp8_e5m2, mxfp6_e2m3, mxfp6_e3m2, mxfp4"
+            echo "                      Groups: mxfp (all 5), mxfp8 (both e4m3+e5m2), mxfp6 (both e2m3+e3m2)"
             echo "  --model NAME|PATH   Model preset or path (default: $DEFAULT_MODEL)"
             echo "  --help              Show this help"
             echo ""
@@ -205,7 +219,7 @@ config_types() {
         q8_0)         TYPE_K="q8_0";        TYPE_V="q8_0";   CLI_K="q8_0";      CLI_V="q8_0"      ;;
         q4_0)         TYPE_K="q4_0";        TYPE_V="q4_0";   CLI_K="q4_0";      CLI_V="q4_0"      ;;
         q8_0+q4_0)    TYPE_K="q8_0";        TYPE_V="q4_0";   CLI_K="q8_0";      CLI_V="q4_0"      ;;
-        mxfp8|mxfp8_e4m3)   TYPE_K="mxfp8";       TYPE_V="mxfp4";  CLI_K="mxfp8";     CLI_V="mxfp4"     ;;
+        mxfp8|mxfp8_e4m3)   TYPE_K="mxfp8_e4m3";  TYPE_V="mxfp4";  CLI_K="mxfp8";     CLI_V="mxfp4"     ;;
         mxfp8_e5m2)         TYPE_K="mxfp8_e5m2";  TYPE_V="mxfp4";  CLI_K="mxfp8_e5m2"; CLI_V="mxfp4"     ;;
         mxfp6|mxfp6_e2m3)   TYPE_K="mxfp6_e2m3";  TYPE_V="mxfp4";  CLI_K="mxfp6";      CLI_V="mxfp4"     ;;
         mxfp6_e3m2)         TYPE_K="mxfp6_e3m2";  TYPE_V="mxfp4";  CLI_K="mxfp6_e3m2"; CLI_V="mxfp4"     ;;
@@ -389,7 +403,7 @@ echo ""
 # Column widths: K(10) V(7) K_GiB(6) V_GiB(6) Total(6) PPL(6) delta(6) pp512(6) tg128(6)
 table_top()  { echo "  ┌────────────┬─────────┬────────┬────────┬────────┬────────┬────────┬────────┬────────┐"; }
 table_hdr()  { printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │\n" \
-                      "K type" "V type" "K GiB" "V GiB" "Total" "PPL" "Δ F16" "pp512" "tg128"; }
+                      "K type" "V type" "K GiB" "V GiB" "Total" "PPL" " Δ F16" "pp512" "tg128"; }
 table_sep()  { echo "  ├────────────┼─────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤"; }
 table_row()  { printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │\n" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"; }
 table_bot()  { echo "  └────────────┴─────────┴────────┴────────┴────────┴────────┴────────┴────────┴────────┘"; }
