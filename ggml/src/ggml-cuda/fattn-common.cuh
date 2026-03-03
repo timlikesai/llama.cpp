@@ -628,11 +628,11 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4_soa(
         const int u = Q_q8[k_KQ_0/nthreads];
         const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
 
-        const int v = *reinterpret_cast<const int *>(K_row + qs_head_off + ib*16 + sizeof(int)*iqs4);
+        const int v = __ldg(reinterpret_cast<const int *>(K_row + qs_head_off + ib*16 + sizeof(int)*iqs4));
         const int2 lut = get_int_from_table_16(v, kvalues_mxfp4);
         const int sumi = ggml_cuda_dp4a(shift ? lut.y : lut.x, u, 0);
 
-        const float e = ggml_cuda_e8m0_to_fp32(*reinterpret_cast<const uint8_t *>(K_row + e_head_off + ib)) * 0.5f;
+        const float e = ggml_cuda_e8m0_to_fp32(__ldg(reinterpret_cast<const uint8_t *>(K_row + e_head_off + ib))) * 0.5f;
         sum += e * sumi * Q_ds.x;
     }
 
@@ -653,12 +653,12 @@ static __device__ __forceinline__ void dequantize_V_mxfp4_soa(
 
     uint8_t qs[ne];
     if constexpr (ne == 4) {
-        *reinterpret_cast<int *>(qs) = *reinterpret_cast<const int *>(V_row + qs_head_off + ib * 16 + iqs);
+        *reinterpret_cast<int *>(qs) = __ldg(reinterpret_cast<const int *>(V_row + qs_head_off + ib * 16 + iqs));
     } else {
-        *reinterpret_cast<uint16_t *>(qs) = *reinterpret_cast<const uint16_t *>(V_row + qs_head_off + ib * 16 + iqs);
+        *reinterpret_cast<uint16_t *>(qs) = __ldg(reinterpret_cast<const uint16_t *>(V_row + qs_head_off + ib * 16 + iqs));
     }
 
-    const float d = ggml_cuda_e8m0_to_fp32(*reinterpret_cast<const uint8_t *>(V_row + e_head_off + ib)) * 0.5f;
+    const float d = ggml_cuda_e8m0_to_fp32(__ldg(reinterpret_cast<const uint8_t *>(V_row + e_head_off + ib))) * 0.5f;
 
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
@@ -702,12 +702,12 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp8_soa(
         const int iqs = (k_KQ * 4) % QK_MXFP8;  // byte offset within block qs
 
         // Load 4 FP8 bytes and Q int8×4.
-        const uint32_t fp8x4 = *reinterpret_cast<const uint32_t *>(K_row + qs_head_off + ib * QK_MXFP8 + iqs);
+        const uint32_t fp8x4 = __ldg(reinterpret_cast<const uint32_t *>(K_row + qs_head_off + ib * QK_MXFP8 + iqs));
         const int u = Q_q8[k_KQ_0/nthreads];
         const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
 
         // E8M0 scale (no 0.5× — FP8 values are already proper floats).
-        const float e = ggml_cuda_e8m0_to_fp32(*reinterpret_cast<const uint8_t *>(K_row + e_head_off + ib));
+        const float e = ggml_cuda_e8m0_to_fp32(__ldg(reinterpret_cast<const uint8_t *>(K_row + e_head_off + ib)));
 
         // Dequant FP8→float, dot with Q int8 values.
         float dot = 0.0f;
@@ -744,23 +744,26 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp6_soa(
         const int elem_start = k_KQ * 4;
         const int ib = elem_start / QK;
         const int elem_in_block = elem_start % QK;
-        const int byte_in_block = elem_in_block * 3 / 4;  // 4 elements = 3 bytes
+        const int byte_in_block = (elem_in_block >> 2) * 3;  // elem_in_block is always a multiple of 4
 
-        // Load 3 packed FP6 bytes.
-        uint8_t packed[3];
-        packed[0] = *(const uint8_t *)(K_row + qs_head_off + ib * qs_per_block + byte_in_block + 0);
-        packed[1] = *(const uint8_t *)(K_row + qs_head_off + ib * qs_per_block + byte_in_block + 1);
-        packed[2] = *(const uint8_t *)(K_row + qs_head_off + ib * qs_per_block + byte_in_block + 2);
+        // Load 3 packed FP6 bytes via __ldg (byte loads avoid alignment issues).
+        const char * qs_base = K_row + qs_head_off + ib * qs_per_block + byte_in_block;
+        const uint32_t packed = (uint32_t)__ldg((const uint8_t *)qs_base)
+                              | ((uint32_t)__ldg((const uint8_t *)qs_base + 1) << 8)
+                              | ((uint32_t)__ldg((const uint8_t *)qs_base + 2) << 16);
 
-        // Unpack 3 bytes → 4 six-bit values.
+        // Unpack 4 six-bit values directly from the uint32_t.
         uint8_t vals[4];
-        mxfp_detail::unpack_fp6x4(packed, vals);
+        vals[0] =  packed        & 0x3F;
+        vals[1] = (packed >>  6) & 0x3F;
+        vals[2] = (packed >> 12) & 0x3F;
+        vals[3] = (packed >> 18) & 0x3F;
 
         const int u = Q_q8[k_KQ_0/nthreads];
         const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
 
         // E8M0 scale (no extra factor for FP6).
-        const float e = ggml_cuda_e8m0_to_fp32(*reinterpret_cast<const uint8_t *>(K_row + e_head_off + ib));
+        const float e = ggml_cuda_e8m0_to_fp32(__ldg(reinterpret_cast<const uint8_t *>(K_row + e_head_off + ib)));
 
         // Per-element dequant and dot product with Q int8.
         float dot = 0.0f;
@@ -790,13 +793,13 @@ static __device__ __forceinline__ void dequantize_V_mxfp8_soa(
 
     uint8_t qs[ne];
     if constexpr (ne == 4) {
-        *reinterpret_cast<int *>(qs) = *reinterpret_cast<const int *>(V_row + qs_head_off + ib * QK_MXFP8 + iqs);
+        *reinterpret_cast<int *>(qs) = __ldg(reinterpret_cast<const int *>(V_row + qs_head_off + ib * QK_MXFP8 + iqs));
     } else {
-        *reinterpret_cast<uint16_t *>(qs) = *reinterpret_cast<const uint16_t *>(V_row + qs_head_off + ib * QK_MXFP8 + iqs);
+        *reinterpret_cast<uint16_t *>(qs) = __ldg(reinterpret_cast<const uint16_t *>(V_row + qs_head_off + ib * QK_MXFP8 + iqs));
     }
 
     // E8M0 scale (no 0.5× for FP8).
-    const float d = ggml_cuda_e8m0_to_fp32(*reinterpret_cast<const uint8_t *>(V_row + e_head_off + ib));
+    const float d = ggml_cuda_e8m0_to_fp32(__ldg(reinterpret_cast<const uint8_t *>(V_row + e_head_off + ib)));
 
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
@@ -832,26 +835,31 @@ static __device__ __forceinline__ void dequantize_V_mxfp6_soa(
 
     const int64_t ib = i0 / QK;
     const int elem_in_block = i0 % QK;
-    const int byte_in_block = elem_in_block * 3 / 4;
+    const int byte_in_block = (elem_in_block >> 2) * 3;  // elem_in_block is always a multiple of 4
 
     static_assert(ne == 2 || ne == 4, "bad ne");
 
     // Load and unpack FP6 values. ne elements = ne*3/4 bytes.
     uint8_t vals[ne];
+    const char * qs_base = V_row + qs_head_off + ib * qs_per_block + byte_in_block;
     if constexpr (ne == 4) {
-        uint8_t packed[3];
-        packed[0] = *(const uint8_t *)(V_row + qs_head_off + ib * qs_per_block + byte_in_block + 0);
-        packed[1] = *(const uint8_t *)(V_row + qs_head_off + ib * qs_per_block + byte_in_block + 1);
-        packed[2] = *(const uint8_t *)(V_row + qs_head_off + ib * qs_per_block + byte_in_block + 2);
-        mxfp_detail::unpack_fp6x4(packed, vals);
+        // Load 3 packed FP6 bytes via __ldg (byte loads avoid alignment issues).
+        const uint32_t packed = (uint32_t)__ldg((const uint8_t *)qs_base)
+                              | ((uint32_t)__ldg((const uint8_t *)qs_base + 1) << 8)
+                              | ((uint32_t)__ldg((const uint8_t *)qs_base + 2) << 16);
+        vals[0] =  packed        & 0x3F;
+        vals[1] = (packed >>  6) & 0x3F;
+        vals[2] = (packed >> 12) & 0x3F;
+        vals[3] = (packed >> 18) & 0x3F;
     } else {
-        // ne == 2: read 12 bits = 1.5 bytes. Read 2 bytes and extract.
-        uint16_t raw = *reinterpret_cast<const uint16_t *>(V_row + qs_head_off + ib * qs_per_block + byte_in_block);
+        // ne == 2: read 12 bits = 1.5 bytes. Read 2 bytes via __ldg.
+        const uint16_t raw = (uint16_t)__ldg((const uint8_t *)qs_base)
+                           | ((uint16_t)__ldg((const uint8_t *)qs_base + 1) << 8);
         vals[0] = raw & 0x3F;
         vals[1] = (raw >> 6) & 0x3F;
     }
 
-    const float d = ggml_cuda_e8m0_to_fp32(*reinterpret_cast<const uint8_t *>(V_row + e_head_off + ib));
+    const float d = ggml_cuda_e8m0_to_fp32(__ldg(reinterpret_cast<const uint8_t *>(V_row + e_head_off + ib)));
 
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
