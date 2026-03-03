@@ -71,8 +71,10 @@ static __global__ void flash_attn_ext_vec(
 #endif // RDNA
     constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
 #else
-    constexpr int nthreads_KQ_q = (D/4 < 32 ? D/4 : 32);
-    constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
+    // MXFP types use fewer threads per dot product (16 vs 32) to enable 2 K/V rows
+    // to be processed in parallel within each warp, halving the sequential loop count.
+    constexpr int nthreads_KQ_q = is_mxfp_soa_v<type_K> ? 16 : (D/4 < 32 ? D/4 : 32);
+    constexpr int nthreads_V_q  = is_mxfp_soa_v<type_V> ? 16 : (D/4 < 32 ? D/4 : 32);
 #endif // GGML_USE_HIP
 
     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
@@ -82,7 +84,8 @@ static __global__ void flash_attn_ext_vec(
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(WARP_SIZE % nthreads_V  == 0, "bad nthreads_V");
 
-    constexpr int V_rows_per_thread = type_V == GGML_TYPE_F16 ? 2*cpy_ne : 4;
+    // MXFP with nthreads_V=16 needs V_rows_per_thread=8 to cover D elements (16×8=128).
+    constexpr int V_rows_per_thread = type_V == GGML_TYPE_F16 ? 2*cpy_ne : (is_mxfp_soa_v<type_V> ? 8 : 4);
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();

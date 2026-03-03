@@ -649,10 +649,15 @@ static __device__ __forceinline__ void dequantize_V_mxfp4_soa(
     const int     iqs   =  i0          % (QK_MXFP4/2);
     const int     shift = (i0 % QK_MXFP4) / (QK_MXFP4/2);
 
-    static_assert(ne == 2 || ne == 4, "bad ne");
+    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
 
     uint8_t qs[ne];
-    if constexpr (ne == 4) {
+    if constexpr (ne == 8) {
+        // 8 consecutive nibbles = 8 bytes. iqs is 0 or 8 (8-byte aligned) → single int2 load.
+        const int2 qs_pair = __ldg(reinterpret_cast<const int2 *>(V_row + qs_head_off + ib * 16 + iqs));
+        *reinterpret_cast<int *>(qs)     = qs_pair.x;
+        *reinterpret_cast<int *>(qs + 4) = qs_pair.y;
+    } else if constexpr (ne == 4) {
         *reinterpret_cast<int *>(qs) = __ldg(reinterpret_cast<const int *>(V_row + qs_head_off + ib * 16 + iqs));
     } else {
         *reinterpret_cast<uint16_t *>(qs) = __ldg(reinterpret_cast<const uint16_t *>(V_row + qs_head_off + ib * 16 + iqs));
@@ -789,10 +794,15 @@ static __device__ __forceinline__ void dequantize_V_mxfp8_soa(
     const int64_t ib  = i0 / QK_MXFP8;
     const int     iqs = i0 % QK_MXFP8;
 
-    static_assert(ne == 2 || ne == 4, "bad ne");
+    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
 
     uint8_t qs[ne];
-    if constexpr (ne == 4) {
+    if constexpr (ne == 8) {
+        // 8 FP8 bytes. iqs is a multiple of 8 → 8-byte aligned → single int2 load.
+        const int2 qs_pair = __ldg(reinterpret_cast<const int2 *>(V_row + qs_head_off + ib * QK_MXFP8 + iqs));
+        *reinterpret_cast<int *>(qs)     = qs_pair.x;
+        *reinterpret_cast<int *>(qs + 4) = qs_pair.y;
+    } else if constexpr (ne == 4) {
         *reinterpret_cast<int *>(qs) = __ldg(reinterpret_cast<const int *>(V_row + qs_head_off + ib * QK_MXFP8 + iqs));
     } else {
         *reinterpret_cast<uint16_t *>(qs) = __ldg(reinterpret_cast<const uint16_t *>(V_row + qs_head_off + ib * QK_MXFP8 + iqs));
@@ -837,12 +847,28 @@ static __device__ __forceinline__ void dequantize_V_mxfp6_soa(
     const int elem_in_block = i0 % QK;
     const int byte_in_block = (elem_in_block >> 2) * 3;  // elem_in_block is always a multiple of 4
 
-    static_assert(ne == 2 || ne == 4, "bad ne");
+    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
 
     // Load and unpack FP6 values. ne elements = ne*3/4 bytes.
     uint8_t vals[ne];
     const char * qs_base = V_row + qs_head_off + ib * qs_per_block + byte_in_block;
-    if constexpr (ne == 4) {
+    if constexpr (ne == 8) {
+        // 8 FP6 values = 6 bytes = two groups of 3 bytes each.
+        const uint32_t packed0 = (uint32_t)__ldg((const uint8_t *)qs_base)
+                               | ((uint32_t)__ldg((const uint8_t *)qs_base + 1) << 8)
+                               | ((uint32_t)__ldg((const uint8_t *)qs_base + 2) << 16);
+        vals[0] =  packed0        & 0x3F;
+        vals[1] = (packed0 >>  6) & 0x3F;
+        vals[2] = (packed0 >> 12) & 0x3F;
+        vals[3] = (packed0 >> 18) & 0x3F;
+        const uint32_t packed1 = (uint32_t)__ldg((const uint8_t *)qs_base + 3)
+                               | ((uint32_t)__ldg((const uint8_t *)qs_base + 4) << 8)
+                               | ((uint32_t)__ldg((const uint8_t *)qs_base + 5) << 16);
+        vals[4] =  packed1        & 0x3F;
+        vals[5] = (packed1 >>  6) & 0x3F;
+        vals[6] = (packed1 >> 12) & 0x3F;
+        vals[7] = (packed1 >> 18) & 0x3F;
+    } else if constexpr (ne == 4) {
         // Load 3 packed FP6 bytes via __ldg (byte loads avoid alignment issues).
         const uint32_t packed = (uint32_t)__ldg((const uint8_t *)qs_base)
                               | ((uint32_t)__ldg((const uint8_t *)qs_base + 1) << 8)
