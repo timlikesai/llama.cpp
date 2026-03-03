@@ -15,14 +15,6 @@
 #   ./sass-diff.sh --kernel PATTERN             # Filter to kernels matching PATTERN
 #   ./sass-diff.sh --help                       # Show usage
 #
-# Workflow:
-#   1. Build baseline:    docker compose build llama-cpp-ultra
-#   2. Save baseline:     ./sass-diff.sh --baseline
-#   3. Edit code, rebuild
-#   4. Save current:      ./sass-diff.sh --current
-#   5. Compare:           ./sass-diff.sh --compare
-#   6. Repeat 3-5
-#
 # The default kernel filter is "flash_attn_ext_vec" (the VEC kernel).
 # Use --kernel to change, e.g. --kernel "flash_attn_ext_mma" for MMA kernels.
 
@@ -34,8 +26,9 @@ DOCKER_IMAGE="local/llama.cpp:full-cuda"
 CUDA_DEVEL_IMAGE="nvidia/cuda:13.1.0-devel-ubuntu24.04"
 SO_NAME="libggml-cuda.so"
 
-# Default kernel filter (VEC kernel for tg128 optimization).
-KERNEL_FILTER="flash_attn_ext_vec"
+# Default kernel filter: D=128, ncols=1 VEC kernels (the tg128 hot path).
+# ILi128ELi1E = template args D=128, ncols=1.
+KERNEL_FILTER="flash_attn_ext_vecILi128ELi1E"
 
 # ── Argument Parsing ────────────────────────────────────────────────────────
 
@@ -43,64 +36,33 @@ ACTION=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --baseline)
-            ACTION="baseline"
-            shift
-            ;;
-        --current)
-            ACTION="current"
-            shift
-            ;;
-        --compare)
-            ACTION="compare"
-            shift
-            ;;
+        --baseline)  ACTION="baseline"; shift ;;
+        --current)   ACTION="current"; shift ;;
+        --compare)   ACTION="compare"; shift ;;
         --stats)
             ACTION="stats"
             STATS_TARGET="${2:-baseline}"
-            shift
-            [[ $# -gt 0 ]] && shift
+            shift; [[ $# -gt 0 ]] && shift
             ;;
-        --list-kernels)
-            ACTION="list-kernels"
-            shift
-            ;;
-        --kernel)
-            KERNEL_FILTER="$2"
-            shift 2
-            ;;
+        --list-kernels) ACTION="list-kernels"; shift ;;
+        --kernel)    KERNEL_FILTER="$2"; shift 2 ;;
         --help)
             echo "Usage: $0 [OPTIONS]"
-            echo ""
-            echo "SASS Diff Tool for Flash Attention VEC Kernel Optimization"
             echo ""
             echo "Actions:"
             echo "  --baseline              Save current docker build as baseline SASS"
             echo "  --current               Save current docker build as current SASS"
-            echo "  --compare               Compare baseline vs current (instruction counts)"
+            echo "  --compare               Compare baseline vs current"
             echo "  --stats [baseline|current]  Show detailed instruction stats"
             echo "  --list-kernels          List all CUDA kernel function names"
             echo ""
             echo "Options:"
             echo "  --kernel PATTERN        Filter to kernels matching PATTERN"
             echo "                          Default: flash_attn_ext_vec"
-            echo "                          Examples: flash_attn_ext_mma, flash_attn"
             echo "  --help                  Show this help"
-            echo ""
-            echo "Workflow:"
-            echo "  1. Build baseline:    docker compose build llama-cpp-ultra"
-            echo "  2. Save baseline:     $0 --baseline"
-            echo "  3. Edit code, rebuild"
-            echo "  4. Save current:      $0 --current"
-            echo "  5. Compare:           $0 --compare"
-            echo "  6. Iterate steps 3-5"
             exit 0
             ;;
-        *)
-            echo "Unknown option: $1"
-            echo "Run $0 --help for usage."
-            exit 1
-            ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
@@ -126,43 +88,49 @@ extract_so() {
     echo "  Saved: $so_path ($(du --human-readable "$so_path" | cut -f1))"
 }
 
-# Dump full SASS for a .so file.
-dump_sass() {
-    local so_path="$1"
-    local sass_path="$2"
+# Dump SASS for matching kernels only. Uses nm (instant, host-side) to find
+# kernel names, then cuobjdump --fun to disassemble only those.
+dump_filtered_sass() {
+    local so_file="$1"
+    local pattern="$2"
+    local output_path="$3"
 
-    echo "Dumping SASS (this may take a moment)..."
+    local so_path="$RESULTS_DIR/$so_file"
+
+    # Step 1: Get matching kernel names via nm (instant, host-side).
+    echo "Finding kernels matching '$pattern'..."
+    local names
+    names=$(nm --defined-only "$so_path" | awk '{print $3}' \
+        | grep "^_Z" | grep "$pattern" | sort -u)
+
+    local count
+    count=$(echo "$names" | grep --count . 2>/dev/null || echo "0")
+    echo "  Found $count matching kernels"
+
+    if [[ $count -eq 0 ]]; then
+        echo "" > "$output_path"
+        return
+    fi
+
+    # Step 2: Build comma-separated function list for cuobjdump --function.
+    local fun_list
+    fun_list=$(echo "$names" | tr '\n' ',' | sed 's/,$//')
+
+    # Step 3: Dump only those kernels (fast — skips everything else).
+    echo "  Disassembling $count kernels..."
     docker run --rm \
         --volume "$RESULTS_DIR:/work:rw" \
         --entrypoint /bin/bash \
         "$CUDA_DEVEL_IMAGE" \
-        -c "cuobjdump --dump-sass /work/$(basename "$so_path")" \
-        > "$sass_path" 2>/dev/null
-    echo "  Saved: $sass_path ($(wc --lines < "$sass_path") lines)"
+        -c "cuobjdump --dump-sass --function '$fun_list' /work/$so_file 2>/dev/null" \
+        > "$output_path"
+
+    local line_count
+    line_count=$(wc --lines < "$output_path")
+    echo "  Saved: $count kernels, $line_count lines"
 }
 
-# Extract SASS for specific kernel(s) matching a pattern.
-# Output: filtered SASS with function headers preserved.
-filter_kernels() {
-    local sass_path="$1"
-    local pattern="$2"
-    local output_path="$3"
-
-    awk -v pat="$pattern" '
-    /^[[:space:]]*\.text\./ {
-        func_name = $0
-        in_func = (func_name ~ pat)
-        if (in_func) print ""
-    }
-    in_func { print }
-    ' "$sass_path" > "$output_path"
-
-    local kernel_count
-    kernel_count=$(grep --count '\.text\.' "$output_path" 2>/dev/null || echo "0")
-    echo "  Filtered: $kernel_count kernels matching '$pattern'"
-}
-
-# Print instruction statistics for a SASS file.
+# Print instruction statistics for a filtered SASS file.
 print_stats() {
     local sass_path="$1"
     local label="$2"
@@ -179,7 +147,6 @@ print_stats() {
     echo "═══ $label: $total total instructions ═══"
     echo ""
 
-    # Count by instruction category.
     echo "  Category counts (sorted by frequency):"
     echo "  ────────────────────────────────────────"
     grep --extended-regexp --only-matching '^\s+/\*[0-9a-f]+\*/\s+\S+' "$sass_path" \
@@ -189,7 +156,6 @@ print_stats() {
         | head -30 \
         | while read -r count instr; do
             printf "  %6d  %-20s" "$count" "$instr"
-            # Annotate key instructions.
             case "$instr" in
                 LDG)    echo "  (global load)" ;;
                 STG)    echo "  (global store)" ;;
@@ -221,19 +187,16 @@ print_stats() {
 
     echo ""
 
-    # Per-kernel breakdown.
     echo "  Per-kernel instruction counts:"
     echo "  ────────────────────────────────────────"
     awk '
-    /^[[:space:]]*\.text\./ {
+    /Function :/ {
         if (func_name != "" && count > 0) {
             printf "  %6d  %s\n", count, short_name
         }
         func_name = $0
-        # Extract short name: last part after the mangled prefix.
         short_name = func_name
-        gsub(/.*\.text\./, "", short_name)
-        # Truncate at 80 chars for readability.
+        gsub(/.*Function : /, "", short_name)
         if (length(short_name) > 80) short_name = substr(short_name, 1, 77) "..."
         count = 0
     }
@@ -252,20 +215,17 @@ compare_sass() {
     local curr_sass="$RESULTS_DIR/current-filtered.sass"
 
     if [[ ! -f "$base_sass" ]]; then
-        echo "ERROR: baseline not found. Run: $0 --baseline"
-        exit 1
+        echo "ERROR: baseline not found. Run: $0 --baseline"; exit 1
     fi
     if [[ ! -f "$curr_sass" ]]; then
-        echo "ERROR: current not found. Run: $0 --current"
-        exit 1
+        echo "ERROR: current not found. Run: $0 --current"; exit 1
     fi
 
     local base_total curr_total
     base_total=$(grep --count --extended-regexp '^\s+/\*[0-9a-f]+\*/' "$base_sass" 2>/dev/null || echo "0")
     curr_total=$(grep --count --extended-regexp '^\s+/\*[0-9a-f]+\*/' "$curr_sass" 2>/dev/null || echo "0")
     local delta=$(( curr_total - base_total ))
-    local sign="+"
-    [[ $delta -lt 0 ]] && sign=""
+    local sign="+"; [[ $delta -lt 0 ]] && sign=""
 
     echo ""
     echo "═══ SASS Comparison: $KERNEL_FILTER ═══"
@@ -275,11 +235,9 @@ compare_sass() {
     echo "  Delta:     ${sign}${delta} instructions"
     echo ""
 
-    # Compare instruction categories side-by-side.
     echo "  Instruction category diff (baseline → current):"
     echo "  ─────────────────────────────────────────────────────────────"
 
-    # Build category counts for both.
     local base_counts curr_counts
     base_counts=$(mktemp)
     curr_counts=$(mktemp)
@@ -292,22 +250,20 @@ compare_sass() {
         | sed 's|.*/\*[0-9a-f]*\*/[[:space:]]*||' | sed 's/\..*//' \
         | sort | uniq --count | sort --numeric-sort --reverse > "$curr_counts"
 
-    # Merge and compare.
+    # Show all categories with changes.
     join -a1 -a2 -e0 -o '0 1.1 2.1' \
         <(awk '{print $2, $1}' "$base_counts" | sort) \
         <(awk '{print $2, $1}' "$curr_counts" | sort) \
         | while read -r instr base_n curr_n; do
             local d=$(( curr_n - base_n ))
             if [[ $d -ne 0 ]]; then
-                local ds="+"
-                [[ $d -lt 0 ]] && ds=""
+                local ds="+"; [[ $d -lt 0 ]] && ds=""
                 printf "  %-14s  %5d → %5d  (%s%d)\n" "$instr" "$base_n" "$curr_n" "$ds" "$d"
             fi
         done | sort -t'(' -k2 -n -r
 
     echo ""
 
-    # Per-kernel comparison.
     echo "  Per-kernel instruction count diff:"
     echo "  ─────────────────────────────────────────────────────────────"
 
@@ -316,9 +272,9 @@ compare_sass() {
     curr_kernels=$(mktemp)
 
     awk '
-    /^[[:space:]]*\.text\./ {
+    /Function :/ {
         if (name != "" && count > 0) print count, name
-        name = $0; gsub(/.*\.text\./, "", name)
+        name = $0; gsub(/.*Function : /, "", name)
         count = 0
     }
     /^\s+\/\*[0-9a-f]+\*\// { count++ }
@@ -326,9 +282,9 @@ compare_sass() {
     ' "$base_sass" | sort -k2 > "$base_kernels"
 
     awk '
-    /^[[:space:]]*\.text\./ {
+    /Function :/ {
         if (name != "" && count > 0) print count, name
-        name = $0; gsub(/.*\.text\./, "", name)
+        name = $0; gsub(/.*Function : /, "", name)
         count = 0
     }
     /^\s+\/\*[0-9a-f]+\*\// { count++ }
@@ -338,9 +294,7 @@ compare_sass() {
     join -a1 -a2 -e0 -o '0 1.1 2.1' "$base_kernels" "$curr_kernels" \
         | while read -r name base_n curr_n; do
             local d=$(( curr_n - base_n ))
-            local ds="+"
-            [[ $d -lt 0 ]] && ds=""
-            # Truncate name for display.
+            local ds="+"; [[ $d -lt 0 ]] && ds=""
             local short="$name"
             [[ ${#short} -gt 60 ]] && short="${short:0:57}..."
             printf "  %5d → %5d  (%s%-4d)  %s\n" "$base_n" "$curr_n" "$ds" "$d" "$short"
@@ -355,8 +309,7 @@ compare_sass() {
 case "$ACTION" in
     baseline|current)
         extract_so "$ACTION"
-        dump_sass "$ACTION.so" "$RESULTS_DIR/${ACTION}-full.sass"
-        filter_kernels "$RESULTS_DIR/${ACTION}-full.sass" "$KERNEL_FILTER" "$RESULTS_DIR/${ACTION}-filtered.sass"
+        dump_filtered_sass "${ACTION}.so" "$KERNEL_FILTER" "$RESULTS_DIR/${ACTION}-filtered.sass"
         print_stats "$RESULTS_DIR/${ACTION}-filtered.sass" "${ACTION^^}"
         ;;
 
@@ -369,22 +322,13 @@ case "$ACTION" in
         ;;
 
     list-kernels)
-        local so_path="$RESULTS_DIR/current.so"
-        if [[ ! -f "$so_path" ]]; then
-            so_path="$RESULTS_DIR/baseline.so"
-        fi
-        if [[ ! -f "$so_path" ]]; then
+        local_so="$RESULTS_DIR/current.so"
+        [[ ! -f "$local_so" ]] && local_so="$RESULTS_DIR/baseline.so"
+        if [[ ! -f "$local_so" ]]; then
             echo "No .so found. Run --baseline or --current first."
             exit 1
         fi
-        echo "Kernel functions in $(basename "$so_path"):"
-        docker run --rm \
-            --volume "$RESULTS_DIR:/work:rw" \
-            --entrypoint /bin/bash \
-            "$CUDA_DEVEL_IMAGE" \
-            -c "cuobjdump --dump-sass /work/$(basename "$so_path")" 2>/dev/null \
-            | grep '\.text\.' \
-            | sed 's/.*\.text\.//' \
-            | sort -u
+        echo "Kernel functions in $(basename "$local_so"):"
+        nm --defined-only "$local_so" | awk '{print $3}' | sort -u
         ;;
 esac
