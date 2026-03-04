@@ -9,14 +9,14 @@
 
 using namespace ggml_cuda_mma;
 
-// ── MMA-specific traits ────────────────────────────────────────────
+// MMA-specific traits:
 // Drive the unified flash attention MMA kernel. All MX formats share
 // identical tile register layouts (4 A regs, 2 B regs, 4 C/D regs).
 // Differences: MMA instruction, k-dimension, scale pairing, Q packing.
 
 template<ggml_type type> struct mxfp_mma_traits;
 
-template<> struct mxfp_mma_traits<GGML_TYPE_MXFP4> {
+template<> struct mxfp_mma_traits<GGML_TYPE_MXFP4_E2M1> {
     static constexpr int k_per_mma      = 64;    // m16n8k64
     static constexpr int smem_k_qs_div  = 8;     // stride_k_qs = DKQ/8 + 4
     static constexpr int smem_k_sc_div  = 64;    // stride_k_sc = DKQ/64 (paired scales)
@@ -61,7 +61,7 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP6_E3M2> {
     }
 };
 
-template<> struct mxfp_mma_traits<GGML_TYPE_MXFP8> {
+template<> struct mxfp_mma_traits<GGML_TYPE_MXFP8_E4M3> {
     static constexpr int k_per_mma      = 32;    // m16n8k32
     static constexpr int smem_k_qs_div  = 4;     // stride_k_qs = DKQ/4 + 4
     static constexpr int smem_k_sc_div  = 32;    // stride_k_sc = DKQ/32 (individual)
@@ -174,7 +174,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_load_K(
     using traits = mxfp_mma_traits<mxfp_type>;
     constexpr int blocks_per_head = DKQ / 32;
 
-    if constexpr (mxfp_type == GGML_TYPE_MXFP4) {
+    if constexpr (mxfp_type == GGML_TYPE_MXFP4_E2M1) {
         // FP4: 16 bytes per block, 1x cp.async per block.
         const unsigned int tile_K_qs_32 = ggml_cuda_cvta_generic_to_shared(tile_K_qs);
 
@@ -768,7 +768,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
         }
 
         // Type-specific packing.
-        if constexpr (mxfp_type == GGML_TYPE_MXFP4) {
+        if constexpr (mxfp_type == GGML_TYPE_MXFP4_E2M1) {
             // Pack 32 values into 4 ints of nibble data.
             if (active) {
 #pragma unroll
@@ -1782,7 +1782,7 @@ static __global__ void flash_attn_ext_mxfp(
         // V shares K buffer (MLA) — V type = MXFP4 (dequant from K's FP4/FP6/FP8 qs).
         // Actually for MLA, V reads first DV dims from K's row.
         // Detect V type from K type: V data in same format as K.
-        if constexpr (mxfp_type == GGML_TYPE_MXFP4) {
+        if constexpr (mxfp_type == GGML_TYPE_MXFP4_E2M1) {
             v_type = 0;
         } else if constexpr (mxfp_type == GGML_TYPE_MXFP6_E2M3) {
             v_type = 3;
@@ -2044,20 +2044,24 @@ void ggml_cuda_flash_attn_ext_mma_mxfp_case(ggml_backend_cuda_context & ctx, ggm
     DECL_FATTN_MMA_MXFP_ALL_NCOLS2(MXFP_TYPE, 128, 128, 32) \
     DECL_FATTN_MMA_MXFP_ALL_NCOLS2(MXFP_TYPE, 256, 256, 32)
 
-DECL_FATTN_MMA_MXFP_STANDARD(GGML_TYPE_MXFP4)
+DECL_FATTN_MMA_MXFP_STANDARD(GGML_TYPE_MXFP4_E2M1)
 DECL_FATTN_MMA_MXFP_STANDARD(GGML_TYPE_MXFP6_E2M3)
+DECL_FATTN_MMA_MXFP_STANDARD(GGML_TYPE_MXFP8_E4M3)
+#ifdef GGML_CUDA_MXFP_ALL_VARIANTS
 DECL_FATTN_MMA_MXFP_STANDARD(GGML_TYPE_MXFP6_E3M2)
-DECL_FATTN_MMA_MXFP_STANDARD(GGML_TYPE_MXFP8)
 DECL_FATTN_MMA_MXFP_STANDARD(GGML_TYPE_MXFP8_E5M2)
+#endif // GGML_CUDA_MXFP_ALL_VARIANTS
 
-// MLA D=576/512 — all MXFP types support MLA
+// MLA D=576/512
 #define DECL_FATTN_MMA_MXFP_MLA(MXFP_TYPE) \
     DECL_FATTN_MMA_MXFP_ALL_NCOLS2(MXFP_TYPE, 576, 512,  8) \
     DECL_FATTN_MMA_MXFP_ALL_NCOLS2(MXFP_TYPE, 576, 512, 16) \
     DECL_FATTN_MMA_MXFP_ALL_NCOLS2(MXFP_TYPE, 576, 512, 32)
 
-DECL_FATTN_MMA_MXFP_MLA(GGML_TYPE_MXFP4)
+DECL_FATTN_MMA_MXFP_MLA(GGML_TYPE_MXFP4_E2M1)
 DECL_FATTN_MMA_MXFP_MLA(GGML_TYPE_MXFP6_E2M3)
+DECL_FATTN_MMA_MXFP_MLA(GGML_TYPE_MXFP8_E4M3)
+#ifdef GGML_CUDA_MXFP_ALL_VARIANTS
 DECL_FATTN_MMA_MXFP_MLA(GGML_TYPE_MXFP6_E3M2)
-DECL_FATTN_MMA_MXFP_MLA(GGML_TYPE_MXFP8)
 DECL_FATTN_MMA_MXFP_MLA(GGML_TYPE_MXFP8_E5M2)
+#endif // GGML_CUDA_MXFP_ALL_VARIANTS

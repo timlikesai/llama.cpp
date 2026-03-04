@@ -202,7 +202,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
-// ── Unified MXFP MMA dispatch ───────────────────────────────────────
+// Unified MXFP MMA dispatch:
 
 template <ggml_type mxfp_type, int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_mxfp_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -271,13 +271,11 @@ static void ggml_cuda_flash_attn_ext_mma_mxfp_switch_d(ggml_backend_cuda_context
         case 256:
             ggml_cuda_flash_attn_ext_mma_mxfp_switch_ncols2<mxfp_type, 256, 256>(ctx, dst);
             break;
-        case 576: {
+        case 576:
             // MLA: D_K=576, D_V=512
-            const int DV = V->ne[0];
-            GGML_ASSERT(DV == 512);
+            GGML_ASSERT(V->ne[0] == 512);
             ggml_cuda_flash_attn_ext_mma_mxfp_switch_ncols2<mxfp_type, 576, 512>(ctx, dst);
             break;
-        }
         default:
             GGML_ABORT("Unsupported D for MXFP MMA");
     }
@@ -289,21 +287,23 @@ static void ggml_cuda_flash_attn_ext_mma_mxfp(ggml_backend_cuda_context & ctx, g
     const ggml_tensor * K = dst->src[1];
 
     switch (K->type) {
-        case GGML_TYPE_MXFP4:
-            ggml_cuda_flash_attn_ext_mma_mxfp_switch_d<GGML_TYPE_MXFP4>(ctx, dst);
+        case GGML_TYPE_MXFP4_E2M1:
+            ggml_cuda_flash_attn_ext_mma_mxfp_switch_d<GGML_TYPE_MXFP4_E2M1>(ctx, dst);
             break;
         case GGML_TYPE_MXFP6_E2M3:
             ggml_cuda_flash_attn_ext_mma_mxfp_switch_d<GGML_TYPE_MXFP6_E2M3>(ctx, dst);
             break;
+        case GGML_TYPE_MXFP8_E4M3:
+            ggml_cuda_flash_attn_ext_mma_mxfp_switch_d<GGML_TYPE_MXFP8_E4M3>(ctx, dst);
+            break;
+#ifdef GGML_CUDA_MXFP_ALL_VARIANTS
         case GGML_TYPE_MXFP6_E3M2:
             ggml_cuda_flash_attn_ext_mma_mxfp_switch_d<GGML_TYPE_MXFP6_E3M2>(ctx, dst);
-            break;
-        case GGML_TYPE_MXFP8:
-            ggml_cuda_flash_attn_ext_mma_mxfp_switch_d<GGML_TYPE_MXFP8>(ctx, dst);
             break;
         case GGML_TYPE_MXFP8_E5M2:
             ggml_cuda_flash_attn_ext_mma_mxfp_switch_d<GGML_TYPE_MXFP8_E5M2>(ctx, dst);
             break;
+#endif // GGML_CUDA_MXFP_ALL_VARIANTS
         default:
             GGML_ABORT("Unsupported K type for MXFP MMA");
     }
@@ -372,33 +372,37 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
 
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP4, GGML_TYPE_MXFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP4_E2M1, GGML_TYPE_MXFP4_E2M1)
 
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8, GGML_TYPE_MXFP4)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8, GGML_TYPE_MXFP8)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E4M3, GGML_TYPE_MXFP4_E2M1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E4M3, GGML_TYPE_MXFP8_E4M3)
 
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP4_E2M1)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP6_E2M3)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP4)
+#ifdef GGML_CUDA_MXFP_ALL_VARIANTS
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP4_E2M1)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP6_E3M2)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP4_E2M1)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP8_E5M2)
+#endif // GGML_CUDA_MXFP_ALL_VARIANTS
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP4, GGML_TYPE_MXFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP4_E2M1, GGML_TYPE_MXFP4_E2M1)
 
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8, GGML_TYPE_MXFP4)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8, GGML_TYPE_MXFP8)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E4M3, GGML_TYPE_MXFP4_E2M1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E4M3, GGML_TYPE_MXFP8_E4M3)
 
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP4_E2M1)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP6_E2M3)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP4)
+#ifdef GGML_CUDA_MXFP_ALL_VARIANTS
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP4_E2M1)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP6_E3M2)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP4_E2M1)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP8_E5M2)
+#endif // GGML_CUDA_MXFP_ALL_VARIANTS
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -496,11 +500,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
             break;
-        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP4_E2M1:
         case GGML_TYPE_MXFP6_E2M3:
+        case GGML_TYPE_MXFP8_E4M3:
+#ifdef GGML_CUDA_MXFP_ALL_VARIANTS
         case GGML_TYPE_MXFP6_E3M2:
         case GGML_TYPE_MXFP8_E5M2:
-        case GGML_TYPE_MXFP8:
+#endif // GGML_CUDA_MXFP_ALL_VARIANTS
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
@@ -516,7 +522,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // Unified MXFP flash attention (Blackwell MMA for FP4/FP6/FP8):
     if (blackwell_mma_available(cc)) {
         const bool is_mxfp = ggml_is_type_mxfp(K->type);
-        if (is_mxfp && K->ne[0] % 32 == 0) {
+        const int64_t D = K->ne[0];
+        if (is_mxfp && (D == 64 || D == 128 || D == 256 || D == 576)) {
             if (can_use_vector_kernel && Q->ne[1] <= 2) {
                 return BEST_FATTN_KERNEL_VEC;
             }

@@ -214,14 +214,14 @@ static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + Q
 #define QK_MXFP8 32
 typedef struct {
     uint8_t e;              // E8M0 shared exponent
-    uint8_t qs[QK_MXFP8];  // 32 FP8 E4M3 values (1 byte each)
+    uint8_t qs[QK_MXFP8];  // 32 FP8 values (1 byte each), used for E4M3 and E5M2
 } block_mxfp8;
 static_assert(sizeof(block_mxfp8) == sizeof(uint8_t) + QK_MXFP8, "wrong mxfp8 block size/padding");
 
 #define QK_MXFP6 32
 typedef struct {
     uint8_t e;                     // E8M0 shared exponent
-    uint8_t qs[QK_MXFP6 * 6 / 8]; // 24 bytes: 32 six-bit values tightly packed
+    uint8_t qs[QK_MXFP6 * 6 / 8]; // 24 bytes: 32 six-bit values tightly packed, used for E2M3 and E3M2
 } block_mxfp6;
 static_assert(sizeof(block_mxfp6) == sizeof(uint8_t) + QK_MXFP6 * 6 / 8, "wrong mxfp6 block size/padding");
 

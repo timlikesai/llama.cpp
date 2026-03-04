@@ -303,10 +303,10 @@ static __device__ __forceinline__ void quantize_q8_1_to_shared(
     }
 }
 
-// Hadamard-rotated variant of quantize_q8_1_to_shared for MXFP4 flash attention.
+// Hadamard-rotated variant of quantize_q8_1_to_shared for MXFP flash attention.
 // Applies a block-32 Walsh-Hadamard rotation to Q before Q8_1 quantization so that
 // Q_rot . K_rot^T = Q . K^T (orthogonality) when K is stored Hadamard-rotated in the cache.
-// Thread mapping: 8 threads (QI8_1) x 4 values = 32 elements = one MXFP4 block.
+// Thread mapping: 8 threads (QI8_1) x 4 values = 32 elements = one MXFP block.
 // Ref: BRQ (arxiv 2511.04214), MR-GPTQ (arxiv 2509.23202).
 template <typename Tds, int ni>
 static __device__ __forceinline__ void quantize_q8_1_hadamard_to_shared(
@@ -319,7 +319,7 @@ static __device__ __forceinline__ void quantize_q8_1_hadamard_to_shared(
     }
 
     // Apply Walsh-Hadamard rotation within each 8-thread Q8_1 block.
-    // 8 threads x 4 values = 32 elements = one MXFP4 quantization block.
+    // 8 threads x 4 values = 32 elements = one MXFP quantization block.
     hadamard_32_q8_1(vals, threadIdx.x % QI8_1);
 
     float amax = fabsf(vals[0]);
@@ -592,7 +592,7 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
 template<ggml_type type>
 static __device__ __forceinline__ float mxfp_elem_to_float(uint8_t raw);
 
-template<> __device__ __forceinline__ float mxfp_elem_to_float<GGML_TYPE_MXFP8>(uint8_t raw) {
+template<> __device__ __forceinline__ float mxfp_elem_to_float<GGML_TYPE_MXFP8_E4M3>(uint8_t raw) {
     const __nv_fp8_e4m3 v = *reinterpret_cast<const __nv_fp8_e4m3 *>(&raw);
     return float(v);
 }
@@ -695,7 +695,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp8_soa(
         const char * __restrict__ K_row, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
         const int qs_head_off, const int e_head_off) {
 
-    static_assert(mxfp_type == GGML_TYPE_MXFP8 || mxfp_type == GGML_TYPE_MXFP8_E5M2, "bad mxfp8 type");
+    static_assert(mxfp_type == GGML_TYPE_MXFP8_E4M3 || mxfp_type == GGML_TYPE_MXFP8_E5M2, "bad mxfp8 type");
     float sum = 0.0f;
 
 #pragma unroll
@@ -790,7 +790,7 @@ static __device__ __forceinline__ void dequantize_V_mxfp8_soa(
         const char * __restrict__ V_row, void * __restrict__ dst, const int64_t i0,
         const int qs_head_off, const int e_head_off) {
 
-    static_assert(mxfp_type == GGML_TYPE_MXFP8 || mxfp_type == GGML_TYPE_MXFP8_E5M2, "bad mxfp8 type");
+    static_assert(mxfp_type == GGML_TYPE_MXFP8_E4M3 || mxfp_type == GGML_TYPE_MXFP8_E5M2, "bad mxfp8 type");
     const int64_t ib  = i0 / QK_MXFP8;
     const int     iqs = i0 % QK_MXFP8;
 
@@ -908,7 +908,7 @@ static __device__ __forceinline__ void dequantize_V_mxfp6_soa(
     }
 }
 
-// ── Unified MXFP VEC dispatch wrappers ──────────────────────────────
+// Unified MXFP VEC dispatch wrappers:
 // Single entry point for all 5 MXFP types. Dispatches to the type-specific
 // implementations above based on compile-time type_K/type_V.
 
@@ -916,7 +916,7 @@ template <ggml_type type_K, int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp_soa(
         const char * __restrict__ K_row, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
         const int qs_head_off, const int e_head_off) {
-    if constexpr (type_K == GGML_TYPE_MXFP4) {
+    if constexpr (type_K == GGML_TYPE_MXFP4_E2M1) {
         return vec_dot_fattn_vec_KQ_mxfp4_soa<D, nthreads>(K_row, Q_q8, Q_ds_v, qs_head_off, e_head_off);
     } else if constexpr (type_K == GGML_TYPE_MXFP6_E2M3 || type_K == GGML_TYPE_MXFP6_E3M2) {
         return vec_dot_fattn_vec_KQ_mxfp6_soa<type_K, D, nthreads>(K_row, Q_q8, Q_ds_v, qs_head_off, e_head_off);
@@ -929,7 +929,7 @@ template <ggml_type type_V, typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_mxfp_soa(
         const char * __restrict__ V_row, void * __restrict__ dst, const int64_t i0,
         const int qs_head_off, const int e_head_off) {
-    if constexpr (type_V == GGML_TYPE_MXFP4) {
+    if constexpr (type_V == GGML_TYPE_MXFP4_E2M1) {
         dequantize_V_mxfp4_soa<T, ne>(V_row, dst, i0, qs_head_off, e_head_off);
     } else if constexpr (type_V == GGML_TYPE_MXFP6_E2M3 || type_V == GGML_TYPE_MXFP6_E3M2) {
         dequantize_V_mxfp6_soa<type_V, T, ne>(V_row, dst, i0, qs_head_off, e_head_off);
@@ -952,9 +952,9 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q5_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
-    } else if constexpr (type_K == GGML_TYPE_MXFP4) {
+    } else if constexpr (type_K == GGML_TYPE_MXFP4_E2M1) {
         return nullptr; // SoA path called explicitly, not via function pointer
-    } else if constexpr (type_K == GGML_TYPE_MXFP8) {
+    } else if constexpr (type_K == GGML_TYPE_MXFP8_E4M3) {
         return nullptr; // SoA path called explicitly, not via function pointer
     } else if constexpr (type_K == GGML_TYPE_MXFP6_E2M3) {
         return nullptr;
@@ -982,9 +982,9 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q5_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q8_0) {
         return dequantize_V_q8_0<T, ne>;
-    } else if constexpr (type_V == GGML_TYPE_MXFP4) {
+    } else if constexpr (type_V == GGML_TYPE_MXFP4_E2M1) {
         return nullptr; // SoA path called explicitly, not via function pointer
-    } else if constexpr (type_V == GGML_TYPE_MXFP8) {
+    } else if constexpr (type_V == GGML_TYPE_MXFP8_E4M3) {
         return nullptr; // SoA path called explicitly, not via function pointer
     } else if constexpr (type_V == GGML_TYPE_MXFP6_E2M3) {
         return nullptr;
@@ -1203,7 +1203,7 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
-// Config options for the MMA kernels (F16, MXFP4, etc.).
+// Config options for the MMA kernels (F16, MXFP, etc.).
 // Should not affect results, only speed/register pressure/shared memory use.
 struct fattn_mma_config {
     int  nthreads;       // Number of threads per CUDA block.

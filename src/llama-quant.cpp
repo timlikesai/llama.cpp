@@ -457,7 +457,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         // MoE   tensors -> MXFP4
         // other tensors -> Q8_0
         if (tensor->ne[2] > 1) {
-            new_type = GGML_TYPE_MXFP4;
+            new_type = GGML_TYPE_MXFP4_E2M1;
         } else {
             new_type = GGML_TYPE_Q8_0;
         }

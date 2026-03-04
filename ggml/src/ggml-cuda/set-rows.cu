@@ -412,7 +412,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
-    } else if (dst->type == GGML_TYPE_MXFP4 || dst->type == GGML_TYPE_MXFP8 ||
+    } else if (dst->type == GGML_TYPE_MXFP4_E2M1 || dst->type == GGML_TYPE_MXFP8_E4M3 ||
                dst->type == GGML_TYPE_MXFP6_E2M3 || dst->type == GGML_TYPE_MXFP6_E3M2 ||
                dst->type == GGML_TYPE_MXFP8_E5M2) {
         // op_params[0] == 1 signals K cache write: apply Hadamard rotation before quantization.
@@ -433,11 +433,13 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             }
 
         switch (dst->type) {
-            case GGML_TYPE_MXFP4:      DISPATCH_MXFP_SOA(GGML_TYPE_MXFP4);      break;
-            case GGML_TYPE_MXFP8:      DISPATCH_MXFP_SOA(GGML_TYPE_MXFP8);      break;
+            case GGML_TYPE_MXFP4_E2M1:      DISPATCH_MXFP_SOA(GGML_TYPE_MXFP4_E2M1);      break;
+            case GGML_TYPE_MXFP8_E4M3:      DISPATCH_MXFP_SOA(GGML_TYPE_MXFP8_E4M3);      break;
             case GGML_TYPE_MXFP6_E2M3: DISPATCH_MXFP_SOA(GGML_TYPE_MXFP6_E2M3); break;
+#ifdef GGML_CUDA_MXFP_ALL_VARIANTS
             case GGML_TYPE_MXFP6_E3M2: DISPATCH_MXFP_SOA(GGML_TYPE_MXFP6_E3M2); break;
             case GGML_TYPE_MXFP8_E5M2: DISPATCH_MXFP_SOA(GGML_TYPE_MXFP8_E5M2); break;
+#endif
             default: GGML_ABORT("unreachable");
         }
 

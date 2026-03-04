@@ -426,9 +426,9 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_4_4 = 36,
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
-        GGML_TYPE_MXFP4       = 39, // MX FP4 E2M1
+        GGML_TYPE_MXFP4_E2M1  = 39, // MX FP4 E2M1
         GGML_TYPE_NVFP4       = 40, // NVFP4 (4 blocks, E4M3 scale)
-        GGML_TYPE_MXFP8       = 41, // MX FP8 E4M3
+        GGML_TYPE_MXFP8_E4M3  = 41, // MX FP8 E4M3
         GGML_TYPE_MXFP6_E2M3  = 42, // MX FP6 E2M3
         GGML_TYPE_MXFP6_E3M2  = 43, // MX FP6 E3M2
         GGML_TYPE_MXFP8_E5M2  = 44, // MX FP8 E5M2
@@ -467,7 +467,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_IQ4_XS  = 22, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ1_M   = 23, // except 1d tensors
         GGML_FTYPE_MOSTLY_BF16    = 24, // except 1d tensors
-        GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
+        GGML_FTYPE_MOSTLY_MXFP4_E2M1 = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
     };
 

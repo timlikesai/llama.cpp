@@ -907,14 +907,35 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q8_0> {
 };
 
 template<>
-struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP4_E2M1> {
     static constexpr int qk = QK_MXFP4;
     static constexpr int qr = QR_MXFP4;
     static constexpr int qi = QI_MXFP4;
 };
 
 template<>
-struct ggml_cuda_type_traits<GGML_TYPE_MXFP8> {
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP8_E4M3> {
+    static constexpr int qk = QK_MXFP8;
+    static constexpr int qr = QR_MXFP8;
+    static constexpr int qi = QI_MXFP8;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP6_E2M3> {
+    static constexpr int qk = QK_MXFP6;
+    static constexpr int qr = QR_MXFP6;
+    static constexpr int qi = QI_MXFP6;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP6_E3M2> {
+    static constexpr int qk = QK_MXFP6;
+    static constexpr int qr = QR_MXFP6;
+    static constexpr int qi = QI_MXFP6;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP8_E5M2> {
     static constexpr int qk = QK_MXFP8;
     static constexpr int qr = QR_MXFP8;
     static constexpr int qi = QI_MXFP8;

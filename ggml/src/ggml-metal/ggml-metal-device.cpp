@@ -758,7 +758,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 nr0 = N_R0_Q8_0;
                 smem = 32*sizeof(float)*N_R0_Q8_0;
             } break;
-        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP4_E2M1:
             {
                 nsg = N_SG_MXFP4;
                 nr0 = N_R0_MXFP4;
@@ -970,7 +970,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 nr0 = N_R0_Q8_0;
                 smem = 32*sizeof(float)*N_R0_Q8_0;
             } break;
-        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP4_E2M1:
             {
                 nsg = N_SG_MXFP4;
                 nr0 = N_R0_MXFP4;

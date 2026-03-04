@@ -3,7 +3,9 @@
 #include "common.cuh"
 #include "hadamard.cuh"
 
-// ── MXFP Type Traits ──────────────────────────────────────────────────
+// ------------------------------------------------------------------------------------------------------------------
+// MXFP Type Traits
+// ------------------------------------------------------------------------------------------------------------------
 // Single source of truth for all MX (Microscaling) format parameters.
 // Adding a new MX variant = one new specialization.
 // All MX formats share: QK=32 (block size), E8M0 shared exponent.
@@ -13,19 +15,19 @@ template<ggml_type type> struct mxfp_traits;
 // Compile-time check: is this an MXFP SoA type?
 template<ggml_type type>
 static constexpr bool is_mxfp_soa_v =
-    type == GGML_TYPE_MXFP4 || type == GGML_TYPE_MXFP8 ||
+    type == GGML_TYPE_MXFP4_E2M1 || type == GGML_TYPE_MXFP8_E4M3 ||
     type == GGML_TYPE_MXFP6_E2M3 || type == GGML_TYPE_MXFP6_E3M2 ||
     type == GGML_TYPE_MXFP8_E5M2;
 
 // Runtime check: is this an MXFP SoA type?
 static __host__ __device__ __forceinline__ bool ggml_is_type_mxfp(ggml_type type) {
-    return type == GGML_TYPE_MXFP4 || type == GGML_TYPE_MXFP8 ||
+    return type == GGML_TYPE_MXFP4_E2M1 || type == GGML_TYPE_MXFP8_E4M3 ||
            type == GGML_TYPE_MXFP6_E2M3 || type == GGML_TYPE_MXFP6_E3M2 ||
            type == GGML_TYPE_MXFP8_E5M2;
 }
 
-// ── FP4 E2M1 ────────────────────────────────────────────────────────
-template<> struct mxfp_traits<GGML_TYPE_MXFP4> {
+// FP4 E2M1:
+template<> struct mxfp_traits<GGML_TYPE_MXFP4_E2M1> {
     static constexpr int bits_per_elem = 4;
     static constexpr int qs_per_block  = 16;   // 32 * 4 / 8
     static constexpr int block_size    = sizeof(block_mxfp4);
@@ -50,7 +52,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP4> {
     }
 };
 
-// ── FP6 helpers ─────────────────────────────────────────────────────
+// FP6 helpers:
 namespace mxfp_detail {
     static __device__ __forceinline__ float fp6_e2m3_to_float(uint8_t v) {
         const float sign = (v & 0x20) ? -1.0f : 1.0f;
@@ -88,6 +90,7 @@ namespace mxfp_detail {
     }
 } // namespace mxfp_detail
 
+// FP6 E2M3:
 template<> struct mxfp_traits<GGML_TYPE_MXFP6_E2M3> {
     static constexpr int bits_per_elem = 6;
     static constexpr int qs_per_block  = 24;   // 32 * 6 / 8
@@ -116,7 +119,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E2M3> {
     }
 };
 
-// ── FP6 E3M2 ────────────────────────────────────────────────────────
+// FP6 E3M2:
 template<> struct mxfp_traits<GGML_TYPE_MXFP6_E3M2> {
     static constexpr int bits_per_elem = 6;
     static constexpr int qs_per_block  = 24;
@@ -145,8 +148,8 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E3M2> {
     }
 };
 
-// ── FP8 E4M3 ────────────────────────────────────────────────────────
-template<> struct mxfp_traits<GGML_TYPE_MXFP8> {
+// FP8 E4M3:
+template<> struct mxfp_traits<GGML_TYPE_MXFP8_E4M3> {
     static constexpr int bits_per_elem = 8;
     static constexpr int qs_per_block  = 32;   // 32 * 8 / 8
     static constexpr int block_size    = sizeof(block_mxfp8);
@@ -170,7 +173,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8> {
     }
 };
 
-// ── FP8 E5M2 ────────────────────────────────────────────────────────
+// FP8 E5M2:
 template<> struct mxfp_traits<GGML_TYPE_MXFP8_E5M2> {
     static constexpr int bits_per_elem = 8;
     static constexpr int qs_per_block  = 32;
@@ -195,7 +198,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E5M2> {
     }
 };
 
-// ── SoA head offset calculation ─────────────────────────────────────
+// SoA head offset calculation:
 // Computes qs and E8M0 byte offsets for a given head in a SoA-layout MXFP row.
 // Layout: [qs_block0 | qs_block1 | ... | e_block0 | e_block1 | ...]
 template<ggml_type type, int D>
@@ -210,7 +213,7 @@ static __device__ __forceinline__ void mxfp_soa_head_offsets(
     e_off  = stride_blocks * traits::qs_per_block + z * blocks_per_head;
 }
 
-// ── Unified SoA quantization ────────────────────────────────────────
+// Unified SoA quantization:
 // Shared Hadamard rotation + direct E8M0 scale + type-specific writes.
 template<ggml_type mxfp_type, bool apply_hadamard>
 static __device__ void quantize_f32_mxfp_block_soa(

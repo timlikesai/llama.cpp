@@ -618,7 +618,7 @@ static void dequantize_row_mxfp4_cuda(const void * vx, dst_t * y, const int64_t 
     dequantize_block_mxfp4<<<nb, 32, 0, stream>>>(vx, y);
 }
 
-// ── SoA dequantization for MXFP6 (E2M3 and E3M2) ──────────────────────
+// SoA dequantization for MXFP6 (E2M3 and E3M2):
 // SoA layout per row: [all_qs_blocks | all_e8m0_bytes]
 // Each block: 24 bytes qs (32 six-bit values packed) + 1 byte e8m0
 
@@ -674,7 +674,7 @@ static void dequantize_row_mxfp6_e3m2_cuda(const void * vx, dst_t * y, const int
     dequantize_block_mxfp6_soa<GGML_TYPE_MXFP6_E3M2><<<nb, 32, 0, stream>>>(vx, y);
 }
 
-// ── SoA dequantization for MXFP8 (E4M3 and E5M2) ──────────────────────
+// SoA dequantization for MXFP8 (E4M3 and E5M2):
 // SoA layout per row: [all_qs_blocks | all_e8m0_bytes]
 // Each block: 32 bytes qs (32 eight-bit values) + 1 byte e8m0
 
@@ -702,7 +702,7 @@ static __global__ void dequantize_block_mxfp8_soa(const void * __restrict__ vx, 
 
     for (int j = 0; j < 4; ++j) {
         const uint8_t raw = qs[il * 4 + j];
-        if constexpr (mxfp8_type == GGML_TYPE_MXFP8) {
+        if constexpr (mxfp8_type == GGML_TYPE_MXFP8_E4M3) {
             const __nv_fp8_e4m3 v = *reinterpret_cast<const __nv_fp8_e4m3 *>(&raw);
             y[j] = d * float(v);
         } else {
@@ -715,7 +715,7 @@ static __global__ void dequantize_block_mxfp8_soa(const void * __restrict__ vx, 
 template<typename dst_t>
 static void dequantize_row_mxfp8_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_mxfp8_soa<GGML_TYPE_MXFP8><<<nb, 32, 0, stream>>>(vx, y);
+    dequantize_block_mxfp8_soa<GGML_TYPE_MXFP8_E4M3><<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
@@ -820,16 +820,18 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_iq4_xs_cuda;
         case GGML_TYPE_IQ3_S:
             return dequantize_row_iq3_s_cuda;
-        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP4_E2M1:
             return dequantize_row_mxfp4_cuda;
-        case GGML_TYPE_MXFP8:
+        case GGML_TYPE_MXFP8_E4M3:
             return dequantize_row_mxfp8_cuda;
         case GGML_TYPE_MXFP6_E2M3:
             return dequantize_row_mxfp6_e2m3_cuda;
+#ifdef GGML_CUDA_MXFP_ALL_VARIANTS
         case GGML_TYPE_MXFP6_E3M2:
             return dequantize_row_mxfp6_e3m2_cuda;
         case GGML_TYPE_MXFP8_E5M2:
             return dequantize_row_mxfp8_e5m2_cuda;
+#endif
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -879,16 +881,18 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_iq4_xs_cuda;
         case GGML_TYPE_IQ3_S:
             return dequantize_row_iq3_s_cuda;
-        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP4_E2M1:
             return dequantize_row_mxfp4_cuda;
-        case GGML_TYPE_MXFP8:
+        case GGML_TYPE_MXFP8_E4M3:
             return dequantize_row_mxfp8_cuda;
         case GGML_TYPE_MXFP6_E2M3:
             return dequantize_row_mxfp6_e2m3_cuda;
+#ifdef GGML_CUDA_MXFP_ALL_VARIANTS
         case GGML_TYPE_MXFP6_E3M2:
             return dequantize_row_mxfp6_e3m2_cuda;
         case GGML_TYPE_MXFP8_E5M2:
             return dequantize_row_mxfp8_e5m2_cuda;
+#endif
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
@@ -912,7 +916,7 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
-        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP4_E2M1:
             return dequantize_block_cuda<QK_MXFP4, QR_MXFP4, dequantize_mxfp4>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
@@ -935,7 +939,7 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
-        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP4_E2M1:
             return dequantize_block_cuda<QK_MXFP4, QR_MXFP4, dequantize_mxfp4>;
         case GGML_TYPE_F16:
             return convert_unary_cuda<half, nv_bfloat16>;

@@ -1,12 +1,12 @@
-// Block-32 Walsh-Hadamard Transform for MXFP4 KV cache quantization.
-// Spreads outlier energy across all block elements, improving E8M0 scale fit.
-
 #pragma once
+
+// Block-32 Walsh-Hadamard Transform for MXFP KV cache quantization.
+// Spreads outlier energy across all block elements, improving E8M0 scale fit.
 
 static constexpr float HADAMARD_32_NORM = 0.17677669529663689f; // 1/sqrt(32)
 
 // Single-thread in-place Hadamard transform over 32 values.
-__device__ __forceinline__ void hadamard_32_inplace(float vals[32]) {
+static __device__ __forceinline__ void hadamard_32_inplace(float vals[32]) {
 #pragma unroll
     for (int stride = 1; stride < 32; stride *= 2) {
 #pragma unroll
@@ -28,7 +28,7 @@ __device__ __forceinline__ void hadamard_32_inplace(float vals[32]) {
 
 // Distributed Hadamard transform: 8 threads each hold 4 of 32 elements.
 // Stages 1-2 are intra-thread butterflies, stages 3-5 use __shfl_xor_sync.
-__device__ __forceinline__ void hadamard_32_q8_1(float vals[4], const int lane) {
+static __device__ __forceinline__ void hadamard_32_q8_1(float vals[4], const int lane) {
     {
         const float a0 = vals[0], b0 = vals[1];
         const float a1 = vals[2], b1 = vals[3];

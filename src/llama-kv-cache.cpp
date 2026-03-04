@@ -14,7 +14,7 @@
 #include <stdexcept>
 
 static inline bool ggml_is_type_mxfp(ggml_type type) {
-    return type == GGML_TYPE_MXFP4 || type == GGML_TYPE_MXFP8 ||
+    return type == GGML_TYPE_MXFP4_E2M1 || type == GGML_TYPE_MXFP8_E4M3 ||
            type == GGML_TYPE_MXFP6_E2M3 || type == GGML_TYPE_MXFP6_E3M2 ||
            type == GGML_TYPE_MXFP8_E5M2;
 }
@@ -1042,7 +1042,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * k = layers[ikv].k;
 
-    // For MXFP4/MXFP8: k->ne[0] may include alignment padding (blocks aligned to 16).
+    // For MXFP types: k->ne[0] may include alignment padding (blocks aligned to 16).
     // The row stride (k->nb[1]) reflects the padded allocation.
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
@@ -1112,7 +1112,7 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
         assert(kv_size == k->ne[1]);
 
         // merge the buffer across all streams because the idxs are global
-        // Use view_2d to preserve nb[1] (which includes alignment padding for MXFP4/MXFP8)
+        // Use view_2d to preserve nb[1] (which includes alignment padding for MXFP types)
         k = ggml_view_2d(ctx, k, k->ne[0], kv_size*n_stream, k->nb[1], 0);
     }
 
