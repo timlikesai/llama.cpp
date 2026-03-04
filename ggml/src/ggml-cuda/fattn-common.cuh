@@ -588,25 +588,10 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
-// Per-element dequantization helpers for MXFP VEC kernels.
+// Per-element dequantization for MXFP VEC kernels — delegates to mxfp_traits::dequant_elem.
 template<ggml_type type>
-static __device__ __forceinline__ float mxfp_elem_to_float(uint8_t raw);
-
-template<> __device__ __forceinline__ float mxfp_elem_to_float<GGML_TYPE_MXFP8_E4M3>(uint8_t raw) {
-    const __nv_fp8_e4m3 v = *reinterpret_cast<const __nv_fp8_e4m3 *>(&raw);
-    return float(v);
-}
-template<> __device__ __forceinline__ float mxfp_elem_to_float<GGML_TYPE_MXFP8_E5M2>(uint8_t raw) {
-    const __nv_fp8_e5m2 v = *reinterpret_cast<const __nv_fp8_e5m2 *>(&raw);
-    return float(v);
-}
-template<> __device__ __forceinline__ float mxfp_elem_to_float<GGML_TYPE_MXFP6_E2M3>(uint8_t raw) {
-    const __half_raw h = __nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)raw, __NV_E2M3);
-    return __half2float(*reinterpret_cast<const __half *>(&h));
-}
-template<> __device__ __forceinline__ float mxfp_elem_to_float<GGML_TYPE_MXFP6_E3M2>(uint8_t raw) {
-    const __half_raw h = __nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)raw, __NV_E3M2);
-    return __half2float(*reinterpret_cast<const __half *>(&h));
+static __device__ __forceinline__ float mxfp_elem_to_float(uint8_t raw) {
+    return mxfp_traits<type>::dequant_elem(raw);
 }
 
 // SoA MXFP4 K dot product for VEC kernel.

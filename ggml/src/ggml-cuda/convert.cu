@@ -651,14 +651,8 @@ static __global__ void dequantize_block_mxfp6_soa(const void * __restrict__ vx, 
     uint8_t vals[4];
     mxfp_detail::unpack_fp6x4(packed, vals);
 
-    if constexpr (mxfp6_type == GGML_TYPE_MXFP6_E2M3) {
-        for (int j = 0; j < 4; ++j) {
-            y[j] = d * mxfp_detail::fp6_e2m3_to_float(vals[j]);
-        }
-    } else {
-        for (int j = 0; j < 4; ++j) {
-            y[j] = d * mxfp_detail::fp6_e3m2_to_float(vals[j]);
-        }
+    for (int j = 0; j < 4; ++j) {
+        y[j] = d * mxfp_traits<mxfp6_type>::dequant_elem(vals[j]);
     }
 }
 
@@ -701,14 +695,7 @@ static __global__ void dequantize_block_mxfp8_soa(const void * __restrict__ vx, 
     dst_t * y = yy + i * QK_K + 32 * ib + 4 * il;
 
     for (int j = 0; j < 4; ++j) {
-        const uint8_t raw = qs[il * 4 + j];
-        if constexpr (mxfp8_type == GGML_TYPE_MXFP8_E4M3) {
-            const __nv_fp8_e4m3 v = *reinterpret_cast<const __nv_fp8_e4m3 *>(&raw);
-            y[j] = d * float(v);
-        } else {
-            const __nv_fp8_e5m2 v = *reinterpret_cast<const __nv_fp8_e5m2 *>(&raw);
-            y[j] = d * float(v);
-        }
+        y[j] = d * mxfp_traits<mxfp8_type>::dequant_elem(qs[il * 4 + j]);
     }
 }
 

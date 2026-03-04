@@ -575,51 +575,7 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
-void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_MXFP8 == 0);
-
-    const int nb = k / QK_MXFP8;
-
-    for (int i = 0; i < nb; i++) {
-        float amax = 0.0f;
-        for (int j = 0; j < QK_MXFP8; j++) {
-            if (amax < fabsf(x[i*QK_MXFP8 + j])) {
-                amax = fabsf(x[i*QK_MXFP8 + j]);
-            }
-        }
-
-        // E8M0 scale: 2^(e-127). FP8 E4M3 max = 448 ≈ 2^8.8.
-        // Want: amax <= 448 * 2^(e-127), so e ≈ floor(log2(amax)) - 8 + 127
-        int e_int = amax > 0.0f ? (int)(floorf(log2f(amax))) - 8 + 127 : 0;
-        if (e_int < 0) e_int = 0;
-        if (e_int > 254) e_int = 254;
-        const uint8_t e = (uint8_t)e_int;
-        const float d = GGML_E8M0_TO_FP32(e);
-        const float inv_d = d > 0.0f ? 1.0f / d : 0.0f;
-
-        y[i].e = e;
-
-        for (int j = 0; j < QK_MXFP8; ++j) {
-            y[i].qs[j] = float_to_fp8_e4m3_rn(x[i*QK_MXFP8 + j] * inv_d);
-        }
-    }
-}
-
-void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_MXFP8 == 0);
-
-    const int nb = k / QK_MXFP8;
-
-    for (int i = 0; i < nb; i++) {
-        const float d = GGML_E8M0_TO_FP32(x[i].e);
-
-        for (int j = 0; j < QK_MXFP8; ++j) {
-            y[i*QK_MXFP8 + j] = fp8_e4m3_to_float(x[i].qs[j]) * d;
-        }
-    }
-}
-
-// ── FP6 E2M3 conversion helpers ──────────────────────────────────────
+// FP6 E2M3 conversion helpers
 // E2M3: 1 sign, 2 exponent (bias 1), 3 mantissa. Max finite = 7.5
 static inline float fp6_e2m3_to_float(uint8_t v) {
     const float sign = (v & 0x20) ? -1.0f : 1.0f;
@@ -635,37 +591,35 @@ static inline uint8_t float_to_fp6_e2m3_rn(float x) {
     uint8_t sign = 0;
     if (x < 0) { sign = 0x20; x = -x; }
     if (x == 0) return sign;
-    // Max finite = 7.5 = (1 + 7/8) * 4
     if (x >= 7.5f) return sign | 0x1F;  // saturate to max
 
     int exp;
-    frexpf(x, &exp);  // we only need the exponent
-    exp -= 1;  // x = (1 + m) * 2^exp
+    frexpf(x, &exp);
+    exp -= 1;
 
     if (exp < 0) {
-        // Subnormal: val = mant * 2^(-3)
         float scaled = x * 8.0f;
         int mant = (int)(scaled + 0.5f);
         if (mant > 7) mant = 7;
         return sign | (uint8_t)mant;
     }
-    if (exp > 2) { exp = 2; }  // clamp
+    if (exp > 2) { exp = 2; }
 
     float mantf = (x / (float)(1 << exp)) - 1.0f;
     int mant = (int)(mantf * 8.0f + 0.5f);
     if (mant > 7) { mant = 0; exp++; }
-    if (exp > 2) return sign | 0x1F;  // saturate
+    if (exp > 2) return sign | 0x1F;
     return sign | (uint8_t)(((exp + 1) << 3) | mant);
 }
 
-// ── FP6 E3M2 conversion helpers ──────────────────────────────────────
+// FP6 E3M2 conversion helpers
 // E3M2: 1 sign, 3 exponent (bias 3), 2 mantissa. Max finite = 28.0
 static inline float fp6_e3m2_to_float(uint8_t v) {
     const float sign = (v & 0x20) ? -1.0f : 1.0f;
     const int exp  = (v >> 2) & 0x7;
     const int mant = v & 0x3;
     if (exp == 0) {
-        return sign * (float)mant * (1.0f / 4.0f);  // subnormal: mant * 2^(-2)  (implicit 2^(1-bias) * mant/4)
+        return sign * (float)mant * (1.0f / 4.0f);
     }
     if (exp == 7) {
         return (mant == 0) ? sign * INFINITY : NAN;
@@ -677,25 +631,21 @@ static inline uint8_t float_to_fp6_e3m2_rn(float x) {
     uint8_t sign = 0;
     if (x < 0) { sign = 0x20; x = -x; }
     if (x == 0) return sign;
-    // Max finite = 28.0 = (1 + 3/4) * 16
-    if (x >= 28.0f) return sign | 0x1E;  // saturate to max finite (exp=6, mant=2... actually max = exp=6,mant=3=28)
+    if (x >= 28.0f) return sign | 0x1E;  // saturate to max finite
 
     int exp;
-    frexpf(x, &exp);  // we only need the exponent
-    exp -= 1;  // x = (1 + m) * 2^exp
+    frexpf(x, &exp);
+    exp -= 1;
     int biased_exp = exp + 3;
 
     if (biased_exp <= 0) {
-        // Subnormal: val = mant * 2^(1-bias) / 4 = mant * 2^(-2) * 2^(-2) = mant/16
-        // Actually: subnormal = mant * 2^(1-bias) * 2^(-mant_bits) = 2^(-2) * mant/4 = mant/16
-        // Standard: 2^(1-bias) * (0.mant) = 2^(1-3) * mant/4 = mant/16
         float scaled = x * 16.0f;
         int mant = (int)(scaled + 0.5f);
         if (mant > 3) mant = 3;
         return sign | (uint8_t)mant;
     }
 
-    if (biased_exp >= 7) return sign | 0x1E;  // saturate (skip inf/nan)
+    if (biased_exp >= 7) return sign | 0x1E;
 
     float mantf = (x / (float)(1 << exp)) - 1.0f;
     int mant = (int)(mantf * 4.0f + 0.5f);
@@ -704,7 +654,7 @@ static inline uint8_t float_to_fp6_e3m2_rn(float x) {
     return sign | (uint8_t)((biased_exp << 2) | mant);
 }
 
-// ── FP8 E5M2 conversion helpers ──────────────────────────────────────
+// FP8 E5M2 conversion helpers
 // E5M2: 1 sign, 5 exponent (bias 15), 2 mantissa. Max finite = 57344
 static inline float fp8_e5m2_to_float(uint8_t v) {
     const uint32_t sign = ((uint32_t)(v & 0x80)) << 24;
@@ -716,14 +666,13 @@ static inline float fp8_e5m2_to_float(uint8_t v) {
         if (mant == 0) {
             bits = sign;
         } else {
-            float val = (float)mant * (1.0f / 4.0f) * (1.0f / 16384.0f);  // 2^(-16) * mant
+            float val = (float)mant * (1.0f / 4.0f) * (1.0f / 16384.0f);
             memcpy(&bits, &val, sizeof(bits));
             bits = (bits & 0x7FFFFFFF) | sign;
         }
     } else if (exp == 31) {
-        bits = sign | 0x7F800000 | (mant ? 0x400000 : 0);  // inf or nan
+        bits = sign | 0x7F800000 | (mant ? 0x400000 : 0);
     } else {
-        // Normal: fp32_exp = exp + 112 (127 - 15), mant shifted 21 bits
         bits = sign | ((exp + 112) << 23) | (mant << 21);
     }
 
@@ -746,7 +695,6 @@ static inline uint8_t float_to_fp8_e5m2_rn(float x) {
     int e5m2_exp = (int)f32_exp - 112;
 
     if (e5m2_exp < 0) {
-        // Subnormal in E5M2
         const int shift = 1 - e5m2_exp;
         const uint32_t full_mant = (1 << 23) | f32_mant;
         const int total_shift = 21 + shift;
@@ -770,12 +718,11 @@ static inline uint8_t float_to_fp8_e5m2_rn(float x) {
         if (mant2 > 3) { mant2 = 0; e5m2_exp++; }
     }
 
-    // Saturate to max finite (exp=30, mant=3)
     if (e5m2_exp >= 31) return sign | 0x7B;
     return sign | (uint8_t)((e5m2_exp << 2) | mant2);
 }
 
-// ── FP6 tight packing: 4 six-bit values <-> 3 bytes ─────────────────
+// FP6 tight packing: 4 six-bit values <-> 3 bytes
 static inline void pack_fp6x4(const uint8_t v[4], uint8_t out[3]) {
     uint32_t packed = (v[0] & 0x3F) | ((v[1] & 0x3F) << 6) | ((v[2] & 0x3F) << 12) | ((v[3] & 0x3F) << 18);
     out[0] = (uint8_t)(packed);
@@ -791,141 +738,134 @@ static inline void unpack_fp6x4(const uint8_t in[3], uint8_t v[4]) {
     v[3] = (packed >> 18) & 0x3F;
 }
 
-void quantize_row_mxfp6_e2m3_ref(const float * GGML_RESTRICT x, block_mxfp6 * GGML_RESTRICT y, int64_t k) {
+// MXFP element traits: per-format converter functions and E8M0 exponent offset.
+// Shared by quantize/dequantize impl functions to eliminate per-variant duplication.
+typedef struct {
+    int      emax_offset;
+    uint8_t  (*to_elem)(float);
+    float    (*to_float)(uint8_t);
+} mxfp_elem_traits_t;
+
+static const mxfp_elem_traits_t mxfp8_e4m3_traits = { 8,  float_to_fp8_e4m3_rn, fp8_e4m3_to_float };
+static const mxfp_elem_traits_t mxfp8_e5m2_traits = { 16, float_to_fp8_e5m2_rn, fp8_e5m2_to_float };
+static const mxfp_elem_traits_t mxfp6_e2m3_traits = { 3,  float_to_fp6_e2m3_rn, fp6_e2m3_to_float };
+static const mxfp_elem_traits_t mxfp6_e3m2_traits = { 5,  float_to_fp6_e3m2_rn, fp6_e3m2_to_float };
+
+// Compute E8M0 shared scale for a block: e = clamp(floor(log2(amax)) - offset + 127, 0, 254)
+static inline uint8_t mxfp_compute_e8m0(const float * x, int qk, int emax_offset) {
+    float amax = 0.0f;
+    for (int j = 0; j < qk; j++) {
+        if (amax < fabsf(x[j])) amax = fabsf(x[j]);
+    }
+    if (amax == 0.0f) return 0;
+    int e_int = (int)(floorf(log2f(amax))) - emax_offset + 127;
+    if (e_int < 0)   return 0;
+    if (e_int > 254) return 254;
+    return (uint8_t)e_int;
+}
+
+// FP8 quantize/dequantize: byte-per-element, shared by E4M3 and E5M2
+static void quantize_row_mxfp8_impl(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y,
+                                     int64_t k, const mxfp_elem_traits_t * traits) {
+    assert(k % QK_MXFP8 == 0);
+    const int nb = k / QK_MXFP8;
+
+    for (int i = 0; i < nb; i++) {
+        const uint8_t e = mxfp_compute_e8m0(&x[i*QK_MXFP8], QK_MXFP8, traits->emax_offset);
+        const float d = GGML_E8M0_TO_FP32(e);
+        const float inv_d = d > 0.0f ? 1.0f / d : 0.0f;
+        y[i].e = e;
+
+        for (int j = 0; j < QK_MXFP8; ++j) {
+            y[i].qs[j] = traits->to_elem(x[i*QK_MXFP8 + j] * inv_d);
+        }
+    }
+}
+
+static void dequantize_row_mxfp8_impl(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y,
+                                       int64_t k, const mxfp_elem_traits_t * traits) {
+    assert(k % QK_MXFP8 == 0);
+    const int nb = k / QK_MXFP8;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_E8M0_TO_FP32(x[i].e);
+        for (int j = 0; j < QK_MXFP8; ++j) {
+            y[i*QK_MXFP8 + j] = traits->to_float(x[i].qs[j]) * d;
+        }
+    }
+}
+
+// FP6 quantize/dequantize: tight 6-bit packing (4 values per 3 bytes), shared by E2M3 and E3M2
+static void quantize_row_mxfp6_impl(const float * GGML_RESTRICT x, block_mxfp6 * GGML_RESTRICT y,
+                                     int64_t k, const mxfp_elem_traits_t * traits) {
     assert(k % QK_MXFP6 == 0);
     const int nb = k / QK_MXFP6;
 
     for (int i = 0; i < nb; i++) {
-        float amax = 0.0f;
-        for (int j = 0; j < QK_MXFP6; j++) {
-            if (amax < fabsf(x[i*QK_MXFP6 + j])) {
-                amax = fabsf(x[i*QK_MXFP6 + j]);
-            }
-        }
-        // E8M0 scale: 2^(e-127). E2M3 max = 7.5 ≈ 2^2.9, so offset = ceil(log2(7.5)) = 3
-        int e_int = amax > 0.0f ? (int)(floorf(log2f(amax))) - 3 + 127 : 0;
-        if (e_int < 0) e_int = 0;
-        if (e_int > 254) e_int = 254;
-        const uint8_t e = (uint8_t)e_int;
+        const uint8_t e = mxfp_compute_e8m0(&x[i*QK_MXFP6], QK_MXFP6, traits->emax_offset);
         const float d = GGML_E8M0_TO_FP32(e);
         const float inv_d = d > 0.0f ? 1.0f / d : 0.0f;
-
         y[i].e = e;
 
-        // Quantize 32 elements into 6-bit values, packed 4 per 3 bytes
         for (int j = 0; j < QK_MXFP6; j += 4) {
             uint8_t vals[4];
             for (int jj = 0; jj < 4; jj++) {
-                vals[jj] = float_to_fp6_e2m3_rn(x[i*QK_MXFP6 + j + jj] * inv_d);
+                vals[jj] = traits->to_elem(x[i*QK_MXFP6 + j + jj] * inv_d);
             }
             pack_fp6x4(vals, &y[i].qs[j * 3 / 4]);
         }
     }
+}
+
+static void dequantize_row_mxfp6_impl(const block_mxfp6 * GGML_RESTRICT x, float * GGML_RESTRICT y,
+                                       int64_t k, const mxfp_elem_traits_t * traits) {
+    assert(k % QK_MXFP6 == 0);
+    const int nb = k / QK_MXFP6;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_E8M0_TO_FP32(x[i].e);
+        for (int j = 0; j < QK_MXFP6; j += 4) {
+            uint8_t vals[4];
+            unpack_fp6x4(&x[i].qs[j * 3 / 4], vals);
+            for (int jj = 0; jj < 4; jj++) {
+                y[i*QK_MXFP6 + j + jj] = traits->to_float(vals[jj]) * d;
+            }
+        }
+    }
+}
+
+// Public API wrappers — one-line delegates to the traits-parameterized impl
+
+void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp8_impl(x, y, k, &mxfp8_e4m3_traits);
+}
+
+void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_mxfp8_impl(x, y, k, &mxfp8_e4m3_traits);
+}
+
+void quantize_row_mxfp6_e2m3_ref(const float * GGML_RESTRICT x, block_mxfp6 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp6_impl(x, y, k, &mxfp6_e2m3_traits);
 }
 
 void dequantize_row_mxfp6_e2m3(const block_mxfp6 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_MXFP6 == 0);
-    const int nb = k / QK_MXFP6;
-
-    for (int i = 0; i < nb; i++) {
-        const float d = GGML_E8M0_TO_FP32(x[i].e);
-
-        for (int j = 0; j < QK_MXFP6; j += 4) {
-            uint8_t vals[4];
-            unpack_fp6x4(&x[i].qs[j * 3 / 4], vals);
-            for (int jj = 0; jj < 4; jj++) {
-                y[i*QK_MXFP6 + j + jj] = fp6_e2m3_to_float(vals[jj]) * d;
-            }
-        }
-    }
+    dequantize_row_mxfp6_impl(x, y, k, &mxfp6_e2m3_traits);
 }
 
 void quantize_row_mxfp6_e3m2_ref(const float * GGML_RESTRICT x, block_mxfp6 * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_MXFP6 == 0);
-    const int nb = k / QK_MXFP6;
-
-    for (int i = 0; i < nb; i++) {
-        float amax = 0.0f;
-        for (int j = 0; j < QK_MXFP6; j++) {
-            if (amax < fabsf(x[i*QK_MXFP6 + j])) {
-                amax = fabsf(x[i*QK_MXFP6 + j]);
-            }
-        }
-        // E3M2 max = 28.0 ≈ 2^4.8, offset = ceil(log2(28)) = 5
-        int e_int = amax > 0.0f ? (int)(floorf(log2f(amax))) - 5 + 127 : 0;
-        if (e_int < 0) e_int = 0;
-        if (e_int > 254) e_int = 254;
-        const uint8_t e = (uint8_t)e_int;
-        const float d = GGML_E8M0_TO_FP32(e);
-        const float inv_d = d > 0.0f ? 1.0f / d : 0.0f;
-
-        y[i].e = e;
-
-        for (int j = 0; j < QK_MXFP6; j += 4) {
-            uint8_t vals[4];
-            for (int jj = 0; jj < 4; jj++) {
-                vals[jj] = float_to_fp6_e3m2_rn(x[i*QK_MXFP6 + j + jj] * inv_d);
-            }
-            pack_fp6x4(vals, &y[i].qs[j * 3 / 4]);
-        }
-    }
+    quantize_row_mxfp6_impl(x, y, k, &mxfp6_e3m2_traits);
 }
 
 void dequantize_row_mxfp6_e3m2(const block_mxfp6 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_MXFP6 == 0);
-    const int nb = k / QK_MXFP6;
-
-    for (int i = 0; i < nb; i++) {
-        const float d = GGML_E8M0_TO_FP32(x[i].e);
-
-        for (int j = 0; j < QK_MXFP6; j += 4) {
-            uint8_t vals[4];
-            unpack_fp6x4(&x[i].qs[j * 3 / 4], vals);
-            for (int jj = 0; jj < 4; jj++) {
-                y[i*QK_MXFP6 + j + jj] = fp6_e3m2_to_float(vals[jj]) * d;
-            }
-        }
-    }
+    dequantize_row_mxfp6_impl(x, y, k, &mxfp6_e3m2_traits);
 }
 
 void quantize_row_mxfp8_e5m2_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_MXFP8 == 0);
-    const int nb = k / QK_MXFP8;
-
-    for (int i = 0; i < nb; i++) {
-        float amax = 0.0f;
-        for (int j = 0; j < QK_MXFP8; j++) {
-            if (amax < fabsf(x[i*QK_MXFP8 + j])) {
-                amax = fabsf(x[i*QK_MXFP8 + j]);
-            }
-        }
-        // E5M2 max = 57344 ≈ 2^15.8, offset = ceil(log2(57344)) = 16
-        int e_int = amax > 0.0f ? (int)(floorf(log2f(amax))) - 16 + 127 : 0;
-        if (e_int < 0) e_int = 0;
-        if (e_int > 254) e_int = 254;
-        const uint8_t e = (uint8_t)e_int;
-        const float d = GGML_E8M0_TO_FP32(e);
-        const float inv_d = d > 0.0f ? 1.0f / d : 0.0f;
-
-        y[i].e = e;
-
-        for (int j = 0; j < QK_MXFP8; ++j) {
-            y[i].qs[j] = float_to_fp8_e5m2_rn(x[i*QK_MXFP8 + j] * inv_d);
-        }
-    }
+    quantize_row_mxfp8_impl(x, y, k, &mxfp8_e5m2_traits);
 }
 
 void dequantize_row_mxfp8_e5m2(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_MXFP8 == 0);
-    const int nb = k / QK_MXFP8;
-
-    for (int i = 0; i < nb; i++) {
-        const float d = GGML_E8M0_TO_FP32(x[i].e);
-
-        for (int j = 0; j < QK_MXFP8; ++j) {
-            y[i*QK_MXFP8 + j] = fp8_e5m2_to_float(x[i].qs[j]) * d;
-        }
-    }
+    dequantize_row_mxfp8_impl(x, y, k, &mxfp8_e5m2_traits);
 }
 
 //
