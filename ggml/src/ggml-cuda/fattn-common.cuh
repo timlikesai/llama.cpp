@@ -307,7 +307,7 @@ static __device__ __forceinline__ void quantize_q8_1_to_shared(
 // Applies a block-32 Walsh-Hadamard rotation to Q before Q8_1 quantization so that
 // Q_rot . K_rot^T = Q . K^T (orthogonality) when K is stored Hadamard-rotated in the cache.
 // Thread mapping: 8 threads (QI8_1) x 4 values = 32 elements = one MXFP block.
-// Ref: BRQ (arxiv 2511.04214), MR-GPTQ (arxiv 2509.23202).
+// Ref: BRQ (arXiv:2511.04214), Bridging the Gap (arXiv:2509.23202), FlashAttention-3 (arXiv:2407.08608).
 template <typename Tds, int ni>
 static __device__ __forceinline__ void quantize_q8_1_hadamard_to_shared(
     const float * __restrict__ x, const float scale, int * __restrict__ yq32, void * __restrict__ yds) {

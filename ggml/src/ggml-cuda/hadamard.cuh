@@ -2,6 +2,11 @@
 
 // Block-32 Walsh-Hadamard Transform for MXFP KV cache quantization.
 // Spreads outlier energy across all block elements, improving E8M0 scale fit.
+//
+// References:
+//   Ashkboos et al., "QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs", arXiv:2404.00456
+//   Zhang et al., "Block Rotation is All You Need for MXFP4 Quantization", arXiv:2511.04214
+//   Dao et al., "FlashAttention-3", arXiv:2407.08608 (incoherent processing for FP8 attention)
 
 static constexpr float HADAMARD_32_NORM = 0.17677669529663689f; // 1/sqrt(32)
 

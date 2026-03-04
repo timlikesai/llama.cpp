@@ -11,7 +11,26 @@
 //     Building on: Schraudolph 1999, "A Fast, Compact Approximation of the Exponential Function"
 //   - Walsh-Hadamard KV cache rotation:
 //     Ashkboos et al., "QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs", arXiv:2404.00456
-//     Zhang et al., "Block Rounded Quantization", arXiv:2511.04214 (block-32 optimal for MX)
+//     Zhang et al., "Block Rotation is All You Need for MXFP4 Quantization", arXiv:2511.04214
+//       (block-32 Hadamard matching MX block size; global rotation hurts MXFP4 due to PoT E8M0)
+//     Dao et al., "FlashAttention-3: Fast and Accurate Attention with Asynchrony
+//       and Low-precision", arXiv:2407.08608 (incoherent processing with Hadamard for FP8 attention)
+//   - KV cache quantization:
+//     Liu et al., "KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache", arXiv:2402.02750
+//       (per-channel K, per-token V — foundational asymmetric KV quantization)
+//     Li et al., "KVTuner: Sensitivity-Aware Mixed-Precision KV Cache", arXiv:2502.04420
+//       (theoretical analysis: K quantization errors more damaging than V; supports mixed K/V precision)
+//     Saxena et al., "KVLinC: KV Cache Quantization with Hadamard Rotation", arXiv:2510.05373
+//   - E8M0 scale and block formats:
+//     Kim et al., "Bridging the Gap for Microscaling FP4 Quantization", arXiv:2509.23202
+//       (outlier amplification and group asymmetry as root causes of MXFP4 degradation)
+//     INT vs FP: Park et al., "Comprehensive Study of Fine-Grained Quantization", arXiv:2510.25602
+//       (MXFP6 as accuracy sweet spot; MXINT8 outperforms MXFP8 at 8-bit without rotation)
+//   - MLA attention:
+//     Liu et al., "SnapMLA: Efficient Long-Context MLA Decoding", arXiv:2602.10718
+//       (RoPE-aware per-token KV quantization; V scale fusion into P matrix for MLA)
+//   - SageAttention3: Jia et al., "Microscaling FP4 Attention on Blackwell", arXiv:2505.11594
+//       (NeurIPS 2025 Spotlight; FP4 QKV quantization inside attention, 5x over FlashAttention-3)
 
 #include "common.cuh"
 #include "cp-async.cuh"
@@ -750,6 +769,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
 
         // Walsh-Hadamard rotation to match K-side rotation (QuaRot, arXiv:2404.00456).
         // Block-32 matches MX block size for optimal quantization (BRQ, arXiv:2511.04214).
+        // FlashAttention-3 independently validates this approach for FP8 (arXiv:2407.08608).
         if constexpr (apply_hadamard) {
             hadamard_32_inplace(vals);
         }
@@ -1222,6 +1242,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_process_tile(
     KQ_max[1] = -FLT_MAX / 2.0f;
 
     // MLA: V is a view of K, so K is not Hadamard-rotated (would corrupt V). Skip Q rotation too.
+    // Future: full Hadamard with output un-rotation (SnapMLA, arXiv:2602.10718) could recover quality.
     constexpr bool apply_hadamard = (DKQ == DV);
     flash_attn_ext_mxfp_quantize_Q<mxfp_type, DKQ, ncols, nwarps, stride_q_qs, stride_q_sc, apply_hadamard>
         (Q_f2, tile_Q_qs, tile_Q_sc, scale, stride_Q1, stride_Q2, ncols1, ncols2, jt, zt_gqa, gqa_ratio, ne01);

@@ -8,6 +8,10 @@
 // ------------------------------------------------------------------------------------------------------------------
 // Single source of truth for all MX (Microscaling) format parameters.
 // Adding a new MX variant = one new specialization.
+//
+// E8M0 scale computation: integer bit extraction with sqrt(2) rounding for MSE-optimal
+// power-of-two scale selection (Bridging the Gap, arXiv:2509.23202; Four Over Six, arXiv:2512.02010).
+// Block-32 matches OCP MX spec (arXiv:2310.10537) and BRQ rotation alignment (arXiv:2511.04214).
 // All MX formats share: QK=32 (block size), E8M0 shared exponent.
 
 template<ggml_type type> struct mxfp_traits;

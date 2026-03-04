@@ -1128,11 +1128,12 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     // store the current K values into the cache
     ggml_tensor * result = ggml_set_rows(ctx, k_dst, k_cur, k_idxs);
 
-    // Flag K cache writes for Walsh-Hadamard rotation.
+    // Flag K cache writes for Walsh-Hadamard rotation (QuaRot, arXiv:2404.00456; BRQ, arXiv:2511.04214).
     // The flash attention kernel applies matching rotation to Q so H(Q)·H(K)^T = Q·K^T.
     // V cache writes are NOT rotated (op_params[0] defaults to 0).
     // MLA exception: V is a view of K, so rotating K would also rotate V.
     // Since V is not un-rotated in the attention output, skip Hadamard for MLA.
+    // See SnapMLA (arXiv:2602.10718) for RoPE-aware quantization as a future alternative.
     if (is_mxfp && !hparams.is_mla()) {
         ((int32_t *)result->op_params)[0] = 1;
     }

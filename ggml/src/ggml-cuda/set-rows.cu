@@ -110,6 +110,8 @@ static void set_rows_cuda_quant(
 }
 
 // Unified MXFP SoA set_rows — works for any MX format via mxfp_traits.
+// When apply_hadamard=true, applies block-32 Walsh-Hadamard rotation before quantization
+// (QuaRot, arXiv:2404.00456; BRQ, arXiv:2511.04214; FlashAttention-3, arXiv:2407.08608).
 template <ggml_type mxfp_type, typename idx_t, bool apply_hadamard>
 static __global__ void k_set_rows_mxfp_soa(
         const float * __restrict__ src0,
