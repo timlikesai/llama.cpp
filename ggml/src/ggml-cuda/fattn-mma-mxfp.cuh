@@ -600,18 +600,8 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_load_V_mxfp6_f16(
                 const uint8_t e_val = *(row_t + V_e_head_off + i0_start / 32 + blk_idx);
                 const float scale = ggml_cuda_e8m0_to_fp32(e_val);
 
-                float f0, f1;
-                if constexpr (v_mxfp6_type == GGML_TYPE_MXFP6_E2M3) {
-                    const __half_raw h0 = __nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)v0_fp6, __NV_E2M3);
-                    const __half_raw h1 = __nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)v1_fp6, __NV_E2M3);
-                    f0 = __half2float(*reinterpret_cast<const __half *>(&h0)) * scale;
-                    f1 = __half2float(*reinterpret_cast<const __half *>(&h1)) * scale;
-                } else {
-                    const __half_raw h0 = __nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)v0_fp6, __NV_E3M2);
-                    const __half_raw h1 = __nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)v1_fp6, __NV_E3M2);
-                    f0 = __half2float(*reinterpret_cast<const __half *>(&h0)) * scale;
-                    f1 = __half2float(*reinterpret_cast<const __half *>(&h1)) * scale;
-                }
+                const float f0 = mxfp_traits<v_mxfp6_type>::dequant_elem(v0_fp6) * scale;
+                const float f1 = mxfp_traits<v_mxfp6_type>::dequant_elem(v1_fp6) * scale;
                 val = make_half2(__float2half(f0), __float2half(f1));
             }
             tile_V[t * stride_tile_V + d_h2] = val;
@@ -814,11 +804,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
                     uint8_t fp6_vals[4];
 #pragma unroll
                     for (int v = 0; v < 4; ++v) {
-                        if constexpr (mxfp_type == GGML_TYPE_MXFP6_E2M3) {
-                            fp6_vals[v] = (uint8_t)__nv_cvt_float_to_fp6(vals[4 * i + v] * inv_d, __NV_E2M3, cudaRoundNearest);
-                        } else {
-                            fp6_vals[v] = (uint8_t)__nv_cvt_float_to_fp6(vals[4 * i + v] * inv_d, __NV_E3M2, cudaRoundNearest);
-                        }
+                        fp6_vals[v] = mxfp_traits<mxfp_type>::quantize_elem(vals[4 * i + v] * inv_d);
                     }
                     uint32_t packed = (fp6_vals[0] & 0x3F) | ((fp6_vals[1] & 0x3F) << 8) |
                                       ((fp6_vals[2] & 0x3F) << 16) | ((fp6_vals[3] & 0x3F) << 24);
@@ -839,11 +825,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
                     uint8_t fp8_bytes[4];
 #pragma unroll
                     for (int v = 0; v < 4; ++v) {
-                        if constexpr (mxfp_type == GGML_TYPE_MXFP8_E5M2) {
-                            fp8_bytes[v] = __nv_cvt_float_to_fp8(vals[4 * i + v] * inv_d, __NV_SATFINITE, __NV_E5M2);
-                        } else {
-                            fp8_bytes[v] = __nv_cvt_float_to_fp8(vals[4 * i + v] * inv_d, __NV_SATFINITE, __NV_E4M3);
-                        }
+                        fp8_bytes[v] = mxfp_traits<mxfp_type>::quantize_elem(vals[4 * i + v] * inv_d);
                     }
                     tile_Q_qs[jc * stride_q_qs + int_idx] = *reinterpret_cast<uint32_t *>(fp8_bytes);
                 }

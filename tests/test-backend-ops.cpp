@@ -49,6 +49,12 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+static inline bool ggml_is_type_mxfp(ggml_type type) {
+    return type == GGML_TYPE_MXFP4_E2M1 || type == GGML_TYPE_MXFP6_E2M3 ||
+           type == GGML_TYPE_MXFP6_E3M2 || type == GGML_TYPE_MXFP8_E4M3 ||
+           type == GGML_TYPE_MXFP8_E5M2;
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
@@ -3932,6 +3938,7 @@ struct test_mul_mat_id : public test_case {
         return 5e-4;
     }
 
+    // Same Blackwell FP4 tolerance as test_mul_mat above.
     double max_nmse_err(ggml_backend_t backend) override {
         // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
         if (type_a == GGML_TYPE_MXFP4_E2M1 && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
@@ -8607,10 +8614,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         // Non-F16 types: test at D=64, D=72, and D=128.
                                                         if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72 && hsk != 128) continue;
                                                         // MXFP types require D % 32 == 0, skip D=72.
-                                                        if (ggml_is_quantized(type_KV) && hsk == 72 &&
-                                                                (type_KV == GGML_TYPE_MXFP4_E2M1 || type_KV == GGML_TYPE_MXFP8_E4M3 ||
-                                                                 type_KV == GGML_TYPE_MXFP6_E2M3 || type_KV == GGML_TYPE_MXFP6_E3M2 ||
-                                                                 type_KV == GGML_TYPE_MXFP8_E5M2)) continue;
+                                                        if (ggml_is_type_mxfp(type_KV) && hsk == 72) continue;
                                                         test_cases.emplace_back(new test_flash_attn_ext(
                                                                     hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV));
                                                         // run fewer test cases permuted

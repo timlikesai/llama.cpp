@@ -618,97 +618,76 @@ static void dequantize_row_mxfp4_cuda(const void * vx, dst_t * y, const int64_t 
     dequantize_block_mxfp4<<<nb, 32, 0, stream>>>(vx, y);
 }
 
-// SoA dequantization for MXFP6 (E2M3 and E3M2):
-// SoA layout per row: [all_qs_blocks | all_e8m0_bytes]
-// Each block: 24 bytes qs (32 six-bit values packed) + 1 byte e8m0
+// Unified SoA dequantization for MXFP6 and MXFP8 formats.
+// SoA layout: [qs_block_0 ... qs_block_N | e8m0_0 ... e8m0_N]
+// Handles FP6 (E2M3, E3M2) and FP8 (E4M3, E5M2) via if constexpr on bits_per_elem.
 
-template<ggml_type mxfp6_type, typename dst_t>
-static __global__ void dequantize_block_mxfp6_soa(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    constexpr int qs_per_block = 24;  // 32 * 6 / 8
+template<ggml_type mxfp_type, typename dst_t>
+static __global__ void dequantize_block_mxfp_soa(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    using traits = mxfp_traits<mxfp_type>;
+    constexpr int qs_per_block = traits::qs_per_block;
+    constexpr int QK = 32;
 
     const int64_t i   = blockIdx.x;   // super-block index (QK_K=256 elements each)
     const int64_t tid = threadIdx.x;  // 0..31
     // 8 blocks of 32 elements per super-block
     const int64_t ib = tid % 8;       // block within super-block
-    const int64_t il = tid / 8;       // group of 4 within block (0..3)
+    const int64_t il = tid / 8;       // element group within block (0..3), each group = 4 elements
 
-    const int64_t blocks_per_superblock = QK_K / QK_MXFP6;  // 8
+    constexpr int blocks_per_superblock = QK_K / QK;  // 8
     const int64_t block_idx = i * blocks_per_superblock + ib;
 
     const char * base = (const char *)vx;
     const int64_t total_superblocks = gridDim.x;
     const int64_t total_blocks = total_superblocks * blocks_per_superblock;
 
-    // SoA: qs at offset block_idx * qs_per_block, e8m0 at total_blocks * qs_per_block + block_idx
+    // SoA layout: [qs_block_0 ... qs_block_N | e8m0_0 ... e8m0_N]
     const uint8_t * qs = (const uint8_t *)(base + block_idx * qs_per_block);
     const uint8_t   e  = *((const uint8_t *)(base + total_blocks * qs_per_block + block_idx));
     const float     d  = ggml_cuda_e8m0_to_fp32(e);
 
     dst_t * y = yy + i * QK_K + 32 * ib + 4 * il;
 
-    // Unpack 4 six-bit values from 3 bytes at offset il*3
-    const uint8_t * packed = qs + il * 3;
-    uint8_t vals[4];
-    mxfp_detail::unpack_fp6x4(packed, vals);
+    if constexpr (traits::bits_per_elem == 6) {
+        // FP6: unpack 4 six-bit values from 3 packed bytes at offset il*3
+        const uint8_t * packed = qs + il * 3;
+        uint8_t vals[4];
+        mxfp_detail::unpack_fp6x4(packed, vals);
 
-    for (int j = 0; j < 4; ++j) {
-        y[j] = d * mxfp_traits<mxfp6_type>::dequant_elem(vals[j]);
+        for (int j = 0; j < 4; ++j) {
+            y[j] = d * traits::dequant_elem(vals[j]);
+        }
+    } else {
+        static_assert(traits::bits_per_elem == 8, "Only 6-bit and 8-bit MXFP SoA formats supported");
+        // FP8: load 4 bytes directly
+        for (int j = 0; j < 4; ++j) {
+            y[j] = d * traits::dequant_elem(qs[il * 4 + j]);
+        }
     }
 }
 
 template<typename dst_t>
 static void dequantize_row_mxfp6_e2m3_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_mxfp6_soa<GGML_TYPE_MXFP6_E2M3><<<nb, 32, 0, stream>>>(vx, y);
+    dequantize_block_mxfp_soa<GGML_TYPE_MXFP6_E2M3><<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_mxfp6_e3m2_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_mxfp6_soa<GGML_TYPE_MXFP6_E3M2><<<nb, 32, 0, stream>>>(vx, y);
-}
-
-// SoA dequantization for MXFP8 (E4M3 and E5M2):
-// SoA layout per row: [all_qs_blocks | all_e8m0_bytes]
-// Each block: 32 bytes qs (32 eight-bit values) + 1 byte e8m0
-
-template<ggml_type mxfp8_type, typename dst_t>
-static __global__ void dequantize_block_mxfp8_soa(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    constexpr int qs_per_block = 32;  // 32 * 8 / 8
-
-    const int64_t i   = blockIdx.x;   // super-block index (QK_K=256 elements each)
-    const int64_t tid = threadIdx.x;  // 0..31
-    const int64_t ib = tid % 8;       // block within super-block
-    const int64_t il = tid / 8;       // group of 4 within block (0..3)
-
-    const int64_t blocks_per_superblock = QK_K / QK_MXFP8;  // 8
-    const int64_t block_idx = i * blocks_per_superblock + ib;
-
-    const char * base = (const char *)vx;
-    const int64_t total_superblocks = gridDim.x;
-    const int64_t total_blocks = total_superblocks * blocks_per_superblock;
-
-    const uint8_t * qs = (const uint8_t *)(base + block_idx * qs_per_block);
-    const uint8_t   e  = *((const uint8_t *)(base + total_blocks * qs_per_block + block_idx));
-    const float     d  = ggml_cuda_e8m0_to_fp32(e);
-
-    dst_t * y = yy + i * QK_K + 32 * ib + 4 * il;
-
-    for (int j = 0; j < 4; ++j) {
-        y[j] = d * mxfp_traits<mxfp8_type>::dequant_elem(qs[il * 4 + j]);
-    }
+    dequantize_block_mxfp_soa<GGML_TYPE_MXFP6_E3M2><<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_mxfp8_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_mxfp8_soa<GGML_TYPE_MXFP8_E4M3><<<nb, 32, 0, stream>>>(vx, y);
+    dequantize_block_mxfp_soa<GGML_TYPE_MXFP8_E4M3><<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_mxfp8_e5m2_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_mxfp8_soa<GGML_TYPE_MXFP8_E5M2><<<nb, 32, 0, stream>>>(vx, y);
+    dequantize_block_mxfp_soa<GGML_TYPE_MXFP8_E5M2><<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template <typename src_t, typename dst_t>

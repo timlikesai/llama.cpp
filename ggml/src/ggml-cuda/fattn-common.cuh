@@ -673,89 +673,83 @@ static __device__ __forceinline__ void dequantize_V_mxfp4_soa(
     }
 }
 
-// SoA MXFP8 K dot product for VEC kernel. Single pass, no residual.
-// FP8 values dequantized to float, dot with Q int8. Works for E4M3 and E5M2.
-template <ggml_type mxfp_type, int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp8_soa(
-        const char * __restrict__ K_row, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
-        const int qs_head_off, const int e_head_off) {
-
-    static_assert(mxfp_type == GGML_TYPE_MXFP8_E4M3 || mxfp_type == GGML_TYPE_MXFP8_E5M2, "bad mxfp8 type");
-    float sum = 0.0f;
-
-#pragma unroll
-    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
-        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-
-        // 4 FP8 values = 4 bytes = 1 int. Each MXFP8 block has 32 bytes of qs.
-        const int ib  = (k_KQ * 4) / QK_MXFP8;  // block index
-        const int iqs = (k_KQ * 4) % QK_MXFP8;  // byte offset within block qs
-
-        // Load 4 FP8 bytes and Q int8×4.
-        const uint32_t fp8x4 = __ldg(reinterpret_cast<const uint32_t *>(K_row + qs_head_off + ib * QK_MXFP8 + iqs));
-        const int u = Q_q8[k_KQ_0/nthreads];
-        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
-
-        // E8M0 scale (no 0.5× — FP8 values are already proper floats).
-        const float e = ggml_cuda_e8m0_to_fp32(__ldg(reinterpret_cast<const uint8_t *>(K_row + e_head_off + ib)));
-
-        // Dequant FP8→float, dot with Q int8 values.
-        float dot = 0.0f;
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const uint8_t fp8_byte = (fp8x4 >> (i*8)) & 0xFF;
-            const int8_t q_val = reinterpret_cast<const int8_t *>(&u)[i];
-            dot += mxfp_elem_to_float<mxfp_type>(fp8_byte) * float(q_val);
-        }
-
-        sum += e * dot * Q_ds.x;
-    }
-
-    return sum;
+// Unpack 4 six-bit values from 3 packed bytes via __ldg byte loads.
+static __device__ __forceinline__ void mxfp_unpack_fp6x4_ldg(const uint8_t * p, uint8_t vals[4]) {
+    const uint32_t packed = (uint32_t)__ldg(p)
+                          | ((uint32_t)__ldg(p + 1) << 8)
+                          | ((uint32_t)__ldg(p + 2) << 16);
+    vals[0] =  packed        & 0x3F;
+    vals[1] = (packed >>  6) & 0x3F;
+    vals[2] = (packed >> 12) & 0x3F;
+    vals[3] = (packed >> 18) & 0x3F;
 }
 
-// SoA MXFP6 K dot product for VEC kernel. Unpacks 6-bit values, converts to float.
+// Load `ne` raw element bytes from SoA MXFP qs region.
+// Uses traits::bits_per_elem to select FP8 (aligned loads) or FP6 (6-bit unpack) path.
+template <ggml_type mxfp_type, int ne>
+static __device__ __forceinline__ void mxfp_load_elems(
+        const char * __restrict__ qs_row, int64_t ib, int elem_in_block, uint8_t vals[ne]) {
+    using traits = mxfp_traits<mxfp_type>;
+    constexpr int qpb = traits::qs_per_block;
+
+    if constexpr (traits::bits_per_elem == 8) {
+        // FP8: byte-per-element, use aligned loads.
+        const char * p = qs_row + ib * qpb + elem_in_block;
+        if constexpr (ne == 8) {
+            const int2 pair = __ldg(reinterpret_cast<const int2 *>(p));
+            *reinterpret_cast<int *>(vals)     = pair.x;
+            *reinterpret_cast<int *>(vals + 4) = pair.y;
+        } else if constexpr (ne == 4) {
+            *reinterpret_cast<int *>(vals) = __ldg(reinterpret_cast<const int *>(p));
+        } else {
+            *reinterpret_cast<uint16_t *>(vals) = __ldg(reinterpret_cast<const uint16_t *>(p));
+        }
+    } else if constexpr (traits::bits_per_elem == 6) {
+        // FP6: tight 6-bit packing. 4 values per 3 bytes. Byte loads avoid alignment issues.
+        const int byte_off = (elem_in_block >> 2) * 3;
+        const uint8_t * p = (const uint8_t *)(qs_row + ib * qpb + byte_off);
+        if constexpr (ne == 8) {
+            mxfp_unpack_fp6x4_ldg(p,     vals);
+            mxfp_unpack_fp6x4_ldg(p + 3, vals + 4);
+        } else if constexpr (ne == 4) {
+            mxfp_unpack_fp6x4_ldg(p, vals);
+        } else {
+            // ne == 2: read 12 bits from 2 bytes.
+            const uint16_t raw = (uint16_t)__ldg(p) | ((uint16_t)__ldg(p + 1) << 8);
+            vals[0] = raw & 0x3F;
+            vals[1] = (raw >> 6) & 0x3F;
+        }
+    }
+}
+
+// SoA MXFP K dot product for VEC kernel. Works for FP6 and FP8 (all 4 sub-types).
+// Per-element dequant to float, dot with Q int8.
 template <ggml_type mxfp_type, int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp6_soa(
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp_soa_impl(
         const char * __restrict__ K_row, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
         const int qs_head_off, const int e_head_off) {
 
-    static_assert(mxfp_type == GGML_TYPE_MXFP6_E2M3 || mxfp_type == GGML_TYPE_MXFP6_E3M2, "bad mxfp6 type");
+    static_assert(mxfp_traits<mxfp_type>::bits_per_elem == 6 || mxfp_traits<mxfp_type>::bits_per_elem == 8,
+                  "Use vec_dot_fattn_vec_KQ_mxfp4_soa for FP4");
     constexpr int QK = 32;
-    constexpr int qs_per_block = 24;  // 32 * 6 / 8
-
     float sum = 0.0f;
 
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
         const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
 
-        // Each iteration processes 4 Q int8 values = 4 K FP6 values = 3 bytes.
         const int elem_start = k_KQ * 4;
         const int ib = elem_start / QK;
         const int elem_in_block = elem_start % QK;
-        const int byte_in_block = (elem_in_block >> 2) * 3;  // elem_in_block is always a multiple of 4
 
-        // Load 3 packed FP6 bytes via __ldg (byte loads avoid alignment issues).
-        const char * qs_base = K_row + qs_head_off + ib * qs_per_block + byte_in_block;
-        const uint32_t packed = (uint32_t)__ldg((const uint8_t *)qs_base)
-                              | ((uint32_t)__ldg((const uint8_t *)qs_base + 1) << 8)
-                              | ((uint32_t)__ldg((const uint8_t *)qs_base + 2) << 16);
-
-        // Unpack 4 six-bit values directly from the uint32_t.
         uint8_t vals[4];
-        vals[0] =  packed        & 0x3F;
-        vals[1] = (packed >>  6) & 0x3F;
-        vals[2] = (packed >> 12) & 0x3F;
-        vals[3] = (packed >> 18) & 0x3F;
+        mxfp_load_elems<mxfp_type, 4>(K_row + qs_head_off, ib, elem_in_block, vals);
 
         const int u = Q_q8[k_KQ_0/nthreads];
         const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
 
-        // E8M0 scale (no extra factor for FP6).
         const float e = ggml_cuda_e8m0_to_fp32(__ldg(reinterpret_cast<const uint8_t *>(K_row + e_head_off + ib)));
 
-        // Per-element dequant and dot product with Q int8.
         float dot = 0.0f;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -769,112 +763,29 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp6_soa(
     return sum;
 }
 
-// SoA MXFP8 V dequantization for VEC kernel. FP8→F16/F32. Works for E4M3 and E5M2.
+// SoA MXFP V dequantization for VEC kernel. Works for FP6 and FP8 (all 4 sub-types).
 template <ggml_type mxfp_type, typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_mxfp8_soa(
+static __device__ __forceinline__ void dequantize_V_mxfp_soa_impl(
         const char * __restrict__ V_row, void * __restrict__ dst, const int64_t i0,
         const int qs_head_off, const int e_head_off) {
 
-    static_assert(mxfp_type == GGML_TYPE_MXFP8_E4M3 || mxfp_type == GGML_TYPE_MXFP8_E5M2, "bad mxfp8 type");
-    const int64_t ib  = i0 / QK_MXFP8;
-    const int     iqs = i0 % QK_MXFP8;
-
-    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
-
-    uint8_t qs[ne];
-    if constexpr (ne == 8) {
-        // 8 FP8 bytes. iqs is a multiple of 8 → 8-byte aligned → single int2 load.
-        const int2 qs_pair = __ldg(reinterpret_cast<const int2 *>(V_row + qs_head_off + ib * QK_MXFP8 + iqs));
-        *reinterpret_cast<int *>(qs)     = qs_pair.x;
-        *reinterpret_cast<int *>(qs + 4) = qs_pair.y;
-    } else if constexpr (ne == 4) {
-        *reinterpret_cast<int *>(qs) = __ldg(reinterpret_cast<const int *>(V_row + qs_head_off + ib * QK_MXFP8 + iqs));
-    } else {
-        *reinterpret_cast<uint16_t *>(qs) = __ldg(reinterpret_cast<const uint16_t *>(V_row + qs_head_off + ib * QK_MXFP8 + iqs));
-    }
-
-    // E8M0 scale (no 0.5× for FP8).
-    const float d = ggml_cuda_e8m0_to_fp32(__ldg(reinterpret_cast<const uint8_t *>(V_row + e_head_off + ib)));
-
-#ifdef FP16_AVAILABLE
-    if constexpr (std::is_same_v<T, half>) {
-        const half2 dh = __float2half2_rn(d);
-
-#pragma unroll
-        for (int l0 = 0; l0 < ne; l0 += 2) {
-            ((half2 *) dst)[l0/2] = dh * make_half2(
-                __float2half(mxfp_elem_to_float<mxfp_type>(qs[l0 + 0])),
-                __float2half(mxfp_elem_to_float<mxfp_type>(qs[l0 + 1])));
-        }
-    } else
-#endif // FP16_AVAILABLE
-    if constexpr (std::is_same_v<T, float>) {
-#pragma unroll
-        for (int l = 0; l < ne; ++l) {
-            ((float *) dst)[l] = d * mxfp_elem_to_float<mxfp_type>(qs[l]);
-        }
-    } else {
-        static_assert(std::is_same_v<T, void>, "unsupported type");
-    }
-}
-
-// SoA MXFP6 V dequantization for VEC kernel. FP6→F16/F32.
-template <ggml_type mxfp_type, typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_mxfp6_soa(
-        const char * __restrict__ V_row, void * __restrict__ dst, const int64_t i0,
-        const int qs_head_off, const int e_head_off) {
-
-    static_assert(mxfp_type == GGML_TYPE_MXFP6_E2M3 || mxfp_type == GGML_TYPE_MXFP6_E3M2, "bad mxfp6 type");
+    static_assert(mxfp_traits<mxfp_type>::bits_per_elem == 6 || mxfp_traits<mxfp_type>::bits_per_elem == 8,
+                  "Use dequantize_V_mxfp4_soa for FP4");
     constexpr int QK = 32;
-    constexpr int qs_per_block = 24;
-
     const int64_t ib = i0 / QK;
     const int elem_in_block = i0 % QK;
-    const int byte_in_block = (elem_in_block >> 2) * 3;  // elem_in_block is always a multiple of 4
 
     static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
 
-    // Load and unpack FP6 values. ne elements = ne*3/4 bytes.
     uint8_t vals[ne];
-    const char * qs_base = V_row + qs_head_off + ib * qs_per_block + byte_in_block;
-    if constexpr (ne == 8) {
-        // 8 FP6 values = 6 bytes = two groups of 3 bytes each.
-        const uint32_t packed0 = (uint32_t)__ldg((const uint8_t *)qs_base)
-                               | ((uint32_t)__ldg((const uint8_t *)qs_base + 1) << 8)
-                               | ((uint32_t)__ldg((const uint8_t *)qs_base + 2) << 16);
-        vals[0] =  packed0        & 0x3F;
-        vals[1] = (packed0 >>  6) & 0x3F;
-        vals[2] = (packed0 >> 12) & 0x3F;
-        vals[3] = (packed0 >> 18) & 0x3F;
-        const uint32_t packed1 = (uint32_t)__ldg((const uint8_t *)qs_base + 3)
-                               | ((uint32_t)__ldg((const uint8_t *)qs_base + 4) << 8)
-                               | ((uint32_t)__ldg((const uint8_t *)qs_base + 5) << 16);
-        vals[4] =  packed1        & 0x3F;
-        vals[5] = (packed1 >>  6) & 0x3F;
-        vals[6] = (packed1 >> 12) & 0x3F;
-        vals[7] = (packed1 >> 18) & 0x3F;
-    } else if constexpr (ne == 4) {
-        // Load 3 packed FP6 bytes via __ldg (byte loads avoid alignment issues).
-        const uint32_t packed = (uint32_t)__ldg((const uint8_t *)qs_base)
-                              | ((uint32_t)__ldg((const uint8_t *)qs_base + 1) << 8)
-                              | ((uint32_t)__ldg((const uint8_t *)qs_base + 2) << 16);
-        vals[0] =  packed        & 0x3F;
-        vals[1] = (packed >>  6) & 0x3F;
-        vals[2] = (packed >> 12) & 0x3F;
-        vals[3] = (packed >> 18) & 0x3F;
-    } else {
-        // ne == 2: read 12 bits = 1.5 bytes. Read 2 bytes via __ldg.
-        const uint16_t raw = (uint16_t)__ldg((const uint8_t *)qs_base)
-                           | ((uint16_t)__ldg((const uint8_t *)qs_base + 1) << 8);
-        vals[0] = raw & 0x3F;
-        vals[1] = (raw >> 6) & 0x3F;
-    }
+    mxfp_load_elems<mxfp_type, ne>(V_row + qs_head_off, ib, elem_in_block, vals);
 
     const float d = ggml_cuda_e8m0_to_fp32(__ldg(reinterpret_cast<const uint8_t *>(V_row + e_head_off + ib)));
 
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
         const half2 dh = __float2half2_rn(d);
+
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
             ((half2 *) dst)[l0/2] = dh * make_half2(
@@ -903,10 +814,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp_soa(
         const int qs_head_off, const int e_head_off) {
     if constexpr (type_K == GGML_TYPE_MXFP4_E2M1) {
         return vec_dot_fattn_vec_KQ_mxfp4_soa<D, nthreads>(K_row, Q_q8, Q_ds_v, qs_head_off, e_head_off);
-    } else if constexpr (type_K == GGML_TYPE_MXFP6_E2M3 || type_K == GGML_TYPE_MXFP6_E3M2) {
-        return vec_dot_fattn_vec_KQ_mxfp6_soa<type_K, D, nthreads>(K_row, Q_q8, Q_ds_v, qs_head_off, e_head_off);
     } else {
-        return vec_dot_fattn_vec_KQ_mxfp8_soa<type_K, D, nthreads>(K_row, Q_q8, Q_ds_v, qs_head_off, e_head_off);
+        return vec_dot_fattn_vec_KQ_mxfp_soa_impl<type_K, D, nthreads>(K_row, Q_q8, Q_ds_v, qs_head_off, e_head_off);
     }
 }
 
@@ -916,10 +825,8 @@ static __device__ __forceinline__ void dequantize_V_mxfp_soa(
         const int qs_head_off, const int e_head_off) {
     if constexpr (type_V == GGML_TYPE_MXFP4_E2M1) {
         dequantize_V_mxfp4_soa<T, ne>(V_row, dst, i0, qs_head_off, e_head_off);
-    } else if constexpr (type_V == GGML_TYPE_MXFP6_E2M3 || type_V == GGML_TYPE_MXFP6_E3M2) {
-        dequantize_V_mxfp6_soa<type_V, T, ne>(V_row, dst, i0, qs_head_off, e_head_off);
     } else {
-        dequantize_V_mxfp8_soa<type_V, T, ne>(V_row, dst, i0, qs_head_off, e_head_off);
+        dequantize_V_mxfp_soa_impl<type_V, T, ne>(V_row, dst, i0, qs_head_off, e_head_off);
     }
 }
 

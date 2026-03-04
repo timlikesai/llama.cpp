@@ -56,6 +56,7 @@
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
+#include "ggml-cuda/mxfp-traits.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/tri.cuh"
@@ -4798,12 +4799,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                        op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
                        op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
-                       op->type == GGML_TYPE_MXFP4_E2M1 || op->type == GGML_TYPE_MXFP8_E4M3 ||
-                       op->type == GGML_TYPE_MXFP6_E2M3 ||
-#ifdef GGML_CUDA_MXFP_ALL_VARIANTS
-                       op->type == GGML_TYPE_MXFP6_E3M2 || op->type == GGML_TYPE_MXFP8_E5M2 ||
-#endif // GGML_CUDA_MXFP_ALL_VARIANTS
-                       false) &&
+                       ggml_is_type_mxfp(op->type)) &&
                        op->src[0]->type == GGML_TYPE_F32 &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             } break;

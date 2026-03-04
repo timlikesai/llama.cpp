@@ -338,6 +338,9 @@ static inline uint8_t float_to_fp8_e4m3_rn(float x) {
     return sign | (uint8_t)((e4m3_exp << 3) | mant3);
 }
 
+// Forward declaration — defined with the other MXFP helpers below.
+static inline uint8_t mxfp_compute_e8m0(const float * x, int qk, int emax_offset);
+
 static inline int best_index_mxfp4(float x, float e) {
     int best_index = 0;
     float best_err = fabsf(kvalues_mxfp4[0]*e - x);
@@ -351,6 +354,10 @@ static inline int best_index_mxfp4(float x, float e) {
     return best_index;
 }
 
+// FP4 E2M1: search-based quantization using best_index_mxfp4 lookup table.
+// Unlike FP6/FP8 which use direct float->element conversion, FP4 finds the
+// closest 4-bit value by minimizing reconstruction error against the lookup table.
+// Scale uses GGML_E8M0_TO_FP32_HALF (includes 0.5x factor for E2M1 mantissa range).
 void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_MXFP4;
 
@@ -359,18 +366,7 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
     const int nb = k / qk;
 
     for (int i = 0; i < nb; i++) {
-        float amax = 0.0f; // absolute max
-
-        for (int j = 0; j < qk; j++) {
-            const float v = x[i*qk + j];
-
-            if (amax < fabsf(v)) {
-                amax = fabsf(v);
-            }
-        }
-
-        const uint8_t e = amax > 0.0f ? (uint8_t) (floorf(log2f(amax)) - 2 + 127) : 0;
-
+        const uint8_t e = mxfp_compute_e8m0(&x[i*qk], qk, 2);
         const float d = GGML_E8M0_TO_FP32_HALF(e);
 
         y[i].e = e;

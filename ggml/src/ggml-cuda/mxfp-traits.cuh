@@ -31,7 +31,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP4_E2M1> {
     static constexpr int bits_per_elem = 4;
     static constexpr int qs_per_block  = 16;   // 32 * 4 / 8
     static constexpr int block_size    = sizeof(block_mxfp4);
-    static constexpr int e8m0_offset   = 2;    // ceil(log2(6.0))
+    static constexpr int e8m0_offset   = 2;    // ceil(log2(6.0)) — max finite FP4 E2M1 value
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
         const uint8_t nibble = ggml_cuda_float_to_fp4_e2m1(val, inv_scale);
@@ -54,6 +54,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP4_E2M1> {
 
 // FP6 helpers:
 namespace mxfp_detail {
+    // FP6 E2M3 layout: [S(1) | E(2) | M(3)] — max normal = 7.5
     static __device__ __forceinline__ float fp6_e2m3_to_float(uint8_t v) {
         const float sign = (v & 0x20) ? -1.0f : 1.0f;
         const int exp  = (v >> 3) & 0x3;
@@ -62,6 +63,7 @@ namespace mxfp_detail {
         return sign * (1.0f + mant * 0.125f) * (float)(1 << (exp - 1));
     }
 
+    // FP6 E3M2 layout: [S(1) | E(3) | M(2)] — max normal = 28.0, no NaN/Inf
     static __device__ __forceinline__ float fp6_e3m2_to_float(uint8_t v) {
         const float sign = (v & 0x20) ? -1.0f : 1.0f;
         const int exp  = (v >> 2) & 0x7;
@@ -95,7 +97,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E2M3> {
     static constexpr int bits_per_elem = 6;
     static constexpr int qs_per_block  = 24;   // 32 * 6 / 8
     static constexpr int block_size    = sizeof(block_mxfp6);
-    static constexpr int e8m0_offset   = 3;    // ceil(log2(7.5))
+    static constexpr int e8m0_offset   = 3;    // ceil(log2(7.5)) — max finite FP6 E2M3 value
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
         const __nv_fp6_storage_t fp6 = __nv_cvt_float_to_fp6(val * inv_scale, __NV_E2M3, cudaRoundNearest);
@@ -108,6 +110,10 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E2M3> {
     static __device__ __forceinline__ float dequant_elem(uint8_t raw) {
         const __half_raw h = __nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)raw, __NV_E2M3);
         return __half2float(*reinterpret_cast<const __half *>(&h));
+    }
+
+    static __device__ __forceinline__ uint8_t quantize_elem(float val) {
+        return (uint8_t)__nv_cvt_float_to_fp6(val, __NV_E2M3, cudaRoundNearest);
     }
 
     static __device__ __forceinline__ void write_qs(
@@ -129,7 +135,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E3M2> {
     static constexpr int bits_per_elem = 6;
     static constexpr int qs_per_block  = 24;
     static constexpr int block_size    = sizeof(block_mxfp6);
-    static constexpr int e8m0_offset   = 5;    // ceil(log2(28.0))
+    static constexpr int e8m0_offset   = 5;    // ceil(log2(28.0)) — max finite FP6 E3M2 value
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
         const __nv_fp6_storage_t fp6 = __nv_cvt_float_to_fp6(val * inv_scale, __NV_E3M2, cudaRoundNearest);
@@ -142,6 +148,10 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E3M2> {
     static __device__ __forceinline__ float dequant_elem(uint8_t raw) {
         const __half_raw h = __nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)raw, __NV_E3M2);
         return __half2float(*reinterpret_cast<const __half *>(&h));
+    }
+
+    static __device__ __forceinline__ uint8_t quantize_elem(float val) {
+        return (uint8_t)__nv_cvt_float_to_fp6(val, __NV_E3M2, cudaRoundNearest);
     }
 
     static __device__ __forceinline__ void write_qs(
@@ -163,7 +173,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E4M3> {
     static constexpr int bits_per_elem = 8;
     static constexpr int qs_per_block  = 32;   // 32 * 8 / 8
     static constexpr int block_size    = sizeof(block_mxfp8);
-    static constexpr int e8m0_offset   = 8;    // ceil(log2(448))
+    static constexpr int e8m0_offset   = 8;    // ceil(log2(448)) — max finite FP8 E4M3 value
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
         const uint8_t fp8 = __nv_cvt_float_to_fp8(val * inv_scale, __NV_SATFINITE, __NV_E4M3);
@@ -176,6 +186,10 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E4M3> {
     static __device__ __forceinline__ float dequant_elem(uint8_t raw) {
         const __nv_fp8_e4m3 v = *reinterpret_cast<const __nv_fp8_e4m3 *>(&raw);
         return float(v);
+    }
+
+    static __device__ __forceinline__ uint8_t quantize_elem(float val) {
+        return __nv_cvt_float_to_fp8(val, __NV_SATFINITE, __NV_E4M3);
     }
 
     static __device__ __forceinline__ void write_qs(
@@ -193,7 +207,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E5M2> {
     static constexpr int bits_per_elem = 8;
     static constexpr int qs_per_block  = 32;
     static constexpr int block_size    = sizeof(block_mxfp8);
-    static constexpr int e8m0_offset   = 16;   // ceil(log2(57344))
+    static constexpr int e8m0_offset   = 16;   // ceil(log2(57344)) — max finite FP8 E5M2 value
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
         const uint8_t fp8 = __nv_cvt_float_to_fp8(val * inv_scale, __NV_SATFINITE, __NV_E5M2);
@@ -206,6 +220,10 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E5M2> {
     static __device__ __forceinline__ float dequant_elem(uint8_t raw) {
         const __nv_fp8_e5m2 v = *reinterpret_cast<const __nv_fp8_e5m2 *>(&raw);
         return float(v);
+    }
+
+    static __device__ __forceinline__ uint8_t quantize_elem(float val) {
+        return __nv_cvt_float_to_fp8(val, __NV_SATFINITE, __NV_E5M2);
     }
 
     static __device__ __forceinline__ void write_qs(
@@ -266,6 +284,7 @@ static __device__ void quantize_f32_mxfp_block_soa(
         uint32_t amax_bits;
         memcpy(&amax_bits, &amax, sizeof(uint32_t));
         const int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
+        // Round log2: add 1 if mantissa >= sqrt(2)-1 (0x3504F3 in IEEE-754 23-bit mantissa).
         const int round_log2 = floor_log2 + ((amax_bits & 0x7FFFFF) >= 0x3504F3 ? 1 : 0);
         const int e_base = round_log2 - traits::e8m0_offset + 127;
 
