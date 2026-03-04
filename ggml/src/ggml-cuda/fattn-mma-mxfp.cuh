@@ -91,6 +91,15 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP8_E5M2> {
     }
 };
 
+// V type discriminant (runtime dispatch — avoids 5×5 K/V template explosion).
+enum {
+    MXFP_V_FP4       = 0,  // MXFP4 E2M1
+    MXFP_V_FP8_E4M3  = 1,  // MXFP8 E4M3
+    MXFP_V_FP8_E5M2  = 2,  // MXFP8 E5M2
+    MXFP_V_FP6_E2M3  = 3,  // MXFP6 E2M3
+    MXFP_V_FP6_E3M2  = 4,  // MXFP6 E3M2
+};
+
 // Fast exp(x) via cubic polynomial approximation (Flash Attention 4 technique).
 // Splits into 2^floor(x*log2e) (bit manipulation) * poly(frac) (3 FMAs).
 // Reduces SFU contention by using CUDA cores instead of the Special Function Unit.
@@ -221,82 +230,61 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_load_K(
                 }
             }
         }
-    } else if constexpr (mxfp_type == GGML_TYPE_MXFP6_E2M3 || mxfp_type == GGML_TYPE_MXFP6_E3M2) {
-        // FP6: cp.async 16-byte chunks of packed data. Total qs per row = blocks_per_head * 24 bytes,
-        // always a multiple of 16. Expansion to fp6x4 words happens later via expand_K_fp6.
+    } else {
+        // FP6/FP8: qs loading differs (FP6: 24B packed chunks, FP8: 2x 16B per block).
         const unsigned int tile_K_qs_32 = ggml_cuda_cvta_generic_to_shared(tile_K_qs);
+        constexpr bool is_fp6 = (mxfp_type == GGML_TYPE_MXFP6_E2M3 || mxfp_type == GGML_TYPE_MXFP6_E3M2);
 
-        constexpr int chunks_per_row = blocks_per_head * 24 / 16;  // = 3*DKQ/64
-        constexpr int total_chunks = nbatch_fa * chunks_per_row;
+        if constexpr (is_fp6) {
+            // FP6: cp.async 16-byte chunks of packed data. Total qs per row = blocks_per_head * 24 bytes,
+            // always a multiple of 16. Expansion to fp6x4 words happens later via expand_K_fp6.
+            constexpr int chunks_per_row = blocks_per_head * 24 / 16;  // = 3*DKQ/64
+            constexpr int total_chunks = nbatch_fa * chunks_per_row;
 
 #pragma unroll
-        for (int flat0 = 0; flat0 < total_chunks; flat0 += nwarps * WARP_SIZE) {
-            const int flat = flat0 + threadIdx.y * WARP_SIZE + threadIdx.x;
-            if (flat0 + nwarps * WARP_SIZE > total_chunks && flat >= total_chunks) {
-                break;
-            }
-
-            const int i = flat / chunks_per_row;
-            const int c = flat % chunks_per_row;
-
-            if (oob_check && i >= k_VKQ_sup) {
-                *reinterpret_cast<int4 *>((char *)tile_K_qs + i * stride_k_qs * (int)sizeof(int) + c * 16) = make_int4(0, 0, 0, 0);
-            } else {
-                const char * row_i = K_row_base + int64_t(k_VKQ_0 + i) * K_pos_stride;
-                const unsigned int smem_dst = tile_K_qs_32 + i * stride_k_qs * (int)sizeof(int) + c * 16;
-                cp_async_cg_16<128>(smem_dst, row_i + K_qs_head_off + c * 16);
-            }
-        }
-
-        // E8M0 scales: individual (scale_vec::1X), loaded synchronously.
-#pragma unroll
-        for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps) {
-            const int i = i0 + threadIdx.y;
-            if (i0 + nwarps > nbatch_fa && i >= nbatch_fa) {
-                break;
-            }
-#pragma unroll
-            for (int s0 = 0; s0 < blocks_per_head; s0 += WARP_SIZE) {
-                const int s = s0 + threadIdx.x;
-                if (s0 + WARP_SIZE > blocks_per_head && s >= blocks_per_head) {
+            for (int flat0 = 0; flat0 < total_chunks; flat0 += nwarps * WARP_SIZE) {
+                const int flat = flat0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+                if (flat0 + nwarps * WARP_SIZE > total_chunks && flat >= total_chunks) {
                     break;
                 }
+
+                const int i = flat / chunks_per_row;
+                const int c = flat % chunks_per_row;
+
                 if (oob_check && i >= k_VKQ_sup) {
-                    tile_K_sc[i * stride_k_sc + s] = 0;
+                    *reinterpret_cast<int4 *>((char *)tile_K_qs + i * stride_k_qs * (int)sizeof(int) + c * 16) = make_int4(0, 0, 0, 0);
                 } else {
                     const char * row_i = K_row_base + int64_t(k_VKQ_0 + i) * K_pos_stride;
-                    const uint8_t e = *(row_i + K_e_head_off + s);
-                    tile_K_sc[i * stride_k_sc + s] = (uint32_t)e;
+                    const unsigned int smem_dst = tile_K_qs_32 + i * stride_k_qs * (int)sizeof(int) + c * 16;
+                    cp_async_cg_16<128>(smem_dst, row_i + K_qs_head_off + c * 16);
+                }
+            }
+        } else {
+            // FP8 (E4M3 or E5M2): 32 bytes/block, 2x 16B cp.async.
+            constexpr int total_halves = nbatch_fa * blocks_per_head * 2;
+#pragma unroll
+            for (int flat0 = 0; flat0 < total_halves; flat0 += nwarps * WARP_SIZE) {
+                const int flat = flat0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+                if (flat0 + nwarps * WARP_SIZE > total_halves && flat >= total_halves) {
+                    break;
+                }
+
+                const int i    = flat / (blocks_per_head * 2);
+                const int bh   = flat % (blocks_per_head * 2);
+                const int b    = bh / 2;
+                const int half_idx = bh % 2;
+
+                if (oob_check && i >= k_VKQ_sup) {
+                    *reinterpret_cast<int4 *>(&tile_K_qs[i * stride_k_qs + b * 8 + half_idx * 4]) = make_int4(0, 0, 0, 0);
+                } else {
+                    const char * row_i = K_row_base + int64_t(k_VKQ_0 + i) * K_pos_stride;
+                    const unsigned int smem_dst = tile_K_qs_32 + (i * stride_k_qs + b * 8 + half_idx * 4) * (int)sizeof(int);
+                    cp_async_cg_16<128>(smem_dst, row_i + K_qs_head_off + b * QK_MXFP8 + half_idx * 16);
                 }
             }
         }
-    } else {
-        // FP8 (E4M3 or E5M2): 32 bytes/block, 2x 16B cp.async.
-        const unsigned int tile_K_qs_32 = ggml_cuda_cvta_generic_to_shared(tile_K_qs);
 
-        constexpr int total_halves = nbatch_fa * blocks_per_head * 2;
-#pragma unroll
-        for (int flat0 = 0; flat0 < total_halves; flat0 += nwarps * WARP_SIZE) {
-            const int flat = flat0 + threadIdx.y * WARP_SIZE + threadIdx.x;
-            if (flat0 + nwarps * WARP_SIZE > total_halves && flat >= total_halves) {
-                break;
-            }
-
-            const int i    = flat / (blocks_per_head * 2);
-            const int bh   = flat % (blocks_per_head * 2);
-            const int b    = bh / 2;
-            const int half_idx = bh % 2;
-
-            if (oob_check && i >= k_VKQ_sup) {
-                *reinterpret_cast<int4 *>(&tile_K_qs[i * stride_k_qs + b * 8 + half_idx * 4]) = make_int4(0, 0, 0, 0);
-            } else {
-                const char * row_i = K_row_base + int64_t(k_VKQ_0 + i) * K_pos_stride;
-                const unsigned int smem_dst = tile_K_qs_32 + (i * stride_k_qs + b * 8 + half_idx * 4) * (int)sizeof(int);
-                cp_async_cg_16<128>(smem_dst, row_i + K_qs_head_off + b * QK_MXFP8 + half_idx * 16);
-            }
-        }
-
-        // E8M0 scales: individual (scale_vec::1X).
+        // E8M0 scales: individual (scale_vec::1X). Shared by FP6 and FP8.
 #pragma unroll
         for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps) {
             const int i = i0 + threadIdx.y;
@@ -461,8 +449,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_load_V_f16(
 }
 
 // Load V: MXFP8 FP8 -> dequant to F16 half2 directly into shared tile.
-// v_fp8_variant: 0=E4M3, 1=E5M2.
-template<int DV, int nwarps, int nbatch_fa, int stride_tile_V, int nbatch_V2, bool oob_check, int v_fp8_variant = 0>
+template<ggml_type v_mxfp8_type, int DV, int nwarps, int nbatch_fa, int stride_tile_V, int nbatch_V2, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_mxfp_load_V_mxfp8_f16(
         const char * const __restrict__ V_row_base,
         const int V_qs_head_off,
@@ -507,20 +494,8 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_load_V_mxfp8_f16(
                 const uint8_t e_val = *(row_t + V_e_head_off + i0_start / 32 + blk_idx);
                 const float scale = ggml_cuda_e8m0_to_fp32(e_val);
 
-                float v0, v1;
-                if constexpr (v_fp8_variant == 1) {
-                    __nv_fp8_e5m2 f8_0, f8_1;
-                    f8_0.__x = fp8_0;
-                    f8_1.__x = fp8_1;
-                    v0 = float(f8_0) * scale;
-                    v1 = float(f8_1) * scale;
-                } else {
-                    __nv_fp8_e4m3 f8_0, f8_1;
-                    f8_0.__x = fp8_0;
-                    f8_1.__x = fp8_1;
-                    v0 = float(f8_0) * scale;
-                    v1 = float(f8_1) * scale;
-                }
+                const float v0 = mxfp_traits<v_mxfp8_type>::dequant_elem(fp8_0) * scale;
+                const float v1 = mxfp_traits<v_mxfp8_type>::dequant_elem(fp8_1) * scale;
                 val = make_half2(__float2half(v0), __float2half(v1));
             }
             tile_V[t * stride_tile_V + d_h2] = val;
@@ -606,6 +581,42 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_load_V_mxfp6_f16(
             }
             tile_V[t * stride_tile_V + d_h2] = val;
         }
+    }
+}
+
+// Dispatch V loading by runtime v_type. Avoids 5×5 K/V template explosion by
+// keeping V type as a runtime parameter instead of a template parameter.
+template<int DV, int nwarps, int nbatch_fa, int stride_tile_V, int nbatch_V2, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_mxfp_load_V_dispatch(
+        const char * const __restrict__ V_row_base,
+        const int V_qs_head_off,
+        const int V_e_head_off,
+        const int V_pos_stride,
+        half2 * const __restrict__ tile_V,
+        const int k_VKQ_0,
+        const int k_VKQ_sup,
+        const int v_type) {
+    switch (v_type) {
+        case MXFP_V_FP4:
+            flash_attn_ext_mxfp_load_V_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
+                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride, tile_V, k_VKQ_0, 0, k_VKQ_sup);
+            break;
+        case MXFP_V_FP8_E4M3:
+            flash_attn_ext_mxfp_load_V_mxfp8_f16<GGML_TYPE_MXFP8_E4M3, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
+                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride, tile_V, k_VKQ_0, 0, k_VKQ_sup);
+            break;
+        case MXFP_V_FP8_E5M2:
+            flash_attn_ext_mxfp_load_V_mxfp8_f16<GGML_TYPE_MXFP8_E5M2, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
+                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride, tile_V, k_VKQ_0, 0, k_VKQ_sup);
+            break;
+        case MXFP_V_FP6_E2M3:
+            flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E2M3, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
+                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride, tile_V, k_VKQ_0, 0, k_VKQ_sup);
+            break;
+        default: // MXFP_V_FP6_E3M2
+            flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E3M2, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
+                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride, tile_V, k_VKQ_0, 0, k_VKQ_sup);
+            break;
     }
 }
 
@@ -794,40 +805,21 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
                 const int scale_pair_idx = block_idx / 2;
                 tile_Q_sc[jc * stride_q_sc + scale_pair_idx] = (uint32_t)e | ((uint32_t)e_partner << 8);
             }
-        } else if constexpr (mxfp_type == GGML_TYPE_MXFP6_E2M3 || mxfp_type == GGML_TYPE_MXFP6_E3M2) {
-            // Pack 32 FP6 values into 8 ints (byte-padded: each 6-bit val in its own byte, 00xxxxxx).
-            // The MMA instruction reads per-byte, so each fp6 value must be byte-aligned.
-            if (active) {
-#pragma unroll
-                for (int i = 0; i < vals_per_block / 4; ++i) {
-                    const int int_idx = block_idx * (vals_per_block / 4) + i;
-                    uint8_t fp6_vals[4];
-#pragma unroll
-                    for (int v = 0; v < 4; ++v) {
-                        fp6_vals[v] = mxfp_traits<mxfp_type>::quantize_elem(vals[4 * i + v] * inv_d);
-                    }
-                    uint32_t packed = (fp6_vals[0] & 0x3F) | ((fp6_vals[1] & 0x3F) << 8) |
-                                      ((fp6_vals[2] & 0x3F) << 16) | ((fp6_vals[3] & 0x3F) << 24);
-                    tile_Q_qs[jc * stride_q_qs + int_idx] = packed;
-                }
-            }
-
-            // E8M0 scale: individual store.
-            if (active) {
-                tile_Q_sc[jc * stride_q_sc + block_idx] = (uint32_t)e;
-            }
         } else {
-            // FP8 (E4M3 or E5M2): pack 32 values into 8 ints.
+            // FP6/FP8: pack 32 quantized values into 8 ints (byte-padded format for MMA).
+            // FP6: mask to 6 bits (byte-padded: 00xxxxxx). FP8: full 8 bits (mask is no-op).
+            constexpr bool is_fp6 = (mxfp_type == GGML_TYPE_MXFP6_E2M3 || mxfp_type == GGML_TYPE_MXFP6_E3M2);
+            constexpr uint8_t elem_mask = is_fp6 ? 0x3F : 0xFF;
             if (active) {
 #pragma unroll
                 for (int i = 0; i < vals_per_block / 4; ++i) {
                     const int int_idx = block_idx * (vals_per_block / 4) + i;
-                    uint8_t fp8_bytes[4];
+                    uint8_t bytes[4];
 #pragma unroll
                     for (int v = 0; v < 4; ++v) {
-                        fp8_bytes[v] = mxfp_traits<mxfp_type>::quantize_elem(vals[4 * i + v] * inv_d);
+                        bytes[v] = mxfp_traits<mxfp_type>::quantize_elem(vals[4 * i + v] * inv_d) & elem_mask;
                     }
-                    tile_Q_qs[jc * stride_q_qs + int_idx] = *reinterpret_cast<uint32_t *>(fp8_bytes);
+                    tile_Q_qs[jc * stride_q_qs + int_idx] = *reinterpret_cast<uint32_t *>(bytes);
                 }
             }
 
@@ -949,27 +941,9 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_iter(
 
         // Load V for the current iteration into tile_V_curr (which aliases tile_K_qs memory).
         const int k_VKQ_curr = kb0 * nbatch_fa;
-        if (v_type == 0) {
-            flash_attn_ext_mxfp_load_V_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
-                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                 tile_V_curr, k_VKQ_curr, 0, k_VKQ_sup);
-        } else if (v_type == 1) {
-            flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check, 0>
-                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                 tile_V_curr, k_VKQ_curr, 0, k_VKQ_sup);
-        } else if (v_type == 2) {
-            flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check, 1>
-                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                 tile_V_curr, k_VKQ_curr, 0, k_VKQ_sup);
-        } else if (v_type == 3) {
-            flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E2M3, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
-                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                 tile_V_curr, k_VKQ_curr, 0, k_VKQ_sup);
-        } else {
-            flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E3M2, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
-                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                 tile_V_curr, k_VKQ_curr, 0, k_VKQ_sup);
-        }
+        flash_attn_ext_mxfp_load_V_dispatch<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
+            (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+             tile_V_curr, k_VKQ_curr, k_VKQ_sup, v_type);
     } else if (!last_iter) {
         const int k_VKQ_next = (kb0 + 1) * nbatch_fa;
 
@@ -982,28 +956,9 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_iter(
                 (mask_h + k_VKQ_next, tile_mask_next, stride_mask, k_VKQ_sup_next, jt * ncols1, ne01);
         }
 
-        // V: dispatch on detected V type.
-        if (v_type == 0) {
-            flash_attn_ext_mxfp_load_V_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
-                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                 tile_V_next, k_VKQ_next, 0, k_VKQ_sup_next);
-        } else if (v_type == 1) {
-            flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check, 0>
-                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                 tile_V_next, k_VKQ_next, 0, k_VKQ_sup_next);
-        } else if (v_type == 2) {
-            flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check, 1>
-                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                 tile_V_next, k_VKQ_next, 0, k_VKQ_sup_next);
-        } else if (v_type == 3) {
-            flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E2M3, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
-                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                 tile_V_next, k_VKQ_next, 0, k_VKQ_sup_next);
-        } else {
-            flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E3M2, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
-                (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                 tile_V_next, k_VKQ_next, 0, k_VKQ_sup_next);
-        }
+        flash_attn_ext_mxfp_load_V_dispatch<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check>
+            (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+             tile_V_next, k_VKQ_next, k_VKQ_sup_next, v_type);
     }
 
     // ---- Phase 2b: Softmax + VKQ rescale ----
@@ -1351,27 +1306,9 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_process_tile(
                 flash_attn_ext_mxfp_load_K<mxfp_type, DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check_v>
                     (K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
                      tile_K_qs_curr, tile_K_sc_curr, k_VKQ_0, k_VKQ_sup_v);
-                if (v_type == 0) {
-                    flash_attn_ext_mxfp_load_V_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
-                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-                } else if (v_type == 1) {
-                    flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v, 0>
-                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-                } else if (v_type == 2) {
-                    flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v, 1>
-                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-                } else if (v_type == 3) {
-                    flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E2M3, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
-                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-                } else {
-                    flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E3M2, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
-                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-                }
+                flash_attn_ext_mxfp_load_V_dispatch<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
+                    (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                     tile_V_curr, k_VKQ_0, k_VKQ_sup_v, v_type);
                 if constexpr (mma_traits::can_cp_async_k) {
                     cp_async_wait_all();
                 }
@@ -1427,27 +1364,9 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_process_tile(
                 flash_attn_ext_mxfp_load_K<mxfp_type, DKQ, nwarps, nbatch_fa, stride_k_qs, stride_k_sc, oob_check_v>
                     (K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
                      tile_K_qs_curr, tile_K_sc_curr, k_VKQ_0, k_VKQ_sup_v);
-                if (v_type == 0) {
-                    flash_attn_ext_mxfp_load_V_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
-                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-                } else if (v_type == 1) {
-                    flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v, 0>
-                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-                } else if (v_type == 2) {
-                    flash_attn_ext_mxfp_load_V_mxfp8_f16<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v, 1>
-                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-                } else if (v_type == 3) {
-                    flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E2M3, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
-                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-                } else {
-                    flash_attn_ext_mxfp_load_V_mxfp6_f16<GGML_TYPE_MXFP6_E3M2, DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
-                        (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                         tile_V_curr, k_VKQ_0, 0, k_VKQ_sup_v);
-                }
+                flash_attn_ext_mxfp_load_V_dispatch<DV, nwarps, nbatch_fa, stride_tile_V, nbatch_V2, oob_check_v>
+                    (V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
+                     tile_V_curr, k_VKQ_0, k_VKQ_sup_v, v_type);
                 if constexpr (mma_traits::can_cp_async_k) {
                     cp_async_wait_all();
                 }
@@ -1761,35 +1680,33 @@ static __global__ void flash_attn_ext_mxfp(
 
     int v_type;
     if (V_is_K_view) {
-        // V shares K buffer (MLA) — V type = MXFP4 (dequant from K's FP4/FP6/FP8 qs).
-        // Actually for MLA, V reads first DV dims from K's row.
-        // Detect V type from K type: V data in same format as K.
+        // MLA: V reads first DV dims from K's row, same format as K.
         if constexpr (mxfp_type == GGML_TYPE_MXFP4_E2M1) {
-            v_type = 0;
+            v_type = MXFP_V_FP4;
         } else if constexpr (mxfp_type == GGML_TYPE_MXFP6_E2M3) {
-            v_type = 3;
+            v_type = MXFP_V_FP6_E2M3;
         } else if constexpr (mxfp_type == GGML_TYPE_MXFP6_E3M2) {
-            v_type = 4;
+            v_type = MXFP_V_FP6_E3M2;
         } else if constexpr (mxfp_type == GGML_TYPE_MXFP8_E5M2) {
-            v_type = 2;
+            v_type = MXFP_V_FP8_E5M2;
         } else {
-            v_type = 1;  // MXFP8 E4M3
+            v_type = MXFP_V_FP8_E4M3;
         }
     } else if (nb21 == expected_mxfp4_stride) {
-        v_type = 0;  // MXFP4
+        v_type = MXFP_V_FP4;
     } else if (nb21 == expected_mxfp6_stride) {
         // FP6 — use same variant as K.
         if constexpr (mxfp_type == GGML_TYPE_MXFP6_E3M2) {
-            v_type = 4;
+            v_type = MXFP_V_FP6_E3M2;
         } else {
-            v_type = 3;  // Default to E2M3
+            v_type = MXFP_V_FP6_E2M3;
         }
     } else {
         // MXFP8 — determine variant from K type.
         if constexpr (mxfp_type == GGML_TYPE_MXFP8_E5M2) {
-            v_type = 2;
+            v_type = MXFP_V_FP8_E5M2;
         } else {
-            v_type = 1;  // E4M3
+            v_type = MXFP_V_FP8_E4M3;
         }
     }
 
@@ -1797,10 +1714,10 @@ static __global__ void flash_attn_ext_mxfp(
     int v_qs_per_block_rt;
     int v_block_size_rt;
     switch (v_type) {
-        case 0:  v_qs_per_block_rt = 16; v_block_size_rt = 17; break;  // MXFP4
-        case 3:
-        case 4:  v_qs_per_block_rt = 24; v_block_size_rt = 25; break;  // MXFP6
-        default: v_qs_per_block_rt = 32; v_block_size_rt = 33; break;  // MXFP8
+        case MXFP_V_FP4:       v_qs_per_block_rt = 16; v_block_size_rt = 17; break;
+        case MXFP_V_FP6_E2M3:
+        case MXFP_V_FP6_E3M2:  v_qs_per_block_rt = 24; v_block_size_rt = 25; break;
+        default:                v_qs_per_block_rt = 32; v_block_size_rt = 33; break;  // MXFP8
     }
     const int stride_V_blocks = V_is_K_view ? stride_K_blocks : (nb21 / v_block_size_rt);
 

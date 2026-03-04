@@ -1133,8 +1133,7 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     // V cache writes are NOT rotated (op_params[0] defaults to 0).
     // MLA exception: V is a view of K, so rotating K would also rotate V.
     // Since V is not un-rotated in the attention output, skip Hadamard for MLA.
-    const bool skip_hadamard = hparams.is_mla() && is_mxfp;
-    if (!skip_hadamard && is_mxfp) {
+    if (is_mxfp && !hparams.is_mla()) {
         ((int32_t *)result->op_params)[0] = 1;
     }
 

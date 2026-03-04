@@ -610,15 +610,13 @@ static inline uint8_t float_to_fp6_e2m3_rn(float x) {
 
 // FP6 E3M2 conversion helpers
 // E3M2: 1 sign, 3 exponent (bias 3), 2 mantissa. Max finite = 28.0
+// MX format: NO NaN/Inf — exp=7 is a valid normal value (unlike IEEE-754).
 static inline float fp6_e3m2_to_float(uint8_t v) {
     const float sign = (v & 0x20) ? -1.0f : 1.0f;
     const int exp  = (v >> 2) & 0x7;
     const int mant = v & 0x3;
     if (exp == 0) {
         return sign * (float)mant * (1.0f / 4.0f);
-    }
-    if (exp == 7) {
-        return (mant == 0) ? sign * INFINITY : NAN;
     }
     return sign * (1.0f + mant / 4.0f) * (float)(1 << (exp - 3));
 }
@@ -627,7 +625,7 @@ static inline uint8_t float_to_fp6_e3m2_rn(float x) {
     uint8_t sign = 0;
     if (x < 0) { sign = 0x20; x = -x; }
     if (x == 0) return sign;
-    if (x >= 28.0f) return sign | 0x1E;  // saturate to max finite
+    if (x >= 28.0f) return sign | 0x1F;  // saturate to max finite (exp=7, mant=3)
 
     int exp;
     frexpf(x, &exp);
@@ -641,12 +639,13 @@ static inline uint8_t float_to_fp6_e3m2_rn(float x) {
         return sign | (uint8_t)mant;
     }
 
-    if (biased_exp >= 7) return sign | 0x1E;
+    // MX format: exp=7 is valid (no NaN/Inf), so only overflow at biased_exp > 7.
+    if (biased_exp > 7) return sign | 0x1F;
 
     float mantf = (x / (float)(1 << exp)) - 1.0f;
     int mant = (int)(mantf * 4.0f + 0.5f);
     if (mant > 3) { mant = 0; biased_exp++; }
-    if (biased_exp >= 7) return sign | 0x1E;
+    if (biased_exp > 7) return sign | 0x1F;
     return sign | (uint8_t)((biased_exp << 2) | mant);
 }
 
