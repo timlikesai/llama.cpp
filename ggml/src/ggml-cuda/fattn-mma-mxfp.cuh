@@ -1,5 +1,18 @@
 #pragma once
 
+// Unified MXFP flash attention MMA kernel for all OCP Microscaling (MX) formats.
+//
+// References:
+//   - MX format specification: OCP Microscaling Formats (MX) Specification v1.0
+//     https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
+//     Rouhani et al., "Microscaling Data Formats for Deep Learning", arXiv:2310.10537
+//   - Fast exp approximation: adapted from Flash Attention (Tri Dao, Dao-AILab/flash-attention).
+//     Cubic Remez minimax polynomial for 2^x on [0,1]; avoids SFU bottleneck.
+//     Building on: Schraudolph 1999, "A Fast, Compact Approximation of the Exponential Function"
+//   - Walsh-Hadamard KV cache rotation:
+//     Ashkboos et al., "QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs", arXiv:2404.00456
+//     Zhang et al., "Block Rounded Quantization", arXiv:2511.04214 (block-32 optimal for MX)
+
 #include "common.cuh"
 #include "cp-async.cuh"
 #include "mma.cuh"
@@ -100,10 +113,10 @@ enum {
     MXFP_V_FP6_E3M2  = 4,  // MXFP6 E3M2
 };
 
-// Fast exp(x) via cubic polynomial approximation (Flash Attention 4 technique).
+// Fast exp(x) via cubic polynomial approximation (Dao-AILab/flash-attention).
 // Splits into 2^floor(x*log2e) (bit manipulation) * poly(frac) (3 FMAs).
-// Reduces SFU contention by using CUDA cores instead of the Special Function Unit.
-// Max relative error ~0.3% over the softmax-relevant range (x <= 0).
+// Coefficients: Remez minimax for 2^x on [0,1]. Max relative error ~0.3% (x <= 0).
+// Avoids SFU bottleneck by using CUDA cores instead of the Special Function Unit.
 static __device__ __forceinline__ float fast_expf_mxfp(const float x) {
     const float x_log2e = x * 1.4426950408889634f;
     const float xi = floorf(x_log2e);
@@ -367,15 +380,16 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_expand_K_fp6(
                 const uint32_t r2 = ((b >> 16) | (c << 16)) & 0xFFFFFF;
                 const uint32_t r3 =  (c >>  8)              & 0xFFFFFF;
 
+                // Expand 4 packed 6-bit values from a 24-bit word into byte-per-element format (00xxxxxx).
+                auto fp6_expand_word = [] __device__ (uint32_t r) -> int {
+                    return (r & 0x3F) | (((r >> 6) & 0x3F) << 8) | (((r >> 12) & 0x3F) << 16) | (((r >> 18) & 0x3F) << 24);
+                };
+
                 const int base = i * stride_k_qs + blk * 8 + cycle * 4;
-                tile_K_qs[base + 0] = (r0 & 0x3F) | (((r0 >>  6) & 0x3F) << 8)
-                                    | (((r0 >> 12) & 0x3F) << 16) | (((r0 >> 18) & 0x3F) << 24);
-                tile_K_qs[base + 1] = (r1 & 0x3F) | (((r1 >>  6) & 0x3F) << 8)
-                                    | (((r1 >> 12) & 0x3F) << 16) | (((r1 >> 18) & 0x3F) << 24);
-                tile_K_qs[base + 2] = (r2 & 0x3F) | (((r2 >>  6) & 0x3F) << 8)
-                                    | (((r2 >> 12) & 0x3F) << 16) | (((r2 >> 18) & 0x3F) << 24);
-                tile_K_qs[base + 3] = (r3 & 0x3F) | (((r3 >>  6) & 0x3F) << 8)
-                                    | (((r3 >> 12) & 0x3F) << 16) | (((r3 >> 18) & 0x3F) << 24);
+                tile_K_qs[base + 0] = fp6_expand_word(r0);
+                tile_K_qs[base + 1] = fp6_expand_word(r1);
+                tile_K_qs[base + 2] = fp6_expand_word(r2);
+                tile_K_qs[base + 3] = fp6_expand_word(r3);
             }
         }
     }
@@ -734,7 +748,8 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
             }
         }
 
-        // Walsh-Hadamard rotation to match K-side rotation.
+        // Walsh-Hadamard rotation to match K-side rotation (QuaRot, arXiv:2404.00456).
+        // Block-32 matches MX block size for optimal quantization (BRQ, arXiv:2511.04214).
         if constexpr (apply_hadamard) {
             hadamard_32_inplace(vals);
         }
@@ -752,9 +767,8 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
             inv_d = 0.0f;
         } else {
             constexpr int EMAX = traits::emax;
-            // Extract IEEE-754 exponent via integer bit ops (avoids SFU-bound log2f).
-            // round(log2(x)) = floor(log2(x)) + (mantissa >= sqrt(2)-1 ? 1 : 0).
-            // sqrt(2)-1 = 0.41421356... → mantissa threshold 0x3504F3 (23-bit field).
+            // E8M0 scale: round(log2(amax)) via IEEE-754 bit extraction (Schraudolph 1999).
+            // floor(log2(x)) from exponent field, +1 if mantissa >= sqrt(2)-1 (0x3504F3).
             uint32_t amax_bits;
             memcpy(&amax_bits, &amax, sizeof(uint32_t));
             const int e_floor = (int)((amax_bits >> 23) & 0xFF) - 127;
@@ -1214,6 +1228,27 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_process_tile(
 
     __syncthreads();
 
+    // Macro to call flash_attn_ext_mxfp_iter with the many shared arguments.
+    // Varies only: tile pointers (curr/next), k_VKQ_sup, last_iter, k_VKQ_sup_next, and optionally single_buf.
+#define MXFP_CALL_ITER(oob_v, single_buf_v, qs_curr, sc_curr, qs_next, sc_next, v_curr, v_next, m_curr, m_next, sup, last, sup_next) \
+    flash_attn_ext_mxfp_iter                                                                                   \
+        <mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_v, single_buf_v> \
+        (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,                                         \
+         V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,                                               \
+         mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,                                               \
+         ne01, ne02, stride_mask,                                                                              \
+         tile_Q_qs, tile_Q_sc, qs_curr, sc_curr, qs_next, sc_next,                                            \
+         v_curr, v_next, m_curr, m_next,                                                                       \
+         VKQ_C, KQ_max, KQ_rowsum, jt, kb0, sup, last, sup_next, v_type)
+
+    // Swap double-buffer pointers after each iteration.
+#define MXFP_SWAP_BUFFERS() do {                                                                                \
+    { int      * tmp = tile_K_qs_curr; tile_K_qs_curr = tile_K_qs_next; tile_K_qs_next = tmp; }                \
+    { uint32_t * tmp = tile_K_sc_curr; tile_K_sc_curr = tile_K_sc_next; tile_K_sc_next = tmp; }                \
+    { half2    * tmp = tile_V_curr;    tile_V_curr    = tile_V_next;    tile_V_next    = tmp; }                 \
+    { half     * tmp = tile_mask_curr; tile_mask_curr = tile_mask_next; tile_mask_next = tmp; }                 \
+} while (0)
+
     if constexpr (single_buf) {
         // ---- Single-buffer iteration ----
         // Each iteration: load K+mask → sync → iter (KQ MMA → sync → load V → softmax → sync → VKQ MMA → sync).
@@ -1238,17 +1273,10 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_process_tile(
                 }
                 __syncthreads();
 
-                flash_attn_ext_mxfp_iter
-                    <mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check_v, /*single_buf=*/true>
-                    (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
-                     V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                     mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-                     ne01, ne02, stride_mask,
-                     tile_Q_qs, tile_Q_sc, tile_K_qs_A, tile_K_sc_A,
-                     tile_K_qs_A, tile_K_sc_A,
-                     tile_V_A, tile_V_A, tile_mask_A, tile_mask_A,
-                     VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
-                     true, 0, v_type);
+                MXFP_CALL_ITER(oob_check_v, true,
+                    tile_K_qs_A, tile_K_sc_A, tile_K_qs_A, tile_K_sc_A,
+                    tile_V_A, tile_V_A, tile_mask_A, tile_mask_A,
+                    k_VKQ_sup_v, true, 0);
             }
         } else {
             constexpr bool oob_check_v = false;
@@ -1266,17 +1294,10 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_process_tile(
                 }
                 __syncthreads();
 
-                flash_attn_ext_mxfp_iter
-                    <mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check_v, /*single_buf=*/true>
-                    (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
-                     V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                     mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-                     ne01, ne02, stride_mask,
-                     tile_Q_qs, tile_Q_sc, tile_K_qs_A, tile_K_sc_A,
-                     tile_K_qs_A, tile_K_sc_A,
-                     tile_V_A, tile_V_A, tile_mask_A, tile_mask_A,
-                     VKQ_C, KQ_max, KQ_rowsum, jt, kb0, nbatch_fa,
-                     true, 0, v_type);
+                MXFP_CALL_ITER(oob_check_v, true,
+                    tile_K_qs_A, tile_K_sc_A, tile_K_qs_A, tile_K_sc_A,
+                    tile_V_A, tile_V_A, tile_mask_A, tile_mask_A,
+                    nbatch_fa, true, 0);
             }
         }
     } else {
@@ -1319,37 +1340,20 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_process_tile(
                 constexpr int k_VKQ_sup_v = nbatch_fa;
                 const int k_VKQ_sup_next = (kb0 + 1 == kb0_stop - 1) ? (ne11 - (kb0 + 1) * nbatch_fa) : nbatch_fa;
 
-                flash_attn_ext_mxfp_iter
-                    <mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check_v>
-                    (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
-                     V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                     mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-                     ne01, ne02, stride_mask,
-                     tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
-                     tile_K_qs_next, tile_K_sc_next,
-                     tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
-                     VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
-                     false, k_VKQ_sup_next, v_type);
+                MXFP_CALL_ITER(oob_check_v, false,
+                    tile_K_qs_curr, tile_K_sc_curr, tile_K_qs_next, tile_K_sc_next,
+                    tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
+                    k_VKQ_sup_v, false, k_VKQ_sup_next);
 
-                { int      * tmp = tile_K_qs_curr; tile_K_qs_curr = tile_K_qs_next; tile_K_qs_next = tmp; }
-                { uint32_t * tmp = tile_K_sc_curr; tile_K_sc_curr = tile_K_sc_next; tile_K_sc_next = tmp; }
-                { half2    * tmp = tile_V_curr;    tile_V_curr    = tile_V_next;    tile_V_next    = tmp; }
-                { half     * tmp = tile_mask_curr; tile_mask_curr = tile_mask_next; tile_mask_next = tmp; }
+                MXFP_SWAP_BUFFERS();
             }
             {
                 const int k_VKQ_sup_v = ne11 - kb0 * nbatch_fa;
 
-                flash_attn_ext_mxfp_iter
-                    <mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check_v>
-                    (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
-                     V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                     mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-                     ne01, ne02, stride_mask,
-                     tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
-                     tile_K_qs_next, tile_K_sc_next,
-                     tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
-                     VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
-                     true, 0, v_type);
+                MXFP_CALL_ITER(oob_check_v, false,
+                    tile_K_qs_curr, tile_K_sc_curr, tile_K_qs_next, tile_K_sc_next,
+                    tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
+                    k_VKQ_sup_v, true, 0);
             }
         } else {
             constexpr bool oob_check_v = false;
@@ -1376,40 +1380,26 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_process_tile(
             for (; kb0 < kb0_stop - 1; ++kb0) {
                 constexpr int k_VKQ_sup_v = nbatch_fa;
 
-                flash_attn_ext_mxfp_iter
-                    <mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check_v>
-                    (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
-                     V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                     mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-                     ne01, ne02, stride_mask,
-                     tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
-                     tile_K_qs_next, tile_K_sc_next,
-                     tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
-                     VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
-                     false, nbatch_fa, v_type);
+                MXFP_CALL_ITER(oob_check_v, false,
+                    tile_K_qs_curr, tile_K_sc_curr, tile_K_qs_next, tile_K_sc_next,
+                    tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
+                    k_VKQ_sup_v, false, nbatch_fa);
 
-                { int      * tmp = tile_K_qs_curr; tile_K_qs_curr = tile_K_qs_next; tile_K_qs_next = tmp; }
-                { uint32_t * tmp = tile_K_sc_curr; tile_K_sc_curr = tile_K_sc_next; tile_K_sc_next = tmp; }
-                { half2    * tmp = tile_V_curr;    tile_V_curr    = tile_V_next;    tile_V_next    = tmp; }
-                { half     * tmp = tile_mask_curr; tile_mask_curr = tile_mask_next; tile_mask_next = tmp; }
+                MXFP_SWAP_BUFFERS();
             }
             {
                 constexpr int k_VKQ_sup_v = nbatch_fa;
 
-                flash_attn_ext_mxfp_iter
-                    <mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup, oob_check_v>
-                    (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, K_pos_stride,
-                     V_row_base, V_qs_head_off, V_e_head_off, V_pos_stride,
-                     mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-                     ne01, ne02, stride_mask,
-                     tile_Q_qs, tile_Q_sc, tile_K_qs_curr, tile_K_sc_curr,
-                     tile_K_qs_next, tile_K_sc_next,
-                     tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
-                     VKQ_C, KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup_v,
-                     true, 0, v_type);
+                MXFP_CALL_ITER(oob_check_v, false,
+                    tile_K_qs_curr, tile_K_sc_curr, tile_K_qs_next, tile_K_sc_next,
+                    tile_V_curr, tile_V_next, tile_mask_curr, tile_mask_next,
+                    k_VKQ_sup_v, true, 0);
             }
         }
     }
+
+#undef MXFP_CALL_ITER
+#undef MXFP_SWAP_BUFFERS
 
     // ---- Finalize: rowsum reduction, attention sinks, result writeback ----
 
@@ -1725,6 +1715,52 @@ static __global__ void flash_attn_ext_mxfp(
     const int iter_j     = (ne01.z    + (ncols1    - 1)) / ncols1;
     const int iter_z_gqa = (gqa_ratio + (ncols2    - 1)) / ncols2;
 
+    // Decode kbc → tile coordinates and compute pointers for K/V/Q/mask/dst.
+    // Used twice (main loop + fixup tail), factored into a lambda to avoid duplication.
+    const float2 * tp_Q_f2;
+    const half   * tp_mask_h;
+    float2       * tp_dstk;
+    const float  * tp_sinks_f;
+    const char   * tp_K_row_base;
+    int tp_K_qs_head_off, tp_K_e_head_off;
+    const char   * tp_V_row_base;
+    int tp_V_qs_head_off, tp_V_e_head_off;
+    float tp_slope;
+    int tp_jt, tp_zt_gqa, tp_sequence;
+
+    auto compute_tile_ptrs = [&] __device__ (const int kbc_val) {
+        tp_sequence =  kbc_val / (iter_k * iter_j * iter_z_gqa * ne12);
+        const int z_KV   = (kbc_val - iter_k * iter_j * iter_z_gqa * ne12 * tp_sequence) / (iter_k * iter_j * iter_z_gqa);
+        tp_zt_gqa = (kbc_val - iter_k * iter_j * iter_z_gqa * ne12 * tp_sequence - iter_k * iter_j * iter_z_gqa * z_KV) / (iter_k * iter_j);
+        tp_jt     = (kbc_val - iter_k * iter_j * iter_z_gqa * ne12 * tp_sequence - iter_k * iter_j * iter_z_gqa * z_KV - iter_k * iter_j * tp_zt_gqa) / iter_k;
+        const int zt_Q = z_KV * gqa_ratio + tp_zt_gqa * ncols2;
+
+        tp_Q_f2      = (const float2 *)(Q + nb03 * tp_sequence + nb02 * zt_Q);
+        tp_mask_h    = ncols2 == 1 && !mask ? nullptr : (const half *)(mask + nb33 * (tp_sequence % ne33));
+        tp_dstk      = ((float2 *)dst) + (tp_sequence * ne01.z * ne02 + zt_Q) * (DV / 2);
+        tp_sinks_f   = sinks ? (const float *)sinks + zt_Q : nullptr;
+
+        tp_K_row_base    = K + nb13 * tp_sequence;
+        tp_K_qs_head_off = z_KV * blocks_per_head_K * k_qs_per_block;
+        tp_K_e_head_off  = stride_K_blocks * k_qs_per_block + z_KV * blocks_per_head_K;
+
+        const int v_head_blks = V_is_K_view ? blocks_per_head_K : blocks_per_head_V;
+        const int v_str_blks  = V_is_K_view ? stride_K_blocks   : stride_V_blocks;
+        tp_V_row_base    = V_is_K_view ? tp_K_row_base : (V + nb23 * tp_sequence);
+        tp_V_qs_head_off = z_KV * v_head_blks * v_qs_per_block_rt;
+        tp_V_e_head_off  = v_str_blks * v_qs_per_block_rt + z_KV * v_head_blks;
+
+        tp_slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
+    };
+
+    // Macro: call process_tile with current tp_* state. Avoids repeating the 20-arg call.
+    #define MXFP_CALL_PROCESS_TILE(needs_fixup_v, is_fixup_v) \
+        flash_attn_ext_mxfp_process_tile<mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup_v, is_fixup_v> \
+            (tp_Q_f2, tp_K_row_base, tp_K_qs_head_off, tp_K_e_head_off, nb11, \
+             tp_V_row_base, tp_V_qs_head_off, tp_V_e_head_off, nb21, \
+             tp_mask_h, tp_sinks_f, tp_dstk, dst_meta, scale, tp_slope, logit_softcap, \
+             ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_mask, tp_jt, tp_zt_gqa, kb0_start, kb0_stop, v_type)
+
     int       kbc      = int64_t(blockIdx.x + 0) * (iter_k * iter_j * iter_z_gqa * ne12 * ne03) / gridDim.x;
     const int kbc_stop = int64_t(blockIdx.x + 1) * (iter_k * iter_j * iter_z_gqa * ne12 * ne03) / gridDim.x;
 
@@ -1732,49 +1768,16 @@ static __global__ void flash_attn_ext_mxfp(
     int kb0_stop  = min(iter_k, kb0_start + kbc_stop - kbc);
 
     while (kbc < kbc_stop && kb0_stop == iter_k) {
-        const int sequence =  kbc / (iter_k * iter_j * iter_z_gqa * ne12);
-        const int z_KV     = (kbc - iter_k * iter_j * iter_z_gqa * ne12 * sequence) / (iter_k * iter_j * iter_z_gqa);
-        const int zt_gqa   = (kbc - iter_k * iter_j * iter_z_gqa * ne12 * sequence - iter_k * iter_j * iter_z_gqa * z_KV) / (iter_k * iter_j);
-        const int jt       = (kbc - iter_k * iter_j * iter_z_gqa * ne12 * sequence - iter_k * iter_j * iter_z_gqa * z_KV - iter_k * iter_j * zt_gqa) / iter_k;
-
-        const int zt_Q = z_KV * gqa_ratio + zt_gqa * ncols2;
-
-        const float2 * Q_f2   = (const float2 *)(Q + nb03 * sequence + nb02 * zt_Q);
-        const half   * mask_h  = ncols2 == 1 && !mask ? nullptr :
-            (const half *)(mask + nb33 * (sequence % ne33));
-        float2       * dstk    = ((float2 *)dst) + (sequence * ne01.z * ne02 + zt_Q) * (DV / 2);
-        const float  * sinks_f = sinks ? (const float *)sinks + zt_Q : nullptr;
-
-        const char * K_row_base    = K + nb13 * sequence;
-        const int K_qs_head_off    = z_KV * blocks_per_head_K * k_qs_per_block;
-        const int K_e_head_off     = stride_K_blocks * k_qs_per_block + z_KV * blocks_per_head_K;
-        const int    v_head_blocks  = V_is_K_view ? blocks_per_head_K : blocks_per_head_V;
-        const int    v_stride_blks  = V_is_K_view ? stride_K_blocks   : stride_V_blocks;
-        const char * V_row_base     = V_is_K_view ? K_row_base        : (V + nb23 * sequence);
-        const int    V_qs_head_off  = z_KV * v_head_blocks * v_qs_per_block_rt;
-        const int    V_e_head_off   = v_stride_blks * v_qs_per_block_rt + z_KV * v_head_blocks;
-
-        const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
+        compute_tile_ptrs(kbc);
 
         if (KV_max) {
-            kb0_stop = min(kb0_stop, KV_max[sequence * iter_j + jt] / nbatch_fa);
+            kb0_stop = min(kb0_stop, KV_max[tp_sequence * iter_j + tp_jt] / nbatch_fa);
         }
 
-        constexpr bool is_fixup = false;
         if (kb0_start == 0) {
-            constexpr bool needs_fixup = false;
-            flash_attn_ext_mxfp_process_tile<mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup>
-                (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, nb11,
-                 V_row_base, V_qs_head_off, V_e_head_off, nb21,
-                 mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, v_type);
+            MXFP_CALL_PROCESS_TILE(false, false);
         } else {
-            constexpr bool needs_fixup = true;
-            flash_attn_ext_mxfp_process_tile<mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup>
-                (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, nb11,
-                 V_row_base, V_qs_head_off, V_e_head_off, nb21,
-                 mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, v_type);
+            MXFP_CALL_PROCESS_TILE(true, false);
         }
 
         kbc += iter_k;
@@ -1788,41 +1791,15 @@ static __global__ void flash_attn_ext_mxfp(
         return;
     }
 
-    const int sequence =  kbc / (iter_k * iter_j * iter_z_gqa * ne12);
-    const int z_KV     = (kbc - iter_k * iter_j * iter_z_gqa * ne12 * sequence) / (iter_k * iter_j * iter_z_gqa);
-    const int zt_gqa   = (kbc - iter_k * iter_j * iter_z_gqa * ne12 * sequence - iter_k * iter_j * iter_z_gqa * z_KV) / (iter_k * iter_j);
-    const int jt       = (kbc - iter_k * iter_j * iter_z_gqa * ne12 * sequence - iter_k * iter_j * iter_z_gqa * z_KV - iter_k * iter_j * zt_gqa) / iter_k;
-
-    const int zt_Q = z_KV * gqa_ratio + zt_gqa * ncols2;
-
-    const float2 * Q_f2   = (const float2 *)(Q + nb03 * sequence + nb02 * zt_Q);
-    const half   * mask_h  = ncols2 == 1 && !mask ? nullptr :
-        (const half *)(mask + nb33 * (sequence % ne33));
-    float2       * dstk    = ((float2 *)dst) + (sequence * ne01.z * ne02 + zt_Q) * (DV / 2);
-    const float  * sinks_f = sinks ? (const float *)sinks + zt_Q : nullptr;
-
-    const char * K_row_base    = K + nb13 * sequence;
-    const int K_qs_head_off    = z_KV * blocks_per_head_K * k_qs_per_block;
-    const int K_e_head_off     = stride_K_blocks * k_qs_per_block + z_KV * blocks_per_head_K;
-    const int    v_head_blocks  = V_is_K_view ? blocks_per_head_K : blocks_per_head_V;
-    const int    v_stride_blks  = V_is_K_view ? stride_K_blocks   : stride_V_blocks;
-    const char * V_row_base     = V_is_K_view ? K_row_base        : (V + nb23 * sequence);
-    const int    V_qs_head_off  = z_KV * v_head_blocks * v_qs_per_block_rt;
-    const int    V_e_head_off   = v_stride_blks * v_qs_per_block_rt + z_KV * v_head_blocks;
-
-    const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
+    compute_tile_ptrs(kbc);
 
     if (KV_max) {
-        kb0_stop = min(kb0_stop, KV_max[sequence * iter_j + jt] / nbatch_fa);
+        kb0_stop = min(kb0_stop, KV_max[tp_sequence * iter_j + tp_jt] / nbatch_fa);
     }
 
-    constexpr bool is_fixup    = true;
-    constexpr bool needs_fixup = false;
-    flash_attn_ext_mxfp_process_tile<mxfp_type, DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, needs_fixup, is_fixup>
-        (Q_f2, K_row_base, K_qs_head_off, K_e_head_off, nb11,
-         V_row_base, V_qs_head_off, V_e_head_off, nb21,
-         mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, v_type);
+    MXFP_CALL_PROCESS_TILE(false, true);
+
+    #undef MXFP_CALL_PROCESS_TILE
 #else
     GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -1895,21 +1872,21 @@ void ggml_cuda_flash_attn_ext_mma_mxfp_case(ggml_backend_cuda_context & ctx, ggm
     float logit_softcap;
     memcpy(&logit_softcap, (const float *)KQV->op_params + 2, sizeof(float));
 
+    const auto select_kernel = [&](fattn_kernel_t kernel, bool (& sml)[GGML_CUDA_MAX_DEVICES]) {
+        if (!sml[id]) {
+            CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+            sml[id] = true;
+        }
+        return kernel;
+    };
+
     fattn_kernel_t fattn_kernel;
     if (logit_softcap == 0.0f) {
-        fattn_kernel = flash_attn_ext_mxfp<mxfp_type, DKQ, DV, ncols1, ncols2, false>;
         static bool sml[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!sml[id]) {
-            CUDA_CHECK(cudaFuncSetAttribute(fattn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            sml[id] = true;
-        }
+        fattn_kernel = select_kernel(flash_attn_ext_mxfp<mxfp_type, DKQ, DV, ncols1, ncols2, false>, sml);
     } else {
-        fattn_kernel = flash_attn_ext_mxfp<mxfp_type, DKQ, DV, ncols1, ncols2, true>;
         static bool sml[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!sml[id]) {
-            CUDA_CHECK(cudaFuncSetAttribute(fattn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            sml[id] = true;
-        }
+        fattn_kernel = select_kernel(flash_attn_ext_mxfp<mxfp_type, DKQ, DV, ncols1, ncols2, true>, sml);
     }
 
     // need_f16_K=false, need_f16_V=false: MXFP kernel reads raw block data directly.
