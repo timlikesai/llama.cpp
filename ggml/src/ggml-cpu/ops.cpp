@@ -8260,16 +8260,30 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
-    ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
-    ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
-    ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
-    ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
-
     const bool is_mxfp_k = (k->type == GGML_TYPE_MXFP4_E2M1 ||
                              k->type == GGML_TYPE_MXFP8_E4M3 ||
                              k->type == GGML_TYPE_MXFP8_E5M2 ||
                              k->type == GGML_TYPE_MXFP6_E2M3 ||
                              k->type == GGML_TYPE_MXFP6_E3M2);
+
+    // For MXFP types: quantize Q to the same MXFP type as K (matching GPU MMA path),
+    // then dequant both K and Q to float for dot product. This ensures identical math
+    // between CPU and GPU: same quantization loss on Q, same dot product semantics.
+    ggml_from_float_t q_to_vec_dot;
+    ggml_vec_dot_t    kq_vec_dot;
+    ggml_to_float_t   mxfp_to_float = nullptr;
+
+    if (is_mxfp_k) {
+        q_to_vec_dot  = ggml_get_type_traits_cpu(k->type)->from_float;   // Q → same MXFP type as K
+        kq_vec_dot    = nullptr;                                          // unused; MXFP path uses dequant + float dot
+        mxfp_to_float = ggml_get_type_traits(k->type)->to_float;         // dequant MXFP → float
+    } else {
+        ggml_type const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
+        q_to_vec_dot = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
+        kq_vec_dot   = ggml_get_type_traits_cpu(k->type)->vec_dot;
+    }
+    ggml_to_float_t const v_to_float = ggml_get_type_traits(v->type)->to_float;
+
     // Hadamard rotation must match K rotation. Skip for MLA (DK != DV) since
     // V is a view of K and rotation would corrupt V.
     const bool apply_hadamard_q = is_mxfp_k && (DK == DV);
@@ -8323,6 +8337,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             q_to_vec_dot(pq, Q_q, DK);
         }
 
+        // For MXFP: dequant Q back to float after MXFP round-trip.
+        // This captures the same quantization loss as the GPU MMA path.
+        float Q_f32[1024];
+        if (is_mxfp_k) {
+            GGML_ASSERT(DK <= 1024);
+            mxfp_to_float((const char *) Q_q, Q_f32, DK);
+        }
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
@@ -8336,7 +8358,18 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float s; // KQ value
 
             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-            kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            if (is_mxfp_k) {
+                // MXFP x MXFP: dequant K to float, dot against round-tripped Q.
+                // Matches GPU MMA which computes exact product of dequantized values.
+                float k_f32[1024];
+                mxfp_to_float(k_data, k_f32, DK);
+                s = 0.0f;
+                for (int64_t j = 0; j < DK; ++j) {
+                    s += k_f32[j] * Q_f32[j];
+                }
+            } else {
+                kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            }
 
             s = s*scale; // scale KQ value
 
@@ -8484,9 +8517,24 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
 
-    GGML_ASSERT(k->type == v->type);
-    const ggml_type kv_type = k->type;
+    const ggml_type k_type = k->type;
+    const ggml_type v_type = v->type;
 
+    const bool is_mxfp_k = (k_type == GGML_TYPE_MXFP4_E2M1 ||
+                             k_type == GGML_TYPE_MXFP8_E4M3 ||
+                             k_type == GGML_TYPE_MXFP8_E5M2 ||
+                             k_type == GGML_TYPE_MXFP6_E2M3 ||
+                             k_type == GGML_TYPE_MXFP6_E3M2);
+    // Hadamard rotation must match K rotation. Skip for MLA (DK != DV) since
+    // V is a view of K and rotation would corrupt V.
+    const bool apply_hadamard_q = is_mxfp_k && (DK == DV);
+
+    // Dequant functions for K and V (null for F32 which needs no conversion)
+    ggml_to_float_t const k_to_float = ggml_get_type_traits(k_type)->to_float;
+    ggml_to_float_t const v_to_float = ggml_get_type_traits(v_type)->to_float;
+
+    // For MXFP Q round-trip: quantize Q to same MXFP type as K, then dequant back
+    ggml_from_float_t const q_to_mxfp = is_mxfp_k ? ggml_get_type_traits_cpu(k_type)->from_float : nullptr;
 
     // broadcast factors
     const int64_t rk2 = neq2/nek2;
@@ -8575,6 +8623,19 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             for (int tq = 0; tq < tile_rows; tq++) {
                 const float * pq = (const float *) ((char *) q->data + ((iq1 + tq)*nbq1 + iq2*nbq2 + iq3*nbq3));
                 memcpy(Q_f32 + tq * DK, pq, DK * sizeof(float));
+
+                if (is_mxfp_k) {
+                    // Apply Hadamard rotation to match K-side rotation
+                    if (apply_hadamard_q) {
+                        ggml_apply_hadamard_blocks(Q_f32 + tq * DK, DK);
+                    }
+                    // MXFP round-trip: quantize Q to same MXFP type as K, then dequant back.
+                    // This captures the same quantization loss as the GPU MMA path.
+                    // Use a stack buffer sized for the largest MXFP block (mxfp8 = 33 bytes/block).
+                    uint8_t q_mxfp_buf[1024]; // 1024 bytes >> 576/32 * 33 = 594 bytes (MLA max)
+                    q_to_mxfp(Q_f32 + tq * DK, q_mxfp_buf, DK);
+                    k_to_float((const char *)q_mxfp_buf, Q_f32 + tq * DK, DK);
+                }
             }
             for (int tq = tile_rows; tq < Q_TILE_SZ; tq++) {
                 memset(Q_f32 + tq * DK, 0, DK * sizeof(float));
@@ -8613,15 +8674,22 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             // Zero-pad the last tile so the GEMM always operates on KV_TILE_SZ columns
             for (int tk = 0; tk < kv_tile; tk++) {
                 const char * k_data = (const char *)k->data + (ic + tk)*nbk1 + ik2*nbk2 + ik3*nbk3;
-                if (kv_type == GGML_TYPE_F16) {
+                if (k_type == GGML_TYPE_F16) {
                     const ggml_fp16_t * k_f16 = (const ggml_fp16_t *)k_data;
                     for (int64_t dk = 0; dk < DK; dk++) {
                         K_f32[dk * KV_TILE_SZ + tk] = GGML_CPU_FP16_TO_FP32(k_f16[dk]);
                     }
-                } else {
+                } else if (k_type == GGML_TYPE_F32) {
                     const float * k_f32_src = (const float *)k_data;
                     for (int64_t dk = 0; dk < DK; dk++) {
                         K_f32[dk * KV_TILE_SZ + tk] = k_f32_src[dk];
+                    }
+                } else {
+                    // Quantized types (MXFP, etc.): dequant row to temp, then scatter-transpose
+                    float k_tmp[1024];
+                    k_to_float(k_data, k_tmp, DK);
+                    for (int64_t dk = 0; dk < DK; dk++) {
+                        K_f32[dk * KV_TILE_SZ + tk] = k_tmp[dk];
                     }
                 }
             }
@@ -8678,10 +8746,13 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             // Pack V tile to contiguous F32, zero-padded
             for (int tk = 0; tk < kv_tile; tk++) {
                 const char * v_data = (const char *)v->data + (ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
-                if (kv_type == GGML_TYPE_F16) {
+                if (v_type == GGML_TYPE_F16) {
                     ggml_fp16_to_fp32_row((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
-                } else {
+                } else if (v_type == GGML_TYPE_F32) {
                     memcpy(V32 + tk * DV, v_data, DV * sizeof(float));
+                } else {
+                    // Quantized types (MXFP, etc.)
+                    v_to_float(v_data, V32 + tk * DV, DV);
                 }
             }
             for (int tq = 0; tq < Q_TILE_SZ; tq++) {
@@ -8850,7 +8921,16 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    const bool kv_is_mxfp       = (k->type == GGML_TYPE_MXFP4_E2M1 ||
+                                    k->type == GGML_TYPE_MXFP8_E4M3 ||
+                                    k->type == GGML_TYPE_MXFP8_E5M2 ||
+                                    k->type == GGML_TYPE_MXFP6_E2M3 ||
+                                    k->type == GGML_TYPE_MXFP6_E3M2);
+    // Split-KV: parallelize across KV chunks for single-query decode (token generation).
+    // Delegates to one_chunk which handles all supported types including MXFP.
+    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1)
+                                   && (kv_is_f32_or_f16 || kv_is_mxfp)
+                                   && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -8909,8 +8989,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
         bool use_tiled = !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
-                                kv_is_f32_or_f16 &&
-                                k->type == v->type &&
+                                (kv_is_f32_or_f16 || kv_is_mxfp) &&
                                 neq1 >= Q_TILE_SZ);
 #ifdef GGML_SIMD
         use_tiled &= (DV % GGML_F32_EPR == 0);

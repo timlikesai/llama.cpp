@@ -5003,8 +5003,26 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #else
             return true;
 #endif // GGML_USE_MUSA
-        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_EXT: {
+            // MXFP types use SoA layout on CUDA but AoS on CPU. If K/V data is
+            // not on CUDA, decline so the CPU backend handles it with AoS layout.
+            // Check both buffer (when assigned) and view_src->buffer (for views).
+            const ggml_tensor * K = op->src[1];
+            const ggml_tensor * V = op->src[2];
+            if (ggml_is_type_mxfp(K->type)) {
+                ggml_backend_buffer_t kb = K->buffer ? K->buffer : (K->view_src ? K->view_src->buffer : nullptr);
+                if (kb && !ggml_backend_buffer_is_cuda(kb)) {
+                    return false;
+                }
+            }
+            if (ggml_is_type_mxfp(V->type)) {
+                ggml_backend_buffer_t vb = V->buffer ? V->buffer : (V->view_src ? V->view_src->buffer : nullptr);
+                if (vb && !ggml_backend_buffer_is_cuda(vb)) {
+                    return false;
+                }
+            }
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+        }
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:

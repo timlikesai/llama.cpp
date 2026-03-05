@@ -42,6 +42,11 @@ MODELS=(
     "devstral-24b|/models/unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF/Devstral-Small-2-24B-Instruct-2512-Q4_1.gguf"
     "granite-tiny|/models/lmstudio-community/granite-4.0-h-tiny-GGUF/granite-4.0-h-tiny-Q8_0.gguf"
     "gemma-3n|/models/unsloth/gemma-3n-E4B-it-GGUF/gemma-3n-E4B-it-Q8_0.gguf"
+    "gemma-3n-text-q8|/models/lmstudio-community/gemma-3n-E4B-it-text-GGUF/gemma-3n-E4B-it-Q8_0.gguf"
+    "gemma-3n-text-q6|/models/lmstudio-community/gemma-3n-E4B-it-text-GGUF/gemma-3n-E4B-it-Q6_K.gguf"
+    "gemma-3n-text-q4|/models/lmstudio-community/gemma-3n-E4B-it-text-GGUF/gemma-3n-E4B-it-Q4_K_M.gguf"
+    "gemma-3-27b-qat|/models/lmstudio-community/gemma-3-27B-it-qat-GGUF/gemma-3-27B-it-QAT-Q4_0.gguf"
+    "embeddinggemma|/models/unsloth/embeddinggemma-300m-GGUF/embeddinggemma-300M-Q8_0.gguf"
     "qwen3-4b-math|/models/mradermacher/Qwen3-4B-math-GGUF/Qwen3-4B-math.Q8_0.gguf"
     "lfm2.5-thinking|/models/unsloth/LFM2.5-1.2B-Thinking-GGUF/LFM2.5-1.2B-Thinking-Q8_0.gguf"
     "lfm2.5-instruct|/models/unsloth/LFM2.5-1.2B-Instruct-GGUF/LFM2.5-1.2B-Instruct-Q8_0.gguf"
@@ -86,7 +91,7 @@ CONFIGS=(
     "mxfp6_e3m2"
     "mxfp4"
 )
-MODEL_INPUT="$DEFAULT_MODEL"
+MODEL_INPUTS=()
 _config_overridden=false
 
 # ── Argument Parsing ─────────────────────────────────────────────────────────
@@ -101,7 +106,7 @@ while [[ $# -gt 0 ]]; do
             DO_PERPLEXITY=false
             shift
             ;;
-        --skip-bench)
+        --skip-bench|--skip-performance)
             DO_BENCH=false
             shift
             ;;
@@ -134,7 +139,44 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --model)
-            MODEL_INPUT="$2"
+            case "$2" in
+                gemma)
+                    # All Gemma models
+                    for entry in "${MODELS[@]}"; do
+                        local_name="${entry%%|*}"
+                        if [[ "$local_name" == gemma* ]]; then
+                            MODEL_INPUTS+=("$local_name")
+                        fi
+                    done
+                    ;;
+                glm)
+                    # All GLM models
+                    for entry in "${MODELS[@]}"; do
+                        local_name="${entry%%|*}"
+                        if [[ "$local_name" == glm* ]]; then
+                            MODEL_INPUTS+=("$local_name")
+                        fi
+                    done
+                    ;;
+                qwen)
+                    # All Qwen models
+                    for entry in "${MODELS[@]}"; do
+                        local_name="${entry%%|*}"
+                        if [[ "$local_name" == qwen* ]]; then
+                            MODEL_INPUTS+=("$local_name")
+                        fi
+                    done
+                    ;;
+                all)
+                    # Every model
+                    for entry in "${MODELS[@]}"; do
+                        MODEL_INPUTS+=("${entry%%|*}")
+                    done
+                    ;;
+                *)
+                    MODEL_INPUTS+=("$2")
+                    ;;
+            esac
             shift 2
             ;;
         --help)
@@ -145,7 +187,8 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --skip-build        Skip Docker build step"
             echo "  --skip-perplexity   Skip perplexity runs (no PPL or memory data)"
-            echo "  --skip-bench        Skip throughput benchmarks (both GPU and CPU)"
+            echo "  --skip-bench        Skip throughput benchmarks (pp512 + tg128)"
+            echo "  --skip-performance  Alias for --skip-bench"
             echo "  --skip-cpu          Skip CPU-only benchmarks"
             echo "  --skip-gpu          Skip GPU benchmarks"
             echo "  --chunks N[,M]      Chunk counts for perplexity, comma-separated (default: 16)"
@@ -153,7 +196,8 @@ while [[ $# -gt 0 ]]; do
             echo "                        f16, q8_0, q4_0, q8_0+q4_0"
             echo "                        mxfp8_e4m3, mxfp8_e5m2, mxfp6_e2m3, mxfp6_e3m2, mxfp4"
             echo "                      Groups: mxfp (all 5), mxfp8 (both e4m3+e5m2), mxfp6 (both e2m3+e3m2)"
-            echo "  --model NAME|PATH   Model preset or path (default: $DEFAULT_MODEL)"
+            echo "  --model NAME|PATH   Model preset, path, or group (repeatable, default: $DEFAULT_MODEL)"
+            echo "                      Groups: gemma (all Gemma), glm (all GLM), qwen (all Qwen), all"
             echo "  --help              Show this help"
             echo ""
             echo "Models:"
@@ -184,10 +228,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ── Resolve Model ────────────────────────────────────────────────────────────
+# ── Resolve Model List ───────────────────────────────────────────────────────
 
-resolve_model "$MODEL_INPUT"
-echo "Model: $MODEL_NAME ($MODEL_PATH)"
+if [[ ${#MODEL_INPUTS[@]} -eq 0 ]]; then
+    MODEL_INPUTS=("$DEFAULT_MODEL")
+fi
+
+echo "Models to test: ${MODEL_INPUTS[*]}"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -289,9 +336,6 @@ if $DO_PERPLEXITY; then
     fi
 fi
 
-RESULTS_DIR="$SCRIPT_DIR/test-results/kv-bench-${MODEL_NAME}-$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$RESULTS_DIR"
-
 # ── Build ────────────────────────────────────────────────────────────────────
 
 if $DO_BUILD; then
@@ -302,43 +346,88 @@ if $DO_BUILD; then
     echo "Build completed successfully."
 fi
 
-# ── Result Storage ───────────────────────────────────────────────────────────
+# ── Table Format (determined once, reused per model) ────────────────────────
 
-# Associative arrays for parsed results.
-declare -A RESULT_PPL
-declare -A RESULT_K_MIB
-declare -A RESULT_V_MIB
-declare -A RESULT_CELLS
-declare -A RESULT_PP512
-declare -A RESULT_TG128
-declare -A RESULT_PPL_CPU
-declare -A RESULT_PP512_CPU
-declare -A RESULT_TG128_CPU
+# Determine which columns to show based on GPU/CPU modes.
+SHOW_GPU_BENCH=$($DO_BENCH && $DO_GPU && echo true || echo false)
+SHOW_CPU_BENCH=$($DO_BENCH && $DO_CPU && echo true || echo false)
+SHOW_GPU_PPL=$($DO_PERPLEXITY && $DO_GPU && echo true || echo false)
+SHOW_CPU_PPL=$($DO_PERPLEXITY && $DO_CPU && echo true || echo false)
 
-# ── Run Tests ────────────────────────────────────────────────────────────────
+# Build table format dynamically. When both GPU and CPU are active, show all columns side-by-side.
+if ($SHOW_GPU_PPL || $SHOW_GPU_BENCH) && ($SHOW_CPU_PPL || $SHOW_CPU_BENCH); then
+    table_top()  { echo "  ┌────────────┬─────────┬────────┬────────┬────────┬─────────┬─────────┬────────┬──────────────────┬──────────────────┐"; }
+    table_hdr()  { printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %7s │ %7s │ %6s │ %8s %7s │ %8s %7s │\n" \
+                          "K type" "V type" "K GiB" "V GiB" "Total" "GPU PPL" "CPU PPL" " Δ F16" "GPU pp" "GPU tg" "CPU pp" "CPU tg"; }
+    table_sep()  { echo "  ├────────────┼─────────┼────────┼────────┼────────┼─────────┼─────────┼────────┼──────────────────┼──────────────────┤"; }
+    table_row()  { printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %7s │ %7s │ %6s │ %8s %7s │ %8s %7s │\n" \
+                          "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}"; }
+    table_bot()  { echo "  └────────────┴─────────┴────────┴────────┴────────┴─────────┴─────────┴────────┴──────────────────┴──────────────────┘"; }
+    TABLE_MODE="full"
+elif $SHOW_GPU_BENCH || $SHOW_GPU_PPL; then
+    table_top()  { echo "  ┌────────────┬─────────┬────────┬────────┬────────┬────────┬────────┬────────┬────────┐"; }
+    table_hdr()  { printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │\n" \
+                          "K type" "V type" "K GiB" "V GiB" "Total" "PPL" " Δ F16" "pp512" "tg128"; }
+    table_sep()  { echo "  ├────────────┼─────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤"; }
+    table_row()  { printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │\n" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"; }
+    table_bot()  { echo "  └────────────┴─────────┴────────┴────────┴────────┴────────┴────────┴────────┴────────┘"; }
+    TABLE_MODE="gpu"
+elif $SHOW_CPU_BENCH || $SHOW_CPU_PPL; then
+    table_top()  { echo "  ┌────────────┬─────────┬────────┬────────┬────────┬────────┬────────┬────────┬────────┐"; }
+    table_hdr()  { printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │\n" \
+                          "K type" "V type" "K GiB" "V GiB" "Total" "PPL" " Δ F16" "pp512" "tg128"; }
+    table_sep()  { echo "  ├────────────┼─────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤"; }
+    table_row()  { printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │\n" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"; }
+    table_bot()  { echo "  └────────────┴─────────┴────────┴────────┴────────┴────────┴────────┴────────┴────────┘"; }
+    TABLE_MODE="cpu"
+else
+    TABLE_MODE="none"
+fi
 
-is_config_supported() {
-    # All configs are supported for all models now (MLA uses matched K/V).
-    return 0
-}
+# ── Per-Model Loop ──────────────────────────────────────────────────────────
 
-# Count supported configs for progress display.
-total_configs=0
-for config in "${CONFIGS[@]}"; do
-    is_config_supported "$config" && (( total_configs++ )) || true
-done
+model_num=0
+total_models=${#MODEL_INPUTS[@]}
+
+for MODEL_INPUT in "${MODEL_INPUTS[@]}"; do
+
+(( model_num += 1 ))
+resolve_model "$MODEL_INPUT"
+
+echo ""
+echo "════════════════════════════════════════════════════════════════════════"
+echo "  Model ${model_num}/${total_models}: ${MODEL_NAME}"
+echo "  ${MODEL_PATH}"
+echo "  $(timestamp)"
+echo "════════════════════════════════════════════════════════════════════════"
+echo ""
+
+RESULTS_DIR="$SCRIPT_DIR/test-results/kv-bench-${MODEL_NAME}-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$RESULTS_DIR"
+
+# ── Result Storage (reset per model) ────────────────────────────────────
+
+declare -A RESULT_PPL=()
+declare -A RESULT_K_MIB=()
+declare -A RESULT_V_MIB=()
+declare -A RESULT_CELLS=()
+declare -A RESULT_PP512=()
+declare -A RESULT_TG128=()
+declare -A RESULT_PPL_CPU=()
+declare -A RESULT_PP512_CPU=()
+declare -A RESULT_TG128_CPU=()
+
+# ── Run Tests ───────────────────────────────────────────────────────────
+
+total_configs=${#CONFIGS[@]}
 config_num=0
 
 for config in "${CONFIGS[@]}"; do
-    if ! is_config_supported "$config"; then
-        echo "  Skipping $config — not supported for $MODEL_NAME (D > 256, V=mxfp4 unsupported)"
-        continue
-    fi
-    (( ++config_num ))
+    (( config_num += 1 ))
     config_types "$config"
-    progress="[${config_num}/${total_configs}]"
+    progress="[${model_num}/${total_models}] [${config_num}/${total_configs}]"
 
-    # ── GPU Perplexity ────────────────────────────────────────────────────
+    # ── GPU Perplexity ──────────────────────────────────────────────
     if $DO_PERPLEXITY && $DO_GPU; then
         for chunks in "${CHUNKS_LIST[@]}"; do
             echo "${progress} K=${TYPE_K} V=${TYPE_V} — GPU perplexity (${chunks} chunks)..."
@@ -359,11 +448,9 @@ for config in "${CONFIGS[@]}"; do
                 exit 1
             fi
 
-            # Parse PPL from "Final estimate: PPL = X.XXXX".
             ppl=$(grep --perl-regexp --only-matching 'Final estimate: PPL = \K[\d.]+' "$local_log" || echo "N/A")
             RESULT_PPL["${config}:${chunks}"]="$ppl"
 
-            # Parse KV cache memory (only need once per config).
             if [[ -z "${RESULT_CELLS[$config]:-}" ]]; then
                 kv_line=$(grep 'llama_kv_cache: size' "$local_log" | tail --lines 1 || echo "")
                 if [[ -n "$kv_line" ]]; then
@@ -379,7 +466,7 @@ for config in "${CONFIGS[@]}"; do
         done
     fi
 
-    # ── CPU Perplexity ────────────────────────────────────────────────────
+    # ── CPU Perplexity ──────────────────────────────────────────────
     if $DO_PERPLEXITY && $DO_CPU; then
         for chunks in "${CHUNKS_LIST[@]}"; do
             echo "${progress} K=${TYPE_K} V=${TYPE_V} — CPU perplexity (${chunks} chunks)..."
@@ -407,7 +494,7 @@ for config in "${CONFIGS[@]}"; do
         done
     fi
 
-    # ── GPU Throughput ────────────────────────────────────────────────────
+    # ── GPU Throughput ──────────────────────────────────────────────
     if $DO_BENCH && $DO_GPU; then
         echo "${progress} K=${TYPE_K} V=${TYPE_V} — GPU bench (pp512 + tg128)..."
 
@@ -428,7 +515,6 @@ for config in "${CONFIGS[@]}"; do
             exit 1
         fi
 
-        # Parse JSONL: "n_prompt": 512 → pp, "n_gen": 128 → tg. Field: "avg_ts".
         pp_ts=$(grep --perl-regexp --only-matching '"n_prompt": 512.*?"avg_ts": \K[\d.]+' "$local_log" || echo "N/A")
         tg_ts=$(grep --perl-regexp --only-matching '"n_gen": 128.*?"avg_ts": \K[\d.]+' "$local_log" || echo "N/A")
 
@@ -438,7 +524,7 @@ for config in "${CONFIGS[@]}"; do
         echo "        GPU: pp512: ${pp_ts} t/s | tg128: ${tg_ts} t/s"
     fi
 
-    # ── CPU Throughput ────────────────────────────────────────────────────
+    # ── CPU Throughput ──────────────────────────────────────────────
     if $DO_BENCH && $DO_CPU; then
         echo "${progress} K=${TYPE_K} V=${TYPE_V} — CPU bench (pp512 + tg128)..."
 
@@ -469,59 +555,16 @@ for config in "${CONFIGS[@]}"; do
     fi
 done
 
-# ── Results Table ────────────────────────────────────────────────────────────
+# ── Results Table ───────────────────────────────────────────────────────
 
 echo ""
-echo "  $MODEL_NAME — ${CHUNKS_LIST[*]} chunks — $(timestamp)"
+echo "  ${MODEL_NAME} — ${MODEL_PATH}"
+echo "  ${CHUNKS_LIST[*]} chunks — $(timestamp)"
 echo ""
 
-# Determine which columns to show based on GPU/CPU modes.
-SHOW_GPU_BENCH=$($DO_BENCH && $DO_GPU && echo true || echo false)
-SHOW_CPU_BENCH=$($DO_BENCH && $DO_CPU && echo true || echo false)
-SHOW_GPU_PPL=$($DO_PERPLEXITY && $DO_GPU && echo true || echo false)
-SHOW_CPU_PPL=$($DO_PERPLEXITY && $DO_CPU && echo true || echo false)
-
-# Build table format dynamically. When both GPU and CPU are active, show all columns side-by-side.
-# Modes: full (GPU+CPU PPL+bench), gpu-only, cpu-only, ppl-only, bench-only, etc.
-if ($SHOW_GPU_PPL || $SHOW_GPU_BENCH) && ($SHOW_CPU_PPL || $SHOW_CPU_BENCH); then
-    # Full GPU + CPU side-by-side
-    #                K(10)     V(7)      KGiB(6) VGiB(6) Tot(6) | GPPL(7) CPPL(7) Δ(6) | Gpp(8) Gtg(7) | Cpp(8) Ctg(7)
-    table_top()  { echo "  ┌────────────┬─────────┬────────┬────────┬────────┬─────────┬─────────┬────────┬──────────────────┬──────────────────┐"; }
-    table_hdr()  { printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %7s │ %7s │ %6s │ %8s %7s │ %8s %7s │\n" \
-                          "K type" "V type" "K GiB" "V GiB" "Total" "GPU PPL" "CPU PPL" " Δ F16" "GPU pp" "GPU tg" "CPU pp" "CPU tg"; }
-    table_sep()  { echo "  ├────────────┼─────────┼────────┼────────┼────────┼─────────┼─────────┼────────┼──────────────────┼──────────────────┤"; }
-    table_row()  { printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %7s │ %7s │ %6s │ %8s %7s │ %8s %7s │\n" \
-                          "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}"; }
-    table_bot()  { echo "  └────────────┴─────────┴────────┴────────┴────────┴─────────┴─────────┴────────┴──────────────────┴──────────────────┘"; }
-    TABLE_MODE="full"
-elif $SHOW_GPU_BENCH || $SHOW_GPU_PPL; then
-    # GPU only (original layout)
-    table_top()  { echo "  ┌────────────┬─────────┬────────┬────────┬────────┬────────┬────────┬────────┬────────┐"; }
-    table_hdr()  { printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │\n" \
-                          "K type" "V type" "K GiB" "V GiB" "Total" "PPL" " Δ F16" "pp512" "tg128"; }
-    table_sep()  { echo "  ├────────────┼─────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤"; }
-    table_row()  { printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │\n" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"; }
-    table_bot()  { echo "  └────────────┴─────────┴────────┴────────┴────────┴────────┴────────┴────────┴────────┘"; }
-    TABLE_MODE="gpu"
-elif $SHOW_CPU_BENCH || $SHOW_CPU_PPL; then
-    # CPU only
-    table_top()  { echo "  ┌────────────┬─────────┬────────┬────────┬────────┬────────┬────────┬────────┬────────┐"; }
-    table_hdr()  { printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │\n" \
-                          "K type" "V type" "K GiB" "V GiB" "Total" "PPL" " Δ F16" "pp512" "tg128"; }
-    table_sep()  { echo "  ├────────────┼─────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤"; }
-    table_row()  { printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │ %6s │\n" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"; }
-    table_bot()  { echo "  └────────────┴─────────┴────────┴────────┴────────┴────────┴────────┴────────┴────────┘"; }
-    TABLE_MODE="cpu"
-else
-    # No data
-    TABLE_MODE="none"
-fi
-
-# Build rows with sortable PPL prefix, then sort by PPL ascending.
 declare -a TABLE_ROWS=()
 
 for config in "${CONFIGS[@]}"; do
-    # Only include configs that actually produced results (PPL or any bench).
     last_chunks="${CHUNKS_LIST[${#CHUNKS_LIST[@]}-1]}"
     has_ppl="${RESULT_PPL["${config}:${last_chunks}"]:-}"
     has_ppl_cpu="${RESULT_PPL_CPU["${config}:${last_chunks}"]:-}"
@@ -564,11 +607,9 @@ for config in "${CONFIGS[@]}"; do
     ppl_cpu_raw="${RESULT_PPL_CPU["${config}:${last_chunks}"]:-}"
     if [[ -n "$ppl_cpu_raw" && "$ppl_cpu_raw" != "N/A" ]]; then
         ppl_cpu_fmt=$(awk "BEGIN { printf \"%.2f\", $ppl_cpu_raw }")
-        # If no GPU PPL for sorting, use CPU PPL.
         if [[ "$sort_key" == "9999.9999" ]]; then
             sort_key=$(printf "%010.4f" "$ppl_cpu_raw")
         fi
-        # If no GPU delta, compute CPU delta vs CPU f16.
         if [[ "$delta_fmt" == "-" && "$config" != "f16" ]]; then
             f16_cpu_raw="${RESULT_PPL_CPU["f16:${last_chunks}"]:-}"
             if [[ -n "$f16_cpu_raw" && "$f16_cpu_raw" != "N/A" ]]; then
@@ -601,7 +642,6 @@ for config in "${CONFIGS[@]}"; do
         tg_cpu_fmt=$(printf "%'.1f" "$tg_cpu_raw")
     fi
 
-    # Store with sort key prefix (pipe-separated).
     TABLE_ROWS+=("${sort_key}|${TYPE_K}|${TYPE_V}|${k_gib_fmt}|${v_gib_fmt}|${total_fmt}|${ppl_fmt}|${ppl_cpu_fmt}|${delta_fmt}|${pp_fmt}|${tg_fmt}|${pp_cpu_fmt}|${tg_cpu_fmt}")
 done
 
@@ -615,7 +655,6 @@ if [[ "$TABLE_MODE" != "none" && ${#SORTED_ROWS[@]} -gt 0 ]]; then
     first=true
     for entry in "${SORTED_ROWS[@]}"; do
         if $first; then first=false; else table_sep; fi
-        # Strip sort key, split fields.
         IFS='|' read -r _sort_key tk tv k_gib v_gib total ppl ppl_cpu delta pp tg pp_cpu tg_cpu <<< "$entry"
         case "$TABLE_MODE" in
             full) table_row "$tk" "$tv" "$k_gib" "$v_gib" "$total" "$ppl" "$ppl_cpu" "$delta" "$pp" "$tg" "$pp_cpu" "$tg_cpu" ;;
@@ -630,3 +669,5 @@ echo ""
 echo "  Memory: GiB per 100K tokens (K + V cache)"
 echo "  Raw logs: $RESULTS_DIR/"
 echo ""
+
+done  # end per-model loop
