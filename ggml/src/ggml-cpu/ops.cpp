@@ -4921,6 +4921,83 @@ void ggml_compute_forward_get_rows(
 
 // Walsh-Hadamard transform for MXFP quantization quality (QuaRot, arXiv:2404.00456).
 // Spreads outliers across 32-element blocks for better E8M0 scale utilization.
+// 5 butterfly stages on 32 floats, followed by 1/sqrt(32) normalization.
+#if defined(__ARM_NEON)
+static void hadamard_32_inplace(float vals[32]) {
+    // Load 32 floats into 8 NEON registers
+    float32x4_t v0 = vld1q_f32(vals +  0);
+    float32x4_t v1 = vld1q_f32(vals +  4);
+    float32x4_t v2 = vld1q_f32(vals +  8);
+    float32x4_t v3 = vld1q_f32(vals + 12);
+    float32x4_t v4 = vld1q_f32(vals + 16);
+    float32x4_t v5 = vld1q_f32(vals + 20);
+    float32x4_t v6 = vld1q_f32(vals + 24);
+    float32x4_t v7 = vld1q_f32(vals + 28);
+
+    // Stage 1 (stride=1): butterfly pairs at offset 1 within each float32x4_t
+    // {a,b,c,d} → {a+b, a-b, c+d, c-d}
+    #define HADAMARD_S1(v) do {                                         \
+        float32x2_t lo = vget_low_f32(v);                              \
+        float32x2_t hi = vget_high_f32(v);                             \
+        float32x2x2_t t = vtrn_f32(lo, hi);                           \
+        float32x2_t sum = vadd_f32(t.val[0], t.val[1]);               \
+        float32x2_t dif = vsub_f32(t.val[0], t.val[1]);               \
+        float32x2x2_t r = vtrn_f32(sum, dif);                         \
+        (v) = vcombine_f32(r.val[0], r.val[1]);                       \
+    } while (0)
+    HADAMARD_S1(v0); HADAMARD_S1(v1); HADAMARD_S1(v2); HADAMARD_S1(v3);
+    HADAMARD_S1(v4); HADAMARD_S1(v5); HADAMARD_S1(v6); HADAMARD_S1(v7);
+    #undef HADAMARD_S1
+
+    // Stage 2 (stride=2): butterfly pairs at offset 2 within each float32x4_t
+    // {a,b,c,d} → {a+c, b+d, a-c, b-d}
+    #define HADAMARD_S2(v) do {                                         \
+        float32x2_t lo = vget_low_f32(v);                              \
+        float32x2_t hi = vget_high_f32(v);                             \
+        (v) = vcombine_f32(vadd_f32(lo, hi), vsub_f32(lo, hi));       \
+    } while (0)
+    HADAMARD_S2(v0); HADAMARD_S2(v1); HADAMARD_S2(v2); HADAMARD_S2(v3);
+    HADAMARD_S2(v4); HADAMARD_S2(v5); HADAMARD_S2(v6); HADAMARD_S2(v7);
+    #undef HADAMARD_S2
+
+    // Stage 3 (stride=4): butterfly across pairs of float32x4_t
+    #define HADAMARD_S4(a, b) do {                                      \
+        float32x4_t s = vaddq_f32(a, b);                               \
+        float32x4_t d = vsubq_f32(a, b);                               \
+        (a) = s; (b) = d;                                              \
+    } while (0)
+    HADAMARD_S4(v0, v1); HADAMARD_S4(v2, v3);
+    HADAMARD_S4(v4, v5); HADAMARD_S4(v6, v7);
+    #undef HADAMARD_S4
+
+    // Stage 4 (stride=8): butterfly across groups of 2 float32x4_t
+    { float32x4_t s, d;
+      s = vaddq_f32(v0, v2); d = vsubq_f32(v0, v2); v0 = s; v2 = d;
+      s = vaddq_f32(v1, v3); d = vsubq_f32(v1, v3); v1 = s; v3 = d;
+      s = vaddq_f32(v4, v6); d = vsubq_f32(v4, v6); v4 = s; v6 = d;
+      s = vaddq_f32(v5, v7); d = vsubq_f32(v5, v7); v5 = s; v7 = d;
+    }
+
+    // Stage 5 (stride=16): butterfly across groups of 4 float32x4_t
+    { float32x4_t s, d;
+      s = vaddq_f32(v0, v4); d = vsubq_f32(v0, v4); v0 = s; v4 = d;
+      s = vaddq_f32(v1, v5); d = vsubq_f32(v1, v5); v1 = s; v5 = d;
+      s = vaddq_f32(v2, v6); d = vsubq_f32(v2, v6); v2 = s; v6 = d;
+      s = vaddq_f32(v3, v7); d = vsubq_f32(v3, v7); v3 = s; v7 = d;
+    }
+
+    // Normalize by 1/sqrt(32) and store
+    const float32x4_t norm = vdupq_n_f32(0.17677669529663689f);
+    vst1q_f32(vals +  0, vmulq_f32(v0, norm));
+    vst1q_f32(vals +  4, vmulq_f32(v1, norm));
+    vst1q_f32(vals +  8, vmulq_f32(v2, norm));
+    vst1q_f32(vals + 12, vmulq_f32(v3, norm));
+    vst1q_f32(vals + 16, vmulq_f32(v4, norm));
+    vst1q_f32(vals + 20, vmulq_f32(v5, norm));
+    vst1q_f32(vals + 24, vmulq_f32(v6, norm));
+    vst1q_f32(vals + 28, vmulq_f32(v7, norm));
+}
+#else
 static void hadamard_32_inplace(float vals[32]) {
     for (int stride = 1; stride < 32; stride *= 2) {
         for (int i = 0; i < 32; i += 2 * stride) {
@@ -4937,6 +5014,7 @@ static void hadamard_32_inplace(float vals[32]) {
         vals[i] *= norm;
     }
 }
+#endif
 
 // Apply Hadamard rotation to each 32-element block in a float buffer.
 static void ggml_apply_hadamard_blocks(float * data, int64_t n) {
@@ -8363,10 +8441,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 // Matches GPU MMA which computes exact product of dequantized values.
                 float k_f32[1024];
                 mxfp_to_float(k_data, k_f32, DK);
-                s = 0.0f;
-                for (int64_t j = 0; j < DK; ++j) {
-                    s += k_f32[j] * Q_f32[j];
-                }
+                ggml_vec_dot_f32(DK, &s, 0, k_f32, 0, Q_f32, 0, 1);
             } else {
                 kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
             }
