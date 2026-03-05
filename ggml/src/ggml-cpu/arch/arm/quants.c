@@ -4161,6 +4161,11 @@ static inline void ggml_vec_dot_mxfp8_q8_0_neon(
     const uint32x4_t v_mant_mask = vdupq_n_u32(mant_mask);
     const uint32x4_t v_ieee_off  = vdupq_n_u32(ieee_exp_off);
     const float32x4_t v_sub_sc   = vdupq_n_f32(sub_scale);
+    // Use variable shifts (vshlq_u32) instead of constant shifts (vshlq_n_u32)
+    // because exp_shift/mant_shift are function parameters, not compile-time constants.
+    // Clang requires _n_ intrinsics to have literal constant arguments.
+    const int32x4_t v_neg_exp_shift = vdupq_n_s32(-exp_shift);
+    const int32x4_t v_mant_shift   = vdupq_n_s32(mant_shift);
 
     for (int ib = 0; ib < nb; ++ib) {
         const float scale = GGML_E8M0_TO_FP32(x[ib].e) * GGML_CPU_FP16_TO_FP32(y[ib].d);
@@ -4183,13 +4188,15 @@ static inline void ggml_vec_dot_mxfp8_q8_0_neon(
             // Dequant FP8 → float for both groups of 4
             #define DEQUANT_FP8_NEON(v_raw, qf, acc) do {                              \
                 const uint32x4_t sign = vandq_u32(v_raw, vdupq_n_u32(0x80));          \
-                const uint32x4_t exp  = vandq_u32(vshrq_n_u32(v_raw, exp_shift), v_exp_mask); \
+                const uint32x4_t exp  = vandq_u32(                                    \
+                    vshlq_u32(v_raw, v_neg_exp_shift),                                 \
+                    v_exp_mask);                                                       \
                 const uint32x4_t mant = vandq_u32(v_raw, v_mant_mask);                \
                 /* Normal: IEEE bits = (exp + offset) << 23 | mant << mant_shift */    \
                 const uint32x4_t ieee = vorrq_u32(                                    \
                     vorrq_u32(vshlq_n_u32(sign, 24),                                  \
                               vshlq_n_u32(vaddq_u32(exp, v_ieee_off), 23)),            \
-                    vshlq_n_u32(mant, mant_shift));                                    \
+                    vshlq_u32(mant, v_mant_shift));             \
                 const float32x4_t normal = vreinterpretq_f32_u32(ieee);               \
                 /* Subnormal: sign * mant * sub_scale */                               \
                 const float32x4_t sub_abs = vmulq_f32(vcvtq_f32_u32(mant), v_sub_sc); \
@@ -4263,6 +4270,8 @@ static inline void ggml_vec_dot_mxfp6_q8_0_neon(
     const uint32x4_t v_mant_mask = vdupq_n_u32(mant_mask);
     const uint32x4_t v_ieee_off  = vdupq_n_u32(ieee_exp_off);
     const float32x4_t v_sub_sc   = vdupq_n_f32(sub_scale);
+    const int32x4_t v_neg_exp_shift = vdupq_n_s32(-exp_shift);
+    const int32x4_t v_mant_shift   = vdupq_n_s32(mant_shift);
 
     for (int ib = 0; ib < nb; ++ib) {
         const block_mxfp6 * GGML_RESTRICT xb = (const block_mxfp6 *)((const char *)vx + ib * block_size);
@@ -4307,12 +4316,14 @@ static inline void ggml_vec_dot_mxfp6_q8_0_neon(
             // Dequant FP6 → float (same IEEE construction as FP8, sign bit at position 5)
             #define DEQUANT_FP6_NEON(v_raw, qf, acc) do {                              \
                 const uint32x4_t sign = vandq_u32(v_raw, vdupq_n_u32(0x20));          \
-                const uint32x4_t exp  = vandq_u32(vshrq_n_u32(v_raw, exp_shift), v_exp_mask); \
+                const uint32x4_t exp  = vandq_u32(                                    \
+                    vshlq_u32(v_raw, v_neg_exp_shift),                                 \
+                    v_exp_mask);                                                       \
                 const uint32x4_t mant = vandq_u32(v_raw, v_mant_mask);                \
                 const uint32x4_t ieee = vorrq_u32(                                    \
                     vorrq_u32(vshlq_n_u32(sign, 26),                                  \
                               vshlq_n_u32(vaddq_u32(exp, v_ieee_off), 23)),            \
-                    vshlq_n_u32(mant, mant_shift));                                    \
+                    vshlq_u32(mant, v_mant_shift));             \
                 const float32x4_t normal = vreinterpretq_f32_u32(ieee);               \
                 const float32x4_t sub_abs = vmulq_f32(vcvtq_f32_u32(mant), v_sub_sc); \
                 const uint32x4_t  sub_bits = vorrq_u32(                               \
