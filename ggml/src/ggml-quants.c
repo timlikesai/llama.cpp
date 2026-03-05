@@ -596,7 +596,7 @@ static inline uint8_t float_to_fp6_e2m3_rn(float x) {
     if (exp < 0) {
         float scaled = x * 8.0f;
         int mant = (int)(scaled + 0.5f);
-        if (mant > 7) mant = 7;
+        if (mant > 7) return sign | 0x08;  // rounds up to first normal (exp=1, mant=0 = 1.0)
         return sign | (uint8_t)mant;
     }
     if (exp > 2) { exp = 2; }
@@ -616,9 +616,9 @@ static inline float fp6_e3m2_to_float(uint8_t v) {
     const int exp  = (v >> 2) & 0x7;
     const int mant = v & 0x3;
     if (exp == 0) {
-        return sign * (float)mant * (1.0f / 4.0f);
+        return sign * (float)mant * (1.0f / 16.0f);  // subnormal: mant * 2^(1-bias-m) = mant * 2^(-4)
     }
-    return sign * (1.0f + mant / 4.0f) * (float)(1 << (exp - 3));
+    return sign * (1.0f + mant / 4.0f) * ldexpf(1.0f, exp - 3);  // 2^(exp-bias)
 }
 
 static inline uint8_t float_to_fp6_e3m2_rn(float x) {
@@ -635,14 +635,14 @@ static inline uint8_t float_to_fp6_e3m2_rn(float x) {
     if (biased_exp <= 0) {
         float scaled = x * 16.0f;
         int mant = (int)(scaled + 0.5f);
-        if (mant > 3) mant = 3;
+        if (mant > 3) return sign | 0x04;  // rounds up to first normal (exp=1, mant=0 = 0.25)
         return sign | (uint8_t)mant;
     }
 
     // MX format: exp=7 is valid (no NaN/Inf), so only overflow at biased_exp > 7.
     if (biased_exp > 7) return sign | 0x1F;
 
-    float mantf = (x / (float)(1 << exp)) - 1.0f;
+    float mantf = (x / ldexpf(1.0f, exp)) - 1.0f;
     int mant = (int)(mantf * 4.0f + 0.5f);
     if (mant > 3) { mant = 0; biased_exp++; }
     if (biased_exp > 7) return sign | 0x1F;
@@ -735,18 +735,42 @@ static inline void unpack_fp6x4(const uint8_t in[3], uint8_t v[4]) {
 
 // MXFP element traits: per-format converter functions and E8M0 exponent offset.
 // Shared by quantize/dequantize impl functions to eliminate per-variant duplication.
+// mse_error: quantize val, reconstruct, return squared error (for MSE-optimal E8M0 search).
 typedef struct {
     int      emax_offset;
     uint8_t  (*to_elem)(float);
     float    (*to_float)(uint8_t);
+    float    (*mse_error)(float val, float inv_scale, float scale);
 } mxfp_elem_traits_t;
 
-static const mxfp_elem_traits_t mxfp8_e4m3_traits = { 8,  float_to_fp8_e4m3_rn, fp8_e4m3_to_float };
-static const mxfp_elem_traits_t mxfp8_e5m2_traits = { 16, float_to_fp8_e5m2_rn, fp8_e5m2_to_float };
-static const mxfp_elem_traits_t mxfp6_e2m3_traits = { 3,  float_to_fp6_e2m3_rn, fp6_e2m3_to_float };
-static const mxfp_elem_traits_t mxfp6_e3m2_traits = { 5,  float_to_fp6_e3m2_rn, fp6_e3m2_to_float };
+// MSE error functions: quantize → dequantize → squared error.
+static float mse_error_fp8_e4m3(float val, float inv_scale, float scale) {
+    const float recon = fp8_e4m3_to_float(float_to_fp8_e4m3_rn(val * inv_scale)) * scale;
+    const float err = val - recon;
+    return err * err;
+}
+static float mse_error_fp8_e5m2(float val, float inv_scale, float scale) {
+    const float recon = fp8_e5m2_to_float(float_to_fp8_e5m2_rn(val * inv_scale)) * scale;
+    const float err = val - recon;
+    return err * err;
+}
+static float mse_error_fp6_e2m3(float val, float inv_scale, float scale) {
+    const float recon = fp6_e2m3_to_float(float_to_fp6_e2m3_rn(val * inv_scale)) * scale;
+    const float err = val - recon;
+    return err * err;
+}
+static float mse_error_fp6_e3m2(float val, float inv_scale, float scale) {
+    const float recon = fp6_e3m2_to_float(float_to_fp6_e3m2_rn(val * inv_scale)) * scale;
+    const float err = val - recon;
+    return err * err;
+}
 
-// Compute E8M0 shared scale for a block: e = clamp(floor(log2(amax)) - offset + 127, 0, 254)
+static const mxfp_elem_traits_t mxfp8_e4m3_traits = { 8,  float_to_fp8_e4m3_rn, fp8_e4m3_to_float, mse_error_fp8_e4m3 };
+static const mxfp_elem_traits_t mxfp8_e5m2_traits = { 16, float_to_fp8_e5m2_rn, fp8_e5m2_to_float, mse_error_fp8_e5m2 };
+static const mxfp_elem_traits_t mxfp6_e2m3_traits = { 3,  float_to_fp6_e2m3_rn, fp6_e2m3_to_float, mse_error_fp6_e2m3 };
+static const mxfp_elem_traits_t mxfp6_e3m2_traits = { 5,  float_to_fp6_e3m2_rn, fp6_e3m2_to_float, mse_error_fp6_e3m2 };
+
+// Compute E8M0 shared scale for a block (simple floor — used only by mxfp4).
 static inline uint8_t mxfp_compute_e8m0(const float * x, int qk, int emax_offset) {
     float amax = 0.0f;
     for (int j = 0; j < qk; j++) {
@@ -759,6 +783,48 @@ static inline uint8_t mxfp_compute_e8m0(const float * x, int qk, int emax_offset
     return (uint8_t)e_int;
 }
 
+// MSE-optimal E8M0: round(log2(amax)) via integer bit ops, then ±1 search.
+// Matches CUDA mxfp-traits.cuh quantize_f32_mxfp_block_soa().
+static inline uint8_t mxfp_compute_e8m0_mse(const float * x, int qk, const mxfp_elem_traits_t * traits) {
+    float amax = 0.0f;
+    for (int j = 0; j < qk; j++) {
+        const float a = fabsf(x[j]);
+        if (a > amax) amax = a;
+    }
+    if (amax == 0.0f) return 0;
+
+    // Integer bit extraction for floor(log2(amax)) — no SFU, matches CUDA.
+    uint32_t amax_bits;
+    memcpy(&amax_bits, &amax, sizeof(uint32_t));
+    const int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
+    // Round: add 1 if mantissa >= sqrt(2)-1 threshold (0x3504F3 in 23-bit IEEE mantissa).
+    const int round_log2 = floor_log2 + ((amax_bits & 0x7FFFFF) >= 0x3504F3 ? 1 : 0);
+    const int e_base = round_log2 - traits->emax_offset + 127;
+
+    // ±1 MSE search: test e_base-1, e_base, e_base+1, pick lowest total MSE.
+    int e_lo = e_base - 1;
+    int e_hi = e_base + 1;
+    if (e_lo < 1)   e_lo = 1;
+    if (e_hi > 255) e_hi = 255;
+    int best_e = e_base < 0 ? 0 : (e_base > 255 ? 255 : e_base);
+    float best_mse = 1e30f;
+
+    for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
+        const float test_scale = GGML_E8M0_TO_FP32((uint8_t)test_e);
+        const float test_inv = 1.0f / test_scale;
+        float mse = 0.0f;
+        for (int j = 0; j < qk; ++j) {
+            mse += traits->mse_error(x[j], test_inv, test_scale);
+        }
+        if (mse < best_mse) {
+            best_mse = mse;
+            best_e = test_e;
+        }
+    }
+
+    return (uint8_t)best_e;
+}
+
 // FP8 quantize/dequantize: byte-per-element, shared by E4M3 and E5M2
 static void quantize_row_mxfp8_impl(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y,
                                      int64_t k, const mxfp_elem_traits_t * traits) {
@@ -766,7 +832,7 @@ static void quantize_row_mxfp8_impl(const float * GGML_RESTRICT x, block_mxfp8 *
     const int nb = k / QK_MXFP8;
 
     for (int i = 0; i < nb; i++) {
-        const uint8_t e = mxfp_compute_e8m0(&x[i*QK_MXFP8], QK_MXFP8, traits->emax_offset);
+        const uint8_t e = mxfp_compute_e8m0_mse(&x[i*QK_MXFP8], QK_MXFP8, traits);
         const float d = GGML_E8M0_TO_FP32(e);
         const float inv_d = d > 0.0f ? 1.0f / d : 0.0f;
         y[i].e = e;
@@ -797,7 +863,7 @@ static void quantize_row_mxfp6_impl(const float * GGML_RESTRICT x, block_mxfp6 *
     const int nb = k / QK_MXFP6;
 
     for (int i = 0; i < nb; i++) {
-        const uint8_t e = mxfp_compute_e8m0(&x[i*QK_MXFP6], QK_MXFP6, traits->emax_offset);
+        const uint8_t e = mxfp_compute_e8m0_mse(&x[i*QK_MXFP6], QK_MXFP6, traits);
         const float d = GGML_E8M0_TO_FP32(e);
         const float inv_d = d > 0.0f ? 1.0f / d : 0.0f;
         y[i].e = e;

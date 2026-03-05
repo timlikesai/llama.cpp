@@ -16,6 +16,10 @@
 #define ggml_vec_dot_q8_0_q8_0_generic ggml_vec_dot_q8_0_q8_0
 #define ggml_vec_dot_mxfp4_q8_0_generic ggml_vec_dot_mxfp4_q8_0
 #define ggml_vec_dot_nvfp4_q8_0_generic ggml_vec_dot_nvfp4_q8_0
+#define ggml_vec_dot_mxfp8_q8_0_generic       ggml_vec_dot_mxfp8_q8_0
+#define ggml_vec_dot_mxfp8_e5m2_q8_0_generic  ggml_vec_dot_mxfp8_e5m2_q8_0
+#define ggml_vec_dot_mxfp6_e2m3_q8_0_generic  ggml_vec_dot_mxfp6_e2m3_q8_0
+#define ggml_vec_dot_mxfp6_e3m2_q8_0_generic  ggml_vec_dot_mxfp6_e3m2_q8_0
 #define ggml_vec_dot_tq1_0_q8_K_generic ggml_vec_dot_tq1_0_q8_K
 #define ggml_vec_dot_tq2_0_q8_K_generic ggml_vec_dot_tq2_0_q8_K
 #define ggml_vec_dot_q2_K_q8_K_generic ggml_vec_dot_q2_K_q8_K

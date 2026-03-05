@@ -74,7 +74,7 @@ namespace mxfp_detail {
         const int mant = v & 0x3;
         if (exp == 0) return sign * (float)mant * 0.0625f;  // 2^(-4)
         // MX E3M2 has no NaN/Inf — exp=7 is a valid normal value (max finite = 28.0).
-        return sign * (1.0f + mant * 0.25f) * (float)(1 << (exp - 3));
+        return sign * ldexpf(1.0f + mant * 0.25f, exp - 3);
     }
 
     // Pack 4 six-bit values into 3 bytes

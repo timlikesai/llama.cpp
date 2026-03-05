@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstring>
 
 // ggml_compute_forward_dup
 
@@ -4918,6 +4919,33 @@ void ggml_compute_forward_get_rows(
     //}
 }
 
+// Walsh-Hadamard transform for MXFP quantization quality (QuaRot, arXiv:2404.00456).
+// Spreads outliers across 32-element blocks for better E8M0 scale utilization.
+static void hadamard_32_inplace(float vals[32]) {
+    for (int stride = 1; stride < 32; stride *= 2) {
+        for (int i = 0; i < 32; i += 2 * stride) {
+            for (int j = 0; j < stride; ++j) {
+                const float a = vals[i + j];
+                const float b = vals[i + j + stride];
+                vals[i + j]          = a + b;
+                vals[i + j + stride] = a - b;
+            }
+        }
+    }
+    const float norm = 0.17677669529663689f; // 1/sqrt(32)
+    for (int i = 0; i < 32; ++i) {
+        vals[i] *= norm;
+    }
+}
+
+// Apply Hadamard rotation to each 32-element block in a float buffer.
+static void ggml_apply_hadamard_blocks(float * data, int64_t n) {
+    GGML_ASSERT(n % 32 == 0);
+    for (int64_t i = 0; i < n; i += 32) {
+        hadamard_32_inplace(data + i);
+    }
+}
+
 template<typename idx_t>
 static void ggml_compute_forward_set_rows_f32(
         const ggml_compute_params * params,
@@ -4949,6 +4977,7 @@ static void ggml_compute_forward_set_rows_f32(
     const int64_t ir1 = std::min(ir0 + dr, nr);
 
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
+    const int32_t apply_hadamard = ((const int32_t *)dst->op_params)[0];
 
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
         for (int64_t i02 = 0; i02 < ne02; ++i02) {
@@ -4961,9 +4990,20 @@ static void ggml_compute_forward_set_rows_f32(
 
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
-                from_float(
-                        (const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03),
-                                        ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3), nc);
+                const float * src_row = (const float *) ((char *) src0->data + i*nb01 + i02*nb02 + i03*nb03);
+                char * dst_row = ((char *) dst->data + i1*nb1 + i02*nb2 + i03*nb3);
+
+                if (apply_hadamard) {
+                    // Hadamard rotation before quantization — spreads outliers for better MXFP quality.
+                    // nc is typically 64-256 for non-MLA models (MLA skips Hadamard via the flag).
+                    GGML_ASSERT(nc <= 1024); // sanity check for stack allocation
+                    float tmp[1024];
+                    memcpy(tmp, src_row, nc * sizeof(float));
+                    ggml_apply_hadamard_blocks(tmp, nc);
+                    from_float(tmp, dst_row, nc);
+                } else {
+                    from_float(src_row, dst_row, nc);
+                }
             }
         }
     }
@@ -8225,6 +8265,15 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
     ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
 
+    const bool is_mxfp_k = (k->type == GGML_TYPE_MXFP4_E2M1 ||
+                             k->type == GGML_TYPE_MXFP8_E4M3 ||
+                             k->type == GGML_TYPE_MXFP8_E5M2 ||
+                             k->type == GGML_TYPE_MXFP6_E2M3 ||
+                             k->type == GGML_TYPE_MXFP6_E3M2);
+    // Hadamard rotation must match K rotation. Skip for MLA (DK != DV) since
+    // V is a view of K and rotation would corrupt V.
+    const bool apply_hadamard_q = is_mxfp_k && (DK == DV);
+
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
 
@@ -8264,7 +8313,15 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const int iv2 = iq2 / rv2;
 
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
-        q_to_vec_dot(pq, Q_q, DK);
+        if (apply_hadamard_q) {
+            GGML_ASSERT(DK <= 1024);
+            float q_tmp[1024];
+            memcpy(q_tmp, pq, DK * sizeof(float));
+            ggml_apply_hadamard_blocks(q_tmp, DK);
+            q_to_vec_dot(q_tmp, Q_q, DK);
+        } else {
+            q_to_vec_dot(pq, Q_q, DK);
+        }
 
         // online softmax / attention
         // loop over n_kv and n_head_kv
