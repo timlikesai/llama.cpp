@@ -967,44 +967,34 @@ static inline uint8_t float_to_fp6_e3m2_rn(float x) {
     return sign | (uint8_t)((biased_exp << 2) | mant);
 }
 
-// Unpack 4 six-bit values from 3 bytes
-static inline void unpack_fp6x4(device const uint8_t * in, thread uint8_t v[4]) {
-    uint32_t packed = (uint32_t)in[0] | ((uint32_t)in[1] << 8) | ((uint32_t)in[2] << 16);
-    v[0] = packed & 0x3F;
-    v[1] = (packed >> 6) & 0x3F;
-    v[2] = (packed >> 12) & 0x3F;
-    v[3] = (packed >> 18) & 0x3F;
-}
-
 // ===== MXFP6 dequantization =====
 // Generic MXFP6 dequantization (parameterized by LUT)
+// Reads bytes directly from struct member to avoid device pointer indirection
+// issues observed on Apple5 (A12) paravirtualized Metal.
 template <typename type4x4>
 static inline void dequantize_mxfp6_impl(device const block_mxfp6 * xb, short il, thread type4x4 & reg, constant float * lut) {
-    device const uint8_t * qs = xb->qs;
     const float d = e8m0_to_fp32(xb->e);
     const short base_group = il * 4;
 
     for (int i = 0; i < 4; ++i) {
-        uint8_t vals[4];
-        unpack_fp6x4(&qs[(base_group + i) * 3], vals);
-        reg[i][0] = d * lut[vals[0]];
-        reg[i][1] = d * lut[vals[1]];
-        reg[i][2] = d * lut[vals[2]];
-        reg[i][3] = d * lut[vals[3]];
+        const short off = (base_group + i) * 3;
+        const uint32_t packed = (uint32_t)xb->qs[off] | ((uint32_t)xb->qs[off + 1] << 8) | ((uint32_t)xb->qs[off + 2] << 16);
+        reg[i][0] = d * lut[packed & 0x3F];
+        reg[i][1] = d * lut[(packed >> 6) & 0x3F];
+        reg[i][2] = d * lut[(packed >> 12) & 0x3F];
+        reg[i][3] = d * lut[(packed >> 18) & 0x3F];
     }
 }
 
 template <typename type4>
 static inline void dequantize_mxfp6_t4_impl(device const block_mxfp6 * xb, short il, thread type4 & reg, constant float * lut) {
-    device const uint8_t * qs = xb->qs;
     const float d = e8m0_to_fp32(xb->e);
-
-    uint8_t vals[4];
-    unpack_fp6x4(&qs[il * 3], vals);
-    reg[0] = d * lut[vals[0]];
-    reg[1] = d * lut[vals[1]];
-    reg[2] = d * lut[vals[2]];
-    reg[3] = d * lut[vals[3]];
+    const short off = il * 3;
+    const uint32_t packed = (uint32_t)xb->qs[off] | ((uint32_t)xb->qs[off + 1] << 8) | ((uint32_t)xb->qs[off + 2] << 16);
+    reg[0] = d * lut[packed & 0x3F];
+    reg[1] = d * lut[(packed >> 6) & 0x3F];
+    reg[2] = d * lut[(packed >> 12) & 0x3F];
+    reg[3] = d * lut[(packed >> 18) & 0x3F];
 }
 
 template <typename type4x4>

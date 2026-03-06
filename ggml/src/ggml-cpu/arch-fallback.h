@@ -123,6 +123,10 @@
 #define ggml_vec_dot_tq1_0_q8_K_generic ggml_vec_dot_tq1_0_q8_K
 #define ggml_vec_dot_tq2_0_q8_K_generic ggml_vec_dot_tq2_0_q8_K
 #define ggml_vec_dot_iq1_m_q8_K_generic ggml_vec_dot_iq1_m_q8_K
+#define dequantize_row_mxfp8_cpu_generic       dequantize_row_mxfp8_cpu
+#define dequantize_row_mxfp8_e5m2_cpu_generic  dequantize_row_mxfp8_e5m2_cpu
+#define dequantize_row_mxfp6_e2m3_cpu_generic  dequantize_row_mxfp6_e2m3_cpu
+#define dequantize_row_mxfp6_e3m2_cpu_generic  dequantize_row_mxfp6_e3m2_cpu
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_0_4x8_generic ggml_quantize_mat_q8_0_4x8
@@ -168,6 +172,10 @@
 #define ggml_vec_dot_iq1_m_q8_K_generic ggml_vec_dot_iq1_m_q8_K
 #define ggml_vec_dot_mxfp4_q8_0_generic ggml_vec_dot_mxfp4_q8_0
 #define ggml_vec_dot_nvfp4_q8_0_generic ggml_vec_dot_nvfp4_q8_0
+#define dequantize_row_mxfp8_cpu_generic       dequantize_row_mxfp8_cpu
+#define dequantize_row_mxfp8_e5m2_cpu_generic  dequantize_row_mxfp8_e5m2_cpu
+#define dequantize_row_mxfp6_e2m3_cpu_generic  dequantize_row_mxfp6_e2m3_cpu
+#define dequantize_row_mxfp6_e3m2_cpu_generic  dequantize_row_mxfp6_e3m2_cpu
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_0_4x8_generic ggml_quantize_mat_q8_0_4x8
@@ -215,6 +223,10 @@
 #define ggml_vec_dot_iq4_xs_q8_K_generic ggml_vec_dot_iq4_xs_q8_K
 #define ggml_vec_dot_mxfp4_q8_0_generic ggml_vec_dot_mxfp4_q8_0
 #define ggml_vec_dot_nvfp4_q8_0_generic ggml_vec_dot_nvfp4_q8_0
+#define dequantize_row_mxfp8_cpu_generic       dequantize_row_mxfp8_cpu
+#define dequantize_row_mxfp8_e5m2_cpu_generic  dequantize_row_mxfp8_e5m2_cpu
+#define dequantize_row_mxfp6_e2m3_cpu_generic  dequantize_row_mxfp6_e2m3_cpu
+#define dequantize_row_mxfp6_e3m2_cpu_generic  dequantize_row_mxfp6_e3m2_cpu
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x1_generic ggml_quantize_mat_q8_0_4x1
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
@@ -258,6 +270,10 @@
 #define ggml_vec_dot_tq1_0_q8_K_generic ggml_vec_dot_tq1_0_q8_K
 #define ggml_vec_dot_tq2_0_q8_K_generic ggml_vec_dot_tq2_0_q8_K
 #define ggml_vec_dot_q2_K_q8_K_generic ggml_vec_dot_q2_K_q8_K
+#define dequantize_row_mxfp8_cpu_generic       dequantize_row_mxfp8_cpu
+#define dequantize_row_mxfp8_e5m2_cpu_generic  dequantize_row_mxfp8_e5m2_cpu
+#define dequantize_row_mxfp6_e2m3_cpu_generic  dequantize_row_mxfp6_e2m3_cpu
+#define dequantize_row_mxfp6_e3m2_cpu_generic  dequantize_row_mxfp6_e3m2_cpu
 #define ggml_vec_dot_iq2_xxs_q8_K_generic ggml_vec_dot_iq2_xxs_q8_K
 #define ggml_vec_dot_iq2_xs_q8_K_generic ggml_vec_dot_iq2_xs_q8_K
 #define ggml_vec_dot_iq2_s_q8_K_generic ggml_vec_dot_iq2_s_q8_K
@@ -318,6 +334,10 @@
 #define ggml_vec_dot_iq4_xs_q8_K_generic ggml_vec_dot_iq4_xs_q8_K
 #define ggml_vec_dot_mxfp4_q8_0_generic ggml_vec_dot_mxfp4_q8_0
 #define ggml_vec_dot_nvfp4_q8_0_generic ggml_vec_dot_nvfp4_q8_0
+#define dequantize_row_mxfp8_cpu_generic       dequantize_row_mxfp8_cpu
+#define dequantize_row_mxfp8_e5m2_cpu_generic  dequantize_row_mxfp8_e5m2_cpu
+#define dequantize_row_mxfp6_e2m3_cpu_generic  dequantize_row_mxfp6_e2m3_cpu
+#define dequantize_row_mxfp6_e3m2_cpu_generic  dequantize_row_mxfp6_e3m2_cpu
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_0_4x8_generic ggml_quantize_mat_q8_0_4x8
