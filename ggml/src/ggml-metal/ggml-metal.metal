@@ -789,33 +789,44 @@ static inline uint8_t float_to_fp8_e4m3_rn(float x) {
         mant3++;
         if (mant3 > 7) { mant3 = 0; e4m3_exp++; }
     }
-    if (e4m3_exp >= 15) return sign | 0x76; // max finite (exp=14, mant=6 = 448)
+    if (e4m3_exp > 15 || (e4m3_exp == 15 && mant3 >= 7)) return sign | 0x7E; // max finite (exp=15, mant=6 = 448)
     return sign | (uint8_t)((e4m3_exp << 3) | mant3);
 }
 
+// Generic MXFP8 dequantization (parameterized by LUT)
 template <typename type4x4>
-void dequantize_mxfp8_e4m3(device const block_mxfp8 * xb, short il, thread type4x4 & reg) {
+static inline void dequantize_mxfp8_impl(device const block_mxfp8 * xb, short il, thread type4x4 & reg, constant float * lut) {
     device const uint8_t * qs = xb->qs;
     const float d = e8m0_to_fp32(xb->e);
     const short offset = il * 16;
 
     for (int i = 0; i < 4; ++i) {
-        reg[i][0] = d * fp8_e4m3_lut[qs[offset + 4*i + 0]];
-        reg[i][1] = d * fp8_e4m3_lut[qs[offset + 4*i + 1]];
-        reg[i][2] = d * fp8_e4m3_lut[qs[offset + 4*i + 2]];
-        reg[i][3] = d * fp8_e4m3_lut[qs[offset + 4*i + 3]];
+        reg[i][0] = d * lut[qs[offset + 4*i + 0]];
+        reg[i][1] = d * lut[qs[offset + 4*i + 1]];
+        reg[i][2] = d * lut[qs[offset + 4*i + 2]];
+        reg[i][3] = d * lut[qs[offset + 4*i + 3]];
     }
 }
 
 template <typename type4>
-void dequantize_mxfp8_e4m3_t4(device const block_mxfp8 * xb, short il, thread type4 & reg) {
+static inline void dequantize_mxfp8_t4_impl(device const block_mxfp8 * xb, short il, thread type4 & reg, constant float * lut) {
     device const uint8_t * qs = xb->qs;
     const float d = e8m0_to_fp32(xb->e);
 
-    reg[0] = d * fp8_e4m3_lut[qs[4*il + 0]];
-    reg[1] = d * fp8_e4m3_lut[qs[4*il + 1]];
-    reg[2] = d * fp8_e4m3_lut[qs[4*il + 2]];
-    reg[3] = d * fp8_e4m3_lut[qs[4*il + 3]];
+    reg[0] = d * lut[qs[4*il + 0]];
+    reg[1] = d * lut[qs[4*il + 1]];
+    reg[2] = d * lut[qs[4*il + 2]];
+    reg[3] = d * lut[qs[4*il + 3]];
+}
+
+template <typename type4x4>
+void dequantize_mxfp8_e4m3(device const block_mxfp8 * xb, short il, thread type4x4 & reg) {
+    dequantize_mxfp8_impl(xb, il, reg, fp8_e4m3_lut);
+}
+
+template <typename type4>
+void dequantize_mxfp8_e4m3_t4(device const block_mxfp8 * xb, short il, thread type4 & reg) {
+    dequantize_mxfp8_t4_impl(xb, il, reg, fp8_e4m3_lut);
 }
 
 // ===== MXFP8 E5M2 dequantization =====
@@ -873,27 +884,12 @@ static inline uint8_t float_to_fp8_e5m2_rn(float x) {
 
 template <typename type4x4>
 void dequantize_mxfp8_e5m2(device const block_mxfp8 * xb, short il, thread type4x4 & reg) {
-    device const uint8_t * qs = xb->qs;
-    const float d = e8m0_to_fp32(xb->e);
-    const short offset = il * 16;
-
-    for (int i = 0; i < 4; ++i) {
-        reg[i][0] = d * fp8_e5m2_lut[qs[offset + 4*i + 0]];
-        reg[i][1] = d * fp8_e5m2_lut[qs[offset + 4*i + 1]];
-        reg[i][2] = d * fp8_e5m2_lut[qs[offset + 4*i + 2]];
-        reg[i][3] = d * fp8_e5m2_lut[qs[offset + 4*i + 3]];
-    }
+    dequantize_mxfp8_impl(xb, il, reg, fp8_e5m2_lut);
 }
 
 template <typename type4>
 void dequantize_mxfp8_e5m2_t4(device const block_mxfp8 * xb, short il, thread type4 & reg) {
-    device const uint8_t * qs = xb->qs;
-    const float d = e8m0_to_fp32(xb->e);
-
-    reg[0] = d * fp8_e5m2_lut[qs[4*il + 0]];
-    reg[1] = d * fp8_e5m2_lut[qs[4*il + 1]];
-    reg[2] = d * fp8_e5m2_lut[qs[4*il + 2]];
-    reg[3] = d * fp8_e5m2_lut[qs[4*il + 3]];
+    dequantize_mxfp8_t4_impl(xb, il, reg, fp8_e5m2_lut);
 }
 
 // ===== MXFP6 conversion helpers =====
@@ -980,65 +976,55 @@ static inline void unpack_fp6x4(device const uint8_t * in, thread uint8_t v[4]) 
     v[3] = (packed >> 18) & 0x3F;
 }
 
-// ===== MXFP6 E2M3 dequantization =====
+// ===== MXFP6 dequantization =====
+// Generic MXFP6 dequantization (parameterized by LUT)
 template <typename type4x4>
-void dequantize_mxfp6_e2m3(device const block_mxfp6 * xb, short il, thread type4x4 & reg) {
+static inline void dequantize_mxfp6_impl(device const block_mxfp6 * xb, short il, thread type4x4 & reg, constant float * lut) {
     device const uint8_t * qs = xb->qs;
     const float d = e8m0_to_fp32(xb->e);
-    // il=0: first 16 elements (groups 0..3), il=1: last 16 (groups 4..7)
     const short base_group = il * 4;
 
     for (int i = 0; i < 4; ++i) {
         uint8_t vals[4];
         unpack_fp6x4(&qs[(base_group + i) * 3], vals);
-        reg[i][0] = d * fp6_e2m3_lut[vals[0]];
-        reg[i][1] = d * fp6_e2m3_lut[vals[1]];
-        reg[i][2] = d * fp6_e2m3_lut[vals[2]];
-        reg[i][3] = d * fp6_e2m3_lut[vals[3]];
+        reg[i][0] = d * lut[vals[0]];
+        reg[i][1] = d * lut[vals[1]];
+        reg[i][2] = d * lut[vals[2]];
+        reg[i][3] = d * lut[vals[3]];
     }
+}
+
+template <typename type4>
+static inline void dequantize_mxfp6_t4_impl(device const block_mxfp6 * xb, short il, thread type4 & reg, constant float * lut) {
+    device const uint8_t * qs = xb->qs;
+    const float d = e8m0_to_fp32(xb->e);
+
+    uint8_t vals[4];
+    unpack_fp6x4(&qs[il * 3], vals);
+    reg[0] = d * lut[vals[0]];
+    reg[1] = d * lut[vals[1]];
+    reg[2] = d * lut[vals[2]];
+    reg[3] = d * lut[vals[3]];
+}
+
+template <typename type4x4>
+void dequantize_mxfp6_e2m3(device const block_mxfp6 * xb, short il, thread type4x4 & reg) {
+    dequantize_mxfp6_impl(xb, il, reg, fp6_e2m3_lut);
 }
 
 template <typename type4>
 void dequantize_mxfp6_e2m3_t4(device const block_mxfp6 * xb, short il, thread type4 & reg) {
-    device const uint8_t * qs = xb->qs;
-    const float d = e8m0_to_fp32(xb->e);
-
-    uint8_t vals[4];
-    unpack_fp6x4(&qs[il * 3], vals);
-    reg[0] = d * fp6_e2m3_lut[vals[0]];
-    reg[1] = d * fp6_e2m3_lut[vals[1]];
-    reg[2] = d * fp6_e2m3_lut[vals[2]];
-    reg[3] = d * fp6_e2m3_lut[vals[3]];
+    dequantize_mxfp6_t4_impl(xb, il, reg, fp6_e2m3_lut);
 }
 
-// ===== MXFP6 E3M2 dequantization =====
 template <typename type4x4>
 void dequantize_mxfp6_e3m2(device const block_mxfp6 * xb, short il, thread type4x4 & reg) {
-    device const uint8_t * qs = xb->qs;
-    const float d = e8m0_to_fp32(xb->e);
-    const short base_group = il * 4;
-
-    for (int i = 0; i < 4; ++i) {
-        uint8_t vals[4];
-        unpack_fp6x4(&qs[(base_group + i) * 3], vals);
-        reg[i][0] = d * fp6_e3m2_lut[vals[0]];
-        reg[i][1] = d * fp6_e3m2_lut[vals[1]];
-        reg[i][2] = d * fp6_e3m2_lut[vals[2]];
-        reg[i][3] = d * fp6_e3m2_lut[vals[3]];
-    }
+    dequantize_mxfp6_impl(xb, il, reg, fp6_e3m2_lut);
 }
 
 template <typename type4>
 void dequantize_mxfp6_e3m2_t4(device const block_mxfp6 * xb, short il, thread type4 & reg) {
-    device const uint8_t * qs = xb->qs;
-    const float d = e8m0_to_fp32(xb->e);
-
-    uint8_t vals[4];
-    unpack_fp6x4(&qs[il * 3], vals);
-    reg[0] = d * fp6_e3m2_lut[vals[0]];
-    reg[1] = d * fp6_e3m2_lut[vals[1]];
-    reg[2] = d * fp6_e3m2_lut[vals[2]];
-    reg[3] = d * fp6_e3m2_lut[vals[3]];
+    dequantize_mxfp6_t4_impl(xb, il, reg, fp6_e3m2_lut);
 }
 
 // ===== MXFP serial quantize functions (for set_rows) =====
@@ -1282,28 +1268,11 @@ void quantize_mxfp6_e3m2_t(thread const float * src, device block_mxfp6 & dst) {
 }
 
 // ===== MXFP8/MXFP6 Q preprocessing for flash attention =====
-// MXFP8 E4M3 round-trip
-static inline float mxfp8_e4m3_roundtrip(float val, float scale) {
+// Generic MXFP round-trip: quantize element to type, then dequantize back to float.
+template <uint8_t (*quant)(float), float (*dequant)(uint8_t)>
+static inline float mxfp_roundtrip(float val, float scale) {
     float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
-    return fp8_e4m3_to_float(float_to_fp8_e4m3_rn(val * inv_scale)) * scale;
-}
-
-// MXFP8 E5M2 round-trip
-static inline float mxfp8_e5m2_roundtrip(float val, float scale) {
-    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
-    return fp8_e5m2_to_float(float_to_fp8_e5m2_rn(val * inv_scale)) * scale;
-}
-
-// MXFP6 E2M3 round-trip
-static inline float mxfp6_e2m3_roundtrip(float val, float scale) {
-    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
-    return fp6_e2m3_to_float(float_to_fp6_e2m3_rn(val * inv_scale)) * scale;
-}
-
-// MXFP6 E3M2 round-trip
-static inline float mxfp6_e3m2_roundtrip(float val, float scale) {
-    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
-    return fp6_e3m2_to_float(float_to_fp6_e3m2_rn(val * inv_scale)) * scale;
+    return dequant(quant(val * inv_scale)) * scale;
 }
 
 // MSE-optimal E8M0 with ±1 search (matches CPU mxfp_compute_e8m0_mse).
@@ -1337,32 +1306,12 @@ static inline uint8_t mxfp_compute_e8m0_mse(float val) {
     return (uint8_t)best_e;
 }
 
-// Preprocessing dispatch for MXFP8 E4M3 (emax_offset = 8)
-static inline float mxfp8_e4m3_preprocess_q_elem(float val, ushort tiisg, bool apply_hadamard) {
+// Generic MXFP Q preprocessing: optional Hadamard + MSE-optimal E8M0 + round-trip.
+template <int EMAX_OFFSET, uint8_t (*quant)(float), float (*dequant)(uint8_t)>
+static inline float mxfp_preprocess_q_elem(float val, ushort tiisg, bool apply_hadamard) {
     if (apply_hadamard) val = hadamard_32_simd(val, tiisg);
-    uint8_t e = mxfp_compute_e8m0_mse<8, mxfp8_e4m3_roundtrip>(val);
-    return mxfp8_e4m3_roundtrip(val, e8m0_to_fp32(e));
-}
-
-// Preprocessing dispatch for MXFP8 E5M2 (emax_offset = 16)
-static inline float mxfp8_e5m2_preprocess_q_elem(float val, ushort tiisg, bool apply_hadamard) {
-    if (apply_hadamard) val = hadamard_32_simd(val, tiisg);
-    uint8_t e = mxfp_compute_e8m0_mse<16, mxfp8_e5m2_roundtrip>(val);
-    return mxfp8_e5m2_roundtrip(val, e8m0_to_fp32(e));
-}
-
-// Preprocessing dispatch for MXFP6 E2M3 (emax_offset = 3)
-static inline float mxfp6_e2m3_preprocess_q_elem(float val, ushort tiisg, bool apply_hadamard) {
-    if (apply_hadamard) val = hadamard_32_simd(val, tiisg);
-    uint8_t e = mxfp_compute_e8m0_mse<3, mxfp6_e2m3_roundtrip>(val);
-    return mxfp6_e2m3_roundtrip(val, e8m0_to_fp32(e));
-}
-
-// Preprocessing dispatch for MXFP6 E3M2 (emax_offset = 5)
-static inline float mxfp6_e3m2_preprocess_q_elem(float val, ushort tiisg, bool apply_hadamard) {
-    if (apply_hadamard) val = hadamard_32_simd(val, tiisg);
-    uint8_t e = mxfp_compute_e8m0_mse<5, mxfp6_e3m2_roundtrip>(val);
-    return mxfp6_e3m2_roundtrip(val, e8m0_to_fp32(e));
+    uint8_t e = mxfp_compute_e8m0_mse<EMAX_OFFSET, mxfp_roundtrip<quant, dequant>>(val);
+    return mxfp_roundtrip<quant, dequant>(val, e8m0_to_fp32(e));
 }
 
 // Dispatch MXFP preprocessing by mxfp_type function constant.
@@ -1370,10 +1319,10 @@ static inline float mxfp6_e3m2_preprocess_q_elem(float val, ushort tiisg, bool a
 static inline float mxfp_preprocess_q_dispatch(float val, ushort tiisg, bool apply_hadamard, int32_t mxfp_type) {
     switch (mxfp_type) {
         case 1:  return mxfp4_preprocess_q_elem(val, tiisg, apply_hadamard);
-        case 2:  return mxfp8_e4m3_preprocess_q_elem(val, tiisg, apply_hadamard);
-        case 3:  return mxfp8_e5m2_preprocess_q_elem(val, tiisg, apply_hadamard);
-        case 4:  return mxfp6_e2m3_preprocess_q_elem(val, tiisg, apply_hadamard);
-        case 5:  return mxfp6_e3m2_preprocess_q_elem(val, tiisg, apply_hadamard);
+        case 2:  return mxfp_preprocess_q_elem<8,  float_to_fp8_e4m3_rn, fp8_e4m3_to_float>(val, tiisg, apply_hadamard);
+        case 3:  return mxfp_preprocess_q_elem<16, float_to_fp8_e5m2_rn, fp8_e5m2_to_float>(val, tiisg, apply_hadamard);
+        case 4:  return mxfp_preprocess_q_elem<3,  float_to_fp6_e2m3_rn, fp6_e2m3_to_float>(val, tiisg, apply_hadamard);
+        case 5:  return mxfp_preprocess_q_elem<5,  float_to_fp6_e3m2_rn, fp6_e3m2_to_float>(val, tiisg, apply_hadamard);
         default: return val;
     }
 }

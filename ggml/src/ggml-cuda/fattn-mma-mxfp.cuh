@@ -112,7 +112,7 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP8_E5M2> {
     static constexpr int k_per_mma      = 32;
     static constexpr int smem_k_qs_div  = 4;
     static constexpr int smem_k_sc_div  = 32;
-    static constexpr int emax           = 15;    // floor(log2(57344))
+    static constexpr int emax           = 16;    // ceil(log2(57344))
     static constexpr bool can_cp_async_k = true;
     static constexpr bool needs_smem_expand_k = false;
 

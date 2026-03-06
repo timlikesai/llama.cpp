@@ -437,10 +437,10 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         switch (dst->type) {
             case GGML_TYPE_MXFP4_E2M1:      DISPATCH_MXFP_SOA(GGML_TYPE_MXFP4_E2M1);      break;
             case GGML_TYPE_MXFP8_E4M3:      DISPATCH_MXFP_SOA(GGML_TYPE_MXFP8_E4M3);      break;
-            case GGML_TYPE_MXFP6_E2M3: DISPATCH_MXFP_SOA(GGML_TYPE_MXFP6_E2M3); break;
+            case GGML_TYPE_MXFP6_E2M3:      DISPATCH_MXFP_SOA(GGML_TYPE_MXFP6_E2M3);      break;
 #ifdef GGML_CUDA_MXFP_ALL_VARIANTS
-            case GGML_TYPE_MXFP6_E3M2: DISPATCH_MXFP_SOA(GGML_TYPE_MXFP6_E3M2); break;
-            case GGML_TYPE_MXFP8_E5M2: DISPATCH_MXFP_SOA(GGML_TYPE_MXFP8_E5M2); break;
+            case GGML_TYPE_MXFP6_E3M2:      DISPATCH_MXFP_SOA(GGML_TYPE_MXFP6_E3M2);      break;
+            case GGML_TYPE_MXFP8_E5M2:      DISPATCH_MXFP_SOA(GGML_TYPE_MXFP8_E5M2);      break;
 #endif
             default: GGML_ABORT("unreachable");
         }

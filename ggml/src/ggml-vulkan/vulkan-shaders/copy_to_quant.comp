@@ -276,7 +276,7 @@ uint compute_e8m0_uint(float vals[32], int emax_offset) {
 }
 
 float e8m0_to_fp32(uint e) {
-    if (e == 0u) return 0.0;
+    if (e == 0u) return uintBitsToFloat(0x00400000u); // 2^(-127), matches MX spec
     return uintBitsToFloat(e << 23);
 }
 #endif
@@ -308,6 +308,25 @@ void quantize(uint dst_idx, uint src_idx) {
         hadamard_32_inplace(vals);
     }
     uint e = compute_e8m0_uint(vals, 2);
+    // ±1 MSE search: test e-1, e, e+1, pick lowest total round-trip error.
+    {
+        int e_lo = max(1, int(e) - 1);
+        int e_hi = min(255, int(e) + 1);
+        uint best_e = clamp(e, 0u, 255u);
+        float best_mse = 1e30;
+        for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
+            float test_d = e8m0_to_fp32(uint(test_e)) * 0.5;
+            float mse = 0.0;
+            for (int j = 0; j < 32; ++j) {
+                uint idx = best_index_mxfp4(vals[j], test_d);
+                float q = float(kvalues_mxfp4_const[idx]) * test_d;
+                float err = vals[j] - q;
+                mse += err * err;
+            }
+            if (mse < best_mse) { best_mse = mse; best_e = uint(test_e); }
+        }
+        e = best_e;
+    }
     float d = e8m0_to_fp32(e) * 0.5;
     data_q[dst_idx].e = uint8_t(e);
     for (int j = 0; j < 16; ++j) {
@@ -342,9 +361,15 @@ uint8_t float_to_fp8_e4m3(float x) {
         if (mant3 > 7u) return uint8_t(sign | 0x08u);
         return uint8_t(sign | mant3);
     }
-    uint mant3 = (f32_mant + (1u << 19)) >> 20;
-    if (mant3 > 7u) { mant3 = 0u; e4m3_exp++; }
-    if (e4m3_exp > 15) return uint8_t(sign | 0x7Eu); // max normal (NaN=0x7F reserved)
+    // Round-to-nearest-even (matches CPU/Metal)
+    uint mant3 = f32_mant >> 20;
+    uint round_bit = (f32_mant >> 19) & 1u;
+    uint sticky = f32_mant & ((1u << 19) - 1u);
+    if (round_bit != 0u && (sticky != 0u || (mant3 & 1u) != 0u)) {
+        mant3++;
+        if (mant3 > 7u) { mant3 = 0u; e4m3_exp++; }
+    }
+    if (e4m3_exp > 15 || (e4m3_exp == 15u && mant3 >= 7u)) return uint8_t(sign | 0x7Eu); // max normal (NaN=0x7F reserved)
     return uint8_t(sign | (uint(e4m3_exp) << 3) | mant3);
 }
 
@@ -357,6 +382,25 @@ void quantize(uint dst_idx, uint src_idx) {
         hadamard_32_inplace(vals);
     }
     uint e = compute_e8m0_uint(vals, 8);
+    // ±1 MSE search: test e-1, e, e+1, pick lowest total round-trip error.
+    {
+        int e_lo = max(1, int(e) - 1);
+        int e_hi = min(255, int(e) + 1);
+        uint best_e = clamp(e, 0u, 255u);
+        float best_mse = 1e30;
+        for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
+            float test_d = e8m0_to_fp32(uint(test_e));
+            float test_inv = test_d > 0.0 ? 1.0 / test_d : 0.0;
+            float mse = 0.0;
+            for (int j = 0; j < 32; ++j) {
+                float q = fp8_e4m3_to_float(uint(float_to_fp8_e4m3(vals[j] * test_inv))) * test_d;
+                float err = vals[j] - q;
+                mse += err * err;
+            }
+            if (mse < best_mse) { best_mse = mse; best_e = uint(test_e); }
+        }
+        e = best_e;
+    }
     float d = e8m0_to_fp32(e);
     float inv_d = d > 0.0 ? 1.0 / d : 0.0;
     data_q[dst_idx].e = uint8_t(e);
@@ -390,8 +434,14 @@ uint8_t float_to_fp8_e5m2(float x) {
         if (mant2 > 3u) return uint8_t(sign | 0x04u);
         return uint8_t(sign | mant2);
     }
-    uint mant2 = (f32_mant + (1u << 20)) >> 21;
-    if (mant2 > 3u) { mant2 = 0u; e5m2_exp++; }
+    // Round-to-nearest-even (matches CPU/Metal)
+    uint mant2 = f32_mant >> 21;
+    uint round_bit = (f32_mant >> 20) & 1u;
+    uint sticky = f32_mant & ((1u << 20) - 1u);
+    if (round_bit != 0u && (sticky != 0u || (mant2 & 1u) != 0u)) {
+        mant2++;
+        if (mant2 > 3u) { mant2 = 0u; e5m2_exp++; }
+    }
     if (e5m2_exp >= 31) return uint8_t(sign | 0x7Bu); // max finite (exp=30, mant=3)
     return uint8_t(sign | (uint(e5m2_exp) << 2) | mant2);
 }
@@ -405,6 +455,25 @@ void quantize(uint dst_idx, uint src_idx) {
         hadamard_32_inplace(vals);
     }
     uint e = compute_e8m0_uint(vals, 16);
+    // ±1 MSE search: test e-1, e, e+1, pick lowest total round-trip error.
+    {
+        int e_lo = max(1, int(e) - 1);
+        int e_hi = min(255, int(e) + 1);
+        uint best_e = clamp(e, 0u, 255u);
+        float best_mse = 1e30;
+        for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
+            float test_d = e8m0_to_fp32(uint(test_e));
+            float test_inv = test_d > 0.0 ? 1.0 / test_d : 0.0;
+            float mse = 0.0;
+            for (int j = 0; j < 32; ++j) {
+                float q = fp8_e5m2_to_float(uint(float_to_fp8_e5m2(vals[j] * test_inv))) * test_d;
+                float err = vals[j] - q;
+                mse += err * err;
+            }
+            if (mse < best_mse) { best_mse = mse; best_e = uint(test_e); }
+        }
+        e = best_e;
+    }
     float d = e8m0_to_fp32(e);
     float inv_d = d > 0.0 ? 1.0 / d : 0.0;
     data_q[dst_idx].e = uint8_t(e);
@@ -456,6 +525,25 @@ void quantize(uint dst_idx, uint src_idx) {
         hadamard_32_inplace(vals);
     }
     uint e = compute_e8m0_uint(vals, 3);
+    // ±1 MSE search: test e-1, e, e+1, pick lowest total round-trip error.
+    {
+        int e_lo = max(1, int(e) - 1);
+        int e_hi = min(255, int(e) + 1);
+        uint best_e = clamp(e, 0u, 255u);
+        float best_mse = 1e30;
+        for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
+            float test_d = e8m0_to_fp32(uint(test_e));
+            float test_inv = test_d > 0.0 ? 1.0 / test_d : 0.0;
+            float mse = 0.0;
+            for (int j = 0; j < 32; ++j) {
+                float q = fp6_e2m3_to_float(float_to_fp6_e2m3(vals[j] * test_inv)) * test_d;
+                float err = vals[j] - q;
+                mse += err * err;
+            }
+            if (mse < best_mse) { best_mse = mse; best_e = uint(test_e); }
+        }
+        e = best_e;
+    }
     float d = e8m0_to_fp32(e);
     float inv_d = d > 0.0 ? 1.0 / d : 0.0;
     data_q[dst_idx].e = uint8_t(e);
@@ -515,6 +603,25 @@ void quantize(uint dst_idx, uint src_idx) {
         hadamard_32_inplace(vals);
     }
     uint e = compute_e8m0_uint(vals, 5);
+    // ±1 MSE search: test e-1, e, e+1, pick lowest total round-trip error.
+    {
+        int e_lo = max(1, int(e) - 1);
+        int e_hi = min(255, int(e) + 1);
+        uint best_e = clamp(e, 0u, 255u);
+        float best_mse = 1e30;
+        for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
+            float test_d = e8m0_to_fp32(uint(test_e));
+            float test_inv = test_d > 0.0 ? 1.0 / test_d : 0.0;
+            float mse = 0.0;
+            for (int j = 0; j < 32; ++j) {
+                float q = fp6_e3m2_to_float(float_to_fp6_e3m2(vals[j] * test_inv)) * test_d;
+                float err = vals[j] - q;
+                mse += err * err;
+            }
+            if (mse < best_mse) { best_mse = mse; best_e = uint(test_e); }
+        }
+        e = best_e;
+    }
     float d = e8m0_to_fp32(e);
     float inv_d = d > 0.0 ? 1.0 / d : 0.0;
     data_q[dst_idx].e = uint8_t(e);

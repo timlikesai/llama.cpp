@@ -468,8 +468,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     if (K->type != V->type) {
         // Mixed-type combos always supported (not gated by FA_ALL_QUANTS):
         const bool is_q8_q4 = (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0);
-        const bool is_mxfp_k = ggml_is_type_mxfp(K->type);
-        const bool is_mxfp_v = ggml_is_type_mxfp(V->type);
+        const bool is_mxfp_k = ggml_is_type_mxfp_enabled(K->type);
+        const bool is_mxfp_v = ggml_is_type_mxfp_enabled(V->type);
         if (!is_q8_q4 && !(is_mxfp_k && is_mxfp_v)) {
             return BEST_FATTN_KERNEL_NONE;
         }
@@ -490,7 +490,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q8_0:
             break;
         default:
-            if (ggml_is_type_mxfp(K->type)) {
+            if (ggml_is_type_mxfp_enabled(K->type)) {
                 break;
             }
             return BEST_FATTN_KERNEL_NONE;
@@ -505,7 +505,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // Unified MXFP flash attention (Blackwell MMA for FP4/FP6/FP8):
     if (blackwell_mma_available(cc)) {
-        const bool is_mxfp = ggml_is_type_mxfp(K->type);
+        const bool is_mxfp = ggml_is_type_mxfp_enabled(K->type);
         const int64_t D = K->ne[0];
         if (is_mxfp && (D == 64 || D == 128 || D == 256 || D == 576)) {
             if (can_use_vector_kernel && Q->ne[1] <= 2) {
