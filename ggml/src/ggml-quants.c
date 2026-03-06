@@ -355,11 +355,23 @@ static inline int best_index_mxfp4(float x, float e);
 // The traits function receives GGML_E8M0_TO_FP32(e) as scale, but MXFP4 uses
 // GGML_E8M0_TO_FP32_HALF(e) = scale/2, so we halve scale for reconstruction.
 static float mse_error_mxfp4(float val, float inv_scale, float scale) {
-    (void)inv_scale;
+    // Decision boundary quantization with direct reconstruction.
+    // kvalues_mxfp4 positive sorted: {0, 1, 2, 3, 4, 6, 8, 12}
+    // Use inv_scale * 2 since MXFP4 scale includes 0.5x factor.
     const float d = scale * 0.5f;
-    const int idx = best_index_mxfp4(val, d);
-    const float recon = kvalues_mxfp4[idx] * d;
-    const float err = val - recon;
+    const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
+    const float normalized = fabsf(val) * inv_d;
+    (void)inv_scale;
+    float qval;
+    if      (normalized < 0.5f)  qval = 0.0f;
+    else if (normalized < 1.5f)  qval = 1.0f;
+    else if (normalized < 2.5f)  qval = 2.0f;
+    else if (normalized < 3.5f)  qval = 3.0f;
+    else if (normalized < 5.0f)  qval = 4.0f;
+    else if (normalized < 7.0f)  qval = 6.0f;
+    else if (normalized < 10.0f) qval = 8.0f;
+    else                         qval = 12.0f;
+    const float err = fabsf(val) - qval * d;
     return err * err;
 }
 
@@ -408,16 +420,21 @@ static inline uint8_t mxfp_compute_e8m0_mse(const float * x, int qk, const mxfp_
 }
 
 static inline int best_index_mxfp4(float x, float e) {
-    int best_index = 0;
-    float best_err = fabsf(kvalues_mxfp4[0]*e - x);
-    for (int i = 1; i < 16; i++) {
-        float err = fabsf(kvalues_mxfp4[i]*e - x);
-        if (err < best_err) {
-            best_index = i;
-            best_err = err;
-        }
-    }
-    return best_index;
+    // Decision boundary quantization: 7 comparisons instead of 16-element scan.
+    // kvalues_mxfp4 positive sorted: {0, 1, 2, 3, 4, 6, 8, 12}
+    // Decision boundaries (midpoints): {0.5, 1.5, 2.5, 3.5, 5, 7, 10}
+    const float inv_e = (e > 0.0f) ? 1.0f / e : 0.0f;
+    const float normalized = fabsf(x) * inv_e;
+    int idx;
+    if      (normalized < 0.5f)  idx = 0;
+    else if (normalized < 1.5f)  idx = 1;
+    else if (normalized < 2.5f)  idx = 2;
+    else if (normalized < 3.5f)  idx = 3;
+    else if (normalized < 5.0f)  idx = 4;
+    else if (normalized < 7.0f)  idx = 5;
+    else if (normalized < 10.0f) idx = 6;
+    else                         idx = 7;
+    return (x < 0.0f) ? (idx + 8) : idx;
 }
 
 // FP4 E2M1: search-based quantization using best_index_mxfp4 lookup table.
@@ -646,7 +663,11 @@ static inline float fp6_e2m3_to_float(uint8_t v) {
     if (exp == 0) {
         return sign * (float)mant * (1.0f / 8.0f);  // subnormal: mant * 2^(-3)
     }
-    return sign * (1.0f + mant / 8.0f) * (float)(1 << (exp - 1));
+    // Normal: (1 + mant/8) * 2^(exp-1). Construct via IEEE bit manipulation.
+    const uint32_t ieee_bits = ((uint32_t)(exp + 126) << 23) | ((uint32_t)mant << 20);
+    float result;
+    memcpy(&result, &ieee_bits, sizeof(float));
+    return sign * result;
 }
 
 static inline uint8_t float_to_fp6_e2m3_rn(float x) {
@@ -684,7 +705,11 @@ static inline float fp6_e3m2_to_float(uint8_t v) {
     if (exp == 0) {
         return sign * (float)mant * (1.0f / 16.0f);  // subnormal: mant * 2^(1-bias-m) = mant * 2^(-4)
     }
-    return sign * (1.0f + mant / 4.0f) * ldexpf(1.0f, exp - 3);  // 2^(exp-bias)
+    // Normal: (1 + mant/4) * 2^(exp-3). Construct via IEEE bit manipulation.
+    const uint32_t ieee_bits = ((uint32_t)(exp + 124) << 23) | ((uint32_t)mant << 21);
+    float result;
+    memcpy(&result, &ieee_bits, sizeof(float));
+    return sign * result;
 }
 
 static inline uint8_t float_to_fp6_e3m2_rn(float x) {
@@ -708,7 +733,10 @@ static inline uint8_t float_to_fp6_e3m2_rn(float x) {
     // MX format: exp=7 is valid (no NaN/Inf), so only overflow at biased_exp > 7.
     if (biased_exp > 7) return sign | 0x1F;
 
-    float mantf = (x / ldexpf(1.0f, exp)) - 1.0f;
+    // 2^exp via IEEE bit construction (safe for negative exp)
+    uint32_t pow2_bits = (uint32_t)(exp + 127) << 23;
+    float pow2; memcpy(&pow2, &pow2_bits, sizeof(float));
+    float mantf = (x / pow2) - 1.0f;
     int mant = (int)(mantf * 4.0f + 0.5f);
     if (mant > 3) { mant = 0; biased_exp++; }
     if (biased_exp > 7) return sign | 0x1F;
