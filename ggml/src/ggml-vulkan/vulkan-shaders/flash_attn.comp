@@ -84,13 +84,20 @@ void main() {
         uint32_t r = (idx + tid) / (HSK / 4);
         if (r < Br && d < HSK / 4 &&
             i * Br + r < N) {
+#ifdef MXFP_Q_PREPROCESS
+            // Load Q without scale — roundtrip must operate on unscaled values (scale applied after)
+            Qf[r * qf_stride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d]);
+#else
             Qf[r * qf_stride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale);
+#endif
         }
     }
 
 #ifdef MXFP_Q_PREPROCESS
     barrier();
-    // Apply Hadamard + MXFP quantize/dequantize round-trip to Q
+    // Apply Hadamard + MXFP quantize/dequantize round-trip to Q, then apply scale.
+    // CPU/CUDA apply Hadamard+roundtrip to unscaled Q; scale is applied afterward.
+    // The roundtrip is nonlinear, so roundtrip(Q*s) != s*roundtrip(Q).
     {
         const uint mxfp_blocks_per_row = HSK / 32u;
         const uint mxfp_active_rows = min(Br, N - i * Br);
@@ -123,9 +130,9 @@ void main() {
                 vals[vi] = mxfp_roundtrip_val(vals[vi], scale);
             }
 
-            // Write back
+            // Write back with p.scale applied after roundtrip
             for (uint vi = 0u; vi < 8u; vi++) {
-                Qf[base + vi] = FLOAT_TYPEV4(vals[vi * 4u + 0u], vals[vi * 4u + 1u], vals[vi * 4u + 2u], vals[vi * 4u + 3u]);
+                Qf[base + vi] = FLOAT_TYPEV4(vals[vi * 4u + 0u], vals[vi * 4u + 1u], vals[vi * 4u + 2u], vals[vi * 4u + 3u]) * FLOAT_TYPE(p.scale);
             }
         }
     }

@@ -21,9 +21,16 @@
 #include "flash_attn_base.glsl"
 
 layout (binding = 0) readonly buffer Q {uint8_t data_q[];};
+layout (binding = 0) readonly buffer QF32 {float data_q_f32[];};
 layout (binding = 1) readonly buffer K {uint8_t data_k[];};
 layout (binding = 2) readonly buffer V {uint8_t data_v[];};
 layout (binding = 3) readonly buffer M {uint8_t data_m[];};
+
+#ifdef MXFP_Q_PREPROCESS
+// Shared memory for Q preprocessing — Hadamard + roundtrip before loading into coopmat.
+// HSK_pad/4 vec4s per row, Br rows. Using float16 to match coopmat A-matrix type.
+shared float16_t q_shmem[Br * HSK_pad];
+#endif
 
 ACC_TYPE maxReduce(const in ACC_TYPE x, const in ACC_TYPE y) {
     return max(x, y);
@@ -130,14 +137,80 @@ void main() {
     tensorLayoutK = setTensorLayoutStrideNV(tensorLayoutK, k_stride, 1);
     tensorLayoutV = setTensorLayoutStrideNV(tensorLayoutV, v_stride, 1);
 
-    coopmat<Q_TYPE, gl_ScopeWorkgroup, Br, HSK_pad, gl_MatrixUseAccumulator> Q;
     coopmat<float16_t, gl_ScopeWorkgroup, Br, HSK_pad, gl_MatrixUseA> Qf16;
+
+#ifdef MXFP_Q_PREPROCESS
+    // MXFP Q preprocessing: load Q into shared memory, apply Hadamard + roundtrip, scale, then load into coopmat.
+    {
+        const uint32_t tid = gl_LocalInvocationIndex;
+        // q_offset in bytes (Q is float32)
+        uint32_t q_byte_offset = gqa_iq1*p.nb01*4 + iq2*p.nb02+iq3*p.nb03;
+
+        // Load Q rows into shared memory as float, then process
+        [[unroll]] for (uint32_t idx = tid; idx < Br * HSK; idx += gl_WorkGroupSize.x) {
+            uint32_t r = idx / HSK;
+            uint32_t d = idx % HSK;
+            float val = 0.0;
+            if (i * Br + r < N && d < HSK) {
+                // Read float32 from Q buffer
+                val = data_q_f32[q_byte_offset / 4 + (i * Br + r) * q_stride + d];
+            }
+            q_shmem[r * HSK_pad + d] = float16_t(val);
+        }
+        // Zero-pad HSK..HSK_pad
+        if (HSK_pad > HSK) {
+            [[unroll]] for (uint32_t idx = tid; idx < Br * (HSK_pad - HSK); idx += gl_WorkGroupSize.x) {
+                uint32_t r = idx / (HSK_pad - HSK);
+                uint32_t d = HSK + idx % (HSK_pad - HSK);
+                q_shmem[r * HSK_pad + d] = float16_t(0.0);
+            }
+        }
+        barrier();
+
+        // Apply Hadamard + roundtrip per 32-element block
+        const uint mxfp_blocks_per_row = HSK / 32u;
+        const uint mxfp_active_rows = min(Br, N - i * Br);
+        const uint mxfp_total_blocks = mxfp_active_rows * mxfp_blocks_per_row;
+        const bool mxfp_apply_hadamard = (HSK == HSV);
+
+        for (uint block_idx = tid; block_idx < mxfp_total_blocks; block_idx += gl_WorkGroupSize.x) {
+            uint row = block_idx / mxfp_blocks_per_row;
+            uint blk = block_idx % mxfp_blocks_per_row;
+            uint base = row * HSK_pad + blk * 32u;
+
+            float vals[32];
+            for (uint vi = 0u; vi < 32u; vi++) {
+                vals[vi] = float(q_shmem[base + vi]);
+            }
+
+            if (mxfp_apply_hadamard) {
+                hadamard_32_shmem(vals);
+            }
+
+            float scale = compute_e8m0_scale(vals);
+            for (uint vi = 0u; vi < 32u; vi++) {
+                vals[vi] = mxfp_roundtrip_val(vals[vi], scale);
+            }
+
+            // Write back with p.scale applied
+            for (uint vi = 0u; vi < 32u; vi++) {
+                q_shmem[base + vi] = float16_t(vals[vi] * p.scale);
+            }
+        }
+        barrier();
+
+        // Load from shared memory into coopmat
+        coopMatLoad(Qf16, q_shmem, 0, HSK_pad, gl_CooperativeMatrixLayoutRowMajor);
+    }
+#else
+    coopmat<Q_TYPE, gl_ScopeWorkgroup, Br, HSK_pad, gl_MatrixUseAccumulator> Q;
 
     uint32_t q_offset = gqa_iq1*p.nb01*4/*sizeof(float)*/ + iq2*p.nb02+iq3*p.nb03;
     coopMatLoadTensorNV(Q, data_q, q_offset, sliceTensorLayoutNV(tensorLayoutQ, i * Br, Br, 0, HSK_pad));
 
     Qf16 = coopmat<float16_t, gl_ScopeWorkgroup, Br, HSK_pad, gl_MatrixUseA>(Q);
     Qf16 *= float16_t(p.scale);
+#endif
 
     coopmat<float16_t, gl_ScopeWorkgroup, Br, HSV_pad, gl_MatrixUseAccumulator> O = coopmat<float16_t, gl_ScopeWorkgroup, Br, HSV_pad, gl_MatrixUseAccumulator>(0);
 

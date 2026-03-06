@@ -162,15 +162,16 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
         blk = v_raw.v_data[a_offset + ib];
     }
     const float d = e8m0_to_fp32(blk.e) * 0.5;
-    const uint iqs0 = iqs & 0xFu;
-    const uint shift = (iqs & 0x10u) >> 2;
-    uint qs0 = uint(blk.qs[iqs0]) >> shift;
-    uint qs1 = uint(blk.qs[iqs0 + 1u]) >> shift;
+    // CPU layout: lower nibbles of bytes 0-15 → elements 0-15,
+    //             upper nibbles of bytes 0-15 → elements 16-31.
+    // iqs is element index (0-31 in steps of 4).
+    const uint iqs0 = iqs & 0xFu;           // byte index (wraps at 16)
+    const uint shift = (iqs & 0x10u) >> 2;   // 0 for elements 0-15, 4 for 16-31
     return FLOAT_TYPEV4(
-        kvalues_mxfp4[qs0 & 0xFu] * d,
-        kvalues_mxfp4[(qs0 >> 4) & 0xFu] * d,
-        kvalues_mxfp4[qs1 & 0xFu] * d,
-        kvalues_mxfp4[(qs1 >> 4) & 0xFu] * d
+        kvalues_mxfp4[(uint(blk.qs[iqs0 + 0u]) >> shift) & 0xFu] * d,
+        kvalues_mxfp4[(uint(blk.qs[iqs0 + 1u]) >> shift) & 0xFu] * d,
+        kvalues_mxfp4[(uint(blk.qs[iqs0 + 2u]) >> shift) & 0xFu] * d,
+        kvalues_mxfp4[(uint(blk.qs[iqs0 + 3u]) >> shift) & 0xFu] * d
     );
 }
 #endif
@@ -367,21 +368,27 @@ float mxfp6_e2m3_roundtrip_val(float val, float scale) {
     if (scale == 0.0) return 0.0;
     float scaled = val / scale;
     scaled = clamp(scaled, -7.5, 7.5);
-    uint bits = floatBitsToUint(scaled);
-    uint sign = bits & 0x80000000u;
+    uint sign = floatBitsToUint(scaled) & 0x80000000u;
     float av = abs(scaled);
-    // E2M3: 2-bit exponent (bias 1), 3-bit mantissa, max value = 7.5
-    int exp32 = int((floatBitsToUint(av) >> 23) & 0xFFu) - 127;
-    uint mant32 = floatBitsToUint(av) & 0x7FFFFFu;
-    int exp6 = exp32 + 1;
-    if (exp6 < 0) return 0.0;
-    if (exp6 > 3) exp6 = 3;
-    uint mant6 = (mant32 + (1u << 19)) >> 20;
-    if (mant6 >= 8u) { mant6 = 0u; exp6++; if (exp6 > 3) exp6 = 3; }
+    // E2M3: 2-bit exponent (bias 1), 3-bit mantissa
+    // Subnormal: value = mant/8, range [0, 0.875]
+    // Normal:    value = (1 + mant/8) * 2^(exp-1), exp 1-3
     float result;
-    if (exp6 == 0) {
-        result = float(mant6) / 8.0;
+    if (av < 0.0625) {
+        // Below smallest subnormal (0.125), round to 0
+        result = 0.0;
+    } else if (av < 1.0) {
+        // Subnormal range: round to nearest mant/8
+        uint mant6 = uint(av * 8.0 + 0.5);
+        if (mant6 >= 8u) { mant6 = 0u; result = 1.0; }  // rounds up to smallest normal
+        else { result = float(mant6) / 8.0; }
     } else {
+        int exp32 = int((floatBitsToUint(av) >> 23) & 0xFFu) - 127;
+        uint mant32 = floatBitsToUint(av) & 0x7FFFFFu;
+        int exp6 = exp32 + 1;
+        if (exp6 > 3) exp6 = 3;
+        uint mant6 = (mant32 + (1u << 19)) >> 20;
+        if (mant6 >= 8u) { mant6 = 0u; exp6++; if (exp6 > 3) exp6 = 3; }
         result = (1.0 + float(mant6) / 8.0) * exp2(float(exp6 - 1));
     }
     return (sign != 0u ? -result : result) * scale;
@@ -392,37 +399,30 @@ float mxfp6_e3m2_roundtrip_val(float val, float scale) {
     if (scale == 0.0) return 0.0;
     float scaled = val / scale;
     scaled = clamp(scaled, -28.0, 28.0);
-    uint bits = floatBitsToUint(scaled);
-    uint sign = bits & 0x80000000u;
+    uint sign = floatBitsToUint(scaled) & 0x80000000u;
     float av = abs(scaled);
-    int exp32 = int((floatBitsToUint(av) >> 23) & 0xFFu) - 127;
-    uint mant32 = floatBitsToUint(av) & 0x7FFFFFu;
-    int exp6 = exp32 + 3;
-    if (exp6 < 0) return 0.0;
-    if (exp6 > 7) exp6 = 7;
-    uint mant6 = (mant32 + (1u << 20)) >> 21;
-    if (mant6 >= 4u) { mant6 = 0u; exp6++; if (exp6 > 7) exp6 = 7; }
+    // E3M2: 3-bit exponent (bias 3), 2-bit mantissa
+    // Subnormal: value = mant * 2^(-2) / 4 = mant/16, range [0, 0.1875]
+    // Normal:    value = (1 + mant/4) * 2^(exp-3), exp 1-7
     float result;
-    if (exp6 == 0) {
-        result = float(mant6) / 4.0 * exp2(-2.0);
+    if (av < 0.03125) {
+        // Below smallest subnormal (0.0625), round to 0
+        result = 0.0;
+    } else if (av < 0.25) {
+        // Subnormal range: round to nearest mant/16
+        uint mant6 = uint(av * 16.0 + 0.5);
+        if (mant6 >= 4u) { mant6 = 0u; result = 0.25; }  // rounds up to smallest normal
+        else { result = float(mant6) / 16.0; }
     } else {
+        int exp32 = int((floatBitsToUint(av) >> 23) & 0xFFu) - 127;
+        uint mant32 = floatBitsToUint(av) & 0x7FFFFFu;
+        int exp6 = exp32 + 3;
+        if (exp6 > 7) exp6 = 7;
+        uint mant6 = (mant32 + (1u << 20)) >> 21;
+        if (mant6 >= 4u) { mant6 = 0u; exp6++; if (exp6 > 7) exp6 = 7; }
         result = (1.0 + float(mant6) / 4.0) * exp2(float(exp6 - 3));
     }
     return (sign != 0u ? -result : result) * scale;
-}
-
-// Compute E8M0 shared exponent for a 32-element block (MSE-optimal with ±1 search)
-float compute_e8m0_scale(float vals[32]) {
-    float amax = 0.0;
-    for (uint i = 0u; i < 32u; i++) {
-        amax = max(amax, abs(vals[i]));
-    }
-    if (amax == 0.0) return 0.0;
-    // E8M0: 2^(e-127), find e such that 2^(e-127) is the shared exponent
-    int e = int(floatBitsToUint(amax) >> 23) & 0xFF;
-    // MSE-optimal: try e-1, e, e+1 and pick best
-    // For simplicity, use the standard approach: just use the max exponent
-    return uintBitsToFloat(uint(e) << 23); // 2^(e-127)
 }
 
 // MXFP quantize/dequantize round-trip dispatcher
@@ -438,6 +438,60 @@ float mxfp_roundtrip_val(float val, float scale) {
 #elif defined(DATA_A_MXFP6_E3M2)
     return mxfp6_e3m2_roundtrip_val(val, scale);
 #endif
+}
+
+// Compute E8M0 shared exponent for a 32-element block (MSE-optimal with ±1 search).
+// Matches CPU mxfp_compute_e8m0_mse: round(log2(amax)) - emax_offset + 127, then ±1 MSE search.
+// emax_offset accounts for the element format's dynamic range (max representable value).
+float compute_e8m0_scale(float vals[32]) {
+    float amax = 0.0;
+    for (uint i = 0u; i < 32u; i++) {
+        amax = max(amax, abs(vals[i]));
+    }
+    if (amax == 0.0) return 0.0;
+
+    // round(log2(amax)) via integer bit extraction — matches CPU.
+    uint amax_bits = floatBitsToUint(amax);
+    int floor_log2 = int((amax_bits >> 23) & 0xFFu) - 127;
+    // Round up if mantissa >= sqrt(2)-1 threshold (0x3504F3 in 23-bit IEEE mantissa)
+    int round_log2 = floor_log2 + (((amax_bits & 0x7FFFFFu) >= 0x3504F3u) ? 1 : 0);
+
+    // emax_offset: floor(log2(max_element_value)) for each format.
+    // Shifts the E8M0 search center to account for the format's dynamic range.
+    // Must match CPU's mxfp_elem_traits_t.emax_offset values.
+#if defined(DATA_A_MXFP4)
+    const int emax_offset = 2;   // max kvalue = 6.0 (after 0.5 factor), 2^2.58
+#elif defined(DATA_A_MXFP8_E4M3)
+    const int emax_offset = 8;   // max = 448, 2^8.8
+#elif defined(DATA_A_MXFP8_E5M2)
+    const int emax_offset = 16;  // max = 57344, 2^15.8
+#elif defined(DATA_A_MXFP6_E2M3)
+    const int emax_offset = 3;   // max = 7.5, 2^2.9
+#elif defined(DATA_A_MXFP6_E3M2)
+    const int emax_offset = 5;   // max = 28, 2^4.8
+#endif
+
+    int e_base = round_log2 - emax_offset + 127;
+
+    // ±1 MSE search: test e_base-1, e_base, e_base+1, pick lowest total MSE.
+    float best_mse = 1e30;
+    int best_e = clamp(e_base, 1, 254);
+    for (int delta = -1; delta <= 1; delta++) {
+        int e_try = e_base + delta;
+        if (e_try < 1 || e_try > 254) continue;
+        float scale_try = uintBitsToFloat(uint(e_try) << 23);
+        float mse = 0.0;
+        for (uint i = 0u; i < 32u; i++) {
+            float recon = mxfp_roundtrip_val(vals[i], scale_try);
+            float err = vals[i] - recon;
+            mse += err * err;
+        }
+        if (mse < best_mse) {
+            best_mse = mse;
+            best_e = e_try;
+        }
+    }
+    return uintBitsToFloat(uint(best_e) << 23);
 }
 
 #endif // MXFP_Q_PREPROCESS

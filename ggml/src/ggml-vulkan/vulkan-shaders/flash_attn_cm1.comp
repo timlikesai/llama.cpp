@@ -88,9 +88,54 @@ void main() {
         uint32_t r = (idx + tid) / (HSK / 4);
         if (r < Br && d < HSK / 4 &&
             i * Br + r < N) {
+#ifdef MXFP_Q_PREPROCESS
+            Qf[r * qstride + d] = f16vec4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d]);
+#else
             Qf[r * qstride + d] = f16vec4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale);
+#endif
         }
     }
+
+#ifdef MXFP_Q_PREPROCESS
+    barrier();
+    // Apply Hadamard + MXFP roundtrip to unscaled Q, then apply scale.
+    {
+        const uint mxfp_blocks_per_row = HSK / 32u;
+        const uint mxfp_active_rows = min(Br, N - i * Br);
+        const uint mxfp_total_blocks = mxfp_active_rows * mxfp_blocks_per_row;
+        const bool mxfp_apply_hadamard = (HSK == HSV);
+
+        for (uint block_idx = tid; block_idx < mxfp_total_blocks; block_idx += gl_WorkGroupSize.x) {
+            uint row = block_idx / mxfp_blocks_per_row;
+            uint blk = block_idx % mxfp_blocks_per_row;
+            uint base = row * qstride + blk * 8u;
+
+            float vals[32];
+            for (uint vi = 0u; vi < 8u; vi++) {
+                f16vec4 v = Qf[base + vi];
+                vals[vi * 4u + 0u] = float(v.x);
+                vals[vi * 4u + 1u] = float(v.y);
+                vals[vi * 4u + 2u] = float(v.z);
+                vals[vi * 4u + 3u] = float(v.w);
+            }
+
+            if (mxfp_apply_hadamard) {
+                hadamard_32_shmem(vals);
+            }
+
+            float scale = compute_e8m0_scale(vals);
+            for (uint vi = 0u; vi < 32u; vi++) {
+                vals[vi] = mxfp_roundtrip_val(vals[vi], scale);
+            }
+
+            for (uint vi = 0u; vi < 8u; vi++) {
+                Qf[base + vi] = f16vec4(vals[vi * 4u + 0u] * p.scale, vals[vi * 4u + 1u] * p.scale,
+                                        vals[vi * 4u + 2u] * p.scale, vals[vi * 4u + 3u] * p.scale);
+            }
+        }
+    }
+#endif
+
     barrier();
 
     f16vec4 Of[rows_per_thread][d_per_thread];
