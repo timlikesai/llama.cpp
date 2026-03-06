@@ -1209,6 +1209,7 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
         /*.nb1  =*/ nb1,
         /*.nb2  =*/ nb2,
         /*.nb3  =*/ nb3,
+        /*.apply_hadamard =*/ ((const int32_t *)op->op_params)[0],
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);

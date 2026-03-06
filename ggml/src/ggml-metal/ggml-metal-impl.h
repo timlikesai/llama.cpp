@@ -26,6 +26,12 @@
 #define N_R0_MXFP4 2
 #define N_SG_MXFP4 2
 
+#define N_R0_MXFP8 2
+#define N_SG_MXFP8 2
+
+#define N_R0_MXFP6 2
+#define N_SG_MXFP6 2
+
 #define N_R0_Q2_K 4
 #define N_SG_Q2_K 2
 
@@ -888,6 +894,7 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    int32_t  apply_hadamard;
 } ggml_metal_kargs_set_rows;
 
 typedef struct {

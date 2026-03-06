@@ -1351,6 +1351,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         ggml_metal_cv_set_int32(cv, ns20, FC_FLASH_ATTN_EXT + 21);
         ggml_metal_cv_set_int32(cv, nsg,  FC_FLASH_ATTN_EXT + 22);
 
+        // MXFP type for Q preprocessing (0=none, 1=mxfp4, 2=mxfp8_e4m3, 3=mxfp8_e5m2, 4=mxfp6_e2m3, 5=mxfp6_e3m2)
+        int32_t mxfp_type = 0;
+        switch (op->src[1]->type) {
+            case GGML_TYPE_MXFP4_E2M1: mxfp_type = 1; break;
+            case GGML_TYPE_MXFP8_E4M3: mxfp_type = 2; break;
+            case GGML_TYPE_MXFP8_E5M2: mxfp_type = 3; break;
+            case GGML_TYPE_MXFP6_E2M3: mxfp_type = 4; break;
+            case GGML_TYPE_MXFP6_E3M2: mxfp_type = 5; break;
+            default: break;
+        }
+        ggml_metal_cv_set_int32(cv, mxfp_type, FC_FLASH_ATTN_EXT + 30);
+
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
         ggml_metal_cv_free(cv);
@@ -1411,6 +1423,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         ggml_metal_cv_set_int32(cv, ns20, FC_FLASH_ATTN_EXT_VEC + 21);
         ggml_metal_cv_set_int32(cv, nsg,  FC_FLASH_ATTN_EXT_VEC + 22);
         ggml_metal_cv_set_int32(cv, nwg,  FC_FLASH_ATTN_EXT_VEC + 23);
+
+        // MXFP type for Q preprocessing
+        int32_t mxfp_type = 0;
+        switch (op->src[1]->type) {
+            case GGML_TYPE_MXFP4_E2M1: mxfp_type = 1; break;
+            case GGML_TYPE_MXFP8_E4M3: mxfp_type = 2; break;
+            case GGML_TYPE_MXFP8_E5M2: mxfp_type = 3; break;
+            case GGML_TYPE_MXFP6_E2M3: mxfp_type = 4; break;
+            case GGML_TYPE_MXFP6_E3M2: mxfp_type = 5; break;
+            default: break;
+        }
+        ggml_metal_cv_set_int32(cv, mxfp_type, FC_FLASH_ATTN_EXT_VEC + 30);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

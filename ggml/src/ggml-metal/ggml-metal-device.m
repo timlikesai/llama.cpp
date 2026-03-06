@@ -1235,6 +1235,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_IQ4_NL:
+                    case GGML_TYPE_MXFP4_E2M1:
+                    case GGML_TYPE_MXFP8_E4M3:
+                    case GGML_TYPE_MXFP8_E5M2:
+                    case GGML_TYPE_MXFP6_E2M3:
+                    case GGML_TYPE_MXFP6_E3M2:
                         return true;
                     default:
                         return false;
