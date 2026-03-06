@@ -38,6 +38,10 @@ static __host__ __device__ __forceinline__ bool ggml_is_type_mxfp_enabled(ggml_t
     return false;
 }
 
+// The trait specializations below use NVIDIA CUDA 12.8+ intrinsics (__nv_cvt_float_to_fp4,
+// __nv_cvt_float_to_fp6, __nv_fp8_e4m3, etc.) from cuda_fp4.h / cuda_fp8.h.
+#if CUDART_VERSION >= 12080
+
 // FP4 E2M1:
 template<> struct mxfp_traits<GGML_TYPE_MXFP4_E2M1> {
     static constexpr int bits_per_elem = 4;
@@ -330,4 +334,6 @@ static __device__ void quantize_f32_mxfp_block_soa(
     // Write E8M0 scale byte to SoA E8M0 region.
     *(row_base + blocks_per_row_total * traits::qs_per_block + block_idx) = e_val;
 }
+
+#endif // CUDART_VERSION >= 12080
 

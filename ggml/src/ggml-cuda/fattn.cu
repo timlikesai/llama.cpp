@@ -1,7 +1,9 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#if CUDART_VERSION >= 12080
 #include "fattn-mma-mxfp.cuh"
+#endif // CUDART_VERSION >= 12080
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
@@ -202,6 +204,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
+#if CUDART_VERSION >= 12080
 // Unified MXFP MMA dispatch:
 
 template <ggml_type mxfp_type, int DKQ, int DV, int ncols2>
@@ -308,6 +311,7 @@ static void ggml_cuda_flash_attn_ext_mma_mxfp(ggml_backend_cuda_context & ctx, g
             GGML_ABORT("Unsupported K type for MXFP MMA");
     }
 }
+#endif // CUDART_VERSION >= 12080
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
     {                                                                                                            \
@@ -379,6 +383,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
+#if CUDART_VERSION >= 12080
     // MXFP VEC cases — always enabled regardless of GGML_CUDA_FA_ALL_QUANTS:
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP4_E2M1, GGML_TYPE_MXFP4_E2M1)
 
@@ -393,6 +398,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP4_E2M1)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP8_E5M2)
 #endif // GGML_CUDA_MXFP_ALL_VARIANTS
+#endif // CUDART_VERSION >= 12080
 
     GGML_ABORT("fatal error");
 }
@@ -503,6 +509,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+#if CUDART_VERSION >= 12080
     // Unified MXFP flash attention (Blackwell MMA for FP4/FP6/FP8):
     if (blackwell_mma_available(cc)) {
         const bool is_mxfp = ggml_is_type_mxfp_enabled(K->type);
@@ -514,6 +521,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_MMA_MXFP;
         }
     }
+#endif // CUDART_VERSION >= 12080
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
@@ -634,9 +642,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
+#if CUDART_VERSION >= 12080
         case BEST_FATTN_KERNEL_MMA_MXFP:
             ggml_cuda_flash_attn_ext_mma_mxfp(ctx, dst);
             break;
+#endif // CUDART_VERSION >= 12080
     }
 }
 
