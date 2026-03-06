@@ -4399,13 +4399,13 @@ static inline void dequantize_row_mxfp8_neon(
             #define DEQUANT_FP8_STORE(v_raw, dst) do {                                   \
                 const uint32x4_t sign = vandq_u32(v_raw, vdupq_n_u32(0x80));            \
                 const uint32x4_t exp  = vandq_u32(                                      \
-                    vshlq_u32(v_raw, vreinterpretq_u32_s32(v_neg_exp_shift)),            \
+                    vshlq_u32(v_raw, v_neg_exp_shift),                                   \
                     v_exp_mask);                                                         \
                 const uint32x4_t mant = vandq_u32(v_raw, v_mant_mask);                  \
                 const uint32x4_t ieee = vorrq_u32(                                      \
                     vorrq_u32(vshlq_n_u32(sign, 24),                                    \
                               vshlq_n_u32(vaddq_u32(exp, v_ieee_off), 23)),              \
-                    vshlq_u32(mant, vreinterpretq_u32_s32(v_mant_shift_v)));             \
+                    vshlq_u32(mant, v_mant_shift_v));                                    \
                 const float32x4_t normal = vreinterpretq_f32_u32(ieee);                 \
                 const float32x4_t sub_abs = vmulq_f32(vcvtq_f32_u32(mant), v_sub_sc);   \
                 const uint32x4_t  sub_bits = vorrq_u32(                                 \
@@ -4459,14 +4459,14 @@ static inline void dequantize_row_mxfp6_neon(
 
             const uint32x4_t sign = vandq_u32(v_raw, vdupq_n_u32(0x20));
             const uint32x4_t exp  = vandq_u32(
-                vshlq_u32(v_raw, vreinterpretq_u32_s32(v_neg_exp_shift)),
+                vshlq_u32(v_raw, v_neg_exp_shift),
                 v_exp_mask);
             const uint32x4_t mant = vandq_u32(v_raw, v_mant_mask);
 
             const uint32x4_t ieee = vorrq_u32(
                 vorrq_u32(vshlq_n_u32(sign, 26),
                           vshlq_n_u32(vaddq_u32(exp, v_ieee_off), 23)),
-                vshlq_u32(mant, vreinterpretq_u32_s32(v_mant_shift_v)));
+                vshlq_u32(mant, v_mant_shift_v));
             const float32x4_t normal = vreinterpretq_f32_u32(ieee);
 
             const float32x4_t sub_abs = vmulq_f32(vcvtq_f32_u32(mant), v_sub_sc);
