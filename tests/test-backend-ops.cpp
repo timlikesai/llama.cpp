@@ -2309,8 +2309,12 @@ struct test_set_rows : public test_case {
     const std::array<int, 2> nr23; // broadcast only dims 2 and 3
     const int r; // rows to set
     const bool v; // view (non-contiguous src1)
+    const bool hadamard; // apply Walsh-Hadamard rotation before quantization
 
     std::string vars() override {
+        if (hadamard) {
+            return VARS_TO_STR6(type, type_idx, ne, nr23, r, v) + ",hadamard=1";
+        }
         return VARS_TO_STR6(type, type_idx, ne, nr23, r, v);
     }
 
@@ -2318,8 +2322,8 @@ struct test_set_rows : public test_case {
             ggml_type type_idx,
             std::array<int64_t, 4> ne,
             std::array<int, 2> nr23,
-            int r, bool v = false)
-        : type(type), type_idx(type_idx), ne(ne), nr23(nr23), r(r), v(v) {}
+            int r, bool v = false, bool hadamard = false)
+        : type(type), type_idx(type_idx), ne(ne), nr23(nr23), r(r), v(v), hadamard(hadamard) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * dst = ggml_new_tensor_4d(ctx, type,          ne[0], ne[1], ne[2]*nr23[0], ne[3]*nr23[1]);
@@ -2338,6 +2342,11 @@ struct test_set_rows : public test_case {
         }
 
         ggml_tensor * out = ggml_set_rows(ctx, dst, src, row_idxs);
+
+        if (hadamard) {
+            ((int32_t *)out->op_params)[0] = 1;
+        }
+
         ggml_set_name(out, "out");
 
         return out;
@@ -6181,9 +6190,14 @@ struct test_flash_attn_ext : public test_case {
 
     const ggml_prec prec;
     const ggml_type type_KV;
+    const ggml_type type_V; // V type, defaults to type_KV for same-type K/V
     std::array<int32_t, 4> permute;
 
     std::string vars() override {
+        if (type_V != type_KV) {
+            return VARS_TO_STR13(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, permute)
+                + ",type_V=" + ggml_type_name(type_V);
+        }
         return VARS_TO_STR13(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, permute);
     }
 
@@ -6200,12 +6214,14 @@ struct test_flash_attn_ext : public test_case {
 
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
-                        ggml_type type_KV = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3})
-        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec), type_KV(type_KV), permute(permute) {}
+                        ggml_type type_KV = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
+                        ggml_type type_V_override = GGML_TYPE_COUNT)
+        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec), type_KV(type_KV),
+          type_V(type_V_override == GGML_TYPE_COUNT ? type_KV : type_V_override), permute(permute) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_KV));
-        const int64_t hsv_padded = GGML_PAD(hsv, ggml_blck_size(type_KV));
+        const int64_t hsv_padded = GGML_PAD(hsv, ggml_blck_size(type_V));
 
         auto const &create_permuted = [&](ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, bool is_view) -> ggml_tensor * {
             int64_t ne[4] = {ne0, ne1, ne2, ne3};
@@ -6243,7 +6259,7 @@ struct test_flash_attn_ext : public test_case {
             //   - https://github.com/ggml-org/llama.cpp/pull/18986
             v = ggml_view_4d(ctx, k, hsv_padded, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
         } else {
-            v = create_permuted(type_KV,       hsv_padded, kv, nh,         nr23[1], true); // the V tensor is usually a view of the V cache
+            v = create_permuted(type_V,        hsv_padded, kv, nh,         nr23[1], true); // the V tensor is usually a view of the V cache
         }
         ggml_set_name(v, "v");
 
@@ -7280,7 +7296,8 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
     GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
     GGML_TYPE_Q8_0,
-    GGML_TYPE_MXFP4_E2M1,
+    GGML_TYPE_MXFP4_E2M1, GGML_TYPE_MXFP8_E4M3, GGML_TYPE_MXFP8_E5M2,
+    GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP6_E3M2,
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
@@ -7412,6 +7429,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+
+    // SET_ROWS with Hadamard rotation (exercises the op_params[0] flag used by MXFP KV cache)
+    for (ggml_type type : {GGML_TYPE_MXFP4_E2M1, GGML_TYPE_MXFP8_E4M3, GGML_TYPE_MXFP8_E5M2,
+                           GGML_TYPE_MXFP6_E2M3, GGML_TYPE_MXFP6_E3M2}) {
+        // ne[0] must be divisible by 32 (Hadamard block size)
+        test_cases.emplace_back(new test_set_rows(type, GGML_TYPE_I64, { 128, 5, 1, 1 }, { 1, 1 }, 1, false, true));
+        test_cases.emplace_back(new test_set_rows(type, GGML_TYPE_I64, { 256, 5, 1, 3 }, { 1, 1 }, 1, false, true));
     }
 
     for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_VISION }) {
@@ -8626,6 +8651,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // Mixed K/V type flash attention (e.g. mxfp8 K + mxfp4 V, our recommended config)
+    for (ggml_type type_K : {GGML_TYPE_MXFP8_E4M3, GGML_TYPE_MXFP6_E2M3}) {
+        for (ggml_type type_V : {GGML_TYPE_MXFP4_E2M1}) {
+            if (type_K == type_V) continue;
+            for (int nb : {1, 3, 32}) {
+                //                     hsk  hsv  nh  nr23    kv   nb  mask  sinks  bias  softcap prec           type_K  permute             type_V
+                test_cases.emplace_back(new test_flash_attn_ext(
+                    128, 128, 4, {1, 1}, 512, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_K, {0, 1, 2, 3}, type_V));
             }
         }
     }
