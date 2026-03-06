@@ -50,6 +50,102 @@ constexpr constant static float kvalues_mxfp4_f[16] = {
     0, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f
 };
 
+// FP8 E4M3 lookup table: byte → float (eliminates per-element bit manipulation in dequant)
+constexpr constant static float fp8_e4m3_lut[256] = {
+           0.0f, 0.001953125f,  0.00390625f, 0.005859375f,   0.0078125f, 0.009765625f,  0.01171875f, 0.013671875f,
+      0.015625f, 0.017578125f,  0.01953125f, 0.021484375f,   0.0234375f, 0.025390625f,  0.02734375f, 0.029296875f,
+       0.03125f,  0.03515625f,   0.0390625f,  0.04296875f,    0.046875f,  0.05078125f,   0.0546875f,  0.05859375f,
+        0.0625f,   0.0703125f,    0.078125f,   0.0859375f,     0.09375f,   0.1015625f,    0.109375f,   0.1171875f,
+         0.125f,    0.140625f,     0.15625f,    0.171875f,      0.1875f,    0.203125f,     0.21875f,    0.234375f,
+          0.25f,     0.28125f,      0.3125f,     0.34375f,       0.375f,     0.40625f,      0.4375f,     0.46875f,
+           0.5f,      0.5625f,       0.625f,      0.6875f,        0.75f,      0.8125f,       0.875f,      0.9375f,
+           1.0f,       1.125f,        1.25f,       1.375f,         1.5f,       1.625f,        1.75f,       1.875f,
+           2.0f,        2.25f,         2.5f,        2.75f,         3.0f,        3.25f,         3.5f,        3.75f,
+           4.0f,         4.5f,         5.0f,         5.5f,         6.0f,         6.5f,         7.0f,         7.5f,
+           8.0f,         9.0f,        10.0f,        11.0f,        12.0f,        13.0f,        14.0f,        15.0f,
+          16.0f,        18.0f,        20.0f,        22.0f,        24.0f,        26.0f,        28.0f,        30.0f,
+          32.0f,        36.0f,        40.0f,        44.0f,        48.0f,        52.0f,        56.0f,        60.0f,
+          64.0f,        72.0f,        80.0f,        88.0f,        96.0f,       104.0f,       112.0f,       120.0f,
+         128.0f,       144.0f,       160.0f,       176.0f,       192.0f,       208.0f,       224.0f,       240.0f,
+         256.0f,       288.0f,       320.0f,       352.0f,       384.0f,       416.0f,       448.0f,          NAN,
+          -0.0f,-0.001953125f, -0.00390625f,-0.005859375f,  -0.0078125f,-0.009765625f, -0.01171875f,-0.013671875f,
+     -0.015625f,-0.017578125f, -0.01953125f,-0.021484375f,  -0.0234375f,-0.025390625f, -0.02734375f,-0.029296875f,
+      -0.03125f, -0.03515625f,  -0.0390625f, -0.04296875f,   -0.046875f, -0.05078125f,  -0.0546875f, -0.05859375f,
+       -0.0625f,  -0.0703125f,   -0.078125f,  -0.0859375f,    -0.09375f,  -0.1015625f,   -0.109375f,  -0.1171875f,
+        -0.125f,   -0.140625f,    -0.15625f,   -0.171875f,     -0.1875f,   -0.203125f,    -0.21875f,   -0.234375f,
+         -0.25f,    -0.28125f,     -0.3125f,    -0.34375f,      -0.375f,    -0.40625f,     -0.4375f,    -0.46875f,
+          -0.5f,     -0.5625f,      -0.625f,     -0.6875f,       -0.75f,     -0.8125f,      -0.875f,     -0.9375f,
+          -1.0f,      -1.125f,       -1.25f,      -1.375f,        -1.5f,      -1.625f,       -1.75f,      -1.875f,
+          -2.0f,       -2.25f,        -2.5f,       -2.75f,        -3.0f,       -3.25f,        -3.5f,       -3.75f,
+          -4.0f,        -4.5f,        -5.0f,        -5.5f,        -6.0f,        -6.5f,        -7.0f,        -7.5f,
+          -8.0f,        -9.0f,       -10.0f,       -11.0f,       -12.0f,       -13.0f,       -14.0f,       -15.0f,
+         -16.0f,       -18.0f,       -20.0f,       -22.0f,       -24.0f,       -26.0f,       -28.0f,       -30.0f,
+         -32.0f,       -36.0f,       -40.0f,       -44.0f,       -48.0f,       -52.0f,       -56.0f,       -60.0f,
+         -64.0f,       -72.0f,       -80.0f,       -88.0f,       -96.0f,      -104.0f,      -112.0f,      -120.0f,
+        -128.0f,      -144.0f,      -160.0f,      -176.0f,      -192.0f,      -208.0f,      -224.0f,      -240.0f,
+        -256.0f,      -288.0f,      -320.0f,      -352.0f,      -384.0f,      -416.0f,      -448.0f,          NAN,
+};
+
+// FP8 E5M2 lookup table: byte → float
+constexpr constant static float fp8_e5m2_lut[256] = {
+       0.0f, 1.525879e-05f, 3.051758e-05f, 4.577637e-05f, 6.103516e-05f, 7.629395e-05f, 9.155273e-05f, 1.068115e-04f,
+    1.220703e-04f, 1.525879e-04f, 1.831055e-04f, 2.136230e-04f, 2.441406e-04f, 3.051758e-04f, 3.662109e-04f, 4.272461e-04f,
+    4.882812e-04f, 6.103516e-04f, 7.324219e-04f, 8.544922e-04f, 9.765625e-04f, 1.220703e-03f, 1.464844e-03f, 1.708984e-03f,
+    1.953125e-03f, 2.441406e-03f, 2.929688e-03f, 3.417969e-03f, 3.906250e-03f, 4.882812e-03f, 5.859375e-03f, 6.835938e-03f,
+    7.812500e-03f, 9.765625e-03f, 1.171875e-02f, 1.367188e-02f, 1.562500e-02f, 1.953125e-02f, 2.343750e-02f, 2.734375e-02f,
+    3.125000e-02f, 3.906250e-02f, 4.687500e-02f, 5.468750e-02f, 6.250000e-02f, 7.812500e-02f, 9.375000e-02f, 1.093750e-01f,
+         0.125f,      0.15625f,       0.1875f,      0.21875f,        0.25f,       0.3125f,        0.375f,       0.4375f,
+           0.5f,        0.625f,         0.75f,        0.875f,         1.0f,         1.25f,          1.5f,         1.75f,
+           2.0f,          2.5f,          3.0f,          3.5f,         4.0f,          5.0f,          6.0f,          7.0f,
+           8.0f,         10.0f,         12.0f,         14.0f,        16.0f,         20.0f,         24.0f,         28.0f,
+          32.0f,         40.0f,         48.0f,         56.0f,        64.0f,         80.0f,         96.0f,        112.0f,
+         128.0f,        160.0f,        192.0f,        224.0f,       256.0f,        320.0f,        384.0f,        448.0f,
+         512.0f,        640.0f,        768.0f,        896.0f,      1024.0f,       1280.0f,       1536.0f,       1792.0f,
+        2048.0f,       2560.0f,       3072.0f,       3584.0f,      4096.0f,       5120.0f,       6144.0f,       7168.0f,
+        8192.0f,      10240.0f,      12288.0f,      14336.0f,     16384.0f,      20480.0f,      24576.0f,      28672.0f,
+       32768.0f,      40960.0f,      49152.0f,      57344.0f,     INFINITY,          NAN,          NAN,          NAN,
+         -0.0f,-1.525879e-05f,-3.051758e-05f,-4.577637e-05f,-6.103516e-05f,-7.629395e-05f,-9.155273e-05f,-1.068115e-04f,
+   -1.220703e-04f,-1.525879e-04f,-1.831055e-04f,-2.136230e-04f,-2.441406e-04f,-3.051758e-04f,-3.662109e-04f,-4.272461e-04f,
+   -4.882812e-04f,-6.103516e-04f,-7.324219e-04f,-8.544922e-04f,-9.765625e-04f,-1.220703e-03f,-1.464844e-03f,-1.708984e-03f,
+   -1.953125e-03f,-2.441406e-03f,-2.929688e-03f,-3.417969e-03f,-3.906250e-03f,-4.882812e-03f,-5.859375e-03f,-6.835938e-03f,
+   -7.812500e-03f,-9.765625e-03f,-1.171875e-02f,-1.367188e-02f,-1.562500e-02f,-1.953125e-02f,-2.343750e-02f,-2.734375e-02f,
+   -3.125000e-02f,-3.906250e-02f,-4.687500e-02f,-5.468750e-02f,-6.250000e-02f,-7.812500e-02f,-9.375000e-02f,-1.093750e-01f,
+        -0.125f,     -0.15625f,      -0.1875f,     -0.21875f,       -0.25f,      -0.3125f,       -0.375f,      -0.4375f,
+          -0.5f,       -0.625f,        -0.75f,       -0.875f,        -1.0f,        -1.25f,         -1.5f,        -1.75f,
+          -2.0f,         -2.5f,         -3.0f,         -3.5f,        -4.0f,         -5.0f,         -6.0f,         -7.0f,
+          -8.0f,        -10.0f,        -12.0f,        -14.0f,       -16.0f,        -20.0f,        -24.0f,        -28.0f,
+         -32.0f,        -40.0f,        -48.0f,        -56.0f,       -64.0f,        -80.0f,        -96.0f,       -112.0f,
+        -128.0f,       -160.0f,       -192.0f,       -224.0f,      -256.0f,       -320.0f,       -384.0f,       -448.0f,
+        -512.0f,       -640.0f,       -768.0f,       -896.0f,     -1024.0f,      -1280.0f,      -1536.0f,      -1792.0f,
+       -2048.0f,      -2560.0f,      -3072.0f,      -3584.0f,     -4096.0f,      -5120.0f,      -6144.0f,      -7168.0f,
+       -8192.0f,     -10240.0f,     -12288.0f,     -14336.0f,    -16384.0f,     -20480.0f,     -24576.0f,     -28672.0f,
+      -32768.0f,     -40960.0f,     -49152.0f,     -57344.0f,    -INFINITY,          NAN,          NAN,          NAN,
+};
+
+// FP6 E2M3 lookup table: 6-bit value → float (64 entries, 256 bytes)
+constexpr constant static float fp6_e2m3_lut[64] = {
+     0.0f,  0.125f,   0.25f,  0.375f,    0.5f,  0.625f,   0.75f,  0.875f,
+     1.0f,  1.125f,   1.25f,  1.375f,    1.5f,  1.625f,   1.75f,  1.875f,
+     2.0f,   2.25f,    2.5f,   2.75f,    3.0f,   3.25f,    3.5f,   3.75f,
+     4.0f,    4.5f,    5.0f,    5.5f,    6.0f,    6.5f,    7.0f,    7.5f,
+    -0.0f, -0.125f,  -0.25f, -0.375f,   -0.5f, -0.625f,  -0.75f, -0.875f,
+    -1.0f, -1.125f,  -1.25f, -1.375f,   -1.5f, -1.625f,  -1.75f, -1.875f,
+    -2.0f,  -2.25f,   -2.5f,  -2.75f,   -3.0f,  -3.25f,   -3.5f,  -3.75f,
+    -4.0f,   -4.5f,   -5.0f,   -5.5f,   -6.0f,   -6.5f,   -7.0f,   -7.5f,
+};
+
+// FP6 E3M2 lookup table: 6-bit value → float (64 entries, 256 bytes)
+constexpr constant static float fp6_e3m2_lut[64] = {
+      0.0f,  0.0625f,  0.125f, 0.1875f,   0.25f, 0.3125f,  0.375f, 0.4375f,
+      0.5f,  0.625f,    0.75f,  0.875f,    1.0f,   1.25f,    1.5f,   1.75f,
+      2.0f,    2.5f,     3.0f,    3.5f,    4.0f,    5.0f,    6.0f,    7.0f,
+      8.0f,   10.0f,    12.0f,   14.0f,   16.0f,   20.0f,   24.0f,   28.0f,
+     -0.0f, -0.0625f, -0.125f,-0.1875f,  -0.25f,-0.3125f, -0.375f,-0.4375f,
+     -0.5f,  -0.625f,  -0.75f, -0.875f,   -1.0f,  -1.25f,   -1.5f,  -1.75f,
+     -2.0f,   -2.5f,    -3.0f,   -3.5f,   -4.0f,   -5.0f,   -6.0f,   -7.0f,
+     -8.0f,  -10.0f,   -12.0f,  -14.0f,  -16.0f,  -20.0f,  -24.0f,  -28.0f,
+};
+
 static inline int best_index_int8(int n, constant float * val, float x) {
     if (x <= val[0]) return 0;
     if (x >= val[n-1]) return n-1;
@@ -589,11 +685,19 @@ static inline uint8_t mxfp4_compute_e8m0(float val) {
 
     for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
         float test_scale = e8m0_to_fp32((uint8_t)test_e);
-        // Find minimum reconstruction error for this thread's value
-        float min_err = abs(kvalues_mxfp4_f[0] * test_scale - val);
-        for (int i = 1; i < 16; i++) {
-            min_err = min(min_err, abs(kvalues_mxfp4_f[i] * test_scale - val));
-        }
+        float inv_scale = test_scale > 0.0f ? 1.0f / test_scale : 0.0f;
+        // Find minimum reconstruction error using decision boundaries
+        float normalized = abs(val) * inv_scale;
+        float qval;
+        if      (normalized < 0.25f) qval = 0.0f;
+        else if (normalized < 0.75f) qval = 0.5f;
+        else if (normalized < 1.25f) qval = 1.0f;
+        else if (normalized < 1.75f) qval = 1.5f;
+        else if (normalized < 2.50f) qval = 2.0f;
+        else if (normalized < 3.50f) qval = 3.0f;
+        else if (normalized < 5.00f) qval = 4.0f;
+        else                         qval = 6.0f;
+        float min_err = abs(qval * test_scale - abs(val));
         float mse = simd_sum(min_err * min_err);
         if (mse < best_mse) {
             best_mse = mse;
@@ -605,17 +709,22 @@ static inline uint8_t mxfp4_compute_e8m0(float val) {
 }
 
 // MXFP4 round-trip: quantize then dequantize a single value given block scale.
+// Uses decision boundaries instead of 16-element linear scan.
+// Positive kvalues sorted: {0, 0.5, 1, 1.5, 2, 3, 4, 6}
+// Decision boundaries (midpoints): {0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0}
 static inline float mxfp4_roundtrip(float val, float scale) {
-    int best_idx = 0;
-    float best_err = abs(kvalues_mxfp4_f[0] * scale - val);
-    for (int i = 1; i < 16; i++) {
-        float err = abs(kvalues_mxfp4_f[i] * scale - val);
-        if (err < best_err) {
-            best_err = err;
-            best_idx = i;
-        }
-    }
-    return kvalues_mxfp4_f[best_idx] * scale;
+    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+    float normalized = abs(val) * inv_scale;
+    float qval;
+    if      (normalized < 0.25f) qval = 0.0f;
+    else if (normalized < 0.75f) qval = 0.5f;
+    else if (normalized < 1.25f) qval = 1.0f;
+    else if (normalized < 1.75f) qval = 1.5f;
+    else if (normalized < 2.50f) qval = 2.0f;
+    else if (normalized < 3.50f) qval = 3.0f;
+    else if (normalized < 5.00f) qval = 4.0f;
+    else                         qval = 6.0f;
+    return copysign(qval * scale, val);
 }
 
 // Apply MXFP4 Q preprocessing to a 32-element block in shared memory.
@@ -688,13 +797,13 @@ template <typename type4x4>
 void dequantize_mxfp8_e4m3(device const block_mxfp8 * xb, short il, thread type4x4 & reg) {
     device const uint8_t * qs = xb->qs;
     const float d = e8m0_to_fp32(xb->e);
-    const short offset = il * 16; // il=0: first 16, il=1: last 16
+    const short offset = il * 16;
 
     for (int i = 0; i < 4; ++i) {
-        reg[i][0] = d * fp8_e4m3_to_float(qs[offset + 4*i + 0]);
-        reg[i][1] = d * fp8_e4m3_to_float(qs[offset + 4*i + 1]);
-        reg[i][2] = d * fp8_e4m3_to_float(qs[offset + 4*i + 2]);
-        reg[i][3] = d * fp8_e4m3_to_float(qs[offset + 4*i + 3]);
+        reg[i][0] = d * fp8_e4m3_lut[qs[offset + 4*i + 0]];
+        reg[i][1] = d * fp8_e4m3_lut[qs[offset + 4*i + 1]];
+        reg[i][2] = d * fp8_e4m3_lut[qs[offset + 4*i + 2]];
+        reg[i][3] = d * fp8_e4m3_lut[qs[offset + 4*i + 3]];
     }
 }
 
@@ -703,10 +812,10 @@ void dequantize_mxfp8_e4m3_t4(device const block_mxfp8 * xb, short il, thread ty
     device const uint8_t * qs = xb->qs;
     const float d = e8m0_to_fp32(xb->e);
 
-    reg[0] = d * fp8_e4m3_to_float(qs[4*il + 0]);
-    reg[1] = d * fp8_e4m3_to_float(qs[4*il + 1]);
-    reg[2] = d * fp8_e4m3_to_float(qs[4*il + 2]);
-    reg[3] = d * fp8_e4m3_to_float(qs[4*il + 3]);
+    reg[0] = d * fp8_e4m3_lut[qs[4*il + 0]];
+    reg[1] = d * fp8_e4m3_lut[qs[4*il + 1]];
+    reg[2] = d * fp8_e4m3_lut[qs[4*il + 2]];
+    reg[3] = d * fp8_e4m3_lut[qs[4*il + 3]];
 }
 
 // ===== MXFP8 E5M2 dequantization =====
@@ -769,10 +878,10 @@ void dequantize_mxfp8_e5m2(device const block_mxfp8 * xb, short il, thread type4
     const short offset = il * 16;
 
     for (int i = 0; i < 4; ++i) {
-        reg[i][0] = d * fp8_e5m2_to_float(qs[offset + 4*i + 0]);
-        reg[i][1] = d * fp8_e5m2_to_float(qs[offset + 4*i + 1]);
-        reg[i][2] = d * fp8_e5m2_to_float(qs[offset + 4*i + 2]);
-        reg[i][3] = d * fp8_e5m2_to_float(qs[offset + 4*i + 3]);
+        reg[i][0] = d * fp8_e5m2_lut[qs[offset + 4*i + 0]];
+        reg[i][1] = d * fp8_e5m2_lut[qs[offset + 4*i + 1]];
+        reg[i][2] = d * fp8_e5m2_lut[qs[offset + 4*i + 2]];
+        reg[i][3] = d * fp8_e5m2_lut[qs[offset + 4*i + 3]];
     }
 }
 
@@ -781,10 +890,10 @@ void dequantize_mxfp8_e5m2_t4(device const block_mxfp8 * xb, short il, thread ty
     device const uint8_t * qs = xb->qs;
     const float d = e8m0_to_fp32(xb->e);
 
-    reg[0] = d * fp8_e5m2_to_float(qs[4*il + 0]);
-    reg[1] = d * fp8_e5m2_to_float(qs[4*il + 1]);
-    reg[2] = d * fp8_e5m2_to_float(qs[4*il + 2]);
-    reg[3] = d * fp8_e5m2_to_float(qs[4*il + 3]);
+    reg[0] = d * fp8_e5m2_lut[qs[4*il + 0]];
+    reg[1] = d * fp8_e5m2_lut[qs[4*il + 1]];
+    reg[2] = d * fp8_e5m2_lut[qs[4*il + 2]];
+    reg[3] = d * fp8_e5m2_lut[qs[4*il + 3]];
 }
 
 // ===== MXFP6 conversion helpers =====
@@ -882,10 +991,10 @@ void dequantize_mxfp6_e2m3(device const block_mxfp6 * xb, short il, thread type4
     for (int i = 0; i < 4; ++i) {
         uint8_t vals[4];
         unpack_fp6x4(&qs[(base_group + i) * 3], vals);
-        reg[i][0] = d * fp6_e2m3_to_float(vals[0]);
-        reg[i][1] = d * fp6_e2m3_to_float(vals[1]);
-        reg[i][2] = d * fp6_e2m3_to_float(vals[2]);
-        reg[i][3] = d * fp6_e2m3_to_float(vals[3]);
+        reg[i][0] = d * fp6_e2m3_lut[vals[0]];
+        reg[i][1] = d * fp6_e2m3_lut[vals[1]];
+        reg[i][2] = d * fp6_e2m3_lut[vals[2]];
+        reg[i][3] = d * fp6_e2m3_lut[vals[3]];
     }
 }
 
@@ -896,10 +1005,10 @@ void dequantize_mxfp6_e2m3_t4(device const block_mxfp6 * xb, short il, thread ty
 
     uint8_t vals[4];
     unpack_fp6x4(&qs[il * 3], vals);
-    reg[0] = d * fp6_e2m3_to_float(vals[0]);
-    reg[1] = d * fp6_e2m3_to_float(vals[1]);
-    reg[2] = d * fp6_e2m3_to_float(vals[2]);
-    reg[3] = d * fp6_e2m3_to_float(vals[3]);
+    reg[0] = d * fp6_e2m3_lut[vals[0]];
+    reg[1] = d * fp6_e2m3_lut[vals[1]];
+    reg[2] = d * fp6_e2m3_lut[vals[2]];
+    reg[3] = d * fp6_e2m3_lut[vals[3]];
 }
 
 // ===== MXFP6 E3M2 dequantization =====
@@ -912,10 +1021,10 @@ void dequantize_mxfp6_e3m2(device const block_mxfp6 * xb, short il, thread type4
     for (int i = 0; i < 4; ++i) {
         uint8_t vals[4];
         unpack_fp6x4(&qs[(base_group + i) * 3], vals);
-        reg[i][0] = d * fp6_e3m2_to_float(vals[0]);
-        reg[i][1] = d * fp6_e3m2_to_float(vals[1]);
-        reg[i][2] = d * fp6_e3m2_to_float(vals[2]);
-        reg[i][3] = d * fp6_e3m2_to_float(vals[3]);
+        reg[i][0] = d * fp6_e3m2_lut[vals[0]];
+        reg[i][1] = d * fp6_e3m2_lut[vals[1]];
+        reg[i][2] = d * fp6_e3m2_lut[vals[2]];
+        reg[i][3] = d * fp6_e3m2_lut[vals[3]];
     }
 }
 
@@ -926,10 +1035,10 @@ void dequantize_mxfp6_e3m2_t4(device const block_mxfp6 * xb, short il, thread ty
 
     uint8_t vals[4];
     unpack_fp6x4(&qs[il * 3], vals);
-    reg[0] = d * fp6_e3m2_to_float(vals[0]);
-    reg[1] = d * fp6_e3m2_to_float(vals[1]);
-    reg[2] = d * fp6_e3m2_to_float(vals[2]);
-    reg[3] = d * fp6_e3m2_to_float(vals[3]);
+    reg[0] = d * fp6_e3m2_lut[vals[0]];
+    reg[1] = d * fp6_e3m2_lut[vals[1]];
+    reg[2] = d * fp6_e3m2_lut[vals[2]];
+    reg[3] = d * fp6_e3m2_lut[vals[3]];
 }
 
 // ===== MXFP serial quantize functions (for set_rows) =====
@@ -1012,12 +1121,20 @@ static inline uint8_t mxfp4_compute_e8m0_serial(SRC_PTR src) {
 
     for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
         float test_scale = e8m0_to_fp32((uint8_t)test_e);
+        float inv_scale = test_scale > 0.0f ? 1.0f / test_scale : 0.0f;
         float mse = 0.0f;
         for (int j = 0; j < 32; ++j) {
-            float min_err = abs(kvalues_mxfp4_f[0] * test_scale - src[j]);
-            for (int i = 1; i < 16; i++) {
-                min_err = min(min_err, abs(kvalues_mxfp4_f[i] * test_scale - src[j]));
-            }
+            float normalized = abs(src[j]) * inv_scale;
+            float qval;
+            if      (normalized < 0.25f) qval = 0.0f;
+            else if (normalized < 0.75f) qval = 0.5f;
+            else if (normalized < 1.25f) qval = 1.0f;
+            else if (normalized < 1.75f) qval = 1.5f;
+            else if (normalized < 2.50f) qval = 2.0f;
+            else if (normalized < 3.50f) qval = 3.0f;
+            else if (normalized < 5.00f) qval = 4.0f;
+            else                         qval = 6.0f;
+            float min_err = abs(qval * test_scale - abs(src[j]));
             mse += min_err * min_err;
         }
         if (mse < best_mse) {
@@ -1029,28 +1146,33 @@ static inline uint8_t mxfp4_compute_e8m0_serial(SRC_PTR src) {
 }
 
 // Find best MXFP4 index for a value given scale.
-static inline uint8_t best_index_mxfp4_metal(float x, float scale) {
-    uint8_t best = 0;
-    float best_err = abs(kvalues_mxfp4_f[0] * scale - x);
-    for (int i = 1; i < 16; i++) {
-        float err = abs(kvalues_mxfp4_f[i] * scale - x);
-        if (err < best_err) {
-            best_err = err;
-            best = (uint8_t)i;
-        }
-    }
-    return best;
+static inline uint8_t best_index_mxfp4_metal(float x, float inv_scale) {
+    // Decision boundary quantization: 7 comparisons instead of 16-element scan.
+    // kvalues_mxfp4_f indices: 0=0, 1=0.5, 2=1, 3=1.5, 4=2, 5=3, 6=4, 7=6
+    //                          8=-0, 9=-0.5, 10=-1, 11=-1.5, 12=-2, 13=-3, 14=-4, 15=-6
+    float normalized = abs(x) * inv_scale;
+    uint8_t idx;
+    if      (normalized < 0.25f) idx = 0;
+    else if (normalized < 0.75f) idx = 1;
+    else if (normalized < 1.25f) idx = 2;
+    else if (normalized < 1.75f) idx = 3;
+    else if (normalized < 2.50f) idx = 4;
+    else if (normalized < 3.50f) idx = 5;
+    else if (normalized < 5.00f) idx = 6;
+    else                         idx = 7;
+    return (x < 0.0f) ? (idx + 8) : idx;
 }
 
 template <typename SRC_PTR>
 void quantize_mxfp4_impl(SRC_PTR src, device block_mxfp4 & dst) {
     uint8_t e = mxfp4_compute_e8m0_serial(src);
     float scale = e8m0_to_fp32(e);
+    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
     dst.e = e;
 
     for (int j = 0; j < 16; ++j) {
-        uint8_t x0 = best_index_mxfp4_metal(src[j],     scale);
-        uint8_t x1 = best_index_mxfp4_metal(src[j + 16], scale);
+        uint8_t x0 = best_index_mxfp4_metal(src[j],     inv_scale);
+        uint8_t x1 = best_index_mxfp4_metal(src[j + 16], inv_scale);
         dst.qs[j] = x0 | (x1 << 4);
     }
 }
