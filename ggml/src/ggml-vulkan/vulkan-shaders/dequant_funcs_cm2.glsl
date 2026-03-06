@@ -685,6 +685,68 @@ float16_t dequantFuncMXFP4(const in decodeBufMXFP4 bl, const in uint blockCoords
 }
 #endif
 
+#if defined(DATA_A_MXFP8_E4M3)
+layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufMXFP8_E4M3 {
+   block_mxfp8 block;
+};
+
+float16_t dequantFuncMXFP8_E4M3(const in decodeBufMXFP8_E4M3 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float d = e8m0_to_fp32(bl.block.e);
+    const uint idx = coordInBlock[1];
+    return float16_t(d * fp8_e4m3_to_float(uint(bl.block.qs[idx])));
+}
+#endif
+
+#if defined(DATA_A_MXFP8_E5M2)
+layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufMXFP8_E5M2 {
+   block_mxfp8 block;
+};
+
+float16_t dequantFuncMXFP8_E5M2(const in decodeBufMXFP8_E5M2 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float d = e8m0_to_fp32(bl.block.e);
+    const uint idx = coordInBlock[1];
+    return float16_t(d * fp8_e5m2_to_float(uint(bl.block.qs[idx])));
+}
+#endif
+
+#if defined(DATA_A_MXFP6_E2M3)
+layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufMXFP6_E2M3 {
+   block_mxfp6 block;
+};
+
+float16_t dequantFuncMXFP6_E2M3(const in decodeBufMXFP6_E2M3 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float d = e8m0_to_fp32(bl.block.e);
+    const uint idx = coordInBlock[1];
+    uint group = idx / 4u;
+    uint within = idx % 4u;
+    uint base = group * 3u;
+    uint packed = uint(bl.block.qs[base]) | (uint(bl.block.qs[base + 1u]) << 8) | (uint(bl.block.qs[base + 2u]) << 16);
+    uint val = (packed >> (within * 6u)) & 0x3Fu;
+    return float16_t(d * fp6_e2m3_to_float(val));
+}
+#endif
+
+#if defined(DATA_A_MXFP6_E3M2)
+layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufMXFP6_E3M2 {
+   block_mxfp6 block;
+};
+
+float16_t dequantFuncMXFP6_E3M2(const in decodeBufMXFP6_E3M2 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float d = e8m0_to_fp32(bl.block.e);
+    const uint idx = coordInBlock[1];
+    uint group = idx / 4u;
+    uint within = idx % 4u;
+    uint base = group * 3u;
+    uint packed = uint(bl.block.qs[base]) | (uint(bl.block.qs[base + 1u]) << 8) | (uint(bl.block.qs[base + 2u]) << 16);
+    uint val = (packed >> (within * 6u)) & 0x3Fu;
+    return float16_t(d * fp6_e3m2_to_float(val));
+}
+#endif
+
 #if defined(DATA_A_Q4_0)
 #define dequantFuncA dequantFuncQ4_0
 #elif defined(DATA_A_Q4_1)
@@ -729,6 +791,14 @@ float16_t dequantFuncMXFP4(const in decodeBufMXFP4 bl, const in uint blockCoords
 #define dequantFuncA dequantFuncIQ4_NL
 #elif defined(DATA_A_MXFP4)
 #define dequantFuncA dequantFuncMXFP4
+#elif defined(DATA_A_MXFP8_E4M3)
+#define dequantFuncA dequantFuncMXFP8_E4M3
+#elif defined(DATA_A_MXFP8_E5M2)
+#define dequantFuncA dequantFuncMXFP8_E5M2
+#elif defined(DATA_A_MXFP6_E2M3)
+#define dequantFuncA dequantFuncMXFP6_E2M3
+#elif defined(DATA_A_MXFP6_E3M2)
+#define dequantFuncA dequantFuncMXFP6_E3M2
 #elif defined(DATA_A_F32)
 #define dequantFuncA dequantFuncF32
 #endif

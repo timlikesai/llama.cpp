@@ -68,6 +68,14 @@ const std::vector<std::string> type_names = {
     "bf16",
 };
 
+// MXFP types that only have flash attention support (not mul_mat_vec/mul_mat_mat)
+const std::vector<std::string> mxfp_fa_only_types = {
+    "mxfp8_e4m3",
+    "mxfp8_e5m2",
+    "mxfp6_e2m3",
+    "mxfp6_e3m2",
+};
+
 enum MatMulIdType {
     NONE,
     DEFAULT,
@@ -637,7 +645,12 @@ void process_shaders() {
                 fa_base_dict["ACC_TYPE_MAX"] = "float16_t(65504.0)";
             }
 
-            for (const auto& tname : type_names) {
+            // Combine type_names and mxfp_fa_only_types for flash attention generation
+            std::vector<std::string> fa_types;
+            fa_types.insert(fa_types.end(), type_names.begin(), type_names.end());
+            fa_types.insert(fa_types.end(), mxfp_fa_only_types.begin(), mxfp_fa_only_types.end());
+
+            for (const auto& tname : fa_types) {
                 if (tname == "bf16") continue;
 
                 if (fp16) {
@@ -655,7 +668,9 @@ void process_shaders() {
                 if (tname == "f16") {
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn_cm1.comp",
                         merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
-                } else if (tname == "q4_0" || tname == "q8_0" || tname == "f32") {
+                } else if (tname == "q4_0" || tname == "q8_0" || tname == "f32" ||
+                           tname == "mxfp4" || tname == "mxfp8_e4m3" || tname == "mxfp8_e5m2" ||
+                           tname == "mxfp6_e2m3" || tname == "mxfp6_e3m2") {
                     std::string data_a_key = "DATA_A_" + to_uppercase(tname);
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn_cm1.comp",
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname)}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
@@ -666,7 +681,9 @@ void process_shaders() {
                 if (tname == "f16") {
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn.comp",
                         merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, false, f16acc);
-                } else if (tname == "q4_0" || tname == "q8_0" || tname == "f32") {
+                } else if (tname == "q4_0" || tname == "q8_0" || tname == "f32" ||
+                           tname == "mxfp4" || tname == "mxfp8_e4m3" || tname == "mxfp8_e5m2" ||
+                           tname == "mxfp6_e2m3" || tname == "mxfp6_e3m2") {
                     std::string data_a_key = "DATA_A_" + to_uppercase(tname);
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn.comp",
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }}), fp16, false, false, f16acc);

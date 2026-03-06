@@ -3422,11 +3422,21 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, )
         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_SCALAR, )
         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_SCALAR, )
+        CREATE_FA(GGML_TYPE_MXFP4_E2M1, mxfp4, FA_SCALAR, )
+        CREATE_FA(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3, FA_SCALAR, )
+        CREATE_FA(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2, FA_SCALAR, )
+        CREATE_FA(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3, FA_SCALAR, )
+        CREATE_FA(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2, FA_SCALAR, )
     } else {
         CREATE_FA(GGML_TYPE_F32, f32, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_SCALAR, _fp32)
+        CREATE_FA(GGML_TYPE_MXFP4_E2M1, mxfp4, FA_SCALAR, _fp32)
+        CREATE_FA(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3, FA_SCALAR, _fp32)
+        CREATE_FA(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2, FA_SCALAR, _fp32)
+        CREATE_FA(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3, FA_SCALAR, _fp32)
+        CREATE_FA(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2, FA_SCALAR, _fp32)
     }
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->coopmat1_fa_support) {
@@ -3434,6 +3444,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA(GGML_TYPE_F16, f16, FA_COOPMAT1, _cm1)
         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_COOPMAT1, _cm1)
         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_COOPMAT1, _cm1)
+        CREATE_FA(GGML_TYPE_MXFP4_E2M1, mxfp4, FA_COOPMAT1, _cm1)
+        CREATE_FA(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3, FA_COOPMAT1, _cm1)
+        CREATE_FA(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2, FA_COOPMAT1, _cm1)
+        CREATE_FA(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3, FA_COOPMAT1, _cm1)
+        CREATE_FA(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2, FA_COOPMAT1, _cm1)
     }
 #endif
 #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
@@ -3446,6 +3461,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA(GGML_TYPE_Q5_1, q5_1, FA_COOPMAT2, _cm2)
         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_COOPMAT2, _cm2)
         CREATE_FA(GGML_TYPE_IQ4_NL, iq4_nl, FA_COOPMAT2, _cm2)
+        CREATE_FA(GGML_TYPE_MXFP4_E2M1, mxfp4, FA_COOPMAT2, _cm2)
+        CREATE_FA(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3, FA_COOPMAT2, _cm2)
+        CREATE_FA(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2, FA_COOPMAT2, _cm2)
+        CREATE_FA(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3, FA_COOPMAT2, _cm2)
+        CREATE_FA(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2, FA_COOPMAT2, _cm2)
     }
 #endif
 #undef CREATE_FA
@@ -15256,6 +15276,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 case GGML_TYPE_F32:
                 case GGML_TYPE_Q4_0:
                 case GGML_TYPE_Q8_0:
+                case GGML_TYPE_MXFP4_E2M1:
+                case GGML_TYPE_MXFP8_E4M3:
+                case GGML_TYPE_MXFP8_E5M2:
+                case GGML_TYPE_MXFP6_E2M3:
+                case GGML_TYPE_MXFP6_E3M2:
                     // supported in scalar and coopmat2 paths
                     break;
                 case GGML_TYPE_Q4_1:

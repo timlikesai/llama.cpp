@@ -1696,6 +1696,56 @@ struct block_mxfp4
 #define A_TYPE block_mxfp4
 #endif
 
+#define QUANT_K_MXFP8 32
+#define QUANT_R_MXFP8 1
+#define QUANT_K_MXFP8_E4M3 QUANT_K_MXFP8
+#define QUANT_K_MXFP8_E5M2 QUANT_K_MXFP8
+
+struct block_mxfp8
+{
+    uint8_t e;
+    uint8_t qs[QUANT_K_MXFP8];
+};
+
+#if defined(DATA_A_MXFP8_E4M3)
+#define QUANT_K QUANT_K_MXFP8
+#define QUANT_R QUANT_R_MXFP8
+#define QUANT_AUXF 1
+#define A_TYPE block_mxfp8
+#endif
+
+#if defined(DATA_A_MXFP8_E5M2)
+#define QUANT_K QUANT_K_MXFP8
+#define QUANT_R QUANT_R_MXFP8
+#define QUANT_AUXF 1
+#define A_TYPE block_mxfp8
+#endif
+
+#define QUANT_K_MXFP6 32
+#define QUANT_R_MXFP6 1
+#define QUANT_K_MXFP6_E2M3 QUANT_K_MXFP6
+#define QUANT_K_MXFP6_E3M2 QUANT_K_MXFP6
+
+struct block_mxfp6
+{
+    uint8_t e;
+    uint8_t qs[24]; // 32 six-bit values tightly packed (4 per 3 bytes)
+};
+
+#if defined(DATA_A_MXFP6_E2M3)
+#define QUANT_K QUANT_K_MXFP6
+#define QUANT_R QUANT_R_MXFP6
+#define QUANT_AUXF 1
+#define A_TYPE block_mxfp6
+#endif
+
+#if defined(DATA_A_MXFP6_E3M2)
+#define QUANT_K QUANT_K_MXFP6
+#define QUANT_R QUANT_R_MXFP6
+#define QUANT_AUXF 1
+#define A_TYPE block_mxfp6
+#endif
+
 #if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
 const int8_t kvalues_iq4nl_const[16] = {
     int8_t(-127), int8_t(-104), int8_t(-83), int8_t(-65), int8_t(-49), int8_t(-35), int8_t(-22), int8_t(-10),
@@ -1731,6 +1781,80 @@ void init_iq_shmem(uvec3 wgsize)
         kvalues_mxfp4[i] = kvalues_mxfp4_const[i];
     }
     barrier();
+}
+#endif
+
+// FP8 E4M3 dequantization: 1 sign, 4 exponent (bias 7), 3 mantissa
+#if defined(DATA_A_MXFP8_E4M3)
+float fp8_e4m3_to_float(uint v) {
+    uint sign = (v & 0x80u) << 24;
+    uint exp  = (v >> 3) & 0xFu;
+    uint mant = v & 0x7u;
+    if (exp == 0u) {
+        if (mant == 0u) return uintBitsToFloat(sign);
+        // Subnormal: mant * 2^(-9)
+        float val = float(mant) * (1.0 / 512.0);
+        return (sign != 0u) ? -val : val;
+    }
+    if (exp == 15u && mant == 7u) return uintBitsToFloat(sign | 0x7FC00000u); // NaN
+    uint bits = sign | ((exp + 120u) << 23) | (mant << 20);
+    return uintBitsToFloat(bits);
+}
+#endif
+
+// FP8 E5M2 dequantization: 1 sign, 5 exponent (bias 15), 2 mantissa
+#if defined(DATA_A_MXFP8_E5M2)
+float fp8_e5m2_to_float(uint v) {
+    uint sign = (v & 0x80u) << 24;
+    uint exp  = (v >> 2) & 0x1Fu;
+    uint mant = v & 0x3u;
+    if (exp == 0u) {
+        if (mant == 0u) return uintBitsToFloat(sign);
+        float val = float(mant) * (1.0 / 65536.0);
+        return (sign != 0u) ? -val : val;
+    }
+    if (exp == 31u) return uintBitsToFloat(sign | 0x7FC00000u); // Inf/NaN
+    uint bits = sign | ((exp + 112u) << 23) | (mant << 21);
+    return uintBitsToFloat(bits);
+}
+#endif
+
+// FP6 E2M3 dequantization: 1 sign, 2 exponent (bias 1), 3 mantissa
+#if defined(DATA_A_MXFP6_E2M3)
+float fp6_e2m3_to_float(uint v) {
+    float sign = ((v & 0x20u) != 0u) ? -1.0 : 1.0;
+    uint exp  = (v >> 3) & 0x3u;
+    uint mant = v & 0x7u;
+    if (exp == 0u) {
+        return sign * float(mant) * (1.0 / 8.0);
+    }
+    uint bits = ((exp + 126u) << 23) | (mant << 20);
+    return sign * uintBitsToFloat(bits);
+}
+#endif
+
+// FP6 E3M2 dequantization: 1 sign, 3 exponent (bias 3), 2 mantissa
+#if defined(DATA_A_MXFP6_E3M2)
+float fp6_e3m2_to_float(uint v) {
+    float sign = ((v & 0x20u) != 0u) ? -1.0 : 1.0;
+    uint exp  = (v >> 2) & 0x7u;
+    uint mant = v & 0x3u;
+    if (exp == 0u) {
+        return sign * float(mant) * (1.0 / 16.0);
+    }
+    uint bits = ((exp + 124u) << 23) | (mant << 21);
+    return sign * uintBitsToFloat(bits);
+}
+#endif
+
+// Unpack 4 six-bit values from 3 packed bytes
+#if defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
+void unpack_fp6x4(uint b0, uint b1, uint b2, out uint v0, out uint v1, out uint v2, out uint v3) {
+    uint packed = b0 | (b1 << 8) | (b2 << 16);
+    v0 = packed & 0x3Fu;
+    v1 = (packed >> 6) & 0x3Fu;
+    v2 = (packed >> 12) & 0x3Fu;
+    v3 = (packed >> 18) & 0x3Fu;
 }
 #endif
 

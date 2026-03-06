@@ -87,6 +87,50 @@ void main() {
             Qf[r * qf_stride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale);
         }
     }
+
+#ifdef MXFP_Q_PREPROCESS
+    barrier();
+    // Apply Hadamard + MXFP quantize/dequantize round-trip to Q
+    {
+        const uint mxfp_blocks_per_row = HSK / 32u;
+        const uint mxfp_active_rows = min(Br, N - i * Br);
+        const uint mxfp_total_blocks = mxfp_active_rows * mxfp_blocks_per_row;
+        const bool mxfp_apply_hadamard = (HSK == HSV);
+
+        for (uint block_idx = tid; block_idx < mxfp_total_blocks; block_idx += gl_WorkGroupSize.x) {
+            uint row = block_idx / mxfp_blocks_per_row;
+            uint blk = block_idx % mxfp_blocks_per_row;
+            uint base = row * qf_stride + blk * 8u;
+
+            // Load 32 elements from shared memory
+            float vals[32];
+            for (uint vi = 0u; vi < 8u; vi++) {
+                FLOAT_TYPEV4 v = Qf[base + vi];
+                vals[vi * 4u + 0u] = float(v.x);
+                vals[vi * 4u + 1u] = float(v.y);
+                vals[vi * 4u + 2u] = float(v.z);
+                vals[vi * 4u + 3u] = float(v.w);
+            }
+
+            // Hadamard rotation
+            if (mxfp_apply_hadamard) {
+                hadamard_32_shmem(vals);
+            }
+
+            // Compute shared exponent and apply round-trip
+            float scale = compute_e8m0_scale(vals);
+            for (uint vi = 0u; vi < 32u; vi++) {
+                vals[vi] = mxfp_roundtrip_val(vals[vi], scale);
+            }
+
+            // Write back
+            for (uint vi = 0u; vi < 8u; vi++) {
+                Qf[base + vi] = FLOAT_TYPEV4(vals[vi * 4u + 0u], vals[vi * 4u + 1u], vals[vi * 4u + 2u], vals[vi * 4u + 3u]);
+            }
+        }
+    }
+#endif
+
     barrier();
 
     FLOAT_TYPEV4 Of[rows_per_thread][HSV_per_thread / 4];
