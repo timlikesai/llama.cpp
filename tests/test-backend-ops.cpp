@@ -49,12 +49,6 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
-static inline bool ggml_is_type_mxfp(ggml_type type) {
-    return type == GGML_TYPE_MXFP4_E2M1 || type == GGML_TYPE_MXFP6_E2M3 ||
-           type == GGML_TYPE_MXFP6_E3M2 || type == GGML_TYPE_MXFP8_E4M3 ||
-           type == GGML_TYPE_MXFP8_E5M2;
-}
-
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);

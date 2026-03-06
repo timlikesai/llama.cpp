@@ -23,11 +23,19 @@ static constexpr bool is_mxfp_soa_v =
     type == GGML_TYPE_MXFP6_E2M3 || type == GGML_TYPE_MXFP6_E3M2 ||
     type == GGML_TYPE_MXFP8_E5M2;
 
-// Runtime check: is this an MXFP SoA type?
-static __host__ __device__ __forceinline__ bool ggml_is_type_mxfp(ggml_type type) {
-    return type == GGML_TYPE_MXFP4_E2M1 || type == GGML_TYPE_MXFP8_E4M3 ||
-           type == GGML_TYPE_MXFP6_E2M3 || type == GGML_TYPE_MXFP6_E3M2 ||
-           type == GGML_TYPE_MXFP8_E5M2;
+// Runtime check: ggml_is_type_mxfp() is now in ggml.h (shared across all backends).
+
+// Runtime check: is this MXFP type compiled (respects GGML_CUDA_MXFP_ALL_VARIANTS gate)?
+static __host__ __device__ __forceinline__ bool ggml_is_type_mxfp_enabled(ggml_type type) {
+    if (type == GGML_TYPE_MXFP4_E2M1 || type == GGML_TYPE_MXFP8_E4M3 || type == GGML_TYPE_MXFP6_E2M3) {
+        return true;
+    }
+#ifdef GGML_CUDA_MXFP_ALL_VARIANTS
+    if (type == GGML_TYPE_MXFP6_E3M2 || type == GGML_TYPE_MXFP8_E5M2) {
+        return true;
+    }
+#endif
+    return false;
 }
 
 // FP4 E2M1:

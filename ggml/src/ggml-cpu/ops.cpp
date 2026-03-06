@@ -2,6 +2,7 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -4919,12 +4920,10 @@ void ggml_compute_forward_get_rows(
     //}
 }
 
-// Walsh-Hadamard transform for MXFP quantization quality (QuaRot, arXiv:2404.00456).
-// Spreads outliers across 32-element blocks for better E8M0 scale utilization.
-// 5 butterfly stages on 32 floats, followed by 1/sqrt(32) normalization.
+// NEON-optimized Hadamard for ARM platforms; scalar fallback uses ggml_hadamard_32_inplace
+// from ggml-quants.c (the reference implementation).
 #if defined(__ARM_NEON)
 static void hadamard_32_inplace(float vals[32]) {
-    // Load 32 floats into 8 NEON registers
     float32x4_t v0 = vld1q_f32(vals +  0);
     float32x4_t v1 = vld1q_f32(vals +  4);
     float32x4_t v2 = vld1q_f32(vals +  8);
@@ -4934,8 +4933,6 @@ static void hadamard_32_inplace(float vals[32]) {
     float32x4_t v6 = vld1q_f32(vals + 24);
     float32x4_t v7 = vld1q_f32(vals + 28);
 
-    // Stage 1 (stride=1): butterfly pairs at offset 1 within each float32x4_t
-    // {a,b,c,d} → {a+b, a-b, c+d, c-d}
     #define HADAMARD_S1(v) do {                                         \
         float32x2_t lo = vget_low_f32(v);                              \
         float32x2_t hi = vget_high_f32(v);                             \
@@ -4949,8 +4946,6 @@ static void hadamard_32_inplace(float vals[32]) {
     HADAMARD_S1(v4); HADAMARD_S1(v5); HADAMARD_S1(v6); HADAMARD_S1(v7);
     #undef HADAMARD_S1
 
-    // Stage 2 (stride=2): butterfly pairs at offset 2 within each float32x4_t
-    // {a,b,c,d} → {a+c, b+d, a-c, b-d}
     #define HADAMARD_S2(v) do {                                         \
         float32x2_t lo = vget_low_f32(v);                              \
         float32x2_t hi = vget_high_f32(v);                             \
@@ -4960,7 +4955,6 @@ static void hadamard_32_inplace(float vals[32]) {
     HADAMARD_S2(v4); HADAMARD_S2(v5); HADAMARD_S2(v6); HADAMARD_S2(v7);
     #undef HADAMARD_S2
 
-    // Stage 3 (stride=4): butterfly across pairs of float32x4_t
     #define HADAMARD_S4(a, b) do {                                      \
         float32x4_t s = vaddq_f32(a, b);                               \
         float32x4_t d = vsubq_f32(a, b);                               \
@@ -4970,7 +4964,6 @@ static void hadamard_32_inplace(float vals[32]) {
     HADAMARD_S4(v4, v5); HADAMARD_S4(v6, v7);
     #undef HADAMARD_S4
 
-    // Stage 4 (stride=8): butterfly across groups of 2 float32x4_t
     { float32x4_t s, d;
       s = vaddq_f32(v0, v2); d = vsubq_f32(v0, v2); v0 = s; v2 = d;
       s = vaddq_f32(v1, v3); d = vsubq_f32(v1, v3); v1 = s; v3 = d;
@@ -4978,7 +4971,6 @@ static void hadamard_32_inplace(float vals[32]) {
       s = vaddq_f32(v5, v7); d = vsubq_f32(v5, v7); v5 = s; v7 = d;
     }
 
-    // Stage 5 (stride=16): butterfly across groups of 4 float32x4_t
     { float32x4_t s, d;
       s = vaddq_f32(v0, v4); d = vsubq_f32(v0, v4); v0 = s; v4 = d;
       s = vaddq_f32(v1, v5); d = vsubq_f32(v1, v5); v1 = s; v5 = d;
@@ -4986,7 +4978,6 @@ static void hadamard_32_inplace(float vals[32]) {
       s = vaddq_f32(v3, v7); d = vsubq_f32(v3, v7); v3 = s; v7 = d;
     }
 
-    // Normalize by 1/sqrt(32) and store
     const float32x4_t norm = vdupq_n_f32(0.17677669529663689f);
     vst1q_f32(vals +  0, vmulq_f32(v0, norm));
     vst1q_f32(vals +  4, vmulq_f32(v1, norm));
@@ -4998,21 +4989,9 @@ static void hadamard_32_inplace(float vals[32]) {
     vst1q_f32(vals + 28, vmulq_f32(v7, norm));
 }
 #else
+// Scalar fallback: delegate to reference implementation in ggml-quants.c
 static void hadamard_32_inplace(float vals[32]) {
-    for (int stride = 1; stride < 32; stride *= 2) {
-        for (int i = 0; i < 32; i += 2 * stride) {
-            for (int j = 0; j < stride; ++j) {
-                const float a = vals[i + j];
-                const float b = vals[i + j + stride];
-                vals[i + j]          = a + b;
-                vals[i + j + stride] = a - b;
-            }
-        }
-    }
-    const float norm = 0.17677669529663689f; // 1/sqrt(32)
-    for (int i = 0; i < 32; ++i) {
-        vals[i] *= norm;
-    }
+    ggml_hadamard_32_inplace(vals);
 }
 #endif
 
@@ -5022,6 +5001,13 @@ static void ggml_apply_hadamard_blocks(float * data, int64_t n) {
     for (int64_t i = 0; i < n; i += 32) {
         hadamard_32_inplace(data + i);
     }
+}
+
+// Prefer SIMD-optimized CPU dequant, fall back to scalar reference.
+static inline ggml_to_float_t ggml_get_to_float_fn(ggml_type type) {
+    ggml_to_float_t fn = ggml_get_type_traits_cpu(type)->to_float;
+    if (!fn) { fn = ggml_get_type_traits(type)->to_float; }
+    return fn;
 }
 
 template<typename idx_t>
@@ -8338,11 +8324,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
-    const bool is_mxfp_k = (k->type == GGML_TYPE_MXFP4_E2M1 ||
-                             k->type == GGML_TYPE_MXFP8_E4M3 ||
-                             k->type == GGML_TYPE_MXFP8_E5M2 ||
-                             k->type == GGML_TYPE_MXFP6_E2M3 ||
-                             k->type == GGML_TYPE_MXFP6_E3M2);
+    const bool is_mxfp_k = ggml_is_type_mxfp(k->type);
 
     // For MXFP types: quantize Q to the same MXFP type as K (matching GPU MMA path),
     // then dequant both K and Q to float for dot product. This ensures identical math
@@ -8354,21 +8336,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     if (is_mxfp_k) {
         q_to_vec_dot  = ggml_get_type_traits_cpu(k->type)->from_float;   // Q → same MXFP type as K
         kq_vec_dot    = nullptr;                                          // unused; MXFP path uses dequant + float dot
-        // Prefer SIMD-optimized CPU dequant, fall back to scalar reference
-        mxfp_to_float = ggml_get_type_traits_cpu(k->type)->to_float;
-        if (!mxfp_to_float) {
-            mxfp_to_float = ggml_get_type_traits(k->type)->to_float;
-        }
+        mxfp_to_float = ggml_get_to_float_fn(k->type);
     } else {
         ggml_type const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
         q_to_vec_dot = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
         kq_vec_dot   = ggml_get_type_traits_cpu(k->type)->vec_dot;
     }
-    // Prefer SIMD-optimized CPU dequant for V, fall back to scalar reference
-    ggml_to_float_t v_to_float = ggml_get_type_traits_cpu(v->type)->to_float;
-    if (!v_to_float) {
-        v_to_float = ggml_get_type_traits(v->type)->to_float;
-    }
+    ggml_to_float_t v_to_float = ggml_get_to_float_fn(v->type);
 
     // Hadamard rotation must match K rotation. Skip for MLA (DK != DV) since
     // V is a view of K and rotation would corrupt V.
@@ -8603,20 +8577,14 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const ggml_type k_type = k->type;
     const ggml_type v_type = v->type;
 
-    const bool is_mxfp_k = (k_type == GGML_TYPE_MXFP4_E2M1 ||
-                             k_type == GGML_TYPE_MXFP8_E4M3 ||
-                             k_type == GGML_TYPE_MXFP8_E5M2 ||
-                             k_type == GGML_TYPE_MXFP6_E2M3 ||
-                             k_type == GGML_TYPE_MXFP6_E3M2);
+    const bool is_mxfp_k = ggml_is_type_mxfp(k_type);
     // Hadamard rotation must match K rotation. Skip for MLA (DK != DV) since
     // V is a view of K and rotation would corrupt V.
     const bool apply_hadamard_q = is_mxfp_k && (DK == DV);
 
-    // Dequant functions for K and V — prefer SIMD-optimized CPU versions, fall back to scalar
-    ggml_to_float_t k_to_float = ggml_get_type_traits_cpu(k_type)->to_float;
-    if (!k_to_float) { k_to_float = ggml_get_type_traits(k_type)->to_float; }
-    ggml_to_float_t v_to_float = ggml_get_type_traits_cpu(v_type)->to_float;
-    if (!v_to_float) { v_to_float = ggml_get_type_traits(v_type)->to_float; }
+    // Dequant functions for K and V
+    ggml_to_float_t k_to_float = ggml_get_to_float_fn(k_type);
+    ggml_to_float_t v_to_float = ggml_get_to_float_fn(v_type);
 
     // For MXFP Q round-trip: quantize Q to same MXFP type as K, then dequant back
     ggml_from_float_t const q_to_mxfp = is_mxfp_k ? ggml_get_type_traits_cpu(k_type)->from_float : nullptr;

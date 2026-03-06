@@ -1338,6 +1338,14 @@ bool ggml_is_quantized(enum ggml_type type) {
     return type_traits[type].is_quantized;
 }
 
+bool ggml_is_type_mxfp(enum ggml_type type) {
+    return type == GGML_TYPE_MXFP4_E2M1 ||
+           type == GGML_TYPE_MXFP8_E4M3 ||
+           type == GGML_TYPE_MXFP8_E5M2 ||
+           type == GGML_TYPE_MXFP6_E2M3 ||
+           type == GGML_TYPE_MXFP6_E3M2;
+}
+
 const char * ggml_op_name(enum ggml_op op) {
     return GGML_OP_NAME[op];
 }
