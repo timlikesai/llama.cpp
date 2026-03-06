@@ -8354,13 +8354,21 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     if (is_mxfp_k) {
         q_to_vec_dot  = ggml_get_type_traits_cpu(k->type)->from_float;   // Q → same MXFP type as K
         kq_vec_dot    = nullptr;                                          // unused; MXFP path uses dequant + float dot
-        mxfp_to_float = ggml_get_type_traits(k->type)->to_float;         // dequant MXFP → float
+        // Prefer SIMD-optimized CPU dequant, fall back to scalar reference
+        mxfp_to_float = ggml_get_type_traits_cpu(k->type)->to_float;
+        if (!mxfp_to_float) {
+            mxfp_to_float = ggml_get_type_traits(k->type)->to_float;
+        }
     } else {
         ggml_type const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
         q_to_vec_dot = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
         kq_vec_dot   = ggml_get_type_traits_cpu(k->type)->vec_dot;
     }
-    ggml_to_float_t const v_to_float = ggml_get_type_traits(v->type)->to_float;
+    // Prefer SIMD-optimized CPU dequant for V, fall back to scalar reference
+    ggml_to_float_t v_to_float = ggml_get_type_traits_cpu(v->type)->to_float;
+    if (!v_to_float) {
+        v_to_float = ggml_get_type_traits(v->type)->to_float;
+    }
 
     // Hadamard rotation must match K rotation. Skip for MLA (DK != DV) since
     // V is a view of K and rotation would corrupt V.
@@ -8604,9 +8612,11 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     // V is a view of K and rotation would corrupt V.
     const bool apply_hadamard_q = is_mxfp_k && (DK == DV);
 
-    // Dequant functions for K and V (null for F32 which needs no conversion)
-    ggml_to_float_t const k_to_float = ggml_get_type_traits(k_type)->to_float;
-    ggml_to_float_t const v_to_float = ggml_get_type_traits(v_type)->to_float;
+    // Dequant functions for K and V — prefer SIMD-optimized CPU versions, fall back to scalar
+    ggml_to_float_t k_to_float = ggml_get_type_traits_cpu(k_type)->to_float;
+    if (!k_to_float) { k_to_float = ggml_get_type_traits(k_type)->to_float; }
+    ggml_to_float_t v_to_float = ggml_get_type_traits_cpu(v_type)->to_float;
+    if (!v_to_float) { v_to_float = ggml_get_type_traits(v_type)->to_float; }
 
     // For MXFP Q round-trip: quantize Q to same MXFP type as K, then dequant back
     ggml_from_float_t const q_to_mxfp = is_mxfp_k ? ggml_get_type_traits_cpu(k_type)->from_float : nullptr;

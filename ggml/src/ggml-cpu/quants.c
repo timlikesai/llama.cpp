@@ -339,6 +339,21 @@ void ggml_vec_dot_mxfp6_e3m2_q8_0_generic(int n, float * GGML_RESTRICT s, size_t
             (ggml_to_float_t)dequantize_row_mxfp6_e3m2);
 }
 
+// Generic (scalar) dequant wrappers — delegates to ggml-quants.c reference implementations.
+// On x86/ARM, arch-specific SIMD versions override these via the fallback.h mapping.
+void dequantize_row_mxfp8_cpu_generic(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_mxfp8(x, y, k);
+}
+void dequantize_row_mxfp8_e5m2_cpu_generic(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_mxfp8_e5m2(x, y, k);
+}
+void dequantize_row_mxfp6_e2m3_cpu_generic(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_mxfp6_e2m3(x, y, k);
+}
+void dequantize_row_mxfp6_e3m2_cpu_generic(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_mxfp6_e3m2(x, y, k);
+}
+
 void ggml_vec_dot_q5_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
