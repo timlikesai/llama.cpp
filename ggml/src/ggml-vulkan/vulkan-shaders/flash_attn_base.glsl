@@ -282,8 +282,7 @@ void hadamard_32_shmem(inout float vals[32]) {
             }
         }
     }
-    // Normalize
-    const float norm = 1.0 / sqrt(32.0);
+    const float norm = 0.17677669529663689; // 1/sqrt(32)
     for (uint i = 0u; i < 32u; i++) {
         vals[i] *= norm;
     }
@@ -292,20 +291,18 @@ void hadamard_32_shmem(inout float vals[32]) {
 // MXFP4 quantize/dequantize round-trip for a single value given a scale
 float mxfp4_roundtrip_val(float val, float scale) {
     if (scale == 0.0) return 0.0;
-    float inv_scale = 1.0 / scale;
-    float av = abs(val) * inv_scale;
-    // Decision boundary quantization (matching CPU/Metal)
-    uint idx;
-    if      (av < 0.25)  idx = 0u;  // -> 0.0
-    else if (av < 0.75)  idx = 1u;  // -> 0.5
-    else if (av < 1.25)  idx = 2u;  // -> 1.0
-    else if (av < 1.75)  idx = 3u;  // -> 1.5
-    else if (av < 2.5)   idx = 4u;  // -> 2.0
-    else if (av < 3.5)   idx = 5u;  // -> 3.0
-    else if (av < 5.0)   idx = 6u;  // -> 4.0
-    else                  idx = 7u;  // -> 6.0
-    const float kvalues[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
-    float dq = kvalues[idx] * scale;
+    float av = abs(val) / scale;
+    // Decision boundary quantization with direct dequant (no array lookup)
+    float dq;
+    if      (av < 0.25)  dq = 0.0;
+    else if (av < 0.75)  dq = 0.5;
+    else if (av < 1.25)  dq = 1.0;
+    else if (av < 1.75)  dq = 1.5;
+    else if (av < 2.5)   dq = 2.0;
+    else if (av < 3.5)   dq = 3.0;
+    else if (av < 5.0)   dq = 4.0;
+    else                  dq = 6.0;
+    dq *= scale;
     return val < 0.0 ? -dq : dq;
 }
 
@@ -440,9 +437,9 @@ float mxfp_roundtrip_val(float val, float scale) {
 #endif
 }
 
-// Compute E8M0 shared exponent for a 32-element block (MSE-optimal with ±1 search).
-// Matches CPU mxfp_compute_e8m0_mse: round(log2(amax)) - emax_offset + 127, then ±1 MSE search.
-// emax_offset accounts for the element format's dynamic range (max representable value).
+// Fast E8M0 scale for Q preprocessing: round(log2(amax)) without MSE search.
+// Matches CUDA's flash_attn_ext_mxfp_quantize_Q (no ±1 search for Q, only K).
+// This is 3x faster since it avoids 96 roundtrip calls per block.
 float compute_e8m0_scale(float vals[32]) {
     float amax = 0.0;
     for (uint i = 0u; i < 32u; i++) {
@@ -450,48 +447,24 @@ float compute_e8m0_scale(float vals[32]) {
     }
     if (amax == 0.0) return 0.0;
 
-    // round(log2(amax)) via integer bit extraction — matches CPU.
     uint amax_bits = floatBitsToUint(amax);
     int floor_log2 = int((amax_bits >> 23) & 0xFFu) - 127;
-    // Round up if mantissa >= sqrt(2)-1 threshold (0x3504F3 in 23-bit IEEE mantissa)
     int round_log2 = floor_log2 + (((amax_bits & 0x7FFFFFu) >= 0x3504F3u) ? 1 : 0);
 
-    // emax_offset: floor(log2(max_element_value)) for each format.
-    // Shifts the E8M0 search center to account for the format's dynamic range.
-    // Must match CPU's mxfp_elem_traits_t.emax_offset values.
 #if defined(DATA_A_MXFP4)
-    const int emax_offset = 2;   // max kvalue = 6.0 (after 0.5 factor), 2^2.58
+    const int emax_offset = 2;
 #elif defined(DATA_A_MXFP8_E4M3)
-    const int emax_offset = 8;   // max = 448, 2^8.8
+    const int emax_offset = 8;
 #elif defined(DATA_A_MXFP8_E5M2)
-    const int emax_offset = 16;  // max = 57344, 2^15.8
+    const int emax_offset = 16;
 #elif defined(DATA_A_MXFP6_E2M3)
-    const int emax_offset = 3;   // max = 7.5, 2^2.9
+    const int emax_offset = 3;
 #elif defined(DATA_A_MXFP6_E3M2)
-    const int emax_offset = 5;   // max = 28, 2^4.8
+    const int emax_offset = 5;
 #endif
 
-    int e_base = round_log2 - emax_offset + 127;
-
-    // ±1 MSE search: test e_base-1, e_base, e_base+1, pick lowest total MSE.
-    float best_mse = 1e30;
-    int best_e = clamp(e_base, 1, 254);
-    for (int delta = -1; delta <= 1; delta++) {
-        int e_try = e_base + delta;
-        if (e_try < 1 || e_try > 254) continue;
-        float scale_try = uintBitsToFloat(uint(e_try) << 23);
-        float mse = 0.0;
-        for (uint i = 0u; i < 32u; i++) {
-            float recon = mxfp_roundtrip_val(vals[i], scale_try);
-            float err = vals[i] - recon;
-            mse += err * err;
-        }
-        if (mse < best_mse) {
-            best_mse = mse;
-            best_e = e_try;
-        }
-    }
-    return uintBitsToFloat(uint(best_e) << 23);
+    int e = clamp(round_log2 - emax_offset + 127, 0, 254);
+    return (e == 0) ? 0.0 : uintBitsToFloat(uint(e) << 23);
 }
 
 #endif // MXFP_Q_PREPROCESS

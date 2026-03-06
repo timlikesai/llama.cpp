@@ -232,6 +232,303 @@ void quantize(uint dst_idx, uint src_idx)
 }
 #endif
 
+// MXFP quantization helpers
+#if defined(DATA_A_MXFP4) || defined(DATA_A_MXFP8_E4M3) || defined(DATA_A_MXFP8_E5M2) || defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
+
+#if defined(SET_ROWS)
+#define MXFP_HADAMARD_FLAG p.param3
+#else
+#define MXFP_HADAMARD_FLAG 0
+#endif
+
+void hadamard_32_inplace(inout float vals[32]) {
+    for (int stride = 1; stride < 32; stride *= 2) {
+        for (int i = 0; i < 32; i += 2 * stride) {
+            for (int j = 0; j < stride; ++j) {
+                float a = vals[i + j];
+                float b = vals[i + j + stride];
+                vals[i + j]          = a + b;
+                vals[i + j + stride] = a - b;
+            }
+        }
+    }
+    const float norm = 0.17677669529663689; // 1/sqrt(32)
+    for (int i = 0; i < 32; ++i) {
+        vals[i] *= norm;
+    }
+}
+
+// E8M0 scale: round(log2(amax)) via integer bit ops
+uint compute_e8m0_uint(float vals[32], int emax_offset) {
+    float amax = 0.0;
+    for (int j = 0; j < 32; ++j) {
+        amax = max(amax, abs(vals[j]));
+    }
+    if (amax == 0.0) return 0u;
+
+    uint amax_bits = floatBitsToUint(amax);
+    int floor_log2 = int((amax_bits >> 23) & 0xFFu) - 127;
+    int round_log2 = floor_log2 + (((amax_bits & 0x7FFFFFu) >= 0x3504F3u) ? 1 : 0);
+    int e_base = round_log2 - emax_offset + 127;
+    if (e_base < 1)   e_base = 1;
+    if (e_base > 255) e_base = 255;
+    return uint(e_base);
+}
+
+float e8m0_to_fp32(uint e) {
+    if (e == 0u) return 0.0;
+    return uintBitsToFloat(e << 23);
+}
+#endif
+
+// MXFP4 E2M1 quantize
+#if defined(DATA_A_MXFP4)
+uint best_index_mxfp4(float x, float d) {
+    if (d == 0.0) return 0u;
+    float normalized = abs(x) / d;
+    uint idx;
+    if      (normalized < 0.5)  idx = 0u;
+    else if (normalized < 1.5)  idx = 1u;
+    else if (normalized < 2.5)  idx = 2u;
+    else if (normalized < 3.5)  idx = 3u;
+    else if (normalized < 5.0)  idx = 4u;
+    else if (normalized < 7.0)  idx = 5u;
+    else if (normalized < 10.0) idx = 6u;
+    else                        idx = 7u;
+    if (x < 0.0) idx += 8u;
+    return idx;
+}
+
+void quantize(uint dst_idx, uint src_idx) {
+    float vals[32];
+    for (int j = 0; j < 32; ++j) {
+        vals[j] = data_s[src_idx + j];
+    }
+    if (MXFP_HADAMARD_FLAG != 0) {
+        hadamard_32_inplace(vals);
+    }
+    uint e = compute_e8m0_uint(vals, 2);
+    float d = e8m0_to_fp32(e) * 0.5;
+    data_q[dst_idx].e = uint8_t(e);
+    for (int j = 0; j < 16; ++j) {
+        uint x0 = best_index_mxfp4(vals[j],      d);
+        uint x1 = best_index_mxfp4(vals[j + 16],  d);
+        data_q[dst_idx].qs[j] = uint8_t(x0 | (x1 << 4));
+    }
+}
+#endif
+
+// MXFP8 E4M3 quantize
+#if defined(DATA_A_MXFP8_E4M3)
+uint8_t float_to_fp8_e4m3(float x) {
+    uint bits = floatBitsToUint(x);
+    uint sign = (bits >> 24) & 0x80u;
+    bits &= 0x7FFFFFFFu;
+    if (bits == 0u) return uint8_t(sign);
+    uint f32_exp  = (bits >> 23) & 0xFFu;
+    uint f32_mant = bits & 0x7FFFFFu;
+    int e4m3_exp = int(f32_exp) - 120;
+    if (e4m3_exp < 0) {
+        int shift = 1 - e4m3_exp;
+        uint full_mant = (1u << 23) | f32_mant;
+        int total_shift = 20 + shift;
+        if (total_shift >= 32) return uint8_t(sign);
+        uint mant3 = full_mant >> total_shift;
+        if (total_shift > 0 && total_shift < 32) {
+            uint round_bit = (full_mant >> (total_shift - 1)) & 1u;
+            uint sticky = (total_shift > 1) ? (full_mant & ((1u << (total_shift - 1)) - 1u)) : 0u;
+            if (round_bit != 0u && (sticky != 0u || (mant3 & 1u) != 0u)) mant3++;
+        }
+        if (mant3 > 7u) return uint8_t(sign | 0x08u);
+        return uint8_t(sign | mant3);
+    }
+    uint mant3 = (f32_mant + (1u << 19)) >> 20;
+    if (mant3 > 7u) { mant3 = 0u; e4m3_exp++; }
+    if (e4m3_exp > 15) return uint8_t(sign | 0x7Eu); // max normal (NaN=0x7F reserved)
+    return uint8_t(sign | (uint(e4m3_exp) << 3) | mant3);
+}
+
+void quantize(uint dst_idx, uint src_idx) {
+    float vals[32];
+    for (int j = 0; j < 32; ++j) {
+        vals[j] = data_s[src_idx + j];
+    }
+    if (MXFP_HADAMARD_FLAG != 0) {
+        hadamard_32_inplace(vals);
+    }
+    uint e = compute_e8m0_uint(vals, 8);
+    float d = e8m0_to_fp32(e);
+    float inv_d = d > 0.0 ? 1.0 / d : 0.0;
+    data_q[dst_idx].e = uint8_t(e);
+    for (int j = 0; j < 32; ++j) {
+        data_q[dst_idx].qs[j] = float_to_fp8_e4m3(vals[j] * inv_d);
+    }
+}
+#endif
+
+// MXFP8 E5M2 quantize
+#if defined(DATA_A_MXFP8_E5M2)
+uint8_t float_to_fp8_e5m2(float x) {
+    uint bits = floatBitsToUint(x);
+    uint sign = (bits >> 24) & 0x80u;
+    bits &= 0x7FFFFFFFu;
+    if (bits == 0u) return uint8_t(sign);
+    uint f32_exp  = (bits >> 23) & 0xFFu;
+    uint f32_mant = bits & 0x7FFFFFu;
+    int e5m2_exp = int(f32_exp) - 112;
+    if (e5m2_exp < 0) {
+        int shift = 1 - e5m2_exp;
+        uint full_mant = (1u << 23) | f32_mant;
+        int total_shift = 21 + shift;
+        if (total_shift >= 32) return uint8_t(sign);
+        uint mant2 = full_mant >> total_shift;
+        if (total_shift > 0 && total_shift < 32) {
+            uint round_bit = (full_mant >> (total_shift - 1)) & 1u;
+            uint sticky = (total_shift > 1) ? (full_mant & ((1u << (total_shift - 1)) - 1u)) : 0u;
+            if (round_bit != 0u && (sticky != 0u || (mant2 & 1u) != 0u)) mant2++;
+        }
+        if (mant2 > 3u) return uint8_t(sign | 0x04u);
+        return uint8_t(sign | mant2);
+    }
+    uint mant2 = (f32_mant + (1u << 20)) >> 21;
+    if (mant2 > 3u) { mant2 = 0u; e5m2_exp++; }
+    if (e5m2_exp >= 31) return uint8_t(sign | 0x7Bu); // max finite (exp=30, mant=3)
+    return uint8_t(sign | (uint(e5m2_exp) << 2) | mant2);
+}
+
+void quantize(uint dst_idx, uint src_idx) {
+    float vals[32];
+    for (int j = 0; j < 32; ++j) {
+        vals[j] = data_s[src_idx + j];
+    }
+    if (MXFP_HADAMARD_FLAG != 0) {
+        hadamard_32_inplace(vals);
+    }
+    uint e = compute_e8m0_uint(vals, 16);
+    float d = e8m0_to_fp32(e);
+    float inv_d = d > 0.0 ? 1.0 / d : 0.0;
+    data_q[dst_idx].e = uint8_t(e);
+    for (int j = 0; j < 32; ++j) {
+        data_q[dst_idx].qs[j] = float_to_fp8_e5m2(vals[j] * inv_d);
+    }
+}
+#endif
+
+// FP6 E2M3 quantize
+#if defined(DATA_A_MXFP6_E2M3)
+uint float_to_fp6_e2m3(float x) {
+    uint sign = 0u;
+    if (x < 0.0) { sign = 0x20u; x = -x; }
+    if (x == 0.0) return sign;
+    if (x >= 7.5) return sign | 0x1Fu;
+
+    uint bits = floatBitsToUint(x);
+    int f32_exp = int((bits >> 23) & 0xFFu) - 127;
+
+    if (f32_exp < 0) {
+        // Subnormal range
+        uint mant = uint(x * 8.0 + 0.5);
+        if (mant > 7u) return sign | 0x08u;
+        return sign | mant;
+    }
+    int exp6 = f32_exp;
+    if (exp6 > 2) exp6 = 2;
+    float mantf = (x / exp2(float(exp6))) - 1.0;
+    uint mant = uint(mantf * 8.0 + 0.5);
+    if (mant > 7u) { mant = 0u; exp6++; }
+    if (exp6 > 2) return sign | 0x1Fu;
+    return sign | (uint(exp6 + 1) << 3) | mant;
+}
+
+void pack_fp6x4(uint v0, uint v1, uint v2, uint v3, out uint8_t b0, out uint8_t b1, out uint8_t b2) {
+    uint packed = (v0 & 0x3Fu) | ((v1 & 0x3Fu) << 6) | ((v2 & 0x3Fu) << 12) | ((v3 & 0x3Fu) << 18);
+    b0 = uint8_t(packed & 0xFFu);
+    b1 = uint8_t((packed >> 8) & 0xFFu);
+    b2 = uint8_t((packed >> 16) & 0xFFu);
+}
+
+void quantize(uint dst_idx, uint src_idx) {
+    float vals[32];
+    for (int j = 0; j < 32; ++j) {
+        vals[j] = data_s[src_idx + j];
+    }
+    if (MXFP_HADAMARD_FLAG != 0) {
+        hadamard_32_inplace(vals);
+    }
+    uint e = compute_e8m0_uint(vals, 3);
+    float d = e8m0_to_fp32(e);
+    float inv_d = d > 0.0 ? 1.0 / d : 0.0;
+    data_q[dst_idx].e = uint8_t(e);
+    for (int j = 0; j < 32; j += 4) {
+        uint v0 = float_to_fp6_e2m3(vals[j + 0] * inv_d);
+        uint v1 = float_to_fp6_e2m3(vals[j + 1] * inv_d);
+        uint v2 = float_to_fp6_e2m3(vals[j + 2] * inv_d);
+        uint v3 = float_to_fp6_e2m3(vals[j + 3] * inv_d);
+        uint base = j * 3 / 4;
+        pack_fp6x4(v0, v1, v2, v3, data_q[dst_idx].qs[base], data_q[dst_idx].qs[base + 1u], data_q[dst_idx].qs[base + 2u]);
+    }
+}
+#endif
+
+// FP6 E3M2 quantize
+#if defined(DATA_A_MXFP6_E3M2)
+uint float_to_fp6_e3m2(float x) {
+    uint sign = 0u;
+    if (x < 0.0) { sign = 0x20u; x = -x; }
+    if (x == 0.0) return sign;
+    if (x >= 28.0) return sign | 0x1Fu;
+
+    uint bits = floatBitsToUint(x);
+    int f32_exp = int((bits >> 23) & 0xFFu) - 127;
+
+    if (f32_exp < 0) {
+        // Subnormal range (no implicit 1 bit)
+        uint mant = uint(x * 16.0 + 0.5);
+        if (mant > 3u) return sign | 0x04u;
+        return sign | mant;
+    }
+    int biased_exp = f32_exp + 3;
+    if (biased_exp > 7) return sign | 0x1Fu;
+    float mantf = (x / exp2(float(f32_exp))) - 1.0;
+    uint mant = uint(mantf * 4.0 + 0.5);
+    if (mant > 3u) { mant = 0u; biased_exp++; }
+    if (biased_exp > 7) return sign | 0x1Fu;
+    return sign | (uint(biased_exp) << 2) | mant;
+}
+
+// pack_fp6x4 reuse (same as E2M3 - only defined once)
+#if !defined(DATA_A_MXFP6_E2M3)
+void pack_fp6x4(uint v0, uint v1, uint v2, uint v3, out uint8_t b0, out uint8_t b1, out uint8_t b2) {
+    uint packed = (v0 & 0x3Fu) | ((v1 & 0x3Fu) << 6) | ((v2 & 0x3Fu) << 12) | ((v3 & 0x3Fu) << 18);
+    b0 = uint8_t(packed & 0xFFu);
+    b1 = uint8_t((packed >> 8) & 0xFFu);
+    b2 = uint8_t((packed >> 16) & 0xFFu);
+}
+#endif
+
+void quantize(uint dst_idx, uint src_idx) {
+    float vals[32];
+    for (int j = 0; j < 32; ++j) {
+        vals[j] = data_s[src_idx + j];
+    }
+    if (MXFP_HADAMARD_FLAG != 0) {
+        hadamard_32_inplace(vals);
+    }
+    uint e = compute_e8m0_uint(vals, 5);
+    float d = e8m0_to_fp32(e);
+    float inv_d = d > 0.0 ? 1.0 / d : 0.0;
+    data_q[dst_idx].e = uint8_t(e);
+    for (int j = 0; j < 32; j += 4) {
+        uint v0 = float_to_fp6_e3m2(vals[j + 0] * inv_d);
+        uint v1 = float_to_fp6_e3m2(vals[j + 1] * inv_d);
+        uint v2 = float_to_fp6_e3m2(vals[j + 2] * inv_d);
+        uint v3 = float_to_fp6_e3m2(vals[j + 3] * inv_d);
+        uint base = j * 3 / 4;
+        pack_fp6x4(v0, v1, v2, v3, data_q[dst_idx].qs[base], data_q[dst_idx].qs[base + 1u], data_q[dst_idx].qs[base + 2u]);
+    }
+}
+#endif
+
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 void quantize(uint dst_idx, uint src_idx)
 {
