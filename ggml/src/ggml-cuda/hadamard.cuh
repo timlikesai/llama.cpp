@@ -57,7 +57,7 @@ static __device__ __forceinline__ void hadamard_32_q8_1(float vals[4], const int
     for (int xor_mask = 1; xor_mask <= 4; xor_mask *= 2) {
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            const float partner = __shfl_xor_sync(0xFFFFFFFF, vals[l], xor_mask);
+            const float partner = __shfl_xor_sync(0xFFFFFFFF, vals[l], xor_mask, WARP_SIZE);
             if (lane & xor_mask) {
                 vals[l] = partner - vals[l];
             } else {

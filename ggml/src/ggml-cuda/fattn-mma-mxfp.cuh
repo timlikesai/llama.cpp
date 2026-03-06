@@ -467,6 +467,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_load_V_f16(
                 const uint8_t e_val = *(row_t + V_e_head_off + i0_start / 32 + blk_idx);
                 const half2 scale_h2 = __float2half2_rn(ggml_cuda_e8m0_to_fp32(e_val));
 
+#if CUDART_VERSION >= 12080
                 __nv_fp4x2_e2m1 fp4_lo;
                 fp4_lo.__x = (b0 & 0x0F) | ((b1 & 0x0F) << 4);
                 val_lo = __hmul2(__float22half2_rn(float2(fp4_lo)), scale_h2);
@@ -474,6 +475,12 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_load_V_f16(
                 __nv_fp4x2_e2m1 fp4_hi;
                 fp4_hi.__x = (b0 >> 4) | (b1 & 0xF0);
                 val_hi = __hmul2(__float22half2_rn(float2(fp4_hi)), scale_h2);
+#else
+                val_lo = __hmul2(make_half2(kvalues_mxfp4[b0 & 0x0F] * 0.5f,
+                                            kvalues_mxfp4[b1 & 0x0F] * 0.5f), scale_h2);
+                val_hi = __hmul2(make_half2(kvalues_mxfp4[b0 >> 4] * 0.5f,
+                                            kvalues_mxfp4[(b1 >> 4) & 0x0F] * 0.5f), scale_h2);
+#endif // CUDART_VERSION >= 12080
             }
             tile_V[t * stride_tile_V + d_h2_lo] = val_lo;
             tile_V[t * stride_tile_V + d_h2_hi] = val_hi;
@@ -810,6 +817,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
                 for (int i = 0; i < vals_per_block / 4; i += 2) {
                     const int int_idx = block_idx * (vals_per_block / 8) + i / 2;
 
+#if CUDART_VERSION >= 12080
                     __nv_fp4x4_e2m1 fp4_lo(make_float4(
                         vals[0               + 2 * i + 0] * inv_d,
                         vals[vals_per_block/2 + 2 * i + 0] * inv_d,
@@ -825,6 +833,27 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
                         vals[vals_per_block/2 + 2 * (i + 1) + 1] * inv_d
                     ));
                     const char2 hi = *reinterpret_cast<const char2 *>(&fp4_hi);
+#else
+                    const float lo_0 = vals[0               + 2 * i + 0] * inv_d;
+                    const float lo_1 = vals[vals_per_block/2 + 2 * i + 0] * inv_d;
+                    const float lo_2 = vals[0               + 2 * i + 1] * inv_d;
+                    const float lo_3 = vals[vals_per_block/2 + 2 * i + 1] * inv_d;
+                    char2 lo;
+                    lo.x = ggml_cuda_float_to_fp4_e2m1(lo_0, 1.0f)
+                         | (ggml_cuda_float_to_fp4_e2m1(lo_1, 1.0f) << 4);
+                    lo.y = ggml_cuda_float_to_fp4_e2m1(lo_2, 1.0f)
+                         | (ggml_cuda_float_to_fp4_e2m1(lo_3, 1.0f) << 4);
+
+                    const float hi_0 = vals[0               + 2 * (i + 1) + 0] * inv_d;
+                    const float hi_1 = vals[vals_per_block/2 + 2 * (i + 1) + 0] * inv_d;
+                    const float hi_2 = vals[0               + 2 * (i + 1) + 1] * inv_d;
+                    const float hi_3 = vals[vals_per_block/2 + 2 * (i + 1) + 1] * inv_d;
+                    char2 hi;
+                    hi.x = ggml_cuda_float_to_fp4_e2m1(hi_0, 1.0f)
+                         | (ggml_cuda_float_to_fp4_e2m1(hi_1, 1.0f) << 4);
+                    hi.y = ggml_cuda_float_to_fp4_e2m1(hi_2, 1.0f)
+                         | (ggml_cuda_float_to_fp4_e2m1(hi_3, 1.0f) << 4);
+#endif // CUDART_VERSION >= 12080
 
                     const uint32_t lo_u16 = *reinterpret_cast<const uint16_t *>(&lo);
                     const uint32_t hi_u16 = *reinterpret_cast<const uint16_t *>(&hi);
@@ -833,7 +862,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
             }
 
             // Exchange scales between even/odd block partners via XOR-1 shuffle.
-            const uint8_t e_partner = __shfl_xor_sync(0xFFFFFFFF, e, 1);
+            const uint8_t e_partner = __shfl_xor_sync(0xFFFFFFFF, e, 1, WARP_SIZE);
 
             if (active && block_idx % 2 == 0) {
                 const int scale_pair_idx = block_idx / 2;
