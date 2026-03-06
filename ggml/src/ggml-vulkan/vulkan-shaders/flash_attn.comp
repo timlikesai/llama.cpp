@@ -221,8 +221,8 @@ void main() {
     uint32_t mo_offset = mo_stride * i;
 
 #if BLOCK_SIZE > 1
-    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / BLOCK_BYTE_SIZE;
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / BLOCK_BYTE_SIZE;
+    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / K_BLOCK_BYTE_SIZE;
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / V_BLOCK_BYTE_SIZE;
 #else
     uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / 2;
     uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / 2;

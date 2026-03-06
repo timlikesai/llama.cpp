@@ -689,6 +689,30 @@ void process_shaders() {
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }}), fp16, false, false, f16acc);
                 }
             }
+
+            // Mixed K/V pipelines: K=mxfp8/mxfp6, V=mxfp4
+            for (const auto& k_tname : std::vector<std::string>{"mxfp8_e4m3", "mxfp8_e5m2", "mxfp6_e2m3", "mxfp6_e3m2"}) {
+                std::string data_a_key = "DATA_A_" + to_uppercase(k_tname);
+                std::string pipeline_name = k_tname + "_v_mxfp4";
+
+                // Scalar path
+                string_to_spv("flash_attn_f32_f16_" + pipeline_name, "flash_attn.comp",
+                    merge_maps(fa_base_dict, {{data_a_key, "1"}, {"DATA_V_MXFP4", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(k_tname) }}), fp16, false, false, f16acc);
+
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+                // cm1 path
+                string_to_spv("flash_attn_f32_f16_" + pipeline_name, "flash_attn_cm1.comp",
+                    merge_maps(fa_base_dict, {{data_a_key, "1"}, {"DATA_V_MXFP4", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(k_tname)}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
+#endif
+
+#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+                if (fp16) {
+                    // cm2 path
+                    string_to_spv("flash_attn_f32_f16_" + pipeline_name, "flash_attn_cm2.comp",
+                        merge_maps(fa_base_dict, {{data_a_key, "1"}, {"DATA_V_MXFP4", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"DEQUANTFUNC", "dequantFunc"+to_uppercase(k_tname) }, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(k_tname) }}), fp16, false, true, f16acc);
+                }
+#endif
+            }
         }
     }
 

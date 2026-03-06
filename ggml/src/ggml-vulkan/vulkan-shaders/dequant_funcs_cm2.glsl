@@ -666,7 +666,7 @@ float16_t dequantFuncIQ4_NL(const in decodeBufIQ4_NL bl, const in uint blockCoor
 }
 #endif
 
-#if defined(DATA_A_MXFP4)
+#if defined(DATA_A_MXFP4) || defined(DATA_V_MXFP4)
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufMXFP4 {
    block_mxfp4 block;
 };

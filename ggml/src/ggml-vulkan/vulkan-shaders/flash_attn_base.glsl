@@ -86,7 +86,11 @@ layout (binding = 1) readonly buffer K_PACKED {vec4 k_data_packed[];} k_packed;
 layout (binding = 2) readonly buffer V_PACKED {vec4 v_data_packed[];} v_packed;
 #elif defined(DATA_A_MXFP4) || defined(DATA_A_MXFP8_E4M3) || defined(DATA_A_MXFP8_E5M2) || defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
 layout (binding = 1) readonly buffer K_RAW {A_TYPE k_data[];} k_raw;
+#if defined(DATA_V_MXFP4) && !defined(DATA_A_MXFP4)
+layout (binding = 2) readonly buffer V_RAW {block_mxfp4 v_data[];} v_raw;
+#else
 layout (binding = 2) readonly buffer V_RAW {A_TYPE v_data[];} v_raw;
+#endif
 #elif defined(A_TYPE_PACKED16)
 layout (binding = 1) readonly buffer K_PACKED16 {A_TYPE_PACKED16 k_data_packed16[];} k_packed;
 layout (binding = 2) readonly buffer V_PACKED16 {A_TYPE_PACKED16 v_data_packed16[];} v_packed;
@@ -94,6 +98,20 @@ layout (binding = 2) readonly buffer V_PACKED16 {A_TYPE_PACKED16 v_data_packed16
 
 #ifndef BLOCK_SIZE
 #define BLOCK_SIZE 1
+#endif
+
+// Arithmetic E2M1 dequant for mixed K/V (V=mxfp4 with non-mxfp4 K).
+// No shared memory LUT needed — pure arithmetic IEEE bit construction.
+#if defined(DATA_V_MXFP4) && !defined(DATA_A_MXFP4)
+float fp4_e2m1_to_float(uint n) {
+    uint sign = (n & 0x8u) << 28;
+    uint exp  = (n >> 1) & 0x3u;
+    uint mant = n & 0x1u;
+    if (exp == 0u) {
+        return (mant == 0u) ? 0.0 : uintBitsToFloat(sign | 0x3F000000u);
+    }
+    return uintBitsToFloat(sign | ((exp + 126u) << 23) | (mant << 22));
+}
 #endif
 
 #if defined(DATA_A_F32)
@@ -179,86 +197,180 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 #if defined(DATA_A_MXFP8_E4M3)
 #define BLOCK_BYTE_SIZE 33
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
-    A_TYPE blk;
     if (binding_idx == BINDING_IDX_K) {
-        blk = k_raw.k_data[a_offset + ib];
+        A_TYPE blk = k_raw.k_data[a_offset + ib];
+        const float d = e8m0_to_fp32(blk.e);
+        return FLOAT_TYPEV4(
+            d * fp8_e4m3_to_float(uint(blk.qs[iqs + 0u])),
+            d * fp8_e4m3_to_float(uint(blk.qs[iqs + 1u])),
+            d * fp8_e4m3_to_float(uint(blk.qs[iqs + 2u])),
+            d * fp8_e4m3_to_float(uint(blk.qs[iqs + 3u]))
+        );
     } else {
-        blk = v_raw.v_data[a_offset + ib];
+#if defined(DATA_V_MXFP4)
+        block_mxfp4 blk = v_raw.v_data[a_offset + ib];
+        const float d = e8m0_to_fp32(blk.e);
+        const uint iqs0 = iqs & 0xFu;
+        const uint shift = (iqs & 0x10u) >> 2;
+        return FLOAT_TYPEV4(
+            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 0u]) >> shift) & 0xFu) * d,
+            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 1u]) >> shift) & 0xFu) * d,
+            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 2u]) >> shift) & 0xFu) * d,
+            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 3u]) >> shift) & 0xFu) * d
+        );
+#else
+        A_TYPE blk = v_raw.v_data[a_offset + ib];
+        const float d = e8m0_to_fp32(blk.e);
+        return FLOAT_TYPEV4(
+            d * fp8_e4m3_to_float(uint(blk.qs[iqs + 0u])),
+            d * fp8_e4m3_to_float(uint(blk.qs[iqs + 1u])),
+            d * fp8_e4m3_to_float(uint(blk.qs[iqs + 2u])),
+            d * fp8_e4m3_to_float(uint(blk.qs[iqs + 3u]))
+        );
+#endif
     }
-    const float d = e8m0_to_fp32(blk.e);
-    return FLOAT_TYPEV4(
-        d * fp8_e4m3_to_float(uint(blk.qs[iqs + 0u])),
-        d * fp8_e4m3_to_float(uint(blk.qs[iqs + 1u])),
-        d * fp8_e4m3_to_float(uint(blk.qs[iqs + 2u])),
-        d * fp8_e4m3_to_float(uint(blk.qs[iqs + 3u]))
-    );
 }
 #endif
 
 #if defined(DATA_A_MXFP8_E5M2)
 #define BLOCK_BYTE_SIZE 33
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
-    A_TYPE blk;
     if (binding_idx == BINDING_IDX_K) {
-        blk = k_raw.k_data[a_offset + ib];
+        A_TYPE blk = k_raw.k_data[a_offset + ib];
+        const float d = e8m0_to_fp32(blk.e);
+        return FLOAT_TYPEV4(
+            d * fp8_e5m2_to_float(uint(blk.qs[iqs + 0u])),
+            d * fp8_e5m2_to_float(uint(blk.qs[iqs + 1u])),
+            d * fp8_e5m2_to_float(uint(blk.qs[iqs + 2u])),
+            d * fp8_e5m2_to_float(uint(blk.qs[iqs + 3u]))
+        );
     } else {
-        blk = v_raw.v_data[a_offset + ib];
+#if defined(DATA_V_MXFP4)
+        block_mxfp4 blk = v_raw.v_data[a_offset + ib];
+        const float d = e8m0_to_fp32(blk.e);
+        const uint iqs0 = iqs & 0xFu;
+        const uint shift = (iqs & 0x10u) >> 2;
+        return FLOAT_TYPEV4(
+            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 0u]) >> shift) & 0xFu) * d,
+            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 1u]) >> shift) & 0xFu) * d,
+            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 2u]) >> shift) & 0xFu) * d,
+            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 3u]) >> shift) & 0xFu) * d
+        );
+#else
+        A_TYPE blk = v_raw.v_data[a_offset + ib];
+        const float d = e8m0_to_fp32(blk.e);
+        return FLOAT_TYPEV4(
+            d * fp8_e5m2_to_float(uint(blk.qs[iqs + 0u])),
+            d * fp8_e5m2_to_float(uint(blk.qs[iqs + 1u])),
+            d * fp8_e5m2_to_float(uint(blk.qs[iqs + 2u])),
+            d * fp8_e5m2_to_float(uint(blk.qs[iqs + 3u]))
+        );
+#endif
     }
-    const float d = e8m0_to_fp32(blk.e);
-    return FLOAT_TYPEV4(
-        d * fp8_e5m2_to_float(uint(blk.qs[iqs + 0u])),
-        d * fp8_e5m2_to_float(uint(blk.qs[iqs + 1u])),
-        d * fp8_e5m2_to_float(uint(blk.qs[iqs + 2u])),
-        d * fp8_e5m2_to_float(uint(blk.qs[iqs + 3u]))
-    );
 }
 #endif
 
 #if defined(DATA_A_MXFP6_E2M3)
 #define BLOCK_BYTE_SIZE 25
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
-    A_TYPE blk;
     if (binding_idx == BINDING_IDX_K) {
-        blk = k_raw.k_data[a_offset + ib];
+        A_TYPE blk = k_raw.k_data[a_offset + ib];
+        const float d = e8m0_to_fp32(blk.e);
+        uint group = iqs / 4u;
+        uint base = group * 3u;
+        uint v0, v1, v2, v3;
+        unpack_fp6x4(uint(blk.qs[base]), uint(blk.qs[base + 1u]), uint(blk.qs[base + 2u]), v0, v1, v2, v3);
+        return FLOAT_TYPEV4(
+            d * fp6_e2m3_to_float(v0),
+            d * fp6_e2m3_to_float(v1),
+            d * fp6_e2m3_to_float(v2),
+            d * fp6_e2m3_to_float(v3)
+        );
     } else {
-        blk = v_raw.v_data[a_offset + ib];
+#if defined(DATA_V_MXFP4)
+        block_mxfp4 blk = v_raw.v_data[a_offset + ib];
+        const float d = e8m0_to_fp32(blk.e);
+        const uint iqs0 = iqs & 0xFu;
+        const uint shift = (iqs & 0x10u) >> 2;
+        return FLOAT_TYPEV4(
+            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 0u]) >> shift) & 0xFu) * d,
+            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 1u]) >> shift) & 0xFu) * d,
+            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 2u]) >> shift) & 0xFu) * d,
+            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 3u]) >> shift) & 0xFu) * d
+        );
+#else
+        A_TYPE blk = v_raw.v_data[a_offset + ib];
+        const float d = e8m0_to_fp32(blk.e);
+        uint group = iqs / 4u;
+        uint base = group * 3u;
+        uint v0, v1, v2, v3;
+        unpack_fp6x4(uint(blk.qs[base]), uint(blk.qs[base + 1u]), uint(blk.qs[base + 2u]), v0, v1, v2, v3);
+        return FLOAT_TYPEV4(
+            d * fp6_e2m3_to_float(v0),
+            d * fp6_e2m3_to_float(v1),
+            d * fp6_e2m3_to_float(v2),
+            d * fp6_e2m3_to_float(v3)
+        );
+#endif
     }
-    const float d = e8m0_to_fp32(blk.e);
-    // iqs is element index within block; each group of 4 elements = 3 bytes
-    uint group = iqs / 4u;
-    uint base = group * 3u;
-    uint v0, v1, v2, v3;
-    unpack_fp6x4(uint(blk.qs[base]), uint(blk.qs[base + 1u]), uint(blk.qs[base + 2u]), v0, v1, v2, v3);
-    return FLOAT_TYPEV4(
-        d * fp6_e2m3_to_float(v0),
-        d * fp6_e2m3_to_float(v1),
-        d * fp6_e2m3_to_float(v2),
-        d * fp6_e2m3_to_float(v3)
-    );
 }
 #endif
 
 #if defined(DATA_A_MXFP6_E3M2)
 #define BLOCK_BYTE_SIZE 25
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
-    A_TYPE blk;
     if (binding_idx == BINDING_IDX_K) {
-        blk = k_raw.k_data[a_offset + ib];
+        A_TYPE blk = k_raw.k_data[a_offset + ib];
+        const float d = e8m0_to_fp32(blk.e);
+        uint group = iqs / 4u;
+        uint base = group * 3u;
+        uint v0, v1, v2, v3;
+        unpack_fp6x4(uint(blk.qs[base]), uint(blk.qs[base + 1u]), uint(blk.qs[base + 2u]), v0, v1, v2, v3);
+        return FLOAT_TYPEV4(
+            d * fp6_e3m2_to_float(v0),
+            d * fp6_e3m2_to_float(v1),
+            d * fp6_e3m2_to_float(v2),
+            d * fp6_e3m2_to_float(v3)
+        );
     } else {
-        blk = v_raw.v_data[a_offset + ib];
+#if defined(DATA_V_MXFP4)
+        block_mxfp4 blk = v_raw.v_data[a_offset + ib];
+        const float d = e8m0_to_fp32(blk.e);
+        const uint iqs0 = iqs & 0xFu;
+        const uint shift = (iqs & 0x10u) >> 2;
+        return FLOAT_TYPEV4(
+            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 0u]) >> shift) & 0xFu) * d,
+            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 1u]) >> shift) & 0xFu) * d,
+            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 2u]) >> shift) & 0xFu) * d,
+            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 3u]) >> shift) & 0xFu) * d
+        );
+#else
+        A_TYPE blk = v_raw.v_data[a_offset + ib];
+        const float d = e8m0_to_fp32(blk.e);
+        uint group = iqs / 4u;
+        uint base = group * 3u;
+        uint v0, v1, v2, v3;
+        unpack_fp6x4(uint(blk.qs[base]), uint(blk.qs[base + 1u]), uint(blk.qs[base + 2u]), v0, v1, v2, v3);
+        return FLOAT_TYPEV4(
+            d * fp6_e3m2_to_float(v0),
+            d * fp6_e3m2_to_float(v1),
+            d * fp6_e3m2_to_float(v2),
+            d * fp6_e3m2_to_float(v3)
+        );
+#endif
     }
-    const float d = e8m0_to_fp32(blk.e);
-    uint group = iqs / 4u;
-    uint base = group * 3u;
-    uint v0, v1, v2, v3;
-    unpack_fp6x4(uint(blk.qs[base]), uint(blk.qs[base + 1u]), uint(blk.qs[base + 2u]), v0, v1, v2, v3);
-    return FLOAT_TYPEV4(
-        d * fp6_e3m2_to_float(v0),
-        d * fp6_e3m2_to_float(v1),
-        d * fp6_e3m2_to_float(v2),
-        d * fp6_e3m2_to_float(v3)
-    );
 }
+#endif
+
+// K and V may have different block byte sizes when using mixed K/V types.
+// Default: both match BLOCK_BYTE_SIZE. Override V when DATA_V_MXFP4 is set.
+#ifdef BLOCK_BYTE_SIZE
+#define K_BLOCK_BYTE_SIZE BLOCK_BYTE_SIZE
+#if defined(DATA_V_MXFP4) && !defined(DATA_A_MXFP4)
+#define V_BLOCK_BYTE_SIZE 17
+#else
+#define V_BLOCK_BYTE_SIZE BLOCK_BYTE_SIZE
+#endif
 #endif
 
 // ===== MXFP Q preprocessing for flash attention =====
