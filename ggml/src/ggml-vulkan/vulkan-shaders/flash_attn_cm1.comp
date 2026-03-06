@@ -8,6 +8,7 @@
 
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_KHR_shader_subgroup_vote : enable
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_cooperative_matrix : enable
@@ -99,38 +100,75 @@ void main() {
 #ifdef MXFP_Q_PREPROCESS
     barrier();
     // Apply Hadamard + MXFP roundtrip to unscaled Q, then apply scale.
+    // Parallelized: each subgroup (32 threads) processes one MX block.
     {
         const uint mxfp_blocks_per_row = HSK / 32u;
         const uint mxfp_active_rows = min(Br, N - i * Br);
         const uint mxfp_total_blocks = mxfp_active_rows * mxfp_blocks_per_row;
         const bool mxfp_apply_hadamard = (HSK == HSV);
 
-        for (uint block_idx = tid; block_idx < mxfp_total_blocks; block_idx += gl_WorkGroupSize.x) {
+        const uint lane = gl_SubgroupInvocationID;
+        const uint sg_id = gl_SubgroupID;
+
+        for (uint block_idx = sg_id; block_idx < mxfp_total_blocks; block_idx += gl_NumSubgroups) {
             uint row = block_idx / mxfp_blocks_per_row;
             uint blk = block_idx % mxfp_blocks_per_row;
             uint base = row * qstride + blk * 8u;
 
-            float vals[32];
-            for (uint vi = 0u; vi < 8u; vi++) {
-                f16vec4 v = Qf[base + vi];
-                vals[vi * 4u + 0u] = float(v.x);
-                vals[vi * 4u + 1u] = float(v.y);
-                vals[vi * 4u + 2u] = float(v.z);
-                vals[vi * 4u + 3u] = float(v.w);
+            // Each thread loads 1 element
+            f16vec4 v4 = Qf[base + lane / 4u];
+            float val;
+            switch (lane & 3u) {
+                case 0u: val = float(v4.x); break;
+                case 1u: val = float(v4.y); break;
+                case 2u: val = float(v4.z); break;
+                case 3u: val = float(v4.w); break;
             }
 
+            // Hadamard via subgroup shuffles
             if (mxfp_apply_hadamard) {
-                hadamard_32_shmem(vals);
+                for (uint stride = 1u; stride < 32u; stride <<= 1u) {
+                    float other = subgroupShuffleXor(val, stride);
+                    val = ((lane & stride) == 0u) ? val + other : other - val;
+                }
+                val *= 0.17677669529663689; // 1/sqrt(32)
             }
 
-            float scale = compute_e8m0_scale(vals);
-            for (uint vi = 0u; vi < 32u; vi++) {
-                vals[vi] = mxfp_roundtrip_val(vals[vi], scale);
+            // E8M0 scale via subgroup max
+            float amax = subgroupMax(abs(val));
+            float scale;
+            if (amax == 0.0) {
+                scale = 0.0;
+            } else {
+                uint amax_bits = floatBitsToUint(amax);
+                int floor_log2 = int((amax_bits >> 23) & 0xFFu) - 127;
+                int round_log2 = floor_log2 + (((amax_bits & 0x7FFFFFu) >= 0x3504F3u) ? 1 : 0);
+#if defined(DATA_A_MXFP4)
+                const int emax_offset = 2;
+#elif defined(DATA_A_MXFP8_E4M3)
+                const int emax_offset = 8;
+#elif defined(DATA_A_MXFP8_E5M2)
+                const int emax_offset = 16;
+#elif defined(DATA_A_MXFP6_E2M3)
+                const int emax_offset = 3;
+#elif defined(DATA_A_MXFP6_E3M2)
+                const int emax_offset = 5;
+#endif
+                int e = clamp(round_log2 - emax_offset + 127, 0, 254);
+                scale = (e == 0) ? 0.0 : uintBitsToFloat(uint(e) << 23);
             }
 
-            for (uint vi = 0u; vi < 8u; vi++) {
-                Qf[base + vi] = f16vec4(vals[vi * 4u + 0u] * p.scale, vals[vi * 4u + 1u] * p.scale,
-                                        vals[vi * 4u + 2u] * p.scale, vals[vi * 4u + 3u] * p.scale);
+            // Each thread roundtrips its single element
+            val = mxfp_roundtrip_val(val, scale);
+            val *= float(p.scale);
+
+            // Write back: groups of 4 threads assemble vec4
+            float v0 = subgroupShuffle(val, (lane & ~3u) + 0u);
+            float v1 = subgroupShuffle(val, (lane & ~3u) + 1u);
+            float v2 = subgroupShuffle(val, (lane & ~3u) + 2u);
+            float v3 = subgroupShuffle(val, (lane & ~3u) + 3u);
+            if ((lane & 3u) == 0u) {
+                Qf[base + lane / 4u] = f16vec4(v0, v1, v2, v3);
             }
         }
     }
