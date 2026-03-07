@@ -764,6 +764,12 @@ void process_shaders() {
         string_to_spv("get_rows_" + tname + "_f32", shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
     }
 
+    // Dequant shaders for MXFP FA-only types (mxfp8, mxfp6 variants)
+    for (const auto & mxfp_tname : mxfp_fa_only_types) {
+        const std::string data_a_key_mxfp = "DATA_A_" + to_uppercase(mxfp_tname);
+        string_to_spv("dequant_" + mxfp_tname, "dequant_" + mxfp_tname + ".comp", merge_maps(base_dict, {{data_a_key_mxfp, "1"}, {"D_TYPE", "float16_t"}}));
+    }
+
     string_to_spv("get_rows_i32", "get_rows.comp", {{"TEMP_TYPE", "uint"}, {"A_TYPE", "uint"}, {"B_TYPE", "int"}, {"D_TYPE", "uint"}});
 
     string_to_spv("mul_mat_vec_p021_f16_f32_subgroup_add", "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPE_VEC4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});

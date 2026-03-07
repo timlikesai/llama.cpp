@@ -1,0 +1,36 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_mxfp6 data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+void main() {
+    const uint i = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
+
+    const uint tid = gl_LocalInvocationID.x % 64;
+    const uint il  = tid/32;
+    const uint ir  = tid%32;
+    const uint ib = 32*i + ir;
+    if (ib >= p.nel / 32) {
+        return;
+    }
+
+    // Each half (il=0 or il=1) processes 16 elements = 4 groups of 4 six-bit values
+    const uint group_base = 4*il;  // il=0: groups 0-3, il=1: groups 4-7
+    const uint b_idx = 1024*i + 32*ir + 16*il;
+
+    const float d = e8m0_to_fp32(data_a[ib].e);
+
+    [[unroll]] for (uint g = 0; g < 4; ++g) {
+        const uint off = (group_base + g) * 3;
+        uint v0, v1, v2, v3;
+        unpack_fp6x4(data_a[ib].qs[off], data_a[ib].qs[off + 1], data_a[ib].qs[off + 2], v0, v1, v2, v3);
+        data_b[b_idx + g*4 + 0] = D_TYPE(d * fp6_e2m3_to_float(v0));
+        data_b[b_idx + g*4 + 1] = D_TYPE(d * fp6_e2m3_to_float(v1));
+        data_b[b_idx + g*4 + 2] = D_TYPE(d * fp6_e2m3_to_float(v2));
+        data_b[b_idx + g*4 + 3] = D_TYPE(d * fp6_e2m3_to_float(v3));
+    }
+}

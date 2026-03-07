@@ -110,7 +110,7 @@ static void set_rows_cuda_quant(
 }
 
 // Unified MXFP SoA set_rows — works for any MX format via mxfp_traits.
-// MXFP4 traits are always available; MXFP8/MXFP6 only on CUDART >= 12080.
+// All traits use portable IEEE bit manipulation — works on all backends.
 // When apply_hadamard=true, applies block-32 Walsh-Hadamard rotation before quantization
 // (QuaRot, arXiv:2404.00456; BRQ, arXiv:2511.04214; FlashAttention-3, arXiv:2407.08608).
 template <ggml_type mxfp_type, typename idx_t, bool apply_hadamard>
@@ -417,12 +417,10 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         );
     }
     else if (dst->type == GGML_TYPE_MXFP4_E2M1
-#if CUDART_VERSION >= 12080
              || dst->type == GGML_TYPE_MXFP8_E4M3
              || dst->type == GGML_TYPE_MXFP6_E2M3
              || dst->type == GGML_TYPE_MXFP6_E3M2
              || dst->type == GGML_TYPE_MXFP8_E5M2
-#endif // CUDART_VERSION >= 12080
              ) {
         // op_params[0] == 1 signals K cache write: apply Hadamard rotation before quantization.
         // V cache writes leave op_params[0] == 0 (no rotation).
@@ -443,14 +441,12 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
         switch (dst->type) {
             case GGML_TYPE_MXFP4_E2M1:      DISPATCH_MXFP_SOA(GGML_TYPE_MXFP4_E2M1);      break;
-#if CUDART_VERSION >= 12080
             case GGML_TYPE_MXFP8_E4M3:      DISPATCH_MXFP_SOA(GGML_TYPE_MXFP8_E4M3);      break;
             case GGML_TYPE_MXFP6_E2M3:      DISPATCH_MXFP_SOA(GGML_TYPE_MXFP6_E2M3);      break;
 #ifdef GGML_CUDA_MXFP_ALL_VARIANTS
             case GGML_TYPE_MXFP6_E3M2:      DISPATCH_MXFP_SOA(GGML_TYPE_MXFP6_E3M2);      break;
             case GGML_TYPE_MXFP8_E5M2:      DISPATCH_MXFP_SOA(GGML_TYPE_MXFP8_E5M2);      break;
 #endif // GGML_CUDA_MXFP_ALL_VARIANTS
-#endif // CUDART_VERSION >= 12080
             default: GGML_ABORT("unreachable");
         }
 

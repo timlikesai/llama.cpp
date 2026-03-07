@@ -618,7 +618,6 @@ static void dequantize_row_mxfp4_cuda(const void * vx, dst_t * y, const int64_t 
     dequantize_block_mxfp4<<<nb, 32, 0, stream>>>(vx, y);
 }
 
-#if CUDART_VERSION >= 12080
 // Unified SoA dequantization for MXFP6 and MXFP8 formats.
 // SoA layout: [qs_block_0 ... qs_block_N | e8m0_0 ... e8m0_N]
 // Handles FP6 (E2M3, E3M2) and FP8 (E4M3, E5M2) via if constexpr on bits_per_elem.
@@ -690,7 +689,6 @@ static void dequantize_row_mxfp8_e5m2_cuda(const void * vx, dst_t * y, const int
     const int nb = (k + QK_K - 1) / QK_K;
     dequantize_block_mxfp_soa<GGML_TYPE_MXFP8_E5M2><<<nb, 32, 0, stream>>>(vx, y);
 }
-#endif // CUDART_VERSION >= 12080
 
 template <typename src_t, typename dst_t>
 static __global__ void convert_unary(
@@ -790,7 +788,6 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_iq3_s_cuda;
         case GGML_TYPE_MXFP4_E2M1:
             return dequantize_row_mxfp4_cuda;
-#if CUDART_VERSION >= 12080
         case GGML_TYPE_MXFP8_E4M3:
             return dequantize_row_mxfp8_cuda;
         case GGML_TYPE_MXFP6_E2M3:
@@ -801,7 +798,6 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
         case GGML_TYPE_MXFP8_E5M2:
             return dequantize_row_mxfp8_e5m2_cuda;
 #endif // GGML_CUDA_MXFP_ALL_VARIANTS
-#endif // CUDART_VERSION >= 12080
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -853,7 +849,6 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_iq3_s_cuda;
         case GGML_TYPE_MXFP4_E2M1:
             return dequantize_row_mxfp4_cuda;
-#if CUDART_VERSION >= 12080
         case GGML_TYPE_MXFP8_E4M3:
             return dequantize_row_mxfp8_cuda;
         case GGML_TYPE_MXFP6_E2M3:
@@ -864,7 +859,6 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
         case GGML_TYPE_MXFP8_E5M2:
             return dequantize_row_mxfp8_e5m2_cuda;
 #endif // GGML_CUDA_MXFP_ALL_VARIANTS
-#endif // CUDART_VERSION >= 12080
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
