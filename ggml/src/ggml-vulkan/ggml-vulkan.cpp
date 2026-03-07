@@ -842,7 +842,7 @@ struct vk_device_struct {
 
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16[GGML_TYPE_COUNT];
     // Mixed K/V pipelines: K=mxfp8/mxfp6, V=mxfp4. Indexed by K type.
-    std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16_v_mxfp4[GGML_TYPE_COUNT];
+    // Mixed MXFP K/V: V type encoded in flags bits 4-6, no separate pipeline array needed
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
@@ -3010,15 +3010,32 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
     }
 }
 
+static uint32_t get_v_type_id(ggml_type k_type, ggml_type v_type) {
+    if (k_type == v_type) return 0; // matched
+    switch (v_type) {
+        case GGML_TYPE_MXFP4_E2M1: return 1;
+        case GGML_TYPE_MXFP8_E4M3: return 2;
+        case GGML_TYPE_MXFP8_E5M2: return 3;
+        case GGML_TYPE_MXFP6_E2M3: return 4;
+        case GGML_TYPE_MXFP6_E3M2: return 5;
+        case GGML_TYPE_Q4_0:       return 6;
+        case GGML_TYPE_Q8_0:       return 7;
+        default: return 0;
+    }
+}
+
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap) {
+                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, uint32_t v_type_id = 0) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
+    // Bits 0-3: mask_opt, mask, logit_softcap, old_amd_windows
+    // Bits 4-6: V type ID for mixed K/V (0=matched, 1-5=MXFP V types, 6=q4_0, 7=q8_0)
     uint32_t flags = (use_mask_opt      ? 1 : 0) |
                      (use_mask          ? 2 : 0) |
                      (use_logit_softcap ? 4 : 0) |
-                     (old_amd_windows   ? 8 : 0);
+                     (old_amd_windows   ? 8 : 0) |
+                     (v_type_id << 4);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -3420,32 +3437,6 @@ static void ggml_vk_load_shaders(vk_device& device) {
             } \
         }
 
-// Mixed K/V: K=mxfp8/mxfp6, V=mxfp4. Same macro but stores in _v_mxfp4 array.
-#define CREATE_FA_V_MXFP4(TYPE, NAMELC, FAPATH, SUFFIX) \
-        for (auto &fa : device->pipeline_flash_attn_f32_f16_v_mxfp4[TYPE]) { \
-            FaCodePath path = fa.first.path; \
-            uint32_t Br = fa.first.Br; \
-            uint32_t Bc = fa.first.Bc; \
-            bool aligned = fa.first.aligned; \
-            bool f32acc = fa.first.f32acc; \
-            uint32_t fa_sgs = fa.first.subgroup_size; \
-            bool fa_ds = fa.first.subgroup_size == 0; \
-            if (path == FAPATH) { \
-                if (aligned) { \
-                    if (f32acc) { \
-                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_aligned_f32acc" #NAMELC, flash_attn_f32_f16_ ## NAMELC ##            SUFFIX ## _len,  flash_attn_f32_f16_ ## NAMELC ##            SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), Bc, true, (!fa_ds && (FAPATH!=FA_COOPMAT2)), ((!fa_ds && (FAPATH!=FA_COOPMAT2)) ? fa_sgs : 0));     \
-                    } else { \
-                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_aligned_f16acc" #NAMELC, flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _len,  flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), Bc, true, (!fa_ds && (FAPATH!=FA_COOPMAT2)), ((!fa_ds && (FAPATH!=FA_COOPMAT2)) ? fa_sgs : 0));     \
-                    } \
-                } else { \
-                    if (f32acc) { \
-                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_f32acc"         #NAMELC, flash_attn_f32_f16_ ## NAMELC ##            SUFFIX ## _len,  flash_attn_f32_f16_ ## NAMELC ##            SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), 1,  true, (!fa_ds && (FAPATH!=FA_COOPMAT2)), ((!fa_ds && (FAPATH!=FA_COOPMAT2)) ? fa_sgs : 0));     \
-                    } else { \
-                        ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_f16acc"         #NAMELC, flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _len,  flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _data,  "main", 7, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), 1,  true, (!fa_ds && (FAPATH!=FA_COOPMAT2)), ((!fa_ds && (FAPATH!=FA_COOPMAT2)) ? fa_sgs : 0));     \
-                    } \
-                } \
-            } \
-        }
 
     if (device->fp16) {
         CREATE_FA(GGML_TYPE_F32, f32, FA_SCALAR, )
@@ -3471,25 +3462,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         }
         CREATE_FA(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3, FA_SCALAR, )
         CREATE_FA(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2, FA_SCALAR, )
-        // Mixed K/V: K=mxfp8/mxfp6, V=mxfp4
-#if defined(GGML_VULKAN_FLOAT8_E4M3_GLSLC_SUPPORT)
-        if (device->shader_float8) {
-            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_f8hw_v_mxfp4, FA_SCALAR, )
-        } else
-#endif
-        {
-            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_v_mxfp4, FA_SCALAR, )
-        }
-#if defined(GGML_VULKAN_FLOAT8_E5M2_GLSLC_SUPPORT)
-        if (device->shader_float8) {
-            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_f8hw_v_mxfp4, FA_SCALAR, )
-        } else
-#endif
-        {
-            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_v_mxfp4, FA_SCALAR, )
-        }
-        CREATE_FA_V_MXFP4(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3_v_mxfp4, FA_SCALAR, )
-        CREATE_FA_V_MXFP4(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2_v_mxfp4, FA_SCALAR, )
+        // Mixed MXFP K/V for scalar: handled by MXFP_ALL_DEQUANT + V_TYPE_ID in Flags spec constant
     } else {
         CREATE_FA(GGML_TYPE_F32, f32, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, _fp32)
@@ -3514,25 +3487,6 @@ static void ggml_vk_load_shaders(vk_device& device) {
         }
         CREATE_FA(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2, FA_SCALAR, _fp32)
-        // Mixed K/V: K=mxfp8/mxfp6, V=mxfp4
-#if defined(GGML_VULKAN_FLOAT8_E4M3_GLSLC_SUPPORT)
-        if (device->shader_float8) {
-            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_f8hw_v_mxfp4, FA_SCALAR, _fp32)
-        } else
-#endif
-        {
-            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_v_mxfp4, FA_SCALAR, _fp32)
-        }
-#if defined(GGML_VULKAN_FLOAT8_E5M2_GLSLC_SUPPORT)
-        if (device->shader_float8) {
-            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_f8hw_v_mxfp4, FA_SCALAR, _fp32)
-        } else
-#endif
-        {
-            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_v_mxfp4, FA_SCALAR, _fp32)
-        }
-        CREATE_FA_V_MXFP4(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3_v_mxfp4, FA_SCALAR, _fp32)
-        CREATE_FA_V_MXFP4(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2_v_mxfp4, FA_SCALAR, _fp32)
     }
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->coopmat1_fa_support) {
@@ -3559,25 +3513,6 @@ static void ggml_vk_load_shaders(vk_device& device) {
         }
         CREATE_FA(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3, FA_COOPMAT1, _cm1)
         CREATE_FA(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2, FA_COOPMAT1, _cm1)
-        // Mixed K/V: K=mxfp8/mxfp6, V=mxfp4
-#if defined(GGML_VULKAN_FLOAT8_E4M3_GLSLC_SUPPORT)
-        if (device->shader_float8) {
-            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_f8hw_v_mxfp4, FA_COOPMAT1, _cm1)
-        } else
-#endif
-        {
-            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_v_mxfp4, FA_COOPMAT1, _cm1)
-        }
-#if defined(GGML_VULKAN_FLOAT8_E5M2_GLSLC_SUPPORT)
-        if (device->shader_float8) {
-            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_f8hw_v_mxfp4, FA_COOPMAT1, _cm1)
-        } else
-#endif
-        {
-            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_v_mxfp4, FA_COOPMAT1, _cm1)
-        }
-        CREATE_FA_V_MXFP4(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3_v_mxfp4, FA_COOPMAT1, _cm1)
-        CREATE_FA_V_MXFP4(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2_v_mxfp4, FA_COOPMAT1, _cm1)
     }
 #endif
 #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
@@ -3609,29 +3544,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
         }
         CREATE_FA(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3, FA_COOPMAT2, _cm2)
         CREATE_FA(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2, FA_COOPMAT2, _cm2)
-        // Mixed K/V: K=mxfp8/mxfp6, V=mxfp4
-#if defined(GGML_VULKAN_FLOAT8_E4M3_GLSLC_SUPPORT)
-        if (device->shader_float8) {
-            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_f8hw_v_mxfp4, FA_COOPMAT2, _cm2)
-        } else
-#endif
-        {
-            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_v_mxfp4, FA_COOPMAT2, _cm2)
-        }
-#if defined(GGML_VULKAN_FLOAT8_E5M2_GLSLC_SUPPORT)
-        if (device->shader_float8) {
-            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_f8hw_v_mxfp4, FA_COOPMAT2, _cm2)
-        } else
-#endif
-        {
-            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_v_mxfp4, FA_COOPMAT2, _cm2)
-        }
-        CREATE_FA_V_MXFP4(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3_v_mxfp4, FA_COOPMAT2, _cm2)
-        CREATE_FA_V_MXFP4(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2_v_mxfp4, FA_COOPMAT2, _cm2)
+        // Mixed MXFP K/V for cm2: handled by spec constant dispatch (same as scalar/cm1)
     }
 #endif
 #undef CREATE_FA
-#undef CREATE_FA_V_MXFP4
 
     const int mul_mat_id_param_count = 5;
 
@@ -9095,19 +9011,38 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
     bool use_mask_opt = mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16;
+
+    // Encode V type for mixed K/V in flags bits 4-6
+    uint32_t v_type_id = 0;
+    if (k->type != v->type) {
+        v_type_id = get_v_type_id(k->type, v->type);
+
+        // Mixed K/V with runtime V dispatch requires scalar/cm1 shaders only.
+        // Downgrade from cm2 to cm1 (or scalar if cm1 unavailable).
+        if (tuning_params.path == FA_COOPMAT2) {
+            tuning_params = get_fa_tuning_params_coopmat1(ctx->device, HSK, HSV, N, KV, k->type, f32acc);
+            bool shape_ok = (f32acc && ctx->device->coopmat_support_16x16x16_f32acc) ||
+                            (!f32acc && ctx->device->coopmat_support_16x16x16_f16acc);
+            bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(ctx->device, tuning_params, HSK, HSV, f32acc);
+            if (!shape_ok || !shmem_ok) {
+                tuning_params = get_fa_tuning_params_scalar(ctx->device, HSK, HSV, N, KV, k->type, f32acc);
+            }
+            // Recompute alignment with new tuning params
+            const uint32_t new_alignment = tuning_params.block_cols;
+            aligned = (KV % new_alignment) == 0 &&
+                      (q_stride & 7) == 0 && (k_stride & 7) == 0 && (v_stride & 7) == 0;
+        }
+    }
+
+
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0);
+                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, v_type_id);
 
     vk_pipeline pipeline = nullptr;
 
     {
         std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
-        // Use mixed K/V pipeline when K and V have different types (V=mxfp4)
-        bool use_mixed = (k->type != v->type && v->type == GGML_TYPE_MXFP4_E2M1);
-
-        auto &pipelines = use_mixed
-            ? ctx->device->pipeline_flash_attn_f32_f16_v_mxfp4[k->type]
-            : ctx->device->pipeline_flash_attn_f32_f16[k->type];
+        auto &pipelines = ctx->device->pipeline_flash_attn_f32_f16[k->type];
         auto it = pipelines.find(fa_pipeline_state);
         if (it != pipelines.end()) {
             pipeline = it->second;
@@ -15476,14 +15411,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
                     return false;
                 }
-                // Mixed K/V: supported for MXFP K types with V=mxfp4
+                // Mixed K/V: supported for any MXFP K×V combination,
+                // and for q8_0/q4_0 mixed combinations.
                 if (op->src[1]->type != op->src[2]->type) {
-                    bool mixed_mxfp = op->src[2]->type == GGML_TYPE_MXFP4_E2M1 &&
-                        (op->src[1]->type == GGML_TYPE_MXFP8_E4M3 ||
-                         op->src[1]->type == GGML_TYPE_MXFP8_E5M2 ||
-                         op->src[1]->type == GGML_TYPE_MXFP6_E2M3 ||
-                         op->src[1]->type == GGML_TYPE_MXFP6_E3M2);
-                    if (!mixed_mxfp) {
+                    const ggml_type kt = op->src[1]->type;
+                    const ggml_type vt = op->src[2]->type;
+                    const bool mxfp_mixed = ggml_is_type_mxfp(kt) && ggml_is_type_mxfp(vt);
+                    const bool q_mixed = (kt == GGML_TYPE_Q8_0 || kt == GGML_TYPE_Q4_0) &&
+                                         (vt == GGML_TYPE_Q8_0 || vt == GGML_TYPE_Q4_0);
+                    if (!mxfp_mixed && !q_mixed) {
                         return false;
                     }
                 }

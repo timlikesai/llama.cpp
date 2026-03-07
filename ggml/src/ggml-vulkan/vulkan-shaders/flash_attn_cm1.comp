@@ -191,7 +191,11 @@ void main() {
 
 #if BLOCK_SIZE > 1
     uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / K_BLOCK_BYTE_SIZE;
+#if defined(MXFP_ALL_DEQUANT) || defined(MIXED_Q_DEQUANT)
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / get_v_block_byte_size();
+#else
     uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / V_BLOCK_BYTE_SIZE;
+#endif
 #else
     uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / 2;
     uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / 2;
@@ -463,7 +467,11 @@ void main() {
                         uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE + 4 * d;
                         uint ib = coord / BLOCK_SIZE;
                         uint iqs = (coord % BLOCK_SIZE);
+#if defined(MXFP_ALL_DEQUANT) || defined(MIXED_Q_DEQUANT)
+                        V_Tf = f16vec4((V_TYPE_ID != 0u) ? dequantize4_v(ib, iqs, v_offset) : dequantize4(ib, iqs, v_offset, BINDING_IDX_V));
+#else
                         V_Tf = f16vec4(dequantize4(ib, iqs, v_offset, BINDING_IDX_V));
+#endif
 #else
                         V_Tf = f16vec4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
 #endif
@@ -511,7 +519,11 @@ void main() {
 
                 if (!KV_bounds_check || (v_row < KV && v_col < HSV)) {
 #if BLOCK_SIZE > 1
+#if defined(MXFP_ALL_DEQUANT) || defined(MIXED_Q_DEQUANT)
+                    kvsh[row * vsh_stride + col] = f16vec4((V_TYPE_ID != 0u) ? dequantize4_v(ib, iqs, v_offset) : dequantize4(ib, iqs, v_offset, BINDING_IDX_V));
+#else
                     kvsh[row * vsh_stride + col] = f16vec4(dequantize4(ib, iqs, v_offset, BINDING_IDX_V));
+#endif
 #else
                     kvsh[row * vsh_stride + col] = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];
 #endif

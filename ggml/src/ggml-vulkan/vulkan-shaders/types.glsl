@@ -1765,7 +1765,7 @@ void init_iq_shmem(uvec3 wgsize)
 }
 #endif
 
-#if defined(DATA_A_MXFP4) || defined(DATA_V_MXFP4)
+#if defined(DATA_A_MXFP4) || defined(MXFP_ALL_DEQUANT)
 const int8_t kvalues_mxfp4_const[16] = {
     int8_t(0), int8_t(1), int8_t(2), int8_t(3), int8_t(4), int8_t(6), int8_t(8), int8_t(12),
     int8_t(0), int8_t(-1), int8_t(-2), int8_t(-3), int8_t(-4), int8_t(-6), int8_t(-8), int8_t(-12),
@@ -1787,8 +1787,8 @@ void init_iq_shmem(uvec3 wgsize)
 // FP8 E4M3 dequantization: 1 sign, 4 exponent (bias 7), 3 mantissa
 // MX E4M3 has NO NaN — all 256 bit patterns are valid numbers.
 // exp=15 mant=7 = ±448 (not NaN as in NVIDIA's non-MX E4M3).
-#if defined(DATA_A_MXFP8_E4M3)
-#if defined(HAS_FLOAT8_E4M3_HW)
+#if defined(DATA_A_MXFP8_E4M3) || defined(MXFP_ALL_DEQUANT)
+#if defined(HAS_FLOAT8_E4M3_HW) && !defined(MXFP_ALL_DEQUANT)
 #extension GL_EXT_float_e4m3 : require
 float fp8_e4m3_to_float(uint v) {
     floate4m3_t f8 = uintBitsToFloate4m3EXT(uint8_t(v));
@@ -1810,8 +1810,8 @@ float fp8_e4m3_to_float(uint v) {
 
 // FP8 E5M2 dequantization: 1 sign, 5 exponent (bias 15), 2 mantissa
 // In MX context, NaN/Inf never appear in KV cache data (quantized from valid floats).
-#if defined(DATA_A_MXFP8_E5M2)
-#if defined(HAS_FLOAT8_E5M2_HW)
+#if defined(DATA_A_MXFP8_E5M2) || defined(MXFP_ALL_DEQUANT)
+#if defined(HAS_FLOAT8_E5M2_HW) && !defined(MXFP_ALL_DEQUANT)
 #extension GL_EXT_float_e5m2 : require
 float fp8_e5m2_to_float(uint v) {
     floate5m2_t f8 = uintBitsToFloate5m2EXT(uint8_t(v));
@@ -1833,7 +1833,7 @@ float fp8_e5m2_to_float(uint v) {
 
 // FP6 E2M3 dequantization: 1 sign, 2 exponent (bias 1), 3 mantissa
 // MX FP6 has no NaN/Inf — all bit patterns are valid normals/subnormals.
-#if defined(DATA_A_MXFP6_E2M3)
+#if defined(DATA_A_MXFP6_E2M3) || defined(MXFP_ALL_DEQUANT)
 float fp6_e2m3_to_float(uint v) {
     uint sign = (v & 0x20u) << 26;  // sign bit → IEEE position 31
     uint exp  = (v >> 3) & 0x3u;
@@ -1848,7 +1848,7 @@ float fp6_e2m3_to_float(uint v) {
 
 // FP6 E3M2 dequantization: 1 sign, 3 exponent (bias 3), 2 mantissa
 // MX FP6 has no NaN/Inf — all bit patterns are valid normals/subnormals.
-#if defined(DATA_A_MXFP6_E3M2)
+#if defined(DATA_A_MXFP6_E3M2) || defined(MXFP_ALL_DEQUANT)
 float fp6_e3m2_to_float(uint v) {
     uint sign = (v & 0x20u) << 26;  // sign bit → IEEE position 31
     uint exp  = (v >> 2) & 0x7u;
@@ -1862,7 +1862,7 @@ float fp6_e3m2_to_float(uint v) {
 #endif
 
 // Unpack 4 six-bit values from 3 packed bytes
-#if defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
+#if defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2) || defined(MXFP_ALL_DEQUANT)
 void unpack_fp6x4(uint b0, uint b1, uint b2, out uint v0, out uint v1, out uint v2, out uint v3) {
     uint packed = b0 | (b1 << 8) | (b2 << 16);
     v0 = packed & 0x3Fu;

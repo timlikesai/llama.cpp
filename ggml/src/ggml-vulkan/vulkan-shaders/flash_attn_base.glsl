@@ -19,6 +19,10 @@ const bool MASK_ENABLE     = (Flags & 2) != 0;
 const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
 
+// V type ID for mixed K/V MXFP types (scalar/cm1 paths).
+// 0 = matched (V same as K), 1=mxfp4, 2=e4m3, 3=e5m2, 4=e2m3, 5=e3m2
+const uint V_TYPE_ID = (Flags >> 4u) & 7u;
+
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
 const uint32_t HSV_pad = (HSV + 15) & ~15;
@@ -87,16 +91,15 @@ layout (binding = 2) readonly buffer V_PACKED {vec4 v_data_packed[];} v_packed;
 #elif defined(DATA_A_MXFP4) || defined(DATA_A_MXFP8_E4M3) || defined(DATA_A_MXFP8_E5M2) || defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
 layout (binding = 1) readonly buffer K_RAW {A_TYPE k_data[];} k_raw;
 layout (binding = 1) readonly buffer K_U32 {uint k_u32[];} k_raw_u32;
-#if defined(DATA_V_MXFP4) && !defined(DATA_A_MXFP4)
-layout (binding = 2) readonly buffer V_RAW {block_mxfp4 v_data[];} v_raw;
+// V buffer uses raw uint access to support any MXFP V type via runtime dispatch
 layout (binding = 2) readonly buffer V_U32 {uint v_u32[];} v_raw_u32;
-#else
-layout (binding = 2) readonly buffer V_RAW {A_TYPE v_data[];} v_raw;
-layout (binding = 2) readonly buffer V_U32 {uint v_u32[];} v_raw_u32;
-#endif
 #elif defined(A_TYPE_PACKED16)
 layout (binding = 1) readonly buffer K_PACKED16 {A_TYPE_PACKED16 k_data_packed16[];} k_packed;
 layout (binding = 2) readonly buffer V_PACKED16 {A_TYPE_PACKED16 v_data_packed16[];} v_packed;
+#if defined(MIXED_Q_DEQUANT)
+// Raw V access for mixed standard quant K/V (e.g. q8_0 K + q4_0 V)
+layout (binding = 2) readonly buffer V_U32_Q {uint v_u32[];} v_raw_u32;
+#endif
 #endif
 
 #ifndef BLOCK_SIZE
@@ -105,7 +108,7 @@ layout (binding = 2) readonly buffer V_PACKED16 {A_TYPE_PACKED16 v_data_packed16
 
 // Branchless E2M1 dequant via constant IEEE-754 bit patterns.
 // No shared memory, no branches — just index + OR + uintBitsToFloat.
-#if defined(DATA_A_MXFP4) || defined(DATA_V_MXFP4)
+#if defined(DATA_A_MXFP4) || defined(MXFP_ALL_DEQUANT)
 float fp4_e2m1_to_float(uint n) {
     // IEEE-754 bits for the 8 positive E2M1 values:
     // 0→0.0, 1→0.5, 2→1.0, 3→1.5, 4→2.0, 5→3.0, 6→4.0, 7→6.0
@@ -183,12 +186,11 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     // Load 4 qs bytes as one uint32 via unaligned read (1-2 loads vs 4 byte loads).
     // Scale byte at struct offset 0, qs at offset 1.
     const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + iqs0;
-    uint packed;
     if (binding_idx == BINDING_IDX_K) {
         const float d = e8m0_to_fp32(k_raw.k_data[idx].e);
         const uint w = byte_off >> 2u;
         const uint s = (byte_off & 3u) << 3u;
-        packed = k_raw_u32.k_u32[w] >> s;
+        uint packed = k_raw_u32.k_u32[w] >> s;
         if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
         return FLOAT_TYPEV4(
             fp4_e2m1_to_float((packed >>  0) >> shift & 0xFu) * d,
@@ -197,10 +199,13 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             fp4_e2m1_to_float((packed >> 24) >> shift & 0xFu) * d
         );
     } else {
-        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
+        const uint v_byte_off = idx * BLOCK_BYTE_SIZE;
+        const uint ew = v_byte_off >> 2u;
+        const uint es = (v_byte_off & 3u) << 3u;
+        const float d = e8m0_to_fp32(uint8_t((v_raw_u32.v_u32[ew] >> es) & 0xFFu));
         const uint w = byte_off >> 2u;
         const uint s = (byte_off & 3u) << 3u;
-        packed = v_raw_u32.v_u32[w] >> s;
+        uint packed = v_raw_u32.v_u32[w] >> s;
         if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
         return FLOAT_TYPEV4(
             fp4_e2m1_to_float((packed >>  0) >> shift & 0xFu) * d,
@@ -231,23 +236,10 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             d * fp8_e4m3_to_float((packed >> 24) & 0xFFu)
         );
     } else {
-#if defined(DATA_V_MXFP4)
-        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
-        const uint iqs0 = iqs & 0xFu;
-        const uint shift = (iqs & 0x10u) >> 2;
-        const uint byte_off = idx * 17u + 1u + iqs0;
-        const uint w = byte_off >> 2u;
-        const uint s = (byte_off & 3u) << 3u;
-        uint packed = v_raw_u32.v_u32[w] >> s;
-        if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
-        return FLOAT_TYPEV4(
-            fp4_e2m1_to_float((packed >>  0) >> shift & 0xFu) * d,
-            fp4_e2m1_to_float((packed >>  8) >> shift & 0xFu) * d,
-            fp4_e2m1_to_float((packed >> 16) >> shift & 0xFu) * d,
-            fp4_e2m1_to_float((packed >> 24) >> shift & 0xFu) * d
-        );
-#else
-        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
+        const uint v_byte_off = idx * BLOCK_BYTE_SIZE;
+        const uint ew = v_byte_off >> 2u;
+        const uint es = (v_byte_off & 3u) << 3u;
+        const float d = e8m0_to_fp32(uint8_t((v_raw_u32.v_u32[ew] >> es) & 0xFFu));
         const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + iqs;
         const uint w = byte_off >> 2u;
         const uint s = (byte_off & 3u) << 3u;
@@ -259,7 +251,6 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             d * fp8_e4m3_to_float((packed >> 16) & 0xFFu),
             d * fp8_e4m3_to_float((packed >> 24) & 0xFFu)
         );
-#endif
     }
 }
 #endif
@@ -282,23 +273,10 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             d * fp8_e5m2_to_float((packed >> 24) & 0xFFu)
         );
     } else {
-#if defined(DATA_V_MXFP4)
-        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
-        const uint iqs0 = iqs & 0xFu;
-        const uint shift = (iqs & 0x10u) >> 2;
-        const uint byte_off = idx * 17u + 1u + iqs0;
-        const uint w = byte_off >> 2u;
-        const uint s = (byte_off & 3u) << 3u;
-        uint packed = v_raw_u32.v_u32[w] >> s;
-        if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
-        return FLOAT_TYPEV4(
-            fp4_e2m1_to_float((packed >>  0) >> shift & 0xFu) * d,
-            fp4_e2m1_to_float((packed >>  8) >> shift & 0xFu) * d,
-            fp4_e2m1_to_float((packed >> 16) >> shift & 0xFu) * d,
-            fp4_e2m1_to_float((packed >> 24) >> shift & 0xFu) * d
-        );
-#else
-        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
+        const uint v_byte_off = idx * BLOCK_BYTE_SIZE;
+        const uint ew = v_byte_off >> 2u;
+        const uint es = (v_byte_off & 3u) << 3u;
+        const float d = e8m0_to_fp32(uint8_t((v_raw_u32.v_u32[ew] >> es) & 0xFFu));
         const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + iqs;
         const uint w = byte_off >> 2u;
         const uint s = (byte_off & 3u) << 3u;
@@ -310,7 +288,6 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             d * fp8_e5m2_to_float((packed >> 16) & 0xFFu),
             d * fp8_e5m2_to_float((packed >> 24) & 0xFFu)
         );
-#endif
     }
 }
 #endif
@@ -338,23 +315,10 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             d * fp6_e2m3_to_float(v3)
         );
     } else {
-#if defined(DATA_V_MXFP4)
-        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
-        const uint iqs0 = iqs & 0xFu;
-        const uint shift = (iqs & 0x10u) >> 2;
-        const uint byte_off = idx * 17u + 1u + iqs0;
-        const uint w = byte_off >> 2u;
-        const uint s = (byte_off & 3u) << 3u;
-        uint packed = v_raw_u32.v_u32[w] >> s;
-        if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
-        return FLOAT_TYPEV4(
-            fp4_e2m1_to_float((packed >>  0) >> shift & 0xFu) * d,
-            fp4_e2m1_to_float((packed >>  8) >> shift & 0xFu) * d,
-            fp4_e2m1_to_float((packed >> 16) >> shift & 0xFu) * d,
-            fp4_e2m1_to_float((packed >> 24) >> shift & 0xFu) * d
-        );
-#else
-        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
+        const uint v_byte_off = idx * BLOCK_BYTE_SIZE;
+        const uint ew = v_byte_off >> 2u;
+        const uint es = (v_byte_off & 3u) << 3u;
+        const float d = e8m0_to_fp32(uint8_t((v_raw_u32.v_u32[ew] >> es) & 0xFFu));
         const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + base;
         const uint w = byte_off >> 2u;
         const uint s = (byte_off & 3u) << 3u;
@@ -368,7 +332,6 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             d * fp6_e2m3_to_float(v2),
             d * fp6_e2m3_to_float(v3)
         );
-#endif
     }
 }
 #endif
@@ -395,23 +358,10 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             d * fp6_e3m2_to_float(v3)
         );
     } else {
-#if defined(DATA_V_MXFP4)
-        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
-        const uint iqs0 = iqs & 0xFu;
-        const uint shift = (iqs & 0x10u) >> 2;
-        const uint byte_off = idx * 17u + 1u + iqs0;
-        const uint w = byte_off >> 2u;
-        const uint s = (byte_off & 3u) << 3u;
-        uint packed = v_raw_u32.v_u32[w] >> s;
-        if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
-        return FLOAT_TYPEV4(
-            fp4_e2m1_to_float((packed >>  0) >> shift & 0xFu) * d,
-            fp4_e2m1_to_float((packed >>  8) >> shift & 0xFu) * d,
-            fp4_e2m1_to_float((packed >> 16) >> shift & 0xFu) * d,
-            fp4_e2m1_to_float((packed >> 24) >> shift & 0xFu) * d
-        );
-#else
-        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
+        const uint v_byte_off = idx * BLOCK_BYTE_SIZE;
+        const uint ew = v_byte_off >> 2u;
+        const uint es = (v_byte_off & 3u) << 3u;
+        const float d = e8m0_to_fp32(uint8_t((v_raw_u32.v_u32[ew] >> es) & 0xFFu));
         const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + base;
         const uint w = byte_off >> 2u;
         const uint s = (byte_off & 3u) << 3u;
@@ -425,20 +375,202 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             d * fp6_e3m2_to_float(v2),
             d * fp6_e3m2_to_float(v3)
         );
-#endif
     }
 }
 #endif
 
+// ===== Mixed V type runtime dispatch (scalar/cm1 paths) =====
+#if defined(MXFP_ALL_DEQUANT)
+
+// Helper: read E8M0 scale byte from v_raw_u32 at a given byte offset
+float v_e8m0_scale(uint byte_off) {
+    uint w = byte_off >> 2u;
+    uint s = (byte_off & 3u) << 3u;
+    return e8m0_to_fp32(uint8_t((v_raw_u32.v_u32[w] >> s) & 0xFFu));
+}
+
+// Helper: read uint32 from v_raw_u32 at unaligned byte offset
+uint v_read_u32(uint byte_off) {
+    uint w = byte_off >> 2u;
+    uint s = (byte_off & 3u) << 3u;
+    uint val = v_raw_u32.v_u32[w] >> s;
+    if (s != 0u) val |= v_raw_u32.v_u32[w + 1u] << (32u - s);
+    return val;
+}
+
+FLOAT_TYPEV4 dequantize4_v_mxfp4(uint idx, uint iqs) {
+    const uint iqs0 = iqs & 0xFu;
+    const uint shift = (iqs & 0x10u) >> 2;
+    const float d = v_e8m0_scale(idx * 17u);
+    uint packed = v_read_u32(idx * 17u + 1u + iqs0);
+    return FLOAT_TYPEV4(
+        fp4_e2m1_to_float((packed >>  0) >> shift & 0xFu) * d,
+        fp4_e2m1_to_float((packed >>  8) >> shift & 0xFu) * d,
+        fp4_e2m1_to_float((packed >> 16) >> shift & 0xFu) * d,
+        fp4_e2m1_to_float((packed >> 24) >> shift & 0xFu) * d
+    );
+}
+
+FLOAT_TYPEV4 dequantize4_v_mxfp8_e4m3(uint idx, uint iqs) {
+    const float d = v_e8m0_scale(idx * 33u);
+    uint packed = v_read_u32(idx * 33u + 1u + iqs);
+    return FLOAT_TYPEV4(
+        d * fp8_e4m3_to_float(packed & 0xFFu),
+        d * fp8_e4m3_to_float((packed >> 8) & 0xFFu),
+        d * fp8_e4m3_to_float((packed >> 16) & 0xFFu),
+        d * fp8_e4m3_to_float((packed >> 24) & 0xFFu)
+    );
+}
+
+FLOAT_TYPEV4 dequantize4_v_mxfp8_e5m2(uint idx, uint iqs) {
+    const float d = v_e8m0_scale(idx * 33u);
+    uint packed = v_read_u32(idx * 33u + 1u + iqs);
+    return FLOAT_TYPEV4(
+        d * fp8_e5m2_to_float(packed & 0xFFu),
+        d * fp8_e5m2_to_float((packed >> 8) & 0xFFu),
+        d * fp8_e5m2_to_float((packed >> 16) & 0xFFu),
+        d * fp8_e5m2_to_float((packed >> 24) & 0xFFu)
+    );
+}
+
+FLOAT_TYPEV4 dequantize4_v_mxfp6_e2m3(uint idx, uint iqs) {
+    const uint group = iqs / 4u;
+    const uint base = group * 3u;
+    const float d = v_e8m0_scale(idx * 25u);
+    const uint byte_off = idx * 25u + 1u + base;
+    uint w = byte_off >> 2u;
+    uint s = (byte_off & 3u) << 3u;
+    uint raw = v_raw_u32.v_u32[w] >> s;
+    if (s > 8u) raw |= v_raw_u32.v_u32[w + 1u] << (32u - s);
+    uint v0, v1, v2, v3;
+    unpack_fp6x4(raw & 0xFFu, (raw >> 8) & 0xFFu, (raw >> 16) & 0xFFu, v0, v1, v2, v3);
+    return FLOAT_TYPEV4(
+        d * fp6_e2m3_to_float(v0),
+        d * fp6_e2m3_to_float(v1),
+        d * fp6_e2m3_to_float(v2),
+        d * fp6_e2m3_to_float(v3)
+    );
+}
+
+FLOAT_TYPEV4 dequantize4_v_mxfp6_e3m2(uint idx, uint iqs) {
+    const uint group = iqs / 4u;
+    const uint base = group * 3u;
+    const float d = v_e8m0_scale(idx * 25u);
+    const uint byte_off = idx * 25u + 1u + base;
+    uint w = byte_off >> 2u;
+    uint s = (byte_off & 3u) << 3u;
+    uint raw = v_raw_u32.v_u32[w] >> s;
+    if (s > 8u) raw |= v_raw_u32.v_u32[w + 1u] << (32u - s);
+    uint v0, v1, v2, v3;
+    unpack_fp6x4(raw & 0xFFu, (raw >> 8) & 0xFFu, (raw >> 16) & 0xFFu, v0, v1, v2, v3);
+    return FLOAT_TYPEV4(
+        d * fp6_e3m2_to_float(v0),
+        d * fp6_e3m2_to_float(v1),
+        d * fp6_e3m2_to_float(v2),
+        d * fp6_e3m2_to_float(v3)
+    );
+}
+
+// V dequant dispatcher: routes to the correct V type based on V_TYPE_ID spec constant.
+FLOAT_TYPEV4 dequantize4_v(uint ib, uint iqs, uint a_offset) {
+    const uint idx = a_offset + ib;
+    switch (V_TYPE_ID) {
+        case 1u: return dequantize4_v_mxfp4(idx, iqs);
+        case 2u: return dequantize4_v_mxfp8_e4m3(idx, iqs);
+        case 3u: return dequantize4_v_mxfp8_e5m2(idx, iqs);
+        case 4u: return dequantize4_v_mxfp6_e2m3(idx, iqs);
+        case 5u: return dequantize4_v_mxfp6_e3m2(idx, iqs);
+        default: return dequantize4(ib, iqs, a_offset, BINDING_IDX_V);
+    }
+}
+
+// V block byte size for offset calculations, based on V_TYPE_ID.
+uint get_v_block_byte_size() {
+    switch (V_TYPE_ID) {
+        case 1u: return 17u;  // mxfp4
+        case 2u: return 33u;  // mxfp8_e4m3
+        case 3u: return 33u;  // mxfp8_e5m2
+        case 4u: return 25u;  // mxfp6_e2m3
+        case 5u: return 25u;  // mxfp6_e3m2
+        default: return BLOCK_BYTE_SIZE;
+    }
+}
+
+#endif // MXFP_ALL_DEQUANT
+
+// Mixed standard quant K/V: standalone V dequant for q4_0 and q8_0.
+// These read from raw uint32 V binding, independent of the K type.
+#if defined(MIXED_Q_DEQUANT)
+
+FLOAT_TYPEV4 dequantize4_v_q4_0(uint ib, uint iqs) {
+    // q4_0 block: 2 bytes scale (f16) + 16 bytes qs = 18 bytes
+    const uint byte_off = ib * 18u;
+    // Read f16 scale from first 2 bytes
+    const uint scale_word = v_raw_u32.v_u32[byte_off >> 2u];
+    const uint scale_shift = (byte_off & 3u) << 3u;
+    const uint16_t scale_u16 = uint16_t((scale_word >> scale_shift) & 0xFFFFu);
+    const FLOAT_TYPE d = FLOAT_TYPE(unpackHalf2x16(uint(scale_u16)).x);
+    // Read qs nibbles: offset 2 bytes into block
+    const uint qs_byte_off = byte_off + 2u + (iqs & 0xFu);
+    const uint shift = (iqs & 0x10u) >> 2u;
+    const uint w0 = qs_byte_off >> 2u;
+    const uint s0 = (qs_byte_off & 3u) << 3u;
+    uint vui_lo = (v_raw_u32.v_u32[w0] >> s0);
+    if (s0 != 0u) vui_lo |= (v_raw_u32.v_u32[w0 + 1u] << (32u - s0));
+    const uint w1 = (qs_byte_off + 2u) >> 2u;
+    const uint s1 = ((qs_byte_off + 2u) & 3u) << 3u;
+    uint vui_hi = (v_raw_u32.v_u32[w1] >> s1);
+    if (s1 != 0u) vui_hi |= (v_raw_u32.v_u32[w1 + 1u] << (32u - s1));
+    vui_lo >>= shift;
+    vui_hi >>= shift;
+    return d * (FLOAT_TYPEV4(vui_lo & 0xFu, (vui_lo >> 8u) & 0xFu, vui_hi & 0xFu, (vui_hi >> 8u) & 0xFu) - FLOAT_TYPE(8.0));
+}
+
+FLOAT_TYPEV4 dequantize4_v_q8_0(uint ib, uint iqs) {
+    // q8_0 block: 2 bytes scale (f16) + 32 bytes qs = 34 bytes
+    const uint byte_off = ib * 34u;
+    // Read f16 scale
+    const uint scale_word = v_raw_u32.v_u32[byte_off >> 2u];
+    const uint scale_shift = (byte_off & 3u) << 3u;
+    const uint16_t scale_u16 = uint16_t((scale_word >> scale_shift) & 0xFFFFu);
+    const FLOAT_TYPE d = FLOAT_TYPE(unpackHalf2x16(uint(scale_u16)).x);
+    // Read qs bytes: offset 2 bytes into block
+    const uint qs_byte_off = byte_off + 2u + iqs;
+    const uint w = qs_byte_off >> 2u;
+    const uint s = (qs_byte_off & 3u) << 3u;
+    uint packed = v_raw_u32.v_u32[w] >> s;
+    if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
+    const i8vec2 v0 = unpack8(int32_t(packed & 0xFFFFu)).xy;
+    const i8vec2 v1 = unpack8(int32_t((packed >> 16u) & 0xFFFFu)).xy;
+    return d * FLOAT_TYPEV4(v0.x, v0.y, v1.x, v1.y);
+}
+
+// V dequant dispatcher for mixed standard quant K/V.
+FLOAT_TYPEV4 dequantize4_v(uint ib, uint iqs, uint a_offset) {
+    const uint idx = a_offset + ib;
+    switch (V_TYPE_ID) {
+        case 6u: return dequantize4_v_q4_0(idx, iqs);
+        case 7u: return dequantize4_v_q8_0(idx, iqs);
+        default: return dequantize4(ib, iqs, a_offset, BINDING_IDX_V);
+    }
+}
+
+uint get_v_block_byte_size() {
+    switch (V_TYPE_ID) {
+        case 6u: return 18u;  // q4_0
+        case 7u: return 34u;  // q8_0
+        default: return BLOCK_BYTE_SIZE;
+    }
+}
+
+#endif // MIXED_Q_DEQUANT
+
 // K and V may have different block byte sizes when using mixed K/V types.
-// Default: both match BLOCK_BYTE_SIZE. Override V when DATA_V_MXFP4 is set.
 #ifdef BLOCK_BYTE_SIZE
 #define K_BLOCK_BYTE_SIZE BLOCK_BYTE_SIZE
-#if defined(DATA_V_MXFP4) && !defined(DATA_A_MXFP4)
-#define V_BLOCK_BYTE_SIZE 17
-#else
+// V_BLOCK_BYTE_SIZE: for matched types use K's block size.
+// For mixed types with MXFP_ALL_DEQUANT or MIXED_Q_DEQUANT, get_v_block_byte_size() is used at runtime.
 #define V_BLOCK_BYTE_SIZE BLOCK_BYTE_SIZE
-#endif
 #endif
 
 // ===== MXFP Q preprocessing for flash attention =====
@@ -621,26 +753,17 @@ float mxfp_roundtrip_val(float val, float scale) {
 // Tests ±R candidates around round(log2(amax)), picks lowest round-trip MSE.
 // Matches CUDA MMA Q and CPU paths for consistent quantization quality.
 // Cost: (2R+1) × 32 roundtrip evals per block — negligible vs attention compute.
-// Vulkan GLSL cannot include C headers, so these mirror ggml-common.h definitions.
-// EMAX_OFFSET: ceil(log2(max_finite)) for each MX element type.
-// MSE_RANGE: search radius for MSE-optimal E8M0 exponent selection.
-#define MXFP_E8M0_MSE_RANGE_VK      2
-#define MXFP4_E2M1_EMAX_OFFSET_VK   2   // ceil(log2(6.0))
-#define MXFP6_E2M3_EMAX_OFFSET_VK   3   // ceil(log2(7.5))
-#define MXFP6_E3M2_EMAX_OFFSET_VK   5   // ceil(log2(28.0))
-#define MXFP8_E4M3_EMAX_OFFSET_VK   8   // ceil(log2(448))
-#define MXFP8_E5M2_EMAX_OFFSET_VK  16   // ceil(log2(57344))
-
+// Constants (MXFP_E8M0_MSE_RANGE, *_EMAX_OFFSET) injected from vulkan-shaders-gen.cpp.
 #if defined(DATA_A_MXFP4)
-    #define MXFP_EMAX_OFFSET MXFP4_E2M1_EMAX_OFFSET_VK
+    #define MXFP_EMAX_OFFSET MXFP4_E2M1_EMAX_OFFSET
 #elif defined(DATA_A_MXFP8_E4M3)
-    #define MXFP_EMAX_OFFSET MXFP8_E4M3_EMAX_OFFSET_VK
+    #define MXFP_EMAX_OFFSET MXFP8_E4M3_EMAX_OFFSET
 #elif defined(DATA_A_MXFP8_E5M2)
-    #define MXFP_EMAX_OFFSET MXFP8_E5M2_EMAX_OFFSET_VK
+    #define MXFP_EMAX_OFFSET MXFP8_E5M2_EMAX_OFFSET
 #elif defined(DATA_A_MXFP6_E2M3)
-    #define MXFP_EMAX_OFFSET MXFP6_E2M3_EMAX_OFFSET_VK
+    #define MXFP_EMAX_OFFSET MXFP6_E2M3_EMAX_OFFSET
 #elif defined(DATA_A_MXFP6_E3M2)
-    #define MXFP_EMAX_OFFSET MXFP6_E3M2_EMAX_OFFSET_VK
+    #define MXFP_EMAX_OFFSET MXFP6_E3M2_EMAX_OFFSET
 #endif
 
 float compute_e8m0_scale(float vals[32]) {
@@ -657,8 +780,8 @@ float compute_e8m0_scale(float vals[32]) {
     const int emax_offset = MXFP_EMAX_OFFSET;
 
     int e_base = round_log2 - emax_offset + 127;
-    int e_lo = clamp(e_base - MXFP_E8M0_MSE_RANGE_VK, 1, 255);
-    int e_hi = clamp(e_base + MXFP_E8M0_MSE_RANGE_VK, 1, 255);
+    int e_lo = clamp(e_base - MXFP_E8M0_MSE_RANGE, 1, 255);
+    int e_hi = clamp(e_base + MXFP_E8M0_MSE_RANGE, 1, 255);
     int best_e = clamp(e_base, 0, 255);
     float best_mse = 1.0e30;
 
@@ -690,8 +813,8 @@ float compute_e8m0_scale_subgroup(float val, float amax) {
     int round_log2 = floor_log2 + (((amax_bits & 0x7FFFFFu) >= 0x3504F3u) ? 1 : 0);
 
     int e_base = round_log2 - MXFP_EMAX_OFFSET + 127;
-    int e_lo = clamp(e_base - MXFP_E8M0_MSE_RANGE_VK, 1, 255);
-    int e_hi = clamp(e_base + MXFP_E8M0_MSE_RANGE_VK, 1, 255);
+    int e_lo = clamp(e_base - MXFP_E8M0_MSE_RANGE, 1, 255);
+    int e_hi = clamp(e_base + MXFP_E8M0_MSE_RANGE, 1, 255);
     int best_e = clamp(e_base, 0, 255);
     float best_mse = 1.0e30;
 

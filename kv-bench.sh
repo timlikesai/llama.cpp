@@ -76,7 +76,7 @@ DO_BUILD=true
 DO_PERPLEXITY=true
 DO_BENCH=true
 DO_GPU=true
-DO_CPU=true
+DO_CPU=false
 CHUNKS_LIST=(16)
 # All MXFP configs use V=mxfp4 (K dominates quality; avoids cartesian explosion).
 # "mxfp8" = E4M3 (default), "mxfp6" = E2M3 (default). Full names also accepted.
