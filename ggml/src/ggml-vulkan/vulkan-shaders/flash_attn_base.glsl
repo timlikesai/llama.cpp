@@ -100,17 +100,17 @@ layout (binding = 2) readonly buffer V_PACKED16 {A_TYPE_PACKED16 v_data_packed16
 #define BLOCK_SIZE 1
 #endif
 
-// Arithmetic E2M1 dequant for mixed K/V (V=mxfp4 with non-mxfp4 K).
-// No shared memory LUT needed — pure arithmetic IEEE bit construction.
-#if defined(DATA_V_MXFP4) && !defined(DATA_A_MXFP4)
+// Branchless E2M1 dequant via constant IEEE-754 bit patterns.
+// No shared memory, no branches — just index + OR + uintBitsToFloat.
+#if defined(DATA_A_MXFP4) || defined(DATA_V_MXFP4)
 float fp4_e2m1_to_float(uint n) {
-    uint sign = (n & 0x8u) << 28;
-    uint exp  = (n >> 1) & 0x3u;
-    uint mant = n & 0x1u;
-    if (exp == 0u) {
-        return (mant == 0u) ? 0.0 : uintBitsToFloat(sign | 0x3F000000u);
-    }
-    return uintBitsToFloat(sign | ((exp + 126u) << 23) | (mant << 22));
+    // IEEE-754 bits for the 8 positive E2M1 values:
+    // 0→0.0, 1→0.5, 2→1.0, 3→1.5, 4→2.0, 5→3.0, 6→4.0, 7→6.0
+    const uint fp4_bits[8] = uint[8](
+        0x00000000u, 0x3F000000u, 0x3F800000u, 0x3FC00000u,
+        0x40000000u, 0x40400000u, 0x40800000u, 0x40C00000u
+    );
+    return uintBitsToFloat(fp4_bits[n & 0x7u] | ((n & 0x8u) << 28));
 }
 #endif
 
@@ -179,17 +179,19 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     } else {
         blk = v_raw.v_data[a_offset + ib];
     }
-    const float d = e8m0_to_fp32(blk.e) * 0.5;
+    const float d = e8m0_to_fp32(blk.e);
     // CPU layout: lower nibbles of bytes 0-15 → elements 0-15,
     //             upper nibbles of bytes 0-15 → elements 16-31.
     // iqs is element index (0-31 in steps of 4).
     const uint iqs0 = iqs & 0xFu;           // byte index (wraps at 16)
     const uint shift = (iqs & 0x10u) >> 2;   // 0 for elements 0-15, 4 for 16-31
+    // Arithmetic dequant avoids shared memory LUT bank conflicts (16-entry LUT
+    // spans only 4 banks → 8-way serialization with 32 threads per warp).
     return FLOAT_TYPEV4(
-        kvalues_mxfp4[(uint(blk.qs[iqs0 + 0u]) >> shift) & 0xFu] * d,
-        kvalues_mxfp4[(uint(blk.qs[iqs0 + 1u]) >> shift) & 0xFu] * d,
-        kvalues_mxfp4[(uint(blk.qs[iqs0 + 2u]) >> shift) & 0xFu] * d,
-        kvalues_mxfp4[(uint(blk.qs[iqs0 + 3u]) >> shift) & 0xFu] * d
+        fp4_e2m1_to_float((uint(blk.qs[iqs0 + 0u]) >> shift) & 0xFu) * d,
+        fp4_e2m1_to_float((uint(blk.qs[iqs0 + 1u]) >> shift) & 0xFu) * d,
+        fp4_e2m1_to_float((uint(blk.qs[iqs0 + 2u]) >> shift) & 0xFu) * d,
+        fp4_e2m1_to_float((uint(blk.qs[iqs0 + 3u]) >> shift) & 0xFu) * d
     );
 }
 #endif

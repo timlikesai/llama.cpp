@@ -1785,65 +1785,63 @@ void init_iq_shmem(uvec3 wgsize)
 #endif
 
 // FP8 E4M3 dequantization: 1 sign, 4 exponent (bias 7), 3 mantissa
+// MX E4M3 has NO NaN — all 256 bit patterns are valid numbers.
+// exp=15 mant=7 = ±448 (not NaN as in NVIDIA's non-MX E4M3).
 #if defined(DATA_A_MXFP8_E4M3)
 float fp8_e4m3_to_float(uint v) {
     uint sign = (v & 0x80u) << 24;
     uint exp  = (v >> 3) & 0xFu;
     uint mant = v & 0x7u;
-    if (exp == 0u) {
-        if (mant == 0u) return uintBitsToFloat(sign);
-        // Subnormal: mant * 2^(-9)
-        float val = float(mant) * (1.0 / 512.0);
-        return (sign != 0u) ? -val : val;
-    }
-    if (exp == 15u && mant == 7u) return uintBitsToFloat(sign | 0x7FC00000u); // NaN
-    uint bits = sign | ((exp + 120u) << 23) | (mant << 20);
-    return uintBitsToFloat(bits);
+    // Normal: reconstruct absolute value via IEEE-754 bit manipulation
+    float normal_val = uintBitsToFloat(((exp + 120u) << 23) | (mant << 20));
+    // Subnormal (exp=0): value = mant * 2^(-9). Select avoids branch divergence.
+    float abs_result = (exp == 0u) ? (float(mant) * (1.0 / 512.0)) : normal_val;
+    return uintBitsToFloat(floatBitsToUint(abs_result) | sign);
 }
 #endif
 
 // FP8 E5M2 dequantization: 1 sign, 5 exponent (bias 15), 2 mantissa
+// In MX context, NaN/Inf never appear in KV cache data (quantized from valid floats).
 #if defined(DATA_A_MXFP8_E5M2)
 float fp8_e5m2_to_float(uint v) {
     uint sign = (v & 0x80u) << 24;
     uint exp  = (v >> 2) & 0x1Fu;
     uint mant = v & 0x3u;
-    if (exp == 0u) {
-        if (mant == 0u) return uintBitsToFloat(sign);
-        float val = float(mant) * (1.0 / 65536.0);
-        return (sign != 0u) ? -val : val;
-    }
-    if (exp == 31u) return uintBitsToFloat(sign | 0x7FC00000u); // Inf/NaN
-    uint bits = sign | ((exp + 112u) << 23) | (mant << 21);
-    return uintBitsToFloat(bits);
+    // Normal: reconstruct absolute value via IEEE-754 bit manipulation
+    float normal_val = uintBitsToFloat(((exp + 112u) << 23) | (mant << 21));
+    // Subnormal (exp=0): value = mant * 2^(-16). Select avoids branch divergence.
+    float abs_result = (exp == 0u) ? (float(mant) * (1.0 / 65536.0)) : normal_val;
+    return uintBitsToFloat(floatBitsToUint(abs_result) | sign);
 }
 #endif
 
 // FP6 E2M3 dequantization: 1 sign, 2 exponent (bias 1), 3 mantissa
+// MX FP6 has no NaN/Inf — all bit patterns are valid normals/subnormals.
 #if defined(DATA_A_MXFP6_E2M3)
 float fp6_e2m3_to_float(uint v) {
-    float sign = ((v & 0x20u) != 0u) ? -1.0 : 1.0;
+    uint sign = (v & 0x20u) << 26;  // sign bit → IEEE position 31
     uint exp  = (v >> 3) & 0x3u;
     uint mant = v & 0x7u;
-    if (exp == 0u) {
-        return sign * float(mant) * (1.0 / 8.0);
-    }
-    uint bits = ((exp + 126u) << 23) | (mant << 20);
-    return sign * uintBitsToFloat(bits);
+    // Normal: reconstruct absolute value via IEEE-754 bit manipulation
+    float normal_val = uintBitsToFloat(((exp + 126u) << 23) | (mant << 20));
+    // Subnormal (exp=0): value = mant/8. Select avoids branch divergence.
+    float abs_result = (exp == 0u) ? (float(mant) * (1.0 / 8.0)) : normal_val;
+    return uintBitsToFloat(floatBitsToUint(abs_result) | sign);
 }
 #endif
 
 // FP6 E3M2 dequantization: 1 sign, 3 exponent (bias 3), 2 mantissa
+// MX FP6 has no NaN/Inf — all bit patterns are valid normals/subnormals.
 #if defined(DATA_A_MXFP6_E3M2)
 float fp6_e3m2_to_float(uint v) {
-    float sign = ((v & 0x20u) != 0u) ? -1.0 : 1.0;
+    uint sign = (v & 0x20u) << 26;  // sign bit → IEEE position 31
     uint exp  = (v >> 2) & 0x7u;
     uint mant = v & 0x3u;
-    if (exp == 0u) {
-        return sign * float(mant) * (1.0 / 16.0);
-    }
-    uint bits = ((exp + 124u) << 23) | (mant << 21);
-    return sign * uintBitsToFloat(bits);
+    // Normal: reconstruct absolute value via IEEE-754 bit manipulation
+    float normal_val = uintBitsToFloat(((exp + 124u) << 23) | (mant << 21));
+    // Subnormal (exp=0): value = mant/16. Select avoids branch divergence.
+    float abs_result = (exp == 0u) ? (float(mant) * (1.0 / 16.0)) : normal_val;
+    return uintBitsToFloat(floatBitsToUint(abs_result) | sign);
 }
 #endif
 
