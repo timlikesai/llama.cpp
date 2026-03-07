@@ -1924,7 +1924,7 @@ void ggml_cuda_flash_attn_ext_mma_mxfp_case(ggml_backend_cuda_context & ctx, ggm
 
     const auto select_kernel = [&](fattn_kernel_t kernel, bool (& sml)[GGML_CUDA_MAX_DEVICES]) {
         if (!sml[id]) {
-            CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
             sml[id] = true;
         }
         return kernel;

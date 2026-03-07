@@ -410,7 +410,9 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_VEC        = 100,
     BEST_FATTN_KERNEL_WMMA_F16   = 300,
     BEST_FATTN_KERNEL_MMA_F16    = 400,
+#if CUDART_VERSION >= 12080
     BEST_FATTN_KERNEL_MMA_MXFP   = 500,
+#endif // CUDART_VERSION >= 12080
 };
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
