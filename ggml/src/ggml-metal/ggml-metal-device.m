@@ -1160,7 +1160,18 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
-            return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
+            {
+                // NVFP4, MXFP8, and MXFP6 types only support flash attention, not mul_mat
+                const enum ggml_type src0t = op->src[0]->type;
+                if (src0t == GGML_TYPE_NVFP4     ||
+                    src0t == GGML_TYPE_MXFP8_E4M3 ||
+                    src0t == GGML_TYPE_MXFP8_E5M2 ||
+                    src0t == GGML_TYPE_MXFP6_E2M3 ||
+                    src0t == GGML_TYPE_MXFP6_E3M2) {
+                    return false;
+                }
+                return has_simdgroup_reduction;
+            }
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:
