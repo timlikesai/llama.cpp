@@ -58,16 +58,17 @@ static __device__ __forceinline__ void mxfp_soa_head_offsets(
     e_off  = stride_blocks * qs_per_block + z * blocks_per_head;
 }
 
-// The trait specializations below use NVIDIA CUDA 12.8+ intrinsics (__nv_cvt_float_to_fp4,
-// __nv_cvt_float_to_fp6, __nv_fp8_e4m3, etc.) from cuda_fp4.h / cuda_fp8.h.
-#if CUDART_VERSION >= 12080
-
-// FP4 E2M1:
+// FP4 E2M1 traits: uses LUT + ggml_cuda_float_to_fp4_e2m1 (has non-CUDART fallback).
+// Defined outside CUDART guard so MXFP4 works on all backends (CUDA, HIP, MUSA).
 template<> struct mxfp_traits<GGML_TYPE_MXFP4_E2M1> {
     static constexpr int bits_per_elem = 4;
     static constexpr int qs_per_block  = 16;   // 32 * 4 / 8
     static constexpr int block_size    = sizeof(block_mxfp4);
     static constexpr int e8m0_offset   = 2;    // ceil(log2(6.0)) — max finite FP4 E2M1 value
+
+    static __device__ __forceinline__ float dequant_elem(uint8_t raw) {
+        return kvalues_mxfp4[raw & 0xF] * 0.5f;
+    }
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
         const uint8_t nibble = ggml_cuda_float_to_fp4_e2m1(val, inv_scale);
@@ -81,12 +82,16 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP4_E2M1> {
             int block_idx, int /*blocks_per_row_total*/, float inv_d) {
         uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * qs_per_block);
         for (int j = 0; j < QK_MXFP4/2; ++j) {
-            qs_dst[j] = __nv_cvt_float2_to_fp4x2(
-                make_float2(src[j] * inv_d, src[QK_MXFP4/2 + j] * inv_d),
-                __NV_E2M1, cudaRoundNearest);
+            const uint8_t lo = ggml_cuda_float_to_fp4_e2m1(src[j], inv_d);
+            const uint8_t hi = ggml_cuda_float_to_fp4_e2m1(src[QK_MXFP4/2 + j], inv_d);
+            qs_dst[j] = lo | (hi << 4);
         }
     }
 };
+
+// The trait specializations below use NVIDIA CUDA 12.8+ intrinsics (__nv_cvt_float_to_fp4,
+// __nv_cvt_float_to_fp6, __nv_fp8_e4m3, etc.) from cuda_fp4.h / cuda_fp8.h.
+#if CUDART_VERSION >= 12080
 
 // FP6 helpers:
 namespace mxfp_detail {
@@ -272,8 +277,12 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E5M2> {
     }
 };
 
+#endif // CUDART_VERSION >= 12080
+
 // Unified SoA quantization:
 // Shared Hadamard rotation + direct E8M0 scale + type-specific writes.
+// Template: only instantiated for types whose mxfp_traits are available.
+// MXFP4 traits are always available; MXFP8/MXFP6 require CUDART >= 12080.
 template<ggml_type mxfp_type, bool apply_hadamard>
 static __device__ void quantize_f32_mxfp_block_soa(
         const float * __restrict__ x,
@@ -339,6 +348,4 @@ static __device__ void quantize_f32_mxfp_block_soa(
     // Write E8M0 scale byte to SoA E8M0 region.
     *(row_base + blocks_per_row_total * traits::qs_per_block + block_idx) = e_val;
 }
-
-#endif // CUDART_VERSION >= 12080
 
