@@ -328,18 +328,33 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E2M3> {
     static constexpr int e8m0_offset   = 3;    // ceil(log2(7.5)) — max finite FP6 E2M3 value
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
+#if CUDART_VERSION >= 12080
+        const __nv_fp6_storage_t fp6 = __nv_cvt_float_to_fp6(val * inv_scale, __NV_E2M3, cudaRoundNearest);
+        const __half_raw h = __nv_cvt_fp6_to_halfraw(fp6, __NV_E2M3);
+        const float recon = __half2float(*reinterpret_cast<const __half *>(&h)) * scale;
+#else
         const uint8_t fp6 = mxfp_detail::float_to_fp6_e2m3(val * inv_scale);
         const float recon = mxfp_detail::fp6_e2m3_to_float(fp6) * scale;
+#endif
         const float err = val - recon;
         return err * err;
     }
 
     static __device__ __forceinline__ float dequant_elem(uint8_t raw) {
+#if CUDART_VERSION >= 12080
+        const __half_raw h = __nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)raw, __NV_E2M3);
+        return __half2float(*reinterpret_cast<const __half *>(&h));
+#else
         return mxfp_detail::fp6_e2m3_to_float(raw);
+#endif
     }
 
     static __device__ __forceinline__ uint8_t quantize_elem(float val) {
+#if CUDART_VERSION >= 12080
+        return (uint8_t)__nv_cvt_float_to_fp6(val, __NV_E2M3, cudaRoundNearest);
+#else
         return mxfp_detail::float_to_fp6_e2m3(val);
+#endif
     }
 
     static __device__ __forceinline__ void write_qs(
@@ -349,7 +364,11 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E2M3> {
         for (int j = 0; j < 32; j += 4) {
             uint8_t vals[4];
             for (int jj = 0; jj < 4; ++jj) {
+#if CUDART_VERSION >= 12080
+                vals[jj] = (uint8_t)__nv_cvt_float_to_fp6(src[j + jj] * inv_d, __NV_E2M3, cudaRoundNearest);
+#else
                 vals[jj] = mxfp_detail::float_to_fp6_e2m3(src[j + jj] * inv_d);
+#endif
             }
             mxfp_detail::pack_fp6x4(vals, &qs_dst[j * 3 / 4]);
         }
@@ -364,18 +383,33 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E3M2> {
     static constexpr int e8m0_offset   = 5;    // ceil(log2(28.0)) — max finite FP6 E3M2 value
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
+#if CUDART_VERSION >= 12080
+        const __nv_fp6_storage_t fp6 = __nv_cvt_float_to_fp6(val * inv_scale, __NV_E3M2, cudaRoundNearest);
+        const __half_raw h = __nv_cvt_fp6_to_halfraw(fp6, __NV_E3M2);
+        const float recon = __half2float(*reinterpret_cast<const __half *>(&h)) * scale;
+#else
         const uint8_t fp6 = mxfp_detail::float_to_fp6_e3m2(val * inv_scale);
         const float recon = mxfp_detail::fp6_e3m2_to_float(fp6) * scale;
+#endif
         const float err = val - recon;
         return err * err;
     }
 
     static __device__ __forceinline__ float dequant_elem(uint8_t raw) {
+#if CUDART_VERSION >= 12080
+        const __half_raw h = __nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)raw, __NV_E3M2);
+        return __half2float(*reinterpret_cast<const __half *>(&h));
+#else
         return mxfp_detail::fp6_e3m2_to_float(raw);
+#endif
     }
 
     static __device__ __forceinline__ uint8_t quantize_elem(float val) {
+#if CUDART_VERSION >= 12080
+        return (uint8_t)__nv_cvt_float_to_fp6(val, __NV_E3M2, cudaRoundNearest);
+#else
         return mxfp_detail::float_to_fp6_e3m2(val);
+#endif
     }
 
     static __device__ __forceinline__ void write_qs(
@@ -385,7 +419,11 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E3M2> {
         for (int j = 0; j < 32; j += 4) {
             uint8_t vals[4];
             for (int jj = 0; jj < 4; ++jj) {
+#if CUDART_VERSION >= 12080
+                vals[jj] = (uint8_t)__nv_cvt_float_to_fp6(src[j + jj] * inv_d, __NV_E3M2, cudaRoundNearest);
+#else
                 vals[jj] = mxfp_detail::float_to_fp6_e3m2(src[j + jj] * inv_d);
+#endif
             }
             mxfp_detail::pack_fp6x4(vals, &qs_dst[j * 3 / 4]);
         }
@@ -400,18 +438,33 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E4M3> {
     static constexpr int e8m0_offset   = 8;    // ceil(log2(448)) — max finite FP8 E4M3 value
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
+#if CUDART_VERSION >= 12050
+        const uint8_t fp8 = __nv_cvt_float_to_fp8(val * inv_scale, __NV_SATFINITE, __NV_E4M3);
+        const __nv_fp8_e4m3 fp8_val = *reinterpret_cast<const __nv_fp8_e4m3 *>(&fp8);
+        const float recon = float(fp8_val) * scale;
+#else
         const uint8_t fp8 = mxfp_detail::float_to_fp8_e4m3(val * inv_scale);
         const float recon = mxfp_detail::fp8_e4m3_to_float(fp8) * scale;
+#endif
         const float err = val - recon;
         return err * err;
     }
 
     static __device__ __forceinline__ float dequant_elem(uint8_t raw) {
+#if CUDART_VERSION >= 12050
+        const __nv_fp8_e4m3 v = *reinterpret_cast<const __nv_fp8_e4m3 *>(&raw);
+        return float(v);
+#else
         return mxfp_detail::fp8_e4m3_to_float(raw);
+#endif
     }
 
     static __device__ __forceinline__ uint8_t quantize_elem(float val) {
+#if CUDART_VERSION >= 12050
+        return __nv_cvt_float_to_fp8(val, __NV_SATFINITE, __NV_E4M3);
+#else
         return mxfp_detail::float_to_fp8_e4m3(val);
+#endif
     }
 
     static __device__ __forceinline__ void write_qs(
@@ -419,7 +472,11 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E4M3> {
             int block_idx, int /*blocks_per_row_total*/, float inv_d) {
         uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * qs_per_block);
         for (int j = 0; j < 32; ++j) {
+#if CUDART_VERSION >= 12050
+            qs_dst[j] = __nv_cvt_float_to_fp8(src[j] * inv_d, __NV_SATFINITE, __NV_E4M3);
+#else
             qs_dst[j] = mxfp_detail::float_to_fp8_e4m3(src[j] * inv_d);
+#endif
         }
     }
 };
@@ -432,18 +489,33 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E5M2> {
     static constexpr int e8m0_offset   = 16;   // ceil(log2(57344)) — max finite FP8 E5M2 value
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
+#if CUDART_VERSION >= 12050
+        const uint8_t fp8 = __nv_cvt_float_to_fp8(val * inv_scale, __NV_SATFINITE, __NV_E5M2);
+        const __nv_fp8_e5m2 fp8_val = *reinterpret_cast<const __nv_fp8_e5m2 *>(&fp8);
+        const float recon = float(fp8_val) * scale;
+#else
         const uint8_t fp8 = mxfp_detail::float_to_fp8_e5m2(val * inv_scale);
         const float recon = mxfp_detail::fp8_e5m2_to_float(fp8) * scale;
+#endif
         const float err = val - recon;
         return err * err;
     }
 
     static __device__ __forceinline__ float dequant_elem(uint8_t raw) {
+#if CUDART_VERSION >= 12050
+        const __nv_fp8_e5m2 v = *reinterpret_cast<const __nv_fp8_e5m2 *>(&raw);
+        return float(v);
+#else
         return mxfp_detail::fp8_e5m2_to_float(raw);
+#endif
     }
 
     static __device__ __forceinline__ uint8_t quantize_elem(float val) {
+#if CUDART_VERSION >= 12050
+        return __nv_cvt_float_to_fp8(val, __NV_SATFINITE, __NV_E5M2);
+#else
         return mxfp_detail::float_to_fp8_e5m2(val);
+#endif
     }
 
     static __device__ __forceinline__ void write_qs(
@@ -451,7 +523,11 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E5M2> {
             int block_idx, int /*blocks_per_row_total*/, float inv_d) {
         uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * qs_per_block);
         for (int j = 0; j < 32; ++j) {
+#if CUDART_VERSION >= 12050
+            qs_dst[j] = __nv_cvt_float_to_fp8(src[j] * inv_d, __NV_SATFINITE, __NV_E5M2);
+#else
             qs_dst[j] = mxfp_detail::float_to_fp8_e5m2(src[j] * inv_d);
+#endif
         }
     }
 };
@@ -485,7 +561,7 @@ static __device__ void quantize_f32_mxfp_block_soa(
 
     uint8_t e_val = 0;
     float inv_d = 0.0f;
-    if (amax != 0.0f) {
+    if (amax != 0.0f && isfinite(amax)) {
         // Base estimate via integer bit extraction (no SFU).
         uint32_t amax_bits;
         memcpy(&amax_bits, &amax, sizeof(uint32_t));

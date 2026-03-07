@@ -4735,6 +4735,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     }
                 }
 #endif // GGML_USE_MUSA
+                // MXFP8 and MXFP6 types only support flash attention, not mul_mat
+                if (a->type == GGML_TYPE_MXFP8_E4M3 ||
+                    a->type == GGML_TYPE_MXFP8_E5M2 ||
+                    a->type == GGML_TYPE_MXFP6_E2M3 ||
+                    a->type == GGML_TYPE_MXFP6_E3M2) {
+                    return false;
+                }
+                // MXFP4 MUL_MAT only supported via MMVQ (batch ≤ 8) to avoid
+                // CUDA graph dispatch issues when crossing the MMVQ/MMQ boundary
+                if (a->type == GGML_TYPE_MXFP4_E2M1 && op->ne[1] > MMVQ_MAX_BATCH_SIZE) {
+                    return false;
+                }
                 switch (a->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
@@ -4744,12 +4756,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_MXFP4_E2M1:
-                    case GGML_TYPE_MXFP8_E4M3:
-                    case GGML_TYPE_MXFP6_E2M3:
-#ifdef GGML_CUDA_MXFP_ALL_VARIANTS
-                    case GGML_TYPE_MXFP6_E3M2:
-                    case GGML_TYPE_MXFP8_E5M2:
-#endif // GGML_CUDA_MXFP_ALL_VARIANTS
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:

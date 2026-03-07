@@ -509,25 +509,46 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
-    // MXFP VEC: portable IEEE bit manipulation, works on all backends (CUDA, HIP, MUSA).
-    // On non-Blackwell this is the only flash attention path for MXFP types.
-    if (ggml_is_type_mxfp_enabled(K->type) && can_use_vector_kernel) {
-        return BEST_FATTN_KERNEL_VEC;
-    }
-
-#if CUDART_VERSION >= 12080
-    // Unified MXFP flash attention (Blackwell MMA for FP4/FP6/FP8):
-    if (blackwell_mma_available(cc)) {
-        const bool is_mxfp = ggml_is_type_mxfp_enabled(K->type);
-        const int64_t D = K->ne[0];
-        if (is_mxfp && (D == 64 || D == 128 || D == 256 || D == 576)) {
-            if (can_use_vector_kernel && Q->ne[1] <= 2) {
-                return BEST_FATTN_KERNEL_VEC;
-            }
-            return BEST_FATTN_KERNEL_MMA_MXFP;
+    // MXFP flash attention dispatch.
+    // Both VEC and MMA kernels expect a flat multi-head SoA layout where all heads' blocks
+    // are packed into each row (matching the real KV cache allocation in llama_kv_cache).
+    // Reject if the layout doesn't match (e.g. test tensors with per-head strides) or
+    // row strides aren't 16-byte aligned (required by cp.async in the MMA kernel).
+    if (ggml_is_type_mxfp_enabled(K->type)) {
+        auto mxfp_layout_ok = [](const ggml_tensor * t, int64_t head_size) -> bool {
+            const size_t ts = ggml_type_size(t->type);
+            const int64_t blocks_per_head = head_size / ggml_blck_size(t->type);
+            const int64_t blocks_needed   = blocks_per_head * t->ne[2];
+            return t->nb[1] % ts == 0
+                && (int64_t)(t->nb[1] / ts) >= blocks_needed
+                && t->nb[1] % 16 == 0;
+        };
+        if (!mxfp_layout_ok(K, K->ne[0]) || !mxfp_layout_ok(V, V->ne[0])) {
+            return BEST_FATTN_KERNEL_NONE;
         }
-    }
+
+        // MMA for prompt processing (large batches): dequantizes K/V once per batch,
+        // much faster than VEC which dequantizes once per query token.
+        // VEC for token generation (small batches): distributed dequant hidden by memory latency.
+#if CUDART_VERSION >= 12080
+        if (blackwell_mma_available(cc)) {
+            const int64_t D = K->ne[0];
+            if (D == 64 || D == 128 || D == 256 || D == 576) {
+                if (can_use_vector_kernel && Q->ne[1] <= 2) {
+                    return BEST_FATTN_KERNEL_VEC;
+                }
+                return BEST_FATTN_KERNEL_MMA_MXFP;
+            }
+        }
 #endif // CUDART_VERSION >= 12080
+
+        // Non-Blackwell or unsupported D: VEC if available, else nothing.
+        if (can_use_vector_kernel) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+
+        return BEST_FATTN_KERNEL_NONE;
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
