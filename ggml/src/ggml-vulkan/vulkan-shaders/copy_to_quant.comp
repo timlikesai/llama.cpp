@@ -569,7 +569,9 @@ uint float_to_fp6_e3m2(float x) {
     uint bits = floatBitsToUint(x);
     int f32_exp = int((bits >> 23) & 0xFFu) - 127;
 
-    if (f32_exp < 0) {
+    // E3M2 bias=3: subnormal when biased_exp = f32_exp+3 <= 0, i.e. f32_exp <= -3.
+    // (E2M3 uses f32_exp < 0 because its bias=1; do NOT copy that threshold here.)
+    if (f32_exp < -2) {
         // Subnormal range (no implicit 1 bit)
         uint mant = uint(x * 16.0 + 0.5);
         if (mant > 3u) return sign | 0x04u;

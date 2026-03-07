@@ -33,6 +33,8 @@ MODELS_BASE="$HOME/.lmstudio/models"
 MODELS=(
     "qwen3-coder|${MODELS_BASE}/spectralyst/Qwen3-Coder-30B-A3B-Instruct-MXFP4_MOE-GGUF/Qwen3-Coder-30B-A3B-Instruct-MXFP4_MOE.gguf"
     "glm-4.7-flash|${MODELS_BASE}/noctrex/GLM-4.7-Flash-MXFP4_MOE-GGUF/GLM-4.7-Flash-MXFP4_MOE.gguf"
+    "gemma-3n|${MODELS_BASE}/unsloth/gemma-3n-E4B-it-GGUF/gemma-3n-E4B-it-Q8_0.gguf"
+    "gemma-3n-text-q8|${MODELS_BASE}/lmstudio-community/gemma-3n-E4B-it-text-GGUF/gemma-3n-E4B-it-Q8_0.gguf"
 )
 DEFAULT_MODEL="qwen3-coder"
 
@@ -71,6 +73,7 @@ CONFIGS=(
 )
 MODEL_INPUTS=()
 _config_overridden=false
+DEVICE=""
 
 # ── Argument Parsing ─────────────────────────────────────────────────────────
 
@@ -94,16 +97,20 @@ while [[ $# -gt 0 ]]; do
             ;;
         --config)
             if [[ "$_config_overridden" != "true" ]]; then
-                CONFIGS=("f16")
+                CONFIGS=()
                 _config_overridden=true
             fi
             case "$2" in
-                f16)   ;;
+                f16)   CONFIGS+=("f16") ;;
                 mxfp)  CONFIGS+=("mxfp8" "mxfp8_e5m2" "mxfp6" "mxfp6_e3m2" "mxfp4") ;;
                 mxfp8) CONFIGS+=("mxfp8" "mxfp8_e5m2") ;;
                 mxfp6) CONFIGS+=("mxfp6" "mxfp6_e3m2") ;;
                 *)     CONFIGS+=("$2") ;;
             esac
+            shift 2
+            ;;
+        --device)
+            DEVICE="$2"
             shift 2
             ;;
         --model)
@@ -121,6 +128,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-bench        Skip throughput benchmarks (pp512 + tg128)"
             echo "  --chunks N[,M]      Chunk counts for perplexity (default: 16)"
             echo "  --config NAME       Config to test (repeatable). Groups: mxfp, mxfp8, mxfp6"
+            echo "  --device DEV        Vulkan device (e.g. 'Vulkan0', 'Vulkan1')"
             echo "  --model NAME|PATH   Model preset or path (default: $DEFAULT_MODEL)"
             echo "  --help              Show this help"
             echo ""
@@ -282,7 +290,11 @@ echo "  Backend: Vulkan | $(timestamp)"
 echo "════════════════════════════════════════════════════════════════════════"
 echo ""
 
-RESULTS_DIR="$SCRIPT_DIR/test-results/kv-bench-vulkan-${MODEL_NAME}-$(date +%Y%m%d-%H%M%S)"
+DEVICE_TAG=""
+if [[ -n "$DEVICE" ]]; then
+    DEVICE_TAG="-$(echo "$DEVICE" | tr '[:upper:]' '[:lower:]')"
+fi
+RESULTS_DIR="$SCRIPT_DIR/test-results/kv-bench-vulkan${DEVICE_TAG}-${MODEL_NAME}-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RESULTS_DIR"
 
 # ── Result Storage (reset per model) ────────────────────────────────────
@@ -317,6 +329,7 @@ for config in "${CONFIGS[@]}"; do
                 --chunks "$chunks" \
                 --flash-attn 1 \
                 --gpu-layers 99 \
+                ${DEVICE:+--device "$DEVICE"} \
                 $(cache_flags_perplexity) \
                 > "$local_log" 2>&1; then
                 echo "ERROR: Perplexity failed for ${config}. Log:"
@@ -352,6 +365,7 @@ for config in "${CONFIGS[@]}"; do
             -m "$MODEL_PATH" \
             -fa 1 \
             -ngl 999 \
+            ${DEVICE:+-dev "$DEVICE"} \
             -p 512 \
             -n 128 \
             -o jsonl \

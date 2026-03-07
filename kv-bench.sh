@@ -124,13 +124,12 @@ while [[ $# -gt 0 ]]; do
             ;;
         --config)
             # First --config replaces defaults; subsequent ones accumulate.
-            # f16 is always included as the baseline for Δ F16 column.
             if [[ "$_config_overridden" != "true" ]]; then
-                CONFIGS=("f16")
+                CONFIGS=()
                 _config_overridden=true
             fi
             case "$2" in
-                f16)   ;;  # already included
+                f16)   CONFIGS+=("f16") ;;
                 mxfp)  CONFIGS+=("mxfp8" "mxfp8_e5m2" "mxfp6" "mxfp6_e3m2" "mxfp4") ;;
                 mxfp8) CONFIGS+=("mxfp8" "mxfp8_e5m2") ;;
                 mxfp6) CONFIGS+=("mxfp6" "mxfp6_e3m2") ;;
