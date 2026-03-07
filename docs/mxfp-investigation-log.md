@@ -172,3 +172,35 @@ accept the non-flash fallback penalty.
 
 **Future Fix**: Add V-type specialization constants to Vulkan MXFP flash attention shaders,
 or generate multiple shader variants. Medium complexity.
+
+
+## Issue 8: Vulkan MXFP tg128 Performance Gap (21%)
+
+**Status**: INVESTIGATED — Architectural Limitation
+
+**Symptom**: All MXFP types show ~21% tg128 regression vs f16 on Vulkan (148 vs 189 t/s).
+On CUDA, the same gap is only 2.5% (184 vs 189 t/s).
+
+**Root Cause**: Vulkan has no hardware MXFP support. CUDA Blackwell has `mma.mxf4` and
+FP8/FP6 hardware intrinsics that convert in silicon. Vulkan must do all dequant in software
+via SPIR-V bit manipulation (~10 instructions per 4 elements vs 1 for f16 vec4 load).
+
+**Evidence**: ALL MXFP types cluster at identical ~148 t/s regardless of dequant complexity:
+- FP4 (simplest), FP6 E2M3, FP6 E3M2, FP8 E4M3, FP8 E5M2 — all ~148 t/s
+- This proves the bottleneck is common block-access overhead, not per-element conversion
+
+**Optimizations Attempted** (commit 17455822a):
+1. LUT → arithmetic dequant (MXFP4): +0.8% (noise)
+2. Branchless dequant (all types): 0%
+3. Disable SHMEM_STAGING at Br=1: 0%
+
+**Bug Fixed**: E4M3 NaN check was incorrect for MX format. MX E4M3 has no NaN — exp=15
+mant=7 = ±480, not NaN. The old code returned NaN for valid max-range values.
+
+**pp512 gap is only ~5%** (5,300 vs 5,500 t/s) because prompt processing amortizes dequant
+across many query rows per tile (Br >> 1).
+
+**Lesson**: When Vulkan lacks hardware support for a quantization format, software dequant
+overhead per KV position is irreducible. The gap is proportional to the ratio of dequant
+instructions to total work per position. At batch=1 (tg), dequant dominates. At batch>>1
+(pp), dot product work dominates and dequant is amortized.

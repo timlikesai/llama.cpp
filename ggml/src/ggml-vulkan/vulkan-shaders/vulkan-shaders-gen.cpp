@@ -663,6 +663,21 @@ void process_shaders() {
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn_cm2.comp",
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"DEQUANTFUNC", "dequantFunc"+to_uppercase(tname) }, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }}), fp16, false, true, f16acc);
                 }
+                // Hardware float8 variants (cm2 path)
+#if defined(GGML_VULKAN_FLOAT8_E4M3_GLSLC_SUPPORT)
+                if (tname == "mxfp8_e4m3") {
+                    std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+                    string_to_spv("flash_attn_f32_f16_" + tname + "_f8hw", "flash_attn_cm2.comp",
+                        merge_maps(fa_base_dict, {{data_a_key, "1"}, {"HAS_FLOAT8_E4M3_HW", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"DEQUANTFUNC", "dequantFunc"+to_uppercase(tname) }, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }}), fp16, false, true, f16acc);
+                }
+#endif
+#if defined(GGML_VULKAN_FLOAT8_E5M2_GLSLC_SUPPORT)
+                if (tname == "mxfp8_e5m2") {
+                    std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+                    string_to_spv("flash_attn_f32_f16_" + tname + "_f8hw", "flash_attn_cm2.comp",
+                        merge_maps(fa_base_dict, {{data_a_key, "1"}, {"HAS_FLOAT8_E5M2_HW", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"DEQUANTFUNC", "dequantFunc"+to_uppercase(tname) }, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }}), fp16, false, true, f16acc);
+                }
+#endif
 #endif
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
                 if (tname == "f16") {
@@ -675,6 +690,21 @@ void process_shaders() {
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn_cm1.comp",
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname)}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
                 }
+                // Hardware float8 variants (cm1 path)
+#if defined(GGML_VULKAN_FLOAT8_E4M3_GLSLC_SUPPORT)
+                if (tname == "mxfp8_e4m3") {
+                    std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+                    string_to_spv("flash_attn_f32_f16_" + tname + "_f8hw", "flash_attn_cm1.comp",
+                        merge_maps(fa_base_dict, {{data_a_key, "1"}, {"HAS_FLOAT8_E4M3_HW", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname)}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
+                }
+#endif
+#if defined(GGML_VULKAN_FLOAT8_E5M2_GLSLC_SUPPORT)
+                if (tname == "mxfp8_e5m2") {
+                    std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+                    string_to_spv("flash_attn_f32_f16_" + tname + "_f8hw", "flash_attn_cm1.comp",
+                        merge_maps(fa_base_dict, {{data_a_key, "1"}, {"HAS_FLOAT8_E5M2_HW", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname)}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
+                }
+#endif
 #endif
                 }
 
@@ -688,6 +718,22 @@ void process_shaders() {
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn.comp",
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }}), fp16, false, false, f16acc);
                 }
+
+                // Hardware float8 variants for FP8 types (scalar path)
+#if defined(GGML_VULKAN_FLOAT8_E4M3_GLSLC_SUPPORT)
+                if (tname == "mxfp8_e4m3") {
+                    std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+                    string_to_spv("flash_attn_f32_f16_" + tname + "_f8hw", "flash_attn.comp",
+                        merge_maps(fa_base_dict, {{data_a_key, "1"}, {"HAS_FLOAT8_E4M3_HW", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }}), fp16, false, false, f16acc);
+                }
+#endif
+#if defined(GGML_VULKAN_FLOAT8_E5M2_GLSLC_SUPPORT)
+                if (tname == "mxfp8_e5m2") {
+                    std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+                    string_to_spv("flash_attn_f32_f16_" + tname + "_f8hw", "flash_attn.comp",
+                        merge_maps(fa_base_dict, {{data_a_key, "1"}, {"HAS_FLOAT8_E5M2_HW", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }}), fp16, false, false, f16acc);
+                }
+#endif
             }
 
             // Mixed K/V pipelines: K=mxfp8/mxfp6, V=mxfp4
@@ -712,6 +758,33 @@ void process_shaders() {
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"DATA_V_MXFP4", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"DEQUANTFUNC", "dequantFunc"+to_uppercase(k_tname) }, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(k_tname) }}), fp16, false, true, f16acc);
                 }
 #endif
+
+                // Hardware float8 variants for mixed K/V (K=mxfp8, V=mxfp4)
+                std::string f8hw_define;
+#if defined(GGML_VULKAN_FLOAT8_E4M3_GLSLC_SUPPORT)
+                if (k_tname == "mxfp8_e4m3") f8hw_define = "HAS_FLOAT8_E4M3_HW";
+#endif
+#if defined(GGML_VULKAN_FLOAT8_E5M2_GLSLC_SUPPORT)
+                if (k_tname == "mxfp8_e5m2") f8hw_define = "HAS_FLOAT8_E5M2_HW";
+#endif
+                if (!f8hw_define.empty()) {
+                    std::string hw_pipeline_name = k_tname + "_f8hw_v_mxfp4";
+                    // Scalar path
+                    string_to_spv("flash_attn_f32_f16_" + hw_pipeline_name, "flash_attn.comp",
+                        merge_maps(fa_base_dict, {{data_a_key, "1"}, {f8hw_define, "1"}, {"DATA_V_MXFP4", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(k_tname) }}), fp16, false, false, f16acc);
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+                    // cm1 path
+                    string_to_spv("flash_attn_f32_f16_" + hw_pipeline_name, "flash_attn_cm1.comp",
+                        merge_maps(fa_base_dict, {{data_a_key, "1"}, {f8hw_define, "1"}, {"DATA_V_MXFP4", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(k_tname)}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
+#endif
+#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+                    if (fp16) {
+                        // cm2 path
+                        string_to_spv("flash_attn_f32_f16_" + hw_pipeline_name, "flash_attn_cm2.comp",
+                            merge_maps(fa_base_dict, {{data_a_key, "1"}, {f8hw_define, "1"}, {"DATA_V_MXFP4", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"DEQUANTFUNC", "dequantFunc"+to_uppercase(k_tname) }, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(k_tname) }}), fp16, false, true, f16acc);
+                    }
+#endif
+                }
             }
         }
     }

@@ -1788,6 +1788,13 @@ void init_iq_shmem(uvec3 wgsize)
 // MX E4M3 has NO NaN — all 256 bit patterns are valid numbers.
 // exp=15 mant=7 = ±448 (not NaN as in NVIDIA's non-MX E4M3).
 #if defined(DATA_A_MXFP8_E4M3)
+#if defined(HAS_FLOAT8_E4M3_HW)
+#extension GL_EXT_float_e4m3 : require
+float fp8_e4m3_to_float(uint v) {
+    floate4m3_t f8 = uintBitsToFloate4m3EXT(uint8_t(v));
+    return float(f8);
+}
+#else
 float fp8_e4m3_to_float(uint v) {
     uint sign = (v & 0x80u) << 24;
     uint exp  = (v >> 3) & 0xFu;
@@ -1799,10 +1806,18 @@ float fp8_e4m3_to_float(uint v) {
     return uintBitsToFloat(floatBitsToUint(abs_result) | sign);
 }
 #endif
+#endif
 
 // FP8 E5M2 dequantization: 1 sign, 5 exponent (bias 15), 2 mantissa
 // In MX context, NaN/Inf never appear in KV cache data (quantized from valid floats).
 #if defined(DATA_A_MXFP8_E5M2)
+#if defined(HAS_FLOAT8_E5M2_HW)
+#extension GL_EXT_float_e5m2 : require
+float fp8_e5m2_to_float(uint v) {
+    floate5m2_t f8 = uintBitsToFloate5m2EXT(uint8_t(v));
+    return float(f8);
+}
+#else
 float fp8_e5m2_to_float(uint v) {
     uint sign = (v & 0x80u) << 24;
     uint exp  = (v >> 2) & 0x1Fu;
@@ -1813,6 +1828,7 @@ float fp8_e5m2_to_float(uint v) {
     float abs_result = (exp == 0u) ? (float(mant) * (1.0 / 65536.0)) : normal_val;
     return uintBitsToFloat(floatBitsToUint(abs_result) | sign);
 }
+#endif
 #endif
 
 // FP6 E2M3 dequantization: 1 sign, 2 exponent (bias 1), 3 mantissa
@@ -1876,16 +1892,7 @@ vec4 bf16_to_fp32(uvec4 u)
 }
 
 float e8m0_to_fp32(uint8_t x) {
-    uint32_t bits;
-
-    if (x == 0) {
-        bits = 0x00400000;
-    } else {
-        bits = x;
-        bits = bits << 23;
-    }
-
-    return uintBitsToFloat(bits);
+    return uintBitsToFloat(x == uint8_t(0) ? 0x00400000u : (uint(x) << 23));
 }
 
 #if BDA

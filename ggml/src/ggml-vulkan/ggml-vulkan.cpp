@@ -626,6 +626,7 @@ struct vk_device_struct {
     bool shader_64b_indexing;
 
     bool integer_dot_product;
+    bool shader_float8;
     // 0: default, 1: force mmvq, -1: disable mmvq
     int32_t mmvq_mode;
 
@@ -3452,13 +3453,41 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_SCALAR, )
         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_SCALAR, )
         CREATE_FA(GGML_TYPE_MXFP4_E2M1, mxfp4, FA_SCALAR, )
-        CREATE_FA(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3, FA_SCALAR, )
-        CREATE_FA(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2, FA_SCALAR, )
+#if defined(GGML_VULKAN_FLOAT8_E4M3_GLSLC_SUPPORT)
+        if (device->shader_float8) {
+            CREATE_FA(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_f8hw, FA_SCALAR, )
+        } else
+#endif
+        {
+            CREATE_FA(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3, FA_SCALAR, )
+        }
+#if defined(GGML_VULKAN_FLOAT8_E5M2_GLSLC_SUPPORT)
+        if (device->shader_float8) {
+            CREATE_FA(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_f8hw, FA_SCALAR, )
+        } else
+#endif
+        {
+            CREATE_FA(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2, FA_SCALAR, )
+        }
         CREATE_FA(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3, FA_SCALAR, )
         CREATE_FA(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2, FA_SCALAR, )
         // Mixed K/V: K=mxfp8/mxfp6, V=mxfp4
-        CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_v_mxfp4, FA_SCALAR, )
-        CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_v_mxfp4, FA_SCALAR, )
+#if defined(GGML_VULKAN_FLOAT8_E4M3_GLSLC_SUPPORT)
+        if (device->shader_float8) {
+            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_f8hw_v_mxfp4, FA_SCALAR, )
+        } else
+#endif
+        {
+            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_v_mxfp4, FA_SCALAR, )
+        }
+#if defined(GGML_VULKAN_FLOAT8_E5M2_GLSLC_SUPPORT)
+        if (device->shader_float8) {
+            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_f8hw_v_mxfp4, FA_SCALAR, )
+        } else
+#endif
+        {
+            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_v_mxfp4, FA_SCALAR, )
+        }
         CREATE_FA_V_MXFP4(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3_v_mxfp4, FA_SCALAR, )
         CREATE_FA_V_MXFP4(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2_v_mxfp4, FA_SCALAR, )
     } else {
@@ -3467,13 +3496,41 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_MXFP4_E2M1, mxfp4, FA_SCALAR, _fp32)
-        CREATE_FA(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3, FA_SCALAR, _fp32)
-        CREATE_FA(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2, FA_SCALAR, _fp32)
+#if defined(GGML_VULKAN_FLOAT8_E4M3_GLSLC_SUPPORT)
+        if (device->shader_float8) {
+            CREATE_FA(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_f8hw, FA_SCALAR, _fp32)
+        } else
+#endif
+        {
+            CREATE_FA(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3, FA_SCALAR, _fp32)
+        }
+#if defined(GGML_VULKAN_FLOAT8_E5M2_GLSLC_SUPPORT)
+        if (device->shader_float8) {
+            CREATE_FA(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_f8hw, FA_SCALAR, _fp32)
+        } else
+#endif
+        {
+            CREATE_FA(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2, FA_SCALAR, _fp32)
+        }
         CREATE_FA(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2, FA_SCALAR, _fp32)
         // Mixed K/V: K=mxfp8/mxfp6, V=mxfp4
-        CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_v_mxfp4, FA_SCALAR, _fp32)
-        CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_v_mxfp4, FA_SCALAR, _fp32)
+#if defined(GGML_VULKAN_FLOAT8_E4M3_GLSLC_SUPPORT)
+        if (device->shader_float8) {
+            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_f8hw_v_mxfp4, FA_SCALAR, _fp32)
+        } else
+#endif
+        {
+            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_v_mxfp4, FA_SCALAR, _fp32)
+        }
+#if defined(GGML_VULKAN_FLOAT8_E5M2_GLSLC_SUPPORT)
+        if (device->shader_float8) {
+            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_f8hw_v_mxfp4, FA_SCALAR, _fp32)
+        } else
+#endif
+        {
+            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_v_mxfp4, FA_SCALAR, _fp32)
+        }
         CREATE_FA_V_MXFP4(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3_v_mxfp4, FA_SCALAR, _fp32)
         CREATE_FA_V_MXFP4(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2_v_mxfp4, FA_SCALAR, _fp32)
     }
@@ -3484,13 +3541,41 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_COOPMAT1, _cm1)
         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_COOPMAT1, _cm1)
         CREATE_FA(GGML_TYPE_MXFP4_E2M1, mxfp4, FA_COOPMAT1, _cm1)
-        CREATE_FA(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3, FA_COOPMAT1, _cm1)
-        CREATE_FA(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2, FA_COOPMAT1, _cm1)
+#if defined(GGML_VULKAN_FLOAT8_E4M3_GLSLC_SUPPORT)
+        if (device->shader_float8) {
+            CREATE_FA(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_f8hw, FA_COOPMAT1, _cm1)
+        } else
+#endif
+        {
+            CREATE_FA(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3, FA_COOPMAT1, _cm1)
+        }
+#if defined(GGML_VULKAN_FLOAT8_E5M2_GLSLC_SUPPORT)
+        if (device->shader_float8) {
+            CREATE_FA(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_f8hw, FA_COOPMAT1, _cm1)
+        } else
+#endif
+        {
+            CREATE_FA(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2, FA_COOPMAT1, _cm1)
+        }
         CREATE_FA(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3, FA_COOPMAT1, _cm1)
         CREATE_FA(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2, FA_COOPMAT1, _cm1)
         // Mixed K/V: K=mxfp8/mxfp6, V=mxfp4
-        CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_v_mxfp4, FA_COOPMAT1, _cm1)
-        CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_v_mxfp4, FA_COOPMAT1, _cm1)
+#if defined(GGML_VULKAN_FLOAT8_E4M3_GLSLC_SUPPORT)
+        if (device->shader_float8) {
+            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_f8hw_v_mxfp4, FA_COOPMAT1, _cm1)
+        } else
+#endif
+        {
+            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_v_mxfp4, FA_COOPMAT1, _cm1)
+        }
+#if defined(GGML_VULKAN_FLOAT8_E5M2_GLSLC_SUPPORT)
+        if (device->shader_float8) {
+            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_f8hw_v_mxfp4, FA_COOPMAT1, _cm1)
+        } else
+#endif
+        {
+            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_v_mxfp4, FA_COOPMAT1, _cm1)
+        }
         CREATE_FA_V_MXFP4(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3_v_mxfp4, FA_COOPMAT1, _cm1)
         CREATE_FA_V_MXFP4(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2_v_mxfp4, FA_COOPMAT1, _cm1)
     }
@@ -3506,13 +3591,41 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_COOPMAT2, _cm2)
         CREATE_FA(GGML_TYPE_IQ4_NL, iq4_nl, FA_COOPMAT2, _cm2)
         CREATE_FA(GGML_TYPE_MXFP4_E2M1, mxfp4, FA_COOPMAT2, _cm2)
-        CREATE_FA(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3, FA_COOPMAT2, _cm2)
-        CREATE_FA(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2, FA_COOPMAT2, _cm2)
+#if defined(GGML_VULKAN_FLOAT8_E4M3_GLSLC_SUPPORT)
+        if (device->shader_float8) {
+            CREATE_FA(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_f8hw, FA_COOPMAT2, _cm2)
+        } else
+#endif
+        {
+            CREATE_FA(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3, FA_COOPMAT2, _cm2)
+        }
+#if defined(GGML_VULKAN_FLOAT8_E5M2_GLSLC_SUPPORT)
+        if (device->shader_float8) {
+            CREATE_FA(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_f8hw, FA_COOPMAT2, _cm2)
+        } else
+#endif
+        {
+            CREATE_FA(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2, FA_COOPMAT2, _cm2)
+        }
         CREATE_FA(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3, FA_COOPMAT2, _cm2)
         CREATE_FA(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2, FA_COOPMAT2, _cm2)
         // Mixed K/V: K=mxfp8/mxfp6, V=mxfp4
-        CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_v_mxfp4, FA_COOPMAT2, _cm2)
-        CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_v_mxfp4, FA_COOPMAT2, _cm2)
+#if defined(GGML_VULKAN_FLOAT8_E4M3_GLSLC_SUPPORT)
+        if (device->shader_float8) {
+            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_f8hw_v_mxfp4, FA_COOPMAT2, _cm2)
+        } else
+#endif
+        {
+            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E4M3, mxfp8_e4m3_v_mxfp4, FA_COOPMAT2, _cm2)
+        }
+#if defined(GGML_VULKAN_FLOAT8_E5M2_GLSLC_SUPPORT)
+        if (device->shader_float8) {
+            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_f8hw_v_mxfp4, FA_COOPMAT2, _cm2)
+        } else
+#endif
+        {
+            CREATE_FA_V_MXFP4(GGML_TYPE_MXFP8_E5M2, mxfp8_e5m2_v_mxfp4, FA_COOPMAT2, _cm2)
+        }
         CREATE_FA_V_MXFP4(GGML_TYPE_MXFP6_E2M3, mxfp6_e2m3_v_mxfp4, FA_COOPMAT2, _cm2)
         CREATE_FA_V_MXFP4(GGML_TYPE_MXFP6_E3M2, mxfp6_e3m2_v_mxfp4, FA_COOPMAT2, _cm2)
     }
@@ -4847,7 +4960,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->coopmat_support = false;
         device->integer_dot_product = false;
         device->shader_64b_indexing = false;
+        device->shader_float8 = false;
         bool bfloat16_support = false;
+        bool float8_support = false;
 
         for (const auto& properties : ext_props) {
             if (strcmp("VK_KHR_maintenance4", properties.extensionName) == 0) {
@@ -4886,6 +5001,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
             } else if (strcmp("VK_KHR_shader_bfloat16", properties.extensionName) == 0 &&
                        !getenv("GGML_VK_DISABLE_BFLOAT16")) {
                 bfloat16_support = true;
+#endif
+#if defined(GGML_VULKAN_FLOAT8_E4M3_GLSLC_SUPPORT) || defined(GGML_VULKAN_FLOAT8_E5M2_GLSLC_SUPPORT)
+            } else if (strcmp("VK_EXT_shader_float8", properties.extensionName) == 0 &&
+                       !getenv("GGML_VK_DISABLE_FLOAT8")) {
+                float8_support = true;
 #endif
             } else if (strcmp("VK_KHR_pipeline_executable_properties", properties.extensionName) == 0) {
                 pipeline_executable_properties_support = true;
@@ -5162,6 +5282,17 @@ static vk_device ggml_vk_get_device(size_t idx) {
         }
 #endif
 
+#if defined(VK_EXT_shader_float8)
+        VkPhysicalDeviceShaderFloat8FeaturesEXT float8_features {};
+        float8_features.pNext = nullptr;
+        float8_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT;
+        if (float8_support) {
+            last_struct->pNext = (VkBaseOutStructure *)&float8_features;
+            last_struct = (VkBaseOutStructure *)&float8_features;
+            device_extensions.push_back("VK_EXT_shader_float8");
+        }
+#endif
+
         VkPhysicalDeviceMaintenance4Features maint4_features {};
         maint4_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES;
         if (maintenance4_support) {
@@ -5211,6 +5342,16 @@ static vk_device ggml_vk_get_device(size_t idx) {
 #else
         device->bf16 = false;
 #endif
+
+#if defined(VK_EXT_shader_float8)
+        device->shader_float8 = float8_support && float8_features.shaderFloat8;
+#else
+        device->shader_float8 = false;
+#endif
+
+        if (device->shader_float8) {
+            GGML_LOG_DEBUG("ggml_vulkan: VK_EXT_shader_float8 enabled — hardware FP8 dequant for MXFP8\n");
+        }
 
         device->pipeline_robustness = pl_robustness_features.pipelineRobustness;
 
