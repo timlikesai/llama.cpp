@@ -1146,8 +1146,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 return false;
             }
             if (op->src[1]->type != op->src[2]->type) {
-                // Allow mixed MXFP K/V types (e.g., mxfp8_e4m3 K + mxfp4 V)
-                if (!ggml_is_type_mxfp(op->src[1]->type) || !ggml_is_type_mxfp(op->src[2]->type)) {
+                // Allow mixed MXFP K/V types and q8_0/q4_0 mixed combinations
+                const enum ggml_type kt = op->src[1]->type;
+                const enum ggml_type vt = op->src[2]->type;
+                const bool mxfp_mixed = ggml_is_type_mxfp(kt) && ggml_is_type_mxfp(vt);
+                const bool q_mixed = (kt == GGML_TYPE_Q8_0 || kt == GGML_TYPE_Q4_0) &&
+                                     (vt == GGML_TYPE_Q8_0 || vt == GGML_TYPE_Q4_0);
+                if (!mxfp_mixed && !q_mixed) {
                     return false;
                 }
             }

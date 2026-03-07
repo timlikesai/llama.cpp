@@ -1334,7 +1334,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         default: break;
     }
 
-    // MXFP V type override for mixed K/V (0=matched, 1-5=override V dequant)
+    // V type override for mixed K/V (0=matched, 1-5=MXFP, 6=q4_0, 7=q8_0)
     int32_t mxfp_v_type = 0;
     if (op->src[1]->type != op->src[2]->type) {
         switch (op->src[2]->type) {
@@ -1343,6 +1343,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
             case GGML_TYPE_MXFP8_E5M2: mxfp_v_type = 3; break;
             case GGML_TYPE_MXFP6_E2M3: mxfp_v_type = 4; break;
             case GGML_TYPE_MXFP6_E3M2: mxfp_v_type = 5; break;
+            case GGML_TYPE_Q4_0:       mxfp_v_type = 6; break;
+            case GGML_TYPE_Q8_0:       mxfp_v_type = 7; break;
             default: break;
         }
     }
@@ -1425,7 +1427,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         default: break;
     }
 
-    // MXFP V type override for mixed K/V (0=matched, 1-5=override V dequant)
+    // V type override for mixed K/V (0=matched, 1-5=MXFP, 6=q4_0, 7=q8_0)
     int32_t mxfp_v_type = 0;
     if (op->src[1]->type != op->src[2]->type) {
         switch (op->src[2]->type) {
@@ -1434,6 +1436,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
             case GGML_TYPE_MXFP8_E5M2: mxfp_v_type = 3; break;
             case GGML_TYPE_MXFP6_E2M3: mxfp_v_type = 4; break;
             case GGML_TYPE_MXFP6_E3M2: mxfp_v_type = 5; break;
+            case GGML_TYPE_Q4_0:       mxfp_v_type = 6; break;
+            case GGML_TYPE_Q8_0:       mxfp_v_type = 7; break;
             default: break;
         }
     }
