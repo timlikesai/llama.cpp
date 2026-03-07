@@ -437,23 +437,24 @@ static float mse_error_mxfp4(float val, float inv_scale, float scale) {
     return err * err;
 }
 
-static const mxfp_elem_traits_t mxfp4_traits = { 2, NULL, NULL, mse_error_mxfp4 };
+static const mxfp_elem_traits_t mxfp4_traits = { MXFP4_E2M1_EMAX_OFFSET, NULL, NULL, mse_error_mxfp4 };
 
 // MSE-optimal E8M0 shared exponent computation.
 //
 // Algorithm:
 //   1. Find amax = max(|x[0..qk-1]|)
 //   2. Compute e_base = round(log2(amax)) - emax_offset + 127 via integer bit ops
-//   3. Test {e_base-1, e_base, e_base+1}, pick the one minimizing total round-trip MSE
+//   3. Test {e_base-R .. e_base+R}, pick the one minimizing total round-trip MSE
+//      where R = MXFP_E8M0_MSE_RANGE (defined in ggml-common.h)
 //
-// The ±1 search is our key improvement over the spec's floor(log2(amax)). It costs
-// ~3× more compute per block but is negligible in the quantization pipeline. The
-// quality improvement is significant: floor-only caused massive PPL regression on CPU.
+// The ±R search improves on the OCP spec's floor(log2(amax)). Wider search finds
+// better scales for blocks with non-uniform value distributions (especially FP4).
+// Cost is (2R+1) × qk roundtrip evaluations per block — negligible vs attention compute.
 //
-// Integer log2 computation avoids log2f() (SFU-dependent on GPU, ~4 cycles vs ~1 for ALU).
-// The sqrt(2) rounding threshold ensures we start from round() not floor().
+// Integer log2 avoids log2f() (SFU-dependent on GPU). The sqrt(2) rounding threshold
+// ensures we start from round() not floor().
 //
-// Ref: OCP MX v1.0 §5.3 "Shared Exponent Computation"
+// Ref: OCP MX v1.0 §5.3; Four Over Six (arXiv:2512.02010)
 static inline uint8_t mxfp_compute_e8m0_mse(const float * x, int qk, const mxfp_elem_traits_t * traits) {
     float amax = 0.0f;
     for (int j = 0; j < qk; j++) {
@@ -470,9 +471,9 @@ static inline uint8_t mxfp_compute_e8m0_mse(const float * x, int qk, const mxfp_
     const int round_log2 = floor_log2 + ((amax_bits & 0x7FFFFF) >= 0x3504F3 ? 1 : 0);
     const int e_base = round_log2 - traits->emax_offset + 127;
 
-    // ±1 MSE search: test e_base-1, e_base, e_base+1, pick lowest total MSE.
-    int e_lo = e_base - 1;
-    int e_hi = e_base + 1;
+    // ±R MSE search: test 2R+1 candidates around e_base, pick lowest total MSE.
+    int e_lo = e_base - MXFP_E8M0_MSE_RANGE;
+    int e_hi = e_base + MXFP_E8M0_MSE_RANGE;
     if (e_lo < 1)   e_lo = 1;
     if (e_hi > 255) e_hi = 255;
     int best_e = e_base < 0 ? 0 : (e_base > 255 ? 255 : e_base);
@@ -979,10 +980,10 @@ static float mse_error_fp6_e3m2(float val, float inv_scale, float scale) {
 //   E5M2: max=57344, ceil(log2(57344)) = 16
 //   E2M3: max=7.5, ceil(log2(7.5)) = 3
 //   E3M2: max=28.0, ceil(log2(28.0)) = 5
-static const mxfp_elem_traits_t mxfp8_e4m3_traits = { 8,  float_to_fp8_e4m3_rn, fp8_e4m3_to_float, mse_error_fp8_e4m3 };
-static const mxfp_elem_traits_t mxfp8_e5m2_traits = { 16, float_to_fp8_e5m2_rn, fp8_e5m2_to_float, mse_error_fp8_e5m2 };
-static const mxfp_elem_traits_t mxfp6_e2m3_traits = { 3,  float_to_fp6_e2m3_rn, fp6_e2m3_to_float, mse_error_fp6_e2m3 };
-static const mxfp_elem_traits_t mxfp6_e3m2_traits = { 5,  float_to_fp6_e3m2_rn, fp6_e3m2_to_float, mse_error_fp6_e3m2 };
+static const mxfp_elem_traits_t mxfp8_e4m3_traits = { MXFP8_E4M3_EMAX_OFFSET,  float_to_fp8_e4m3_rn, fp8_e4m3_to_float, mse_error_fp8_e4m3 };
+static const mxfp_elem_traits_t mxfp8_e5m2_traits = { MXFP8_E5M2_EMAX_OFFSET, float_to_fp8_e5m2_rn, fp8_e5m2_to_float, mse_error_fp8_e5m2 };
+static const mxfp_elem_traits_t mxfp6_e2m3_traits = { MXFP6_E2M3_EMAX_OFFSET,  float_to_fp6_e2m3_rn, fp6_e2m3_to_float, mse_error_fp6_e2m3 };
+static const mxfp_elem_traits_t mxfp6_e3m2_traits = { MXFP6_E3M2_EMAX_OFFSET,  float_to_fp6_e3m2_rn, fp6_e3m2_to_float, mse_error_fp6_e3m2 };
 
 // FP8 quantize/dequantize: byte-per-element, shared by E4M3 and E5M2
 static void quantize_row_mxfp8_impl(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y,

@@ -64,7 +64,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP4_E2M1> {
     static constexpr int bits_per_elem = 4;
     static constexpr int qs_per_block  = 16;   // 32 * 4 / 8
     static constexpr int block_size    = sizeof(block_mxfp4);
-    static constexpr int e8m0_offset   = 2;    // ceil(log2(6.0)) — max finite FP4 E2M1 value
+    static constexpr int e8m0_offset   = MXFP4_E2M1_EMAX_OFFSET;
 
     static __device__ __forceinline__ float dequant_elem(uint8_t raw) {
         return kvalues_mxfp4[raw & 0xF] * 0.5f;
@@ -325,7 +325,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E2M3> {
     static constexpr int bits_per_elem = 6;
     static constexpr int qs_per_block  = 24;   // 32 * 6 / 8
     static constexpr int block_size    = sizeof(block_mxfp6);
-    static constexpr int e8m0_offset   = 3;    // ceil(log2(7.5)) — max finite FP6 E2M3 value
+    static constexpr int e8m0_offset   = MXFP6_E2M3_EMAX_OFFSET;
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
 #if CUDART_VERSION >= 12080
@@ -380,7 +380,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E3M2> {
     static constexpr int bits_per_elem = 6;
     static constexpr int qs_per_block  = 24;
     static constexpr int block_size    = sizeof(block_mxfp6);
-    static constexpr int e8m0_offset   = 5;    // ceil(log2(28.0)) — max finite FP6 E3M2 value
+    static constexpr int e8m0_offset   = MXFP6_E3M2_EMAX_OFFSET;
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
 #if CUDART_VERSION >= 12080
@@ -435,7 +435,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E4M3> {
     static constexpr int bits_per_elem = 8;
     static constexpr int qs_per_block  = 32;   // 32 * 8 / 8
     static constexpr int block_size    = sizeof(block_mxfp8);
-    static constexpr int e8m0_offset   = 8;    // ceil(log2(448)) — max finite FP8 E4M3 value
+    static constexpr int e8m0_offset   = MXFP8_E4M3_EMAX_OFFSET;
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
 #if CUDART_VERSION >= 12050
@@ -486,7 +486,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E5M2> {
     static constexpr int bits_per_elem = 8;
     static constexpr int qs_per_block  = 32;
     static constexpr int block_size    = sizeof(block_mxfp8);
-    static constexpr int e8m0_offset   = 16;   // ceil(log2(57344)) — max finite FP8 E5M2 value
+    static constexpr int e8m0_offset   = MXFP8_E5M2_EMAX_OFFSET;
 
     static __device__ __forceinline__ float mse_error(float val, float inv_scale, float scale) {
 #if CUDART_VERSION >= 12050
@@ -570,9 +570,9 @@ static __device__ void quantize_f32_mxfp_block_soa(
         const int round_log2 = floor_log2 + ((amax_bits & 0x7FFFFF) >= 0x3504F3 ? 1 : 0);
         const int e_base = round_log2 - traits::e8m0_offset + 127;
 
-        // MSE-optimal search: test ±1 around estimate, pick lowest MSE.
-        const int e_lo = max(1, min(255, e_base - 1));
-        const int e_hi = max(1, min(255, e_base + 1));
+        // MSE-optimal search: test ±R around estimate, pick lowest MSE.
+        const int e_lo = max(1, min(255, e_base - MXFP_E8M0_MSE_RANGE));
+        const int e_hi = max(1, min(255, e_base + MXFP_E8M0_MSE_RANGE));
         int best_e = max(0, min(255, e_base));
         float best_mse = 1e30f;
 

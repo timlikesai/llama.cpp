@@ -86,10 +86,13 @@ layout (binding = 1) readonly buffer K_PACKED {vec4 k_data_packed[];} k_packed;
 layout (binding = 2) readonly buffer V_PACKED {vec4 v_data_packed[];} v_packed;
 #elif defined(DATA_A_MXFP4) || defined(DATA_A_MXFP8_E4M3) || defined(DATA_A_MXFP8_E5M2) || defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
 layout (binding = 1) readonly buffer K_RAW {A_TYPE k_data[];} k_raw;
+layout (binding = 1) readonly buffer K_U32 {uint k_u32[];} k_raw_u32;
 #if defined(DATA_V_MXFP4) && !defined(DATA_A_MXFP4)
 layout (binding = 2) readonly buffer V_RAW {block_mxfp4 v_data[];} v_raw;
+layout (binding = 2) readonly buffer V_U32 {uint v_u32[];} v_raw_u32;
 #else
 layout (binding = 2) readonly buffer V_RAW {A_TYPE v_data[];} v_raw;
+layout (binding = 2) readonly buffer V_U32 {uint v_u32[];} v_raw_u32;
 #endif
 #elif defined(A_TYPE_PACKED16)
 layout (binding = 1) readonly buffer K_PACKED16 {A_TYPE_PACKED16 k_data_packed16[];} k_packed;
@@ -173,61 +176,88 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 #if defined(DATA_A_MXFP4)
 #define BLOCK_BYTE_SIZE 17
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
-    A_TYPE blk;
-    if (binding_idx == BINDING_IDX_K) {
-        blk = k_raw.k_data[a_offset + ib];
-    } else {
-        blk = v_raw.v_data[a_offset + ib];
-    }
-    const float d = e8m0_to_fp32(blk.e);
-    // CPU layout: lower nibbles of bytes 0-15 → elements 0-15,
-    //             upper nibbles of bytes 0-15 → elements 16-31.
+    const uint idx = a_offset + ib;
     // iqs is element index (0-31 in steps of 4).
     const uint iqs0 = iqs & 0xFu;           // byte index (wraps at 16)
     const uint shift = (iqs & 0x10u) >> 2;   // 0 for elements 0-15, 4 for 16-31
-    // Arithmetic dequant avoids shared memory LUT bank conflicts (16-entry LUT
-    // spans only 4 banks → 8-way serialization with 32 threads per warp).
-    return FLOAT_TYPEV4(
-        fp4_e2m1_to_float((uint(blk.qs[iqs0 + 0u]) >> shift) & 0xFu) * d,
-        fp4_e2m1_to_float((uint(blk.qs[iqs0 + 1u]) >> shift) & 0xFu) * d,
-        fp4_e2m1_to_float((uint(blk.qs[iqs0 + 2u]) >> shift) & 0xFu) * d,
-        fp4_e2m1_to_float((uint(blk.qs[iqs0 + 3u]) >> shift) & 0xFu) * d
-    );
+    // Load 4 qs bytes as one uint32 via unaligned read (1-2 loads vs 4 byte loads).
+    // Scale byte at struct offset 0, qs at offset 1.
+    const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + iqs0;
+    uint packed;
+    if (binding_idx == BINDING_IDX_K) {
+        const float d = e8m0_to_fp32(k_raw.k_data[idx].e);
+        const uint w = byte_off >> 2u;
+        const uint s = (byte_off & 3u) << 3u;
+        packed = k_raw_u32.k_u32[w] >> s;
+        if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
+        return FLOAT_TYPEV4(
+            fp4_e2m1_to_float((packed >>  0) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >>  8) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >> 16) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >> 24) >> shift & 0xFu) * d
+        );
+    } else {
+        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
+        const uint w = byte_off >> 2u;
+        const uint s = (byte_off & 3u) << 3u;
+        packed = v_raw_u32.v_u32[w] >> s;
+        if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
+        return FLOAT_TYPEV4(
+            fp4_e2m1_to_float((packed >>  0) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >>  8) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >> 16) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >> 24) >> shift & 0xFu) * d
+        );
+    }
 }
 #endif
 
 #if defined(DATA_A_MXFP8_E4M3)
 #define BLOCK_BYTE_SIZE 33
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    const uint idx = a_offset + ib;
     if (binding_idx == BINDING_IDX_K) {
-        A_TYPE blk = k_raw.k_data[a_offset + ib];
-        const float d = e8m0_to_fp32(blk.e);
+        const float d = e8m0_to_fp32(k_raw.k_data[idx].e);
+        // Load 4 consecutive qs bytes as one uint32
+        const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + iqs;
+        const uint w = byte_off >> 2u;
+        const uint s = (byte_off & 3u) << 3u;
+        uint packed = k_raw_u32.k_u32[w] >> s;
+        if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
         return FLOAT_TYPEV4(
-            d * fp8_e4m3_to_float(uint(blk.qs[iqs + 0u])),
-            d * fp8_e4m3_to_float(uint(blk.qs[iqs + 1u])),
-            d * fp8_e4m3_to_float(uint(blk.qs[iqs + 2u])),
-            d * fp8_e4m3_to_float(uint(blk.qs[iqs + 3u]))
+            d * fp8_e4m3_to_float(packed & 0xFFu),
+            d * fp8_e4m3_to_float((packed >> 8) & 0xFFu),
+            d * fp8_e4m3_to_float((packed >> 16) & 0xFFu),
+            d * fp8_e4m3_to_float((packed >> 24) & 0xFFu)
         );
     } else {
 #if defined(DATA_V_MXFP4)
-        block_mxfp4 blk = v_raw.v_data[a_offset + ib];
-        const float d = e8m0_to_fp32(blk.e);
+        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
         const uint iqs0 = iqs & 0xFu;
         const uint shift = (iqs & 0x10u) >> 2;
+        const uint byte_off = idx * 17u + 1u + iqs0;
+        const uint w = byte_off >> 2u;
+        const uint s = (byte_off & 3u) << 3u;
+        uint packed = v_raw_u32.v_u32[w] >> s;
+        if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
         return FLOAT_TYPEV4(
-            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 0u]) >> shift) & 0xFu) * d,
-            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 1u]) >> shift) & 0xFu) * d,
-            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 2u]) >> shift) & 0xFu) * d,
-            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 3u]) >> shift) & 0xFu) * d
+            fp4_e2m1_to_float((packed >>  0) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >>  8) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >> 16) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >> 24) >> shift & 0xFu) * d
         );
 #else
-        A_TYPE blk = v_raw.v_data[a_offset + ib];
-        const float d = e8m0_to_fp32(blk.e);
+        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
+        const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + iqs;
+        const uint w = byte_off >> 2u;
+        const uint s = (byte_off & 3u) << 3u;
+        uint packed = v_raw_u32.v_u32[w] >> s;
+        if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
         return FLOAT_TYPEV4(
-            d * fp8_e4m3_to_float(uint(blk.qs[iqs + 0u])),
-            d * fp8_e4m3_to_float(uint(blk.qs[iqs + 1u])),
-            d * fp8_e4m3_to_float(uint(blk.qs[iqs + 2u])),
-            d * fp8_e4m3_to_float(uint(blk.qs[iqs + 3u]))
+            d * fp8_e4m3_to_float(packed & 0xFFu),
+            d * fp8_e4m3_to_float((packed >> 8) & 0xFFu),
+            d * fp8_e4m3_to_float((packed >> 16) & 0xFFu),
+            d * fp8_e4m3_to_float((packed >> 24) & 0xFFu)
         );
 #endif
     }
@@ -237,35 +267,48 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 #if defined(DATA_A_MXFP8_E5M2)
 #define BLOCK_BYTE_SIZE 33
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    const uint idx = a_offset + ib;
     if (binding_idx == BINDING_IDX_K) {
-        A_TYPE blk = k_raw.k_data[a_offset + ib];
-        const float d = e8m0_to_fp32(blk.e);
+        const float d = e8m0_to_fp32(k_raw.k_data[idx].e);
+        const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + iqs;
+        const uint w = byte_off >> 2u;
+        const uint s = (byte_off & 3u) << 3u;
+        uint packed = k_raw_u32.k_u32[w] >> s;
+        if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
         return FLOAT_TYPEV4(
-            d * fp8_e5m2_to_float(uint(blk.qs[iqs + 0u])),
-            d * fp8_e5m2_to_float(uint(blk.qs[iqs + 1u])),
-            d * fp8_e5m2_to_float(uint(blk.qs[iqs + 2u])),
-            d * fp8_e5m2_to_float(uint(blk.qs[iqs + 3u]))
+            d * fp8_e5m2_to_float(packed & 0xFFu),
+            d * fp8_e5m2_to_float((packed >> 8) & 0xFFu),
+            d * fp8_e5m2_to_float((packed >> 16) & 0xFFu),
+            d * fp8_e5m2_to_float((packed >> 24) & 0xFFu)
         );
     } else {
 #if defined(DATA_V_MXFP4)
-        block_mxfp4 blk = v_raw.v_data[a_offset + ib];
-        const float d = e8m0_to_fp32(blk.e);
+        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
         const uint iqs0 = iqs & 0xFu;
         const uint shift = (iqs & 0x10u) >> 2;
+        const uint byte_off = idx * 17u + 1u + iqs0;
+        const uint w = byte_off >> 2u;
+        const uint s = (byte_off & 3u) << 3u;
+        uint packed = v_raw_u32.v_u32[w] >> s;
+        if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
         return FLOAT_TYPEV4(
-            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 0u]) >> shift) & 0xFu) * d,
-            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 1u]) >> shift) & 0xFu) * d,
-            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 2u]) >> shift) & 0xFu) * d,
-            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 3u]) >> shift) & 0xFu) * d
+            fp4_e2m1_to_float((packed >>  0) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >>  8) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >> 16) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >> 24) >> shift & 0xFu) * d
         );
 #else
-        A_TYPE blk = v_raw.v_data[a_offset + ib];
-        const float d = e8m0_to_fp32(blk.e);
+        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
+        const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + iqs;
+        const uint w = byte_off >> 2u;
+        const uint s = (byte_off & 3u) << 3u;
+        uint packed = v_raw_u32.v_u32[w] >> s;
+        if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
         return FLOAT_TYPEV4(
-            d * fp8_e5m2_to_float(uint(blk.qs[iqs + 0u])),
-            d * fp8_e5m2_to_float(uint(blk.qs[iqs + 1u])),
-            d * fp8_e5m2_to_float(uint(blk.qs[iqs + 2u])),
-            d * fp8_e5m2_to_float(uint(blk.qs[iqs + 3u]))
+            d * fp8_e5m2_to_float(packed & 0xFFu),
+            d * fp8_e5m2_to_float((packed >> 8) & 0xFFu),
+            d * fp8_e5m2_to_float((packed >> 16) & 0xFFu),
+            d * fp8_e5m2_to_float((packed >> 24) & 0xFFu)
         );
 #endif
     }
@@ -275,13 +318,19 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 #if defined(DATA_A_MXFP6_E2M3)
 #define BLOCK_BYTE_SIZE 25
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    const uint idx = a_offset + ib;
+    const uint group = iqs / 4u;
+    const uint base = group * 3u;
     if (binding_idx == BINDING_IDX_K) {
-        A_TYPE blk = k_raw.k_data[a_offset + ib];
-        const float d = e8m0_to_fp32(blk.e);
-        uint group = iqs / 4u;
-        uint base = group * 3u;
+        const float d = e8m0_to_fp32(k_raw.k_data[idx].e);
+        // Load 3 packed bytes as uint32 and extract
+        const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + base;
+        const uint w = byte_off >> 2u;
+        const uint s = (byte_off & 3u) << 3u;
+        uint raw = k_raw_u32.k_u32[w] >> s;
+        if (s > 8u) raw |= k_raw_u32.k_u32[w + 1u] << (32u - s);
         uint v0, v1, v2, v3;
-        unpack_fp6x4(uint(blk.qs[base]), uint(blk.qs[base + 1u]), uint(blk.qs[base + 2u]), v0, v1, v2, v3);
+        unpack_fp6x4(raw & 0xFFu, (raw >> 8) & 0xFFu, (raw >> 16) & 0xFFu, v0, v1, v2, v3);
         return FLOAT_TYPEV4(
             d * fp6_e2m3_to_float(v0),
             d * fp6_e2m3_to_float(v1),
@@ -290,23 +339,29 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
         );
     } else {
 #if defined(DATA_V_MXFP4)
-        block_mxfp4 blk = v_raw.v_data[a_offset + ib];
-        const float d = e8m0_to_fp32(blk.e);
+        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
         const uint iqs0 = iqs & 0xFu;
         const uint shift = (iqs & 0x10u) >> 2;
+        const uint byte_off = idx * 17u + 1u + iqs0;
+        const uint w = byte_off >> 2u;
+        const uint s = (byte_off & 3u) << 3u;
+        uint packed = v_raw_u32.v_u32[w] >> s;
+        if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
         return FLOAT_TYPEV4(
-            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 0u]) >> shift) & 0xFu) * d,
-            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 1u]) >> shift) & 0xFu) * d,
-            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 2u]) >> shift) & 0xFu) * d,
-            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 3u]) >> shift) & 0xFu) * d
+            fp4_e2m1_to_float((packed >>  0) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >>  8) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >> 16) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >> 24) >> shift & 0xFu) * d
         );
 #else
-        A_TYPE blk = v_raw.v_data[a_offset + ib];
-        const float d = e8m0_to_fp32(blk.e);
-        uint group = iqs / 4u;
-        uint base = group * 3u;
+        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
+        const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + base;
+        const uint w = byte_off >> 2u;
+        const uint s = (byte_off & 3u) << 3u;
+        uint raw = v_raw_u32.v_u32[w] >> s;
+        if (s > 8u) raw |= v_raw_u32.v_u32[w + 1u] << (32u - s);
         uint v0, v1, v2, v3;
-        unpack_fp6x4(uint(blk.qs[base]), uint(blk.qs[base + 1u]), uint(blk.qs[base + 2u]), v0, v1, v2, v3);
+        unpack_fp6x4(raw & 0xFFu, (raw >> 8) & 0xFFu, (raw >> 16) & 0xFFu, v0, v1, v2, v3);
         return FLOAT_TYPEV4(
             d * fp6_e2m3_to_float(v0),
             d * fp6_e2m3_to_float(v1),
@@ -321,13 +376,18 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 #if defined(DATA_A_MXFP6_E3M2)
 #define BLOCK_BYTE_SIZE 25
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    const uint idx = a_offset + ib;
+    const uint group = iqs / 4u;
+    const uint base = group * 3u;
     if (binding_idx == BINDING_IDX_K) {
-        A_TYPE blk = k_raw.k_data[a_offset + ib];
-        const float d = e8m0_to_fp32(blk.e);
-        uint group = iqs / 4u;
-        uint base = group * 3u;
+        const float d = e8m0_to_fp32(k_raw.k_data[idx].e);
+        const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + base;
+        const uint w = byte_off >> 2u;
+        const uint s = (byte_off & 3u) << 3u;
+        uint raw = k_raw_u32.k_u32[w] >> s;
+        if (s > 8u) raw |= k_raw_u32.k_u32[w + 1u] << (32u - s);
         uint v0, v1, v2, v3;
-        unpack_fp6x4(uint(blk.qs[base]), uint(blk.qs[base + 1u]), uint(blk.qs[base + 2u]), v0, v1, v2, v3);
+        unpack_fp6x4(raw & 0xFFu, (raw >> 8) & 0xFFu, (raw >> 16) & 0xFFu, v0, v1, v2, v3);
         return FLOAT_TYPEV4(
             d * fp6_e3m2_to_float(v0),
             d * fp6_e3m2_to_float(v1),
@@ -336,23 +396,29 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
         );
     } else {
 #if defined(DATA_V_MXFP4)
-        block_mxfp4 blk = v_raw.v_data[a_offset + ib];
-        const float d = e8m0_to_fp32(blk.e);
+        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
         const uint iqs0 = iqs & 0xFu;
         const uint shift = (iqs & 0x10u) >> 2;
+        const uint byte_off = idx * 17u + 1u + iqs0;
+        const uint w = byte_off >> 2u;
+        const uint s = (byte_off & 3u) << 3u;
+        uint packed = v_raw_u32.v_u32[w] >> s;
+        if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
         return FLOAT_TYPEV4(
-            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 0u]) >> shift) & 0xFu) * d,
-            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 1u]) >> shift) & 0xFu) * d,
-            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 2u]) >> shift) & 0xFu) * d,
-            fp4_e2m1_to_float((uint(blk.qs[iqs0 + 3u]) >> shift) & 0xFu) * d
+            fp4_e2m1_to_float((packed >>  0) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >>  8) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >> 16) >> shift & 0xFu) * d,
+            fp4_e2m1_to_float((packed >> 24) >> shift & 0xFu) * d
         );
 #else
-        A_TYPE blk = v_raw.v_data[a_offset + ib];
-        const float d = e8m0_to_fp32(blk.e);
-        uint group = iqs / 4u;
-        uint base = group * 3u;
+        const float d = e8m0_to_fp32(v_raw.v_data[idx].e);
+        const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + base;
+        const uint w = byte_off >> 2u;
+        const uint s = (byte_off & 3u) << 3u;
+        uint raw = v_raw_u32.v_u32[w] >> s;
+        if (s > 8u) raw |= v_raw_u32.v_u32[w + 1u] << (32u - s);
         uint v0, v1, v2, v3;
-        unpack_fp6x4(uint(blk.qs[base]), uint(blk.qs[base + 1u]), uint(blk.qs[base + 2u]), v0, v1, v2, v3);
+        unpack_fp6x4(raw & 0xFFu, (raw >> 8) & 0xFFu, (raw >> 16) & 0xFFu, v0, v1, v2, v3);
         return FLOAT_TYPEV4(
             d * fp6_e3m2_to_float(v0),
             d * fp6_e3m2_to_float(v1),
@@ -551,9 +617,32 @@ float mxfp_roundtrip_val(float val, float scale) {
 #endif
 }
 
-// Fast E8M0 scale for Q preprocessing: round(log2(amax)) without MSE search.
-// Matches CUDA's flash_attn_ext_mxfp_quantize_Q (no ±1 search for Q, only K).
-// This is 3x faster since it avoids 96 roundtrip calls per block.
+// MSE-optimal E8M0 scale for Q preprocessing.
+// Tests ±R candidates around round(log2(amax)), picks lowest round-trip MSE.
+// Matches CUDA MMA Q and CPU paths for consistent quantization quality.
+// Cost: (2R+1) × 32 roundtrip evals per block — negligible vs attention compute.
+// Vulkan GLSL cannot include C headers, so these mirror ggml-common.h definitions.
+// EMAX_OFFSET: ceil(log2(max_finite)) for each MX element type.
+// MSE_RANGE: search radius for MSE-optimal E8M0 exponent selection.
+#define MXFP_E8M0_MSE_RANGE_VK      2
+#define MXFP4_E2M1_EMAX_OFFSET_VK   2   // ceil(log2(6.0))
+#define MXFP6_E2M3_EMAX_OFFSET_VK   3   // ceil(log2(7.5))
+#define MXFP6_E3M2_EMAX_OFFSET_VK   5   // ceil(log2(28.0))
+#define MXFP8_E4M3_EMAX_OFFSET_VK   8   // ceil(log2(448))
+#define MXFP8_E5M2_EMAX_OFFSET_VK  16   // ceil(log2(57344))
+
+#if defined(DATA_A_MXFP4)
+    #define MXFP_EMAX_OFFSET MXFP4_E2M1_EMAX_OFFSET_VK
+#elif defined(DATA_A_MXFP8_E4M3)
+    #define MXFP_EMAX_OFFSET MXFP8_E4M3_EMAX_OFFSET_VK
+#elif defined(DATA_A_MXFP8_E5M2)
+    #define MXFP_EMAX_OFFSET MXFP8_E5M2_EMAX_OFFSET_VK
+#elif defined(DATA_A_MXFP6_E2M3)
+    #define MXFP_EMAX_OFFSET MXFP6_E2M3_EMAX_OFFSET_VK
+#elif defined(DATA_A_MXFP6_E3M2)
+    #define MXFP_EMAX_OFFSET MXFP6_E3M2_EMAX_OFFSET_VK
+#endif
+
 float compute_e8m0_scale(float vals[32]) {
     float amax = 0.0;
     for (uint i = 0u; i < 32u; i++) {
@@ -565,20 +654,65 @@ float compute_e8m0_scale(float vals[32]) {
     int floor_log2 = int((amax_bits >> 23) & 0xFFu) - 127;
     int round_log2 = floor_log2 + (((amax_bits & 0x7FFFFFu) >= 0x3504F3u) ? 1 : 0);
 
-#if defined(DATA_A_MXFP4)
-    const int emax_offset = 2;
-#elif defined(DATA_A_MXFP8_E4M3)
-    const int emax_offset = 8;
-#elif defined(DATA_A_MXFP8_E5M2)
-    const int emax_offset = 16;
-#elif defined(DATA_A_MXFP6_E2M3)
-    const int emax_offset = 3;
-#elif defined(DATA_A_MXFP6_E3M2)
-    const int emax_offset = 5;
-#endif
+    const int emax_offset = MXFP_EMAX_OFFSET;
 
-    int e = clamp(round_log2 - emax_offset + 127, 0, 254);
-    return (e == 0) ? 0.0 : uintBitsToFloat(uint(e) << 23);
+    int e_base = round_log2 - emax_offset + 127;
+    int e_lo = clamp(e_base - MXFP_E8M0_MSE_RANGE_VK, 1, 255);
+    int e_hi = clamp(e_base + MXFP_E8M0_MSE_RANGE_VK, 1, 255);
+    int best_e = clamp(e_base, 0, 255);
+    float best_mse = 1.0e30;
+
+    for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
+        float test_scale = (test_e == 0) ? 0.0 : uintBitsToFloat(uint(test_e) << 23);
+        float mse = 0.0;
+        for (uint j = 0u; j < 32u; ++j) {
+            float recon = mxfp_roundtrip_val(vals[j], test_scale);
+            float err = vals[j] - recon;
+            mse += err * err;
+        }
+        if (mse < best_mse) {
+            best_mse = mse;
+            best_e = test_e;
+        }
+    }
+
+    return (best_e == 0) ? 0.0 : uintBitsToFloat(uint(best_e) << 23);
+}
+
+// Subgroup-parallel MSE-optimal E8M0 scale: each lane holds one element of a 32-element block.
+// Uses shuffle-tree reduction for MSE sum — matches CPU/CUDA/Metal MSE search quality.
+// amax must already be reduced across the subgroup (all lanes hold the same value).
+float compute_e8m0_scale_subgroup(float val, float amax) {
+    if (amax == 0.0) return 0.0;
+
+    uint amax_bits = floatBitsToUint(amax);
+    int floor_log2 = int((amax_bits >> 23) & 0xFFu) - 127;
+    int round_log2 = floor_log2 + (((amax_bits & 0x7FFFFFu) >= 0x3504F3u) ? 1 : 0);
+
+    int e_base = round_log2 - MXFP_EMAX_OFFSET + 127;
+    int e_lo = clamp(e_base - MXFP_E8M0_MSE_RANGE_VK, 1, 255);
+    int e_hi = clamp(e_base + MXFP_E8M0_MSE_RANGE_VK, 1, 255);
+    int best_e = clamp(e_base, 0, 255);
+    float best_mse = 1.0e30;
+
+    for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
+        float test_scale = uintBitsToFloat(uint(test_e) << 23);
+        float recon = mxfp_roundtrip_val(val, test_scale);
+        float err = val - recon;
+        // Shuffle-tree sum across 32 lanes for total MSE
+        float mse = err * err;
+        mse += subgroupShuffleXor(mse, 1u);
+        mse += subgroupShuffleXor(mse, 2u);
+        mse += subgroupShuffleXor(mse, 4u);
+        mse += subgroupShuffleXor(mse, 8u);
+        mse += subgroupShuffleXor(mse, 16u);
+        if (mse < best_mse) {
+            best_mse = mse;
+            best_e = test_e;
+        }
+    }
+
+    return (best_e == 0) ? 0.0 : uintBitsToFloat(uint(best_e) << 23);
 }
 
 #endif // MXFP_Q_PREPROCESS

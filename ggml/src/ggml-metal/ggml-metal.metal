@@ -667,7 +667,7 @@ static inline float hadamard_32_simd(float val, ushort tiisg) {
     return val * 0.17677669529663689f; // 1/sqrt(32)
 }
 
-// MSE-optimal E8M0 exponent for a 32-element block (MXFP4, emax_offset=2).
+// MSE-optimal E8M0 exponent for a 32-element block (MXFP4, MXFP4_E2M1_EMAX_OFFSET).
 // Each thread holds one element; uses simd reductions across the block.
 static inline uint8_t mxfp4_compute_e8m0(float val) {
     float amax = simd_max(abs(val));
@@ -676,10 +676,10 @@ static inline uint8_t mxfp4_compute_e8m0(float val) {
     uint32_t amax_bits = as_type<uint32_t>(amax);
     int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
     int round_up = ((amax_bits & 0x7FFFFF) >= 0x3504F3) ? 1 : 0;
-    int e_base = floor_log2 + round_up - 2 + 127; // emax_offset=2 for MXFP4
+    int e_base = floor_log2 + round_up - MXFP4_E2M1_EMAX_OFFSET + 127;
 
-    int e_lo = max(e_base - 1, 1);
-    int e_hi = min(e_base + 1, 255);
+    int e_lo = max(e_base - MXFP_E8M0_MSE_RANGE, 1);
+    int e_hi = min(e_base + MXFP_E8M0_MSE_RANGE, 255);
     int best_e = clamp(e_base, 0, 255);
     float best_mse = 1e30f;
 
@@ -1040,7 +1040,7 @@ static inline void hadamard_32_serial(thread float * vals) {
 }
 
 // Serial E8M0 computation for a block of 32 floats (single thread, no simd).
-// MSE-optimal: round(log2(amax)) ±1 search using type-specific round-trip.
+// MSE-optimal: round(log2(amax)) ±R search using type-specific round-trip.
 template <int EMAX_OFFSET, uint8_t (*elem_quant)(float), float (*elem_dequant)(uint8_t), typename SRC_PTR>
 static inline uint8_t mxfp_compute_e8m0_serial(SRC_PTR src) {
     float amax = 0.0f;
@@ -1054,8 +1054,8 @@ static inline uint8_t mxfp_compute_e8m0_serial(SRC_PTR src) {
     int round_up = ((amax_bits & 0x7FFFFF) >= 0x3504F3) ? 1 : 0;
     int e_base = floor_log2 + round_up - EMAX_OFFSET + 127;
 
-    int e_lo = max(e_base - 1, 1);
-    int e_hi = min(e_base + 1, 255);
+    int e_lo = max(e_base - MXFP_E8M0_MSE_RANGE, 1);
+    int e_hi = min(e_base + MXFP_E8M0_MSE_RANGE, 255);
     int best_e = clamp(e_base, 0, 255);
     float best_mse = 1e30f;
 
@@ -1088,10 +1088,10 @@ static inline uint8_t mxfp4_compute_e8m0_serial(SRC_PTR src) {
     uint32_t amax_bits = as_type<uint32_t>(amax);
     int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
     int round_up = ((amax_bits & 0x7FFFFF) >= 0x3504F3) ? 1 : 0;
-    int e_base = floor_log2 + round_up - 2 + 127; // emax_offset=2
+    int e_base = floor_log2 + round_up - MXFP4_E2M1_EMAX_OFFSET + 127;
 
-    int e_lo = max(e_base - 1, 1);
-    int e_hi = min(e_base + 1, 255);
+    int e_lo = max(e_base - MXFP_E8M0_MSE_RANGE, 1);
+    int e_hi = min(e_base + MXFP_E8M0_MSE_RANGE, 255);
     int best_e = clamp(e_base, 0, 255);
     float best_mse = 1e30f;
 
@@ -1265,7 +1265,7 @@ static inline float mxfp_roundtrip(float val, float scale) {
     return dequant(quant(val * inv_scale)) * scale;
 }
 
-// MSE-optimal E8M0 with ±1 search (matches CPU mxfp_compute_e8m0_mse).
+// MSE-optimal E8M0 with ±R search (matches CPU mxfp_compute_e8m0_mse).
 // Round-trip function computes per-element MSE for a given scale.
 template <int EMAX_OFFSET, float (*roundtrip_fn)(float, float)>
 static inline uint8_t mxfp_compute_e8m0_mse(float val) {
@@ -1277,8 +1277,8 @@ static inline uint8_t mxfp_compute_e8m0_mse(float val) {
     int round_up = ((amax_bits & 0x7FFFFF) >= 0x3504F3) ? 1 : 0;
     int e_base = floor_log2 + round_up - EMAX_OFFSET + 127;
 
-    int e_lo = max(e_base - 1, 1);
-    int e_hi = min(e_base + 1, 255);
+    int e_lo = max(e_base - MXFP_E8M0_MSE_RANGE, 1);
+    int e_hi = min(e_base + MXFP_E8M0_MSE_RANGE, 255);
     int best_e = clamp(e_base, 0, 255);
     float best_mse = 1e30f;
 

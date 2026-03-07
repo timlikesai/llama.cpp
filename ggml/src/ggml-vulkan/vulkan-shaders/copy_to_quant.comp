@@ -235,6 +235,14 @@ void quantize(uint dst_idx, uint src_idx)
 // MXFP quantization helpers
 #if defined(DATA_A_MXFP4) || defined(DATA_A_MXFP8_E4M3) || defined(DATA_A_MXFP8_E5M2) || defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
 
+// Mirror ggml-common.h constants (GLSL cannot include C headers).
+#define MXFP_E8M0_MSE_RANGE_VK      2
+#define MXFP4_E2M1_EMAX_OFFSET_VK   2   // ceil(log2(6.0))
+#define MXFP6_E2M3_EMAX_OFFSET_VK   3   // ceil(log2(7.5))
+#define MXFP6_E3M2_EMAX_OFFSET_VK   5   // ceil(log2(28.0))
+#define MXFP8_E4M3_EMAX_OFFSET_VK   8   // ceil(log2(448))
+#define MXFP8_E5M2_EMAX_OFFSET_VK  16   // ceil(log2(57344))
+
 #if defined(SET_ROWS)
 #define MXFP_HADAMARD_FLAG p.param3
 #else
@@ -307,11 +315,11 @@ void quantize(uint dst_idx, uint src_idx) {
     if (MXFP_HADAMARD_FLAG != 0) {
         hadamard_32_inplace(vals);
     }
-    uint e = compute_e8m0_uint(vals, 2);
-    // ±1 MSE search: test e-1, e, e+1, pick lowest total round-trip error.
+    uint e = compute_e8m0_uint(vals, MXFP4_E2M1_EMAX_OFFSET_VK);
+    // ±R MSE search: test 2R+1 candidates, pick lowest total round-trip error.
     {
-        int e_lo = max(1, int(e) - 1);
-        int e_hi = min(255, int(e) + 1);
+        int e_lo = max(1, int(e) - MXFP_E8M0_MSE_RANGE_VK);
+        int e_hi = min(255, int(e) + MXFP_E8M0_MSE_RANGE_VK);
         uint best_e = clamp(e, 0u, 255u);
         float best_mse = 1e30;
         for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
@@ -381,11 +389,11 @@ void quantize(uint dst_idx, uint src_idx) {
     if (MXFP_HADAMARD_FLAG != 0) {
         hadamard_32_inplace(vals);
     }
-    uint e = compute_e8m0_uint(vals, 8);
-    // ±1 MSE search: test e-1, e, e+1, pick lowest total round-trip error.
+    uint e = compute_e8m0_uint(vals, MXFP8_E4M3_EMAX_OFFSET_VK);
+    // ±R MSE search: test 2R+1 candidates, pick lowest total round-trip error.
     {
-        int e_lo = max(1, int(e) - 1);
-        int e_hi = min(255, int(e) + 1);
+        int e_lo = max(1, int(e) - MXFP_E8M0_MSE_RANGE_VK);
+        int e_hi = min(255, int(e) + MXFP_E8M0_MSE_RANGE_VK);
         uint best_e = clamp(e, 0u, 255u);
         float best_mse = 1e30;
         for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
@@ -454,11 +462,11 @@ void quantize(uint dst_idx, uint src_idx) {
     if (MXFP_HADAMARD_FLAG != 0) {
         hadamard_32_inplace(vals);
     }
-    uint e = compute_e8m0_uint(vals, 16);
-    // ±1 MSE search: test e-1, e, e+1, pick lowest total round-trip error.
+    uint e = compute_e8m0_uint(vals, MXFP8_E5M2_EMAX_OFFSET_VK);
+    // ±R MSE search: test 2R+1 candidates, pick lowest total round-trip error.
     {
-        int e_lo = max(1, int(e) - 1);
-        int e_hi = min(255, int(e) + 1);
+        int e_lo = max(1, int(e) - MXFP_E8M0_MSE_RANGE_VK);
+        int e_hi = min(255, int(e) + MXFP_E8M0_MSE_RANGE_VK);
         uint best_e = clamp(e, 0u, 255u);
         float best_mse = 1e30;
         for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
@@ -524,11 +532,11 @@ void quantize(uint dst_idx, uint src_idx) {
     if (MXFP_HADAMARD_FLAG != 0) {
         hadamard_32_inplace(vals);
     }
-    uint e = compute_e8m0_uint(vals, 3);
-    // ±1 MSE search: test e-1, e, e+1, pick lowest total round-trip error.
+    uint e = compute_e8m0_uint(vals, MXFP6_E2M3_EMAX_OFFSET_VK);
+    // ±R MSE search: test 2R+1 candidates, pick lowest total round-trip error.
     {
-        int e_lo = max(1, int(e) - 1);
-        int e_hi = min(255, int(e) + 1);
+        int e_lo = max(1, int(e) - MXFP_E8M0_MSE_RANGE_VK);
+        int e_hi = min(255, int(e) + MXFP_E8M0_MSE_RANGE_VK);
         uint best_e = clamp(e, 0u, 255u);
         float best_mse = 1e30;
         for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
@@ -604,11 +612,11 @@ void quantize(uint dst_idx, uint src_idx) {
     if (MXFP_HADAMARD_FLAG != 0) {
         hadamard_32_inplace(vals);
     }
-    uint e = compute_e8m0_uint(vals, 5);
-    // ±1 MSE search: test e-1, e, e+1, pick lowest total round-trip error.
+    uint e = compute_e8m0_uint(vals, MXFP6_E3M2_EMAX_OFFSET_VK);
+    // ±R MSE search: test 2R+1 candidates, pick lowest total round-trip error.
     {
-        int e_lo = max(1, int(e) - 1);
-        int e_hi = min(255, int(e) + 1);
+        int e_lo = max(1, int(e) - MXFP_E8M0_MSE_RANGE_VK);
+        int e_hi = min(255, int(e) + MXFP_E8M0_MSE_RANGE_VK);
         uint best_e = clamp(e, 0u, 255u);
         float best_mse = 1e30;
         for (int test_e = e_lo; test_e <= e_hi; ++test_e) {

@@ -196,6 +196,18 @@ typedef struct {
 } block_q4_1;
 static_assert(sizeof(block_q4_1) == 2 * sizeof(ggml_half) + QK4_1 / 2, "wrong q4_1 block size/padding");
 
+// MXFP E8M0 shared exponent constants (OCP MX v1.0 §5.3).
+// EMAX_OFFSET: ceil(log2(max_finite)) for each element type — used to center the E8M0 scale.
+// MSE_RANGE: search radius around round(log2(amax)). Tests 2*range+1 candidate exponents,
+// picking the one that minimizes total round-trip quantization error per block.
+// Inspired by "Four Over Six" (arXiv:2512.02010); generalized to all MX types.
+#define MXFP_E8M0_MSE_RANGE      2
+#define MXFP4_E2M1_EMAX_OFFSET   2   // ceil(log2(6.0))
+#define MXFP6_E2M3_EMAX_OFFSET   3   // ceil(log2(7.5))
+#define MXFP6_E3M2_EMAX_OFFSET   5   // ceil(log2(28.0))
+#define MXFP8_E4M3_EMAX_OFFSET   8   // ceil(log2(448))
+#define MXFP8_E5M2_EMAX_OFFSET  16   // ceil(log2(57344))
+
 #define QK_MXFP4 32
 typedef struct {
     uint8_t e; // E8M0

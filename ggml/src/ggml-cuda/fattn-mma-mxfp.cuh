@@ -52,7 +52,7 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP4_E2M1> {
     static constexpr int k_per_mma      = 64;    // m16n8k64
     static constexpr int smem_k_qs_div  = 8;     // stride_k_qs = DKQ/8 + 4
     static constexpr int smem_k_sc_div  = 64;    // stride_k_sc = DKQ/64 (paired scales)
-    static constexpr int emax           = 2;     // ceil(log2(6.0))
+    static constexpr int emax           = MXFP4_E2M1_EMAX_OFFSET;
     static constexpr bool can_cp_async_k = true;
     static constexpr bool needs_smem_expand_k = false;
 
@@ -67,7 +67,7 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP6_E2M3> {
     static constexpr int k_per_mma      = 32;    // m16n8k32
     static constexpr int smem_k_qs_div  = 4;     // stride_k_qs = DKQ/4 + 4
     static constexpr int smem_k_sc_div  = 32;    // stride_k_sc = DKQ/32 (individual)
-    static constexpr int emax           = 3;     // ceil(log2(7.5))
+    static constexpr int emax           = MXFP6_E2M3_EMAX_OFFSET;
     static constexpr bool can_cp_async_k = true;  // raw packed bytes loaded as 16B chunks
     static constexpr bool needs_smem_expand_k = true; // packed→expanded in-place after async load
 
@@ -82,7 +82,7 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP6_E3M2> {
     static constexpr int k_per_mma      = 32;
     static constexpr int smem_k_qs_div  = 4;
     static constexpr int smem_k_sc_div  = 32;
-    static constexpr int emax           = 5;     // ceil(log2(28.0))
+    static constexpr int emax           = MXFP6_E3M2_EMAX_OFFSET;
     static constexpr bool can_cp_async_k = true;  // raw packed bytes loaded as 16B chunks
     static constexpr bool needs_smem_expand_k = true; // packed→expanded in-place after async load
 
@@ -97,7 +97,7 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP8_E4M3> {
     static constexpr int k_per_mma      = 32;    // m16n8k32
     static constexpr int smem_k_qs_div  = 4;     // stride_k_qs = DKQ/4 + 4
     static constexpr int smem_k_sc_div  = 32;    // stride_k_sc = DKQ/32 (individual)
-    static constexpr int emax           = 8;     // ceil(log2(448))
+    static constexpr int emax           = MXFP8_E4M3_EMAX_OFFSET;
     static constexpr bool can_cp_async_k = true;  // 32-byte blocks = 2x 16B cp.async
     static constexpr bool needs_smem_expand_k = false;
 
@@ -112,7 +112,7 @@ template<> struct mxfp_mma_traits<GGML_TYPE_MXFP8_E5M2> {
     static constexpr int k_per_mma      = 32;
     static constexpr int smem_k_qs_div  = 4;
     static constexpr int smem_k_sc_div  = 32;
-    static constexpr int emax           = 16;    // ceil(log2(57344))
+    static constexpr int emax           = MXFP8_E5M2_EMAX_OFFSET;
     static constexpr bool can_cp_async_k = true;
     static constexpr bool needs_smem_expand_k = false;
 
@@ -793,6 +793,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
             e = 0;
             inv_d = 0.0f;
         } else {
+            using soa_traits = mxfp_traits<mxfp_type>;
             constexpr int EMAX = traits::emax;
             // E8M0 scale: round(log2(amax)) via IEEE-754 bit extraction (Schraudolph 1999).
             // floor(log2(x)) from exponent field, +1 if mantissa >= sqrt(2)-1 (0x3504F3).
@@ -800,12 +801,33 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
             memcpy(&amax_bits, &amax, sizeof(uint32_t));
             const int e_floor = (int)((amax_bits >> 23) & 0xFF) - 127;
             const int e_int = e_floor + ((amax_bits & 0x7FFFFF) >= 0x3504F3 ? 1 : 0);
-            int biased = e_int - EMAX + 127;
-            biased = max(biased, 0);
-            biased = min(biased, 254);
-            e = static_cast<uint8_t>(biased);
+            const int e_base = e_int - EMAX + 127;
+
+            // MSE-optimal search: test ±R around estimate, pick lowest MSE.
+            // Matches set-rows and CPU paths for consistent quantization quality.
+            const int e_lo = max(1, min(255, e_base - MXFP_E8M0_MSE_RANGE));
+            const int e_hi = max(1, min(255, e_base + MXFP_E8M0_MSE_RANGE));
+            int best_e = max(0, min(255, e_base));
+            float best_mse = 1e30f;
+
+#pragma unroll
+            for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
+                const float test_scale = ggml_cuda_e8m0_to_fp32((uint8_t)test_e);
+                const float test_inv = 1.0f / test_scale;
+                float mse = 0.0f;
+#pragma unroll
+                for (int i = 0; i < vals_per_block; ++i) {
+                    mse += soa_traits::mse_error(vals[i], test_inv, test_scale);
+                }
+                if (mse < best_mse) {
+                    best_mse = mse;
+                    best_e = test_e;
+                }
+            }
+
+            e = static_cast<uint8_t>(best_e);
             // Construct reciprocal power-of-2 via integer bit ops (avoids SFU-bound __frcp_rn).
-            const uint32_t inv_bits = (uint32_t)(254 - biased) << 23;
+            const uint32_t inv_bits = (uint32_t)(254 - best_e) << 23;
             memcpy(&inv_d, &inv_bits, sizeof(float));
         }
 
