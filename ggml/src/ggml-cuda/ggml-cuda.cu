@@ -4742,11 +4742,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     a->type == GGML_TYPE_MXFP6_E3M2) {
                     return false;
                 }
-                // MXFP4 MUL_MAT only supported via MMVQ (batch ≤ 8) to avoid
-                // CUDA graph dispatch issues when crossing the MMVQ/MMQ boundary
-                if (a->type == GGML_TYPE_MXFP4_E2M1 && op->ne[1] > MMVQ_MAX_BATCH_SIZE) {
-                    return false;
-                }
                 switch (a->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:

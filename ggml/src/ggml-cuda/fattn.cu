@@ -512,16 +512,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // MXFP flash attention dispatch.
     // Both VEC and MMA kernels expect a flat multi-head SoA layout where all heads' blocks
     // are packed into each row (matching the real KV cache allocation in llama_kv_cache).
-    // Reject if the layout doesn't match (e.g. test tensors with per-head strides) or
-    // row strides aren't 16-byte aligned (required by cp.async in the MMA kernel).
+    // Reject if the layout doesn't match (e.g. test tensors with per-head strides).
     if (ggml_is_type_mxfp_enabled(K->type)) {
         auto mxfp_layout_ok = [](const ggml_tensor * t, int64_t head_size) -> bool {
             const size_t ts = ggml_type_size(t->type);
             const int64_t blocks_per_head = head_size / ggml_blck_size(t->type);
             const int64_t blocks_needed   = blocks_per_head * t->ne[2];
             return t->nb[1] % ts == 0
-                && (int64_t)(t->nb[1] / ts) >= blocks_needed
-                && t->nb[1] % 16 == 0;
+                && (int64_t)(t->nb[1] / ts) >= blocks_needed;
         };
         if (!mxfp_layout_ok(K, K->ne[0]) || !mxfp_layout_ok(V, V->ne[0])) {
             return BEST_FATTN_KERNEL_NONE;

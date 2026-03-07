@@ -38,6 +38,9 @@ MODELS=(
 )
 DEFAULT_MODEL="qwen3-coder"
 
+# Default to both NVIDIA GPUs (skip Intel iGPU at Vulkan0)
+DEFAULT_DEVICE="Vulkan1/Vulkan2"
+
 # Resolve model name/path → sets MODEL_PATH and MODEL_NAME.
 resolve_model() {
     local input="$1"
@@ -73,7 +76,7 @@ CONFIGS=(
 )
 MODEL_INPUTS=()
 _config_overridden=false
-DEVICE=""
+DEVICE="$DEFAULT_DEVICE"
 
 # ── Argument Parsing ─────────────────────────────────────────────────────────
 
@@ -128,7 +131,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-bench        Skip throughput benchmarks (pp512 + tg128)"
             echo "  --chunks N[,M]      Chunk counts for perplexity (default: 16)"
             echo "  --config NAME       Config to test (repeatable). Groups: mxfp, mxfp8, mxfp6"
-            echo "  --device DEV        Vulkan device (e.g. 'Vulkan0', 'Vulkan1')"
+            echo "  --device DEV        Vulkan device(s), /-separated (default: $DEFAULT_DEVICE)"
             echo "  --model NAME|PATH   Model preset or path (default: $DEFAULT_MODEL)"
             echo "  --help              Show this help"
             echo ""
@@ -323,13 +326,16 @@ for config in "${CONFIGS[@]}"; do
 
             local_log="$RESULTS_DIR/${config}-perplexity-${chunks}ch.log"
 
+            # llama-perplexity uses --device with comma separator
+            DEVICE_PERPLEXITY="${DEVICE//\//,}"
+
             if ! "$LLAMA_PERPLEXITY" \
                 --model "$MODEL_PATH" \
                 --file "$DATASETS_DIR/$DATASET_FILE" \
                 --chunks "$chunks" \
                 --flash-attn 1 \
                 --gpu-layers 99 \
-                ${DEVICE:+--device "$DEVICE"} \
+                ${DEVICE_PERPLEXITY:+--device "$DEVICE_PERPLEXITY"} \
                 $(cache_flags_perplexity) \
                 > "$local_log" 2>&1; then
                 echo "ERROR: Perplexity failed for ${config}. Log:"
