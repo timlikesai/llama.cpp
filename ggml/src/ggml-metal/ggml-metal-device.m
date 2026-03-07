@@ -1146,7 +1146,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 return false;
             }
             if (op->src[1]->type != op->src[2]->type) {
-                return false;
+                // Allow mixed MXFP K/V types (e.g., mxfp8_e4m3 K + mxfp4 V)
+                if (!ggml_is_type_mxfp(op->src[1]->type) || !ggml_is_type_mxfp(op->src[2]->type)) {
+                    return false;
+                }
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
         case GGML_OP_SSM_CONV:

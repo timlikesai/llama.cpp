@@ -1317,6 +1317,47 @@ static inline float mxfp_preprocess_q_dispatch(float val, ushort tiisg, bool app
     }
 }
 
+// Block byte size for MXFP V type dispatch.
+// mxfp_v_type: 1=mxfp4(17B), 2=mxfp8_e4m3(33B), 3=mxfp8_e5m2(33B), 4=mxfp6_e2m3(25B), 5=mxfp6_e3m2(25B)
+static inline short mxfp_v_block_size(int32_t mxfp_v_type) {
+    switch (mxfp_v_type) {
+        case 1:  return sizeof(block_mxfp4);
+        case 2:
+        case 3:  return sizeof(block_mxfp8);
+        case 4:
+        case 5:  return sizeof(block_mxfp6);
+        default: return 0;
+    }
+}
+
+// Dispatch MXFP V dequant by mxfp_v_type function constant (4x4 variant for main kernel).
+// Reads raw bytes from device memory and dequantizes based on the V type.
+// The function constant is resolved at PSO creation time, so the switch compiles away.
+template <typename type4x4>
+static inline void mxfp_dequant_v_4x4_dispatch(device const char * v_data, short il, thread type4x4 & reg, int32_t mxfp_v_type) {
+    switch (mxfp_v_type) {
+        case 1: dequantize_mxfp4(     (device const block_mxfp4 *) v_data, il, reg); break;
+        case 2: dequantize_mxfp8_e4m3((device const block_mxfp8 *) v_data, il, reg); break;
+        case 3: dequantize_mxfp8_e5m2((device const block_mxfp8 *) v_data, il, reg); break;
+        case 4: dequantize_mxfp6_e2m3((device const block_mxfp6 *) v_data, il, reg); break;
+        case 5: dequantize_mxfp6_e3m2((device const block_mxfp6 *) v_data, il, reg); break;
+        default: break;
+    }
+}
+
+// Dispatch MXFP V dequant by mxfp_v_type function constant (t4 variant for vec kernel).
+template <typename type4>
+static inline void mxfp_dequant_v_t4_dispatch(device const char * v_data, short il, thread type4 & reg, int32_t mxfp_v_type) {
+    switch (mxfp_v_type) {
+        case 1: dequantize_mxfp4_t4(     (device const block_mxfp4 *) v_data, il, reg); break;
+        case 2: dequantize_mxfp8_e4m3_t4((device const block_mxfp8 *) v_data, il, reg); break;
+        case 3: dequantize_mxfp8_e5m2_t4((device const block_mxfp8 *) v_data, il, reg); break;
+        case 4: dequantize_mxfp6_e2m3_t4((device const block_mxfp6 *) v_data, il, reg); break;
+        case 5: dequantize_mxfp6_e3m2_t4((device const block_mxfp6 *) v_data, il, reg); break;
+        default: break;
+    }
+}
+
 template <typename type4x4>
 void dequantize_q2_K(device const block_q2_K *xb, short il, thread type4x4 & reg) {
     const float d = xb->d;
@@ -6197,7 +6238,9 @@ constant int32_t FC_flash_attn_ext_ns20 [[function_constant(FC_FLASH_ATTN_EXT + 
 constant int32_t FC_flash_attn_ext_nsg  [[function_constant(FC_FLASH_ATTN_EXT + 22)]];
 
 // MXFP type for Q preprocessing (0=none, 1=mxfp4_e2m1, 2=mxfp8_e4m3, 3=mxfp8_e5m2, 4=mxfp6_e2m3, 5=mxfp6_e3m2)
-constant int32_t FC_flash_attn_ext_mxfp_type [[function_constant(FC_FLASH_ATTN_EXT + 30)]];
+constant int32_t FC_flash_attn_ext_mxfp_type   [[function_constant(FC_FLASH_ATTN_EXT + 30)]];
+// MXFP V type override for mixed K/V (0=matched, uses template V dequant; 1-5=override V dequant)
+constant int32_t FC_flash_attn_ext_mxfp_v_type [[function_constant(FC_FLASH_ATTN_EXT + 31)]];
 
 // ref: https://arxiv.org/pdf/2307.08691.pdf
 template<
@@ -6739,23 +6782,36 @@ void kernel_flash_attn_ext_impl(
                         }
                     }
                 } else {
-                    // TODO: this is the quantized V cache branch - not optimized yet
+                    // quantized V cache branch (matched or mixed MXFP K/V types)
 
                     const short tx = tiisg%4;
                     const short ty = tiisg/4;
+
+                    // block byte size for V: use override type if mixed, else template type
+                    const short v_bs = (FC_flash_attn_ext_mxfp_v_type > 0)
+                        ? mxfp_v_block_size(FC_flash_attn_ext_mxfp_v_type)
+                        : (short) sizeof(vd4x4_t);
+                    // nl for 4x4 dequant: all MXFP types have nl=2 (32 elems / 16 per 4x4)
+                    constexpr short nl_v_eff = 2;
 
                     for (short cc = 0; cc < C/8; ++cc) {
                         s8x8_t vs;
                         simdgroup_load(vs, ss + 8*cc, SH, 0, false);
 
                         for (short ii = 4*sgitg; ii < DV16; ii += 4*NSG) {
-                            device const vd4x4_t * pv4x4 = (device const vd4x4_t *) (v + ((ic + 8*cc + ty)*args.nb21));
-
                             if (DV16%4 == 0) {
                                 // no need for bound checks
                                 {
                                     v4x4_t tmp;
-                                    deq_v(pv4x4 + (ii + tx)/nl_v, (ii + tx)%nl_v, tmp);
+                                    if (FC_flash_attn_ext_mxfp_v_type > 0) {
+                                        device const char * v_row = v + ((ic + 8*cc + ty)*args.nb21);
+                                        mxfp_dequant_v_4x4_dispatch(v_row + ((ii + tx)/nl_v_eff)*v_bs,
+                                                                    (ii + tx)%nl_v_eff, tmp,
+                                                                    FC_flash_attn_ext_mxfp_v_type);
+                                    } else {
+                                        device const vd4x4_t * pv4x4 = (device const vd4x4_t *) (v + ((ic + 8*cc + ty)*args.nb21));
+                                        deq_v(pv4x4 + (ii + tx)/nl_v, (ii + tx)%nl_v, tmp);
+                                    }
                                     sv4x4[4*ty + tx] = tmp;
                                 }
 
@@ -6779,7 +6835,15 @@ void kernel_flash_attn_ext_impl(
                             } else {
                                 if (ii + tx < DV16) {
                                     v4x4_t tmp;
-                                    deq_v(pv4x4 + (ii + tx)/nl_v, (ii + tx)%nl_v, tmp);
+                                    if (FC_flash_attn_ext_mxfp_v_type > 0) {
+                                        device const char * v_row = v + ((ic + 8*cc + ty)*args.nb21);
+                                        mxfp_dequant_v_4x4_dispatch(v_row + ((ii + tx)/nl_v_eff)*v_bs,
+                                                                    (ii + tx)%nl_v_eff, tmp,
+                                                                    FC_flash_attn_ext_mxfp_v_type);
+                                    } else {
+                                        device const vd4x4_t * pv4x4 = (device const vd4x4_t *) (v + ((ic + 8*cc + ty)*args.nb21));
+                                        deq_v(pv4x4 + (ii + tx)/nl_v, (ii + tx)%nl_v, tmp);
+                                    }
                                     sv4x4[4*ty + tx] = tmp;
                                 }
 
@@ -7149,7 +7213,9 @@ constant int32_t FC_flash_attn_ext_vec_nsg  [[function_constant(FC_FLASH_ATTN_EX
 constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 23)]];
 
 // MXFP type for Q preprocessing (same enum as non-vec kernel)
-constant int32_t FC_flash_attn_ext_vec_mxfp_type [[function_constant(FC_FLASH_ATTN_EXT_VEC + 30)]];
+constant int32_t FC_flash_attn_ext_vec_mxfp_type   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 30)]];
+// MXFP V type override for mixed K/V (0=matched, uses template V dequant; 1-5=override V dequant)
+constant int32_t FC_flash_attn_ext_vec_mxfp_v_type [[function_constant(FC_FLASH_ATTN_EXT_VEC + 31)]];
 
 template<
     typename q4_t,  // query types in shared memory
@@ -7468,14 +7534,27 @@ kernel void kernel_flash_attn_ext_vec(
                         }
                     }
                 } else {
-                    FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
-                        device const vd4_t * pv4 = (device const vd4_t *) (v + ((ic + NE*cc + ty)*args.nb21));
+                    // block byte size for V: use override type if mixed, else template type
+                    const short v_bs = (FC_flash_attn_ext_vec_mxfp_v_type > 0)
+                        ? mxfp_v_block_size(FC_flash_attn_ext_vec_mxfp_v_type)
+                        : (short) sizeof(vd4_t);
+                    // nl for t4 dequant: all MXFP types have nl=8 (32 elems / 4 per t4)
+                    constexpr short nl_v_eff = 8;
 
+                    FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
                         FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
                             const short i = ii*NL + tx;
 
                             v4_t mv;
-                            deq_v_t4(pv4 + i/nl_v, i%nl_v, mv);
+                            if (FC_flash_attn_ext_vec_mxfp_v_type > 0) {
+                                device const char * v_row = v + ((ic + NE*cc + ty)*args.nb21);
+                                mxfp_dequant_v_t4_dispatch(v_row + (i/nl_v_eff)*v_bs,
+                                                           i%nl_v_eff, mv,
+                                                           FC_flash_attn_ext_vec_mxfp_v_type);
+                            } else {
+                                device const vd4_t * pv4 = (device const vd4_t *) (v + ((ic + NE*cc + ty)*args.nb21));
+                                deq_v_t4(pv4 + i/nl_v, i%nl_v, mv);
+                            }
 
                             lo[ii] += o4_t(float4(mv)*float4(ss[NE*cc + ty]));
                         }

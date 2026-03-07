@@ -1323,7 +1323,31 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
             dk,
             dv);
 
-    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_bcm=%d_ns10=%d_ns20=%d_nsg=%d",
+    // MXFP type for Q preprocessing (0=none, 1=mxfp4, 2=mxfp8_e4m3, 3=mxfp8_e5m2, 4=mxfp6_e2m3, 5=mxfp6_e3m2)
+    int32_t mxfp_type = 0;
+    switch (op->src[1]->type) {
+        case GGML_TYPE_MXFP4_E2M1: mxfp_type = 1; break;
+        case GGML_TYPE_MXFP8_E4M3: mxfp_type = 2; break;
+        case GGML_TYPE_MXFP8_E5M2: mxfp_type = 3; break;
+        case GGML_TYPE_MXFP6_E2M3: mxfp_type = 4; break;
+        case GGML_TYPE_MXFP6_E3M2: mxfp_type = 5; break;
+        default: break;
+    }
+
+    // MXFP V type override for mixed K/V (0=matched, 1-5=override V dequant)
+    int32_t mxfp_v_type = 0;
+    if (op->src[1]->type != op->src[2]->type) {
+        switch (op->src[2]->type) {
+            case GGML_TYPE_MXFP4_E2M1: mxfp_v_type = 1; break;
+            case GGML_TYPE_MXFP8_E4M3: mxfp_v_type = 2; break;
+            case GGML_TYPE_MXFP8_E5M2: mxfp_v_type = 3; break;
+            case GGML_TYPE_MXFP6_E2M3: mxfp_v_type = 4; break;
+            case GGML_TYPE_MXFP6_E3M2: mxfp_v_type = 5; break;
+            default: break;
+        }
+    }
+
+    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_bcm=%d_ns10=%d_ns20=%d_nsg=%d_mvt=%d",
             base,
             has_mask,
             has_sinks,
@@ -1333,7 +1357,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
             bc_mask,
             ns10,
             ns20,
-            nsg);
+            nsg,
+            mxfp_v_type);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1351,17 +1376,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         ggml_metal_cv_set_int32(cv, ns20, FC_FLASH_ATTN_EXT + 21);
         ggml_metal_cv_set_int32(cv, nsg,  FC_FLASH_ATTN_EXT + 22);
 
-        // MXFP type for Q preprocessing (0=none, 1=mxfp4, 2=mxfp8_e4m3, 3=mxfp8_e5m2, 4=mxfp6_e2m3, 5=mxfp6_e3m2)
-        int32_t mxfp_type = 0;
-        switch (op->src[1]->type) {
-            case GGML_TYPE_MXFP4_E2M1: mxfp_type = 1; break;
-            case GGML_TYPE_MXFP8_E4M3: mxfp_type = 2; break;
-            case GGML_TYPE_MXFP8_E5M2: mxfp_type = 3; break;
-            case GGML_TYPE_MXFP6_E2M3: mxfp_type = 4; break;
-            case GGML_TYPE_MXFP6_E3M2: mxfp_type = 5; break;
-            default: break;
-        }
-        ggml_metal_cv_set_int32(cv, mxfp_type, FC_FLASH_ATTN_EXT + 30);
+        ggml_metal_cv_set_int32(cv, mxfp_type,   FC_FLASH_ATTN_EXT + 30);
+        ggml_metal_cv_set_int32(cv, mxfp_v_type, FC_FLASH_ATTN_EXT + 31);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -1398,7 +1414,31 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
             dk,
             dv);
 
-    snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d",
+    // MXFP type for Q preprocessing
+    int32_t mxfp_type = 0;
+    switch (op->src[1]->type) {
+        case GGML_TYPE_MXFP4_E2M1: mxfp_type = 1; break;
+        case GGML_TYPE_MXFP8_E4M3: mxfp_type = 2; break;
+        case GGML_TYPE_MXFP8_E5M2: mxfp_type = 3; break;
+        case GGML_TYPE_MXFP6_E2M3: mxfp_type = 4; break;
+        case GGML_TYPE_MXFP6_E3M2: mxfp_type = 5; break;
+        default: break;
+    }
+
+    // MXFP V type override for mixed K/V (0=matched, 1-5=override V dequant)
+    int32_t mxfp_v_type = 0;
+    if (op->src[1]->type != op->src[2]->type) {
+        switch (op->src[2]->type) {
+            case GGML_TYPE_MXFP4_E2M1: mxfp_v_type = 1; break;
+            case GGML_TYPE_MXFP8_E4M3: mxfp_v_type = 2; break;
+            case GGML_TYPE_MXFP8_E5M2: mxfp_v_type = 3; break;
+            case GGML_TYPE_MXFP6_E2M3: mxfp_v_type = 4; break;
+            case GGML_TYPE_MXFP6_E3M2: mxfp_v_type = 5; break;
+            default: break;
+        }
+    }
+
+    snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d_mvt=%d",
             base,
             has_mask,
             has_sinks,
@@ -1407,7 +1447,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
             has_kvpad,
             ns10,
             ns20,
-            nsg, nwg);
+            nsg, nwg,
+            mxfp_v_type);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1424,17 +1465,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         ggml_metal_cv_set_int32(cv, nsg,  FC_FLASH_ATTN_EXT_VEC + 22);
         ggml_metal_cv_set_int32(cv, nwg,  FC_FLASH_ATTN_EXT_VEC + 23);
 
-        // MXFP type for Q preprocessing
-        int32_t mxfp_type = 0;
-        switch (op->src[1]->type) {
-            case GGML_TYPE_MXFP4_E2M1: mxfp_type = 1; break;
-            case GGML_TYPE_MXFP8_E4M3: mxfp_type = 2; break;
-            case GGML_TYPE_MXFP8_E5M2: mxfp_type = 3; break;
-            case GGML_TYPE_MXFP6_E2M3: mxfp_type = 4; break;
-            case GGML_TYPE_MXFP6_E3M2: mxfp_type = 5; break;
-            default: break;
-        }
-        ggml_metal_cv_set_int32(cv, mxfp_type, FC_FLASH_ATTN_EXT_VEC + 30);
+        ggml_metal_cv_set_int32(cv, mxfp_type,   FC_FLASH_ATTN_EXT_VEC + 30);
+        ggml_metal_cv_set_int32(cv, mxfp_v_type, FC_FLASH_ATTN_EXT_VEC + 31);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
