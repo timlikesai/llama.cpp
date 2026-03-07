@@ -56,6 +56,8 @@ if (MUSAToolkit_FOUND)
         list(APPEND GGML_SOURCES_MUSA ${SRCS})
         file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*q8_0-q4_0.cu")
         list(APPEND GGML_SOURCES_MUSA ${SRCS})
+        file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*mxfp4-mxfp4.cu")
+        list(APPEND GGML_SOURCES_MUSA ${SRCS})
     endif()
 
     set_source_files_properties(${GGML_SOURCES_MUSA} PROPERTIES LANGUAGE CXX)

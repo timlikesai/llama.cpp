@@ -115,14 +115,12 @@ static __global__ void flash_attn_ext_vec(
 
     int K_qs_head_off = 0, K_e_head_off = 0;
     int V_qs_head_off = 0, V_e_head_off = 0;
-#if CUDART_VERSION >= 12080
     if constexpr (is_mxfp_soa_v<type_K>) {
         mxfp_soa_head_offsets<type_K, D>(nb11, head, gqa_ratio, K_qs_head_off, K_e_head_off);
     }
     if constexpr (is_mxfp_soa_v<type_V>) {
         mxfp_soa_head_offsets<type_V, D>(nb21, head, gqa_ratio, V_qs_head_off, V_e_head_off);
     }
-#endif // CUDART_VERSION >= 12080
 
     const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
 
@@ -633,6 +631,7 @@ extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_MXFP4_E2M1, GGML_TYPE_MXFP4_E2M1);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_MXFP4_E2M1, GGML_TYPE_MXFP4_E2M1);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_MXFP4_E2M1, GGML_TYPE_MXFP4_E2M1);
 
+#if CUDART_VERSION >= 12080
 // MXFP8: K=mxfp8 with V=mxfp4 (default) or V=mxfp8 (max quality)
 extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_MXFP8_E4M3, GGML_TYPE_MXFP4_E2M1);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_MXFP8_E4M3, GGML_TYPE_MXFP4_E2M1);
@@ -666,3 +665,4 @@ extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP8_E5M2);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP8_E5M2);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP8_E5M2);
 #endif // GGML_CUDA_MXFP_ALL_VARIANTS
+#endif // CUDART_VERSION >= 12080

@@ -383,10 +383,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
-#if CUDART_VERSION >= 12080
-    // MXFP VEC cases — always enabled regardless of GGML_CUDA_FA_ALL_QUANTS:
+    // MXFP4 VEC: uses LUT-only code, works on all backends (CUDA, HIP, MUSA):
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP4_E2M1, GGML_TYPE_MXFP4_E2M1)
 
+#if CUDART_VERSION >= 12080
+    // MXFP8/MXFP6 VEC: requires mxfp_traits (CUDA 12.8+ intrinsics for dequant):
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E4M3, GGML_TYPE_MXFP4_E2M1)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8_E4M3, GGML_TYPE_MXFP8_E4M3)
 
@@ -510,6 +511,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    // MXFP4 VEC: LUT-only dequant, works on all backends (CUDA, HIP, MUSA).
+    // On non-Blackwell this is the only flash attention path for MXFP4.
+    if (K->type == GGML_TYPE_MXFP4_E2M1 && can_use_vector_kernel) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
 
 #if CUDART_VERSION >= 12080
     // Unified MXFP flash attention (Blackwell MMA for FP4/FP6/FP8):

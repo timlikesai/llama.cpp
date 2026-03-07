@@ -38,6 +38,26 @@ static __host__ __device__ __forceinline__ bool ggml_is_type_mxfp_enabled(ggml_t
     return false;
 }
 
+// SoA head offset calculation:
+// Computes qs and E8M0 byte offsets for a given head in a SoA-layout MXFP row.
+// Layout: [qs_block0 | qs_block1 | ... | e_block0 | e_block1 | ...]
+// Defined outside CUDART guard so it works on HIP/MUSA too.
+template<ggml_type type, int D>
+static __device__ __forceinline__ void mxfp_soa_head_offsets(
+        const int nb_row, const int head, const int gqa_ratio,
+        int & qs_off, int & e_off) {
+    // block_size and qs_per_block derived from ggml-common.h struct definitions:
+    //   MXFP4: block=17 (1+16), qs=16    MXFP8: block=33 (1+32), qs=32    MXFP6: block=25 (1+24), qs=24
+    constexpr int qs_per_block = (type == GGML_TYPE_MXFP4_E2M1) ? 16 :
+                                 (type == GGML_TYPE_MXFP8_E4M3 || type == GGML_TYPE_MXFP8_E5M2) ? 32 : 24;
+    constexpr int block_size   = qs_per_block + 1;  // +1 byte for E8M0 scale
+    constexpr int blocks_per_head = D / 32;
+    const int stride_blocks = nb_row / block_size;
+    const int z = head / gqa_ratio;
+    qs_off = z * blocks_per_head * qs_per_block;
+    e_off  = stride_blocks * qs_per_block + z * blocks_per_head;
+}
+
 // The trait specializations below use NVIDIA CUDA 12.8+ intrinsics (__nv_cvt_float_to_fp4,
 // __nv_cvt_float_to_fp6, __nv_fp8_e4m3, etc.) from cuda_fp4.h / cuda_fp8.h.
 #if CUDART_VERSION >= 12080
@@ -251,21 +271,6 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E5M2> {
         }
     }
 };
-
-// SoA head offset calculation:
-// Computes qs and E8M0 byte offsets for a given head in a SoA-layout MXFP row.
-// Layout: [qs_block0 | qs_block1 | ... | e_block0 | e_block1 | ...]
-template<ggml_type type, int D>
-static __device__ __forceinline__ void mxfp_soa_head_offsets(
-        const int nb_row, const int head, const int gqa_ratio,
-        int & qs_off, int & e_off) {
-    using traits = mxfp_traits<type>;
-    constexpr int blocks_per_head = D / 32;
-    const int stride_blocks = nb_row / traits::block_size;
-    const int z = head / gqa_ratio;
-    qs_off = z * blocks_per_head * traits::qs_per_block;
-    e_off  = stride_blocks * traits::qs_per_block + z * blocks_per_head;
-}
 
 // Unified SoA quantization:
 // Shared Hadamard rotation + direct E8M0 scale + type-specific writes.
