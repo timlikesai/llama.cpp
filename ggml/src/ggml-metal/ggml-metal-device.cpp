@@ -1317,12 +1317,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
     // do bounds checks for the mask?
     const bool bc_mask = op->src[3] && (op->src[3]->ne[1] % 8 != 0);
 
-    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
-            "flash_attn_ext",
-            ggml_type_name(op->src[1]->type),
-            dk,
-            dv);
-
     // MXFP type for Q preprocessing (0=none, 1=mxfp4, 2=mxfp8_e4m3, 3=mxfp8_e5m2, 4=mxfp6_e2m3, 5=mxfp6_e3m2)
     int32_t mxfp_type = 0;
     switch (op->src[1]->type) {
@@ -1347,6 +1341,31 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
             case GGML_TYPE_Q8_0:       mxfp_v_type = 7; break;
             default: break;
         }
+    }
+
+    // Check if we have a native mixed K/V kernel (avoids dispatch overhead)
+    bool native_mixed = false;
+    if (mxfp_v_type != 0) {
+        const auto kt = op->src[1]->type;
+        const auto vt = op->src[2]->type;
+        native_mixed =
+            (kt == GGML_TYPE_MXFP8_E4M3 && vt == GGML_TYPE_MXFP4_E2M1) ||
+            (kt == GGML_TYPE_MXFP6_E2M3 && vt == GGML_TYPE_MXFP4_E2M1) ||
+            (kt == GGML_TYPE_Q8_0       && vt == GGML_TYPE_Q4_0);
+    }
+
+    if (native_mixed) {
+        snprintf(base, 256, "kernel_%s_%s_v_%s_dk%d_dv%d",
+                "flash_attn_ext",
+                ggml_type_name(op->src[1]->type),
+                ggml_type_name(op->src[2]->type),
+                dk, dv);
+        mxfp_v_type = 0; // native kernel handles V type via template
+    } else {
+        snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
+                "flash_attn_ext",
+                ggml_type_name(op->src[1]->type),
+                dk, dv);
     }
 
     snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_bcm=%d_ns10=%d_ns20=%d_nsg=%d_mvt=%d",
@@ -1410,12 +1429,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     const int32_t ns10 = op->src[1]->nb[1]/op->src[1]->nb[0];
     const int32_t ns20 = op->src[2]->nb[1]/op->src[2]->nb[0];
 
-    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
-            "flash_attn_ext_vec",
-            ggml_type_name(op->src[1]->type),
-            dk,
-            dv);
-
     // MXFP type for Q preprocessing
     int32_t mxfp_type = 0;
     switch (op->src[1]->type) {
@@ -1440,6 +1453,31 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
             case GGML_TYPE_Q8_0:       mxfp_v_type = 7; break;
             default: break;
         }
+    }
+
+    // Check if we have a native mixed K/V kernel (avoids dispatch overhead)
+    bool native_mixed = false;
+    if (mxfp_v_type != 0) {
+        const auto kt = op->src[1]->type;
+        const auto vt = op->src[2]->type;
+        native_mixed =
+            (kt == GGML_TYPE_MXFP8_E4M3 && vt == GGML_TYPE_MXFP4_E2M1) ||
+            (kt == GGML_TYPE_MXFP6_E2M3 && vt == GGML_TYPE_MXFP4_E2M1) ||
+            (kt == GGML_TYPE_Q8_0       && vt == GGML_TYPE_Q4_0);
+    }
+
+    if (native_mixed) {
+        snprintf(base, 256, "kernel_%s_%s_v_%s_dk%d_dv%d",
+                "flash_attn_ext_vec",
+                ggml_type_name(op->src[1]->type),
+                ggml_type_name(op->src[2]->type),
+                dk, dv);
+        mxfp_v_type = 0; // native kernel handles V type via template
+    } else {
+        snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
+                "flash_attn_ext_vec",
+                ggml_type_name(op->src[1]->type),
+                dk, dv);
     }
 
     snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d_mvt=%d",
