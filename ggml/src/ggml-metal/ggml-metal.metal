@@ -630,12 +630,14 @@ void dequantize_mxfp4(device const block_mxfp4 * xb, short il, thread type4x4 & 
     const float d = e8m0_to_fp32(xb->e);
     const uint8_t shr = il >= 1 ? 4 : 0;
 
+    float4x4 reg_f;
     for (int i = 0; i < 4; ++i) {
-        reg[i][0] = d * kvalues_mxfp4_f[(q2[4*i + 0] >> shr) & 0x0F];
-        reg[i][1] = d * kvalues_mxfp4_f[(q2[4*i + 1] >> shr) & 0x0F];
-        reg[i][2] = d * kvalues_mxfp4_f[(q2[4*i + 2] >> shr) & 0x0F];
-        reg[i][3] = d * kvalues_mxfp4_f[(q2[4*i + 3] >> shr) & 0x0F];
+        reg_f[i][0] = d * kvalues_mxfp4_f[(q2[4*i + 0] >> shr) & 0x0F];
+        reg_f[i][1] = d * kvalues_mxfp4_f[(q2[4*i + 1] >> shr) & 0x0F];
+        reg_f[i][2] = d * kvalues_mxfp4_f[(q2[4*i + 2] >> shr) & 0x0F];
+        reg_f[i][3] = d * kvalues_mxfp4_f[(q2[4*i + 3] >> shr) & 0x0F];
     }
+    reg = (type4x4) reg_f;
 }
 
 template <typename type4>
@@ -647,10 +649,12 @@ void dequantize_mxfp4_t4(device const block_mxfp4 * xb, short il, thread type4 &
 
     const uint8_t shr = il >= 4 ? 4 : 0;
 
-    reg[0] = d * kvalues_mxfp4_f[(q2[4*il4 + 0] >> shr) & 0x0F];
-    reg[1] = d * kvalues_mxfp4_f[(q2[4*il4 + 1] >> shr) & 0x0F];
-    reg[2] = d * kvalues_mxfp4_f[(q2[4*il4 + 2] >> shr) & 0x0F];
-    reg[3] = d * kvalues_mxfp4_f[(q2[4*il4 + 3] >> shr) & 0x0F];
+    float4 reg_f;
+    reg_f[0] = d * kvalues_mxfp4_f[(q2[4*il4 + 0] >> shr) & 0x0F];
+    reg_f[1] = d * kvalues_mxfp4_f[(q2[4*il4 + 1] >> shr) & 0x0F];
+    reg_f[2] = d * kvalues_mxfp4_f[(q2[4*il4 + 2] >> shr) & 0x0F];
+    reg_f[3] = d * kvalues_mxfp4_f[(q2[4*il4 + 3] >> shr) & 0x0F];
+    reg = (type4) reg_f;
 }
 
 // ===== MXFP Q preprocessing for flash attention =====
@@ -800,12 +804,14 @@ static inline void dequantize_mxfp8_impl(device const block_mxfp8 * xb, short il
     const float d = e8m0_to_fp32(xb->e);
     const short offset = il * 16;
 
+    float4x4 reg_f;
     for (int i = 0; i < 4; ++i) {
-        reg[i][0] = d * lut[qs[offset + 4*i + 0]];
-        reg[i][1] = d * lut[qs[offset + 4*i + 1]];
-        reg[i][2] = d * lut[qs[offset + 4*i + 2]];
-        reg[i][3] = d * lut[qs[offset + 4*i + 3]];
+        reg_f[i][0] = d * lut[qs[offset + 4*i + 0]];
+        reg_f[i][1] = d * lut[qs[offset + 4*i + 1]];
+        reg_f[i][2] = d * lut[qs[offset + 4*i + 2]];
+        reg_f[i][3] = d * lut[qs[offset + 4*i + 3]];
     }
+    reg = (type4x4) reg_f;
 }
 
 template <typename type4>
@@ -813,10 +819,12 @@ static inline void dequantize_mxfp8_t4_impl(device const block_mxfp8 * xb, short
     device const uint8_t * qs = xb->qs;
     const float d = e8m0_to_fp32(xb->e);
 
-    reg[0] = d * lut[qs[4*il + 0]];
-    reg[1] = d * lut[qs[4*il + 1]];
-    reg[2] = d * lut[qs[4*il + 2]];
-    reg[3] = d * lut[qs[4*il + 3]];
+    float4 reg_f;
+    reg_f[0] = d * lut[qs[4*il + 0]];
+    reg_f[1] = d * lut[qs[4*il + 1]];
+    reg_f[2] = d * lut[qs[4*il + 2]];
+    reg_f[3] = d * lut[qs[4*il + 3]];
+    reg = (type4) reg_f;
 }
 
 template <typename type4x4>
@@ -976,14 +984,16 @@ static inline void dequantize_mxfp6_impl(device const block_mxfp6 * xb, short il
     const float d = e8m0_to_fp32(xb->e);
     const short base_group = il * 4;
 
+    float4x4 reg_f;
     for (int i = 0; i < 4; ++i) {
         const short off = (base_group + i) * 3;
         const uint32_t packed = (uint32_t)xb->qs[off] | ((uint32_t)xb->qs[off + 1] << 8) | ((uint32_t)xb->qs[off + 2] << 16);
-        reg[i][0] = d * lut[packed & 0x3F];
-        reg[i][1] = d * lut[(packed >> 6) & 0x3F];
-        reg[i][2] = d * lut[(packed >> 12) & 0x3F];
-        reg[i][3] = d * lut[(packed >> 18) & 0x3F];
+        reg_f[i][0] = d * lut[packed & 0x3F];
+        reg_f[i][1] = d * lut[(packed >> 6) & 0x3F];
+        reg_f[i][2] = d * lut[(packed >> 12) & 0x3F];
+        reg_f[i][3] = d * lut[(packed >> 18) & 0x3F];
     }
+    reg = (type4x4) reg_f;
 }
 
 template <typename type4>
@@ -991,10 +1001,12 @@ static inline void dequantize_mxfp6_t4_impl(device const block_mxfp6 * xb, short
     const float d = e8m0_to_fp32(xb->e);
     const short off = il * 3;
     const uint32_t packed = (uint32_t)xb->qs[off] | ((uint32_t)xb->qs[off + 1] << 8) | ((uint32_t)xb->qs[off + 2] << 16);
-    reg[0] = d * lut[packed & 0x3F];
-    reg[1] = d * lut[(packed >> 6) & 0x3F];
-    reg[2] = d * lut[(packed >> 12) & 0x3F];
-    reg[3] = d * lut[(packed >> 18) & 0x3F];
+    float4 reg_f;
+    reg_f[0] = d * lut[packed & 0x3F];
+    reg_f[1] = d * lut[(packed >> 6) & 0x3F];
+    reg_f[2] = d * lut[(packed >> 12) & 0x3F];
+    reg_f[3] = d * lut[(packed >> 18) & 0x3F];
+    reg = (type4) reg_f;
 }
 
 template <typename type4x4>
