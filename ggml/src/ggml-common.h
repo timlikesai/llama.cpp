@@ -237,6 +237,23 @@ typedef struct {
 } block_mxfp6;
 static_assert(sizeof(block_mxfp6) == sizeof(uint8_t) + QK_MXFP6 * 6 / 8, "wrong mxfp6 block size/padding");
 
+// MXFP SoA (Struct-of-Arrays) layout constants.
+//
+// AoS layout (default block struct): [e₀|qs₀][e₁|qs₁]... → 17/25/33 byte strides, never aligned
+// SoA layout (for KV cache perf):    [qs₀|qs₁|...][e₀|e₁|...] → qs region is naturally aligned
+//
+// SoA separates the 1-byte E8M0 scale from the quantized data, enabling aligned bulk memory
+// transfers. The qs region starts at offset 0 and is contiguous:
+//   MXFP4: 16 bytes/block → 16B aligned (perfect for float4/uint4 loads)
+//   MXFP8: 32 bytes/block → 32B aligned (two float4 loads)
+//   MXFP6: 24 bytes/block →  8B aligned (three uint64 loads)
+//
+// Total bytes per row is IDENTICAL to AoS — same tensor strides, just rearranged.
+// All backends should use SoA for MXFP KV cache data to enable aligned memory access.
+#define MXFP4_SOA_QS_PER_BLOCK  (QK_MXFP4 / 2)       // 16 bytes
+#define MXFP8_SOA_QS_PER_BLOCK  (QK_MXFP8)            // 32 bytes
+#define MXFP6_SOA_QS_PER_BLOCK  (QK_MXFP6 * 6 / 8)   // 24 bytes
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta
@@ -513,6 +530,34 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 #define GGML_TABLE_END() };
 
 #define GGML_COMMON_IMPL
+#endif
+
+// Cross-backend inline function qualifier and type-pun macro.
+// Used by shared MXFP SoA helpers below.
+#if defined(GGML_COMMON_IMPL_METAL)
+#define GGML_COMMON_FN      static inline
+#define GGML_U32_TO_F32(x)  as_type<float>((uint32_t)(x))
+#define GGML_THREAD_PTR(T)  thread T
+#elif defined(GGML_COMMON_IMPL_CUDA) || defined(GGML_COMMON_IMPL_HIP) || defined(GGML_COMMON_IMPL_MUSA)
+#define GGML_COMMON_FN      static __device__ __forceinline__
+#define GGML_U32_TO_F32(x)  ggml_common_u32_to_f32_impl((uint32_t)(x))
+#define GGML_THREAD_PTR(T)  T
+// CUDA/HIP memcpy-based type pun (strict aliasing safe)
+static __device__ __forceinline__ float ggml_common_u32_to_f32_impl(uint32_t v) {
+    float f; memcpy(&f, &v, sizeof(f)); return f;
+}
+#elif defined(GGML_COMMON_IMPL_C) || defined(GGML_COMMON_IMPL_CPP) || defined(GGML_COMMON_IMPL_SYCL)
+#define GGML_COMMON_FN      static inline
+#define GGML_THREAD_PTR(T)  T
+#ifndef __cplusplus
+#include <string.h>  // memcpy for C
+#else
+#include <cstring>   // memcpy for C++
+#endif
+#define GGML_U32_TO_F32(x)  ggml_common_u32_to_f32_impl((uint32_t)(x))
+static inline float ggml_common_u32_to_f32_impl(uint32_t v) {
+    float f; memcpy(&f, &v, sizeof(f)); return f;
+}
 #endif
 
 #if defined(GGML_COMMON_IMPL)
@@ -1137,6 +1182,55 @@ GGML_TABLE_END()
 GGML_TABLE_BEGIN(int8_t, kvalues_mxfp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 GGML_TABLE_END()
+
+// ── MXFP SoA shared functions ──────────────────────────────────────────────
+// Portable across Metal, CUDA, HIP, MUSA, SYCL, and CPU (C/C++).
+// These enable all backends to use SoA layout for MXFP KV cache data.
+
+// E8M0 → float: 2^(e-127). The fundamental scale conversion for all MX types.
+// E8M0 is exponent-only (no mantissa) — just set the IEEE-754 exponent field.
+GGML_COMMON_FN float ggml_e8m0_to_f32(uint8_t e) {
+    // e=0 → 2^(-127) represented as smallest positive denormal
+    uint32_t bits = (e == 0) ? 0x00400000u : ((uint32_t)e << 23);
+    return GGML_U32_TO_F32(bits);
+}
+
+// SoA byte offset to the qs (quantized data) region for a given block.
+// In SoA layout: qs is contiguous from byte 0, so offset = block_idx * qs_per_block.
+GGML_COMMON_FN int ggml_mxfp_soa_qs_offset(int block_idx, int qs_per_block) {
+    return block_idx * qs_per_block;
+}
+
+// SoA byte offset to the E8M0 scale for a given block.
+// Scales are packed contiguously after all qs data: offset = total_qs_bytes + block_idx.
+GGML_COMMON_FN int ggml_mxfp_soa_e_offset(int block_idx, int blocks_per_row, int qs_per_block) {
+    return blocks_per_row * qs_per_block + block_idx;
+}
+
+// Compute qs and E8M0 byte offsets for a given head within a SoA-layout row.
+// Accounts for GQA (grouped-query attention) head mapping.
+//
+// Layout per row: [qs_head0 | qs_head1 | ... | e_head0 | e_head1 | ...]
+//
+// Parameters:
+//   nb_row:       total bytes per row (tensor nb[1])
+//   head:         query head index
+//   gqa_ratio:    ne02/ne_12_2 (number of Q heads sharing each KV head)
+//   block_size:   sizeof(block_mxfp*) — the AoS struct size (17, 25, or 33)
+//   qs_per_block: MXFP*_SOA_QS_PER_BLOCK (16, 24, or 32)
+//   d:            head dimension (embedding per head)
+//   qs_off:       [out] byte offset to start of qs data for this head
+//   e_off:        [out] byte offset to start of E8M0 scales for this head
+GGML_COMMON_FN void ggml_mxfp_soa_head_offsets(
+        int nb_row, int head, int gqa_ratio,
+        int block_size, int qs_per_block, int d,
+        GGML_THREAD_PTR(int *) qs_off, GGML_THREAD_PTR(int *) e_off) {
+    int blocks_per_head = d / 32;
+    int stride_blocks   = nb_row / block_size;
+    int kv_head         = head / gqa_ratio;
+    *qs_off = kv_head * blocks_per_head * qs_per_block;
+    *e_off  = stride_blocks * qs_per_block + kv_head * blocks_per_head;
+}
 
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f

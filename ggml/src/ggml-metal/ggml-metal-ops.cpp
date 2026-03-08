@@ -1177,23 +1177,11 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
 
     const int32_t nk0 = ne0/ggml_blck_size(op->type);
 
-    int nth = 32; // SIMD width
-
-    while (nth < nk0 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
-        nth *= 2;
-    }
-
-    int nrptg = 1;
-    if (nth > nk0) {
-        nrptg = (nth + nk0 - 1)/nk0;
-        nth   = nk0;
-
-        if (nrptg*nth > ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
-            nrptg--;
-        }
-    }
-
-    nth = std::min(nth, nk0);
+    const bool is_mxfp_simd = (op->type == GGML_TYPE_MXFP4_E2M1 ||
+                               op->type == GGML_TYPE_MXFP8_E4M3 ||
+                               op->type == GGML_TYPE_MXFP8_E5M2 ||
+                               op->type == GGML_TYPE_MXFP6_E2M3 ||
+                               op->type == GGML_TYPE_MXFP6_E3M2);
 
     ggml_metal_kargs_set_rows args = {
         /*.nk0  =*/ nk0,
@@ -1218,7 +1206,25 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nrptg - 1)/nrptg, ne02, ne03, nth, nrptg, 1);
+    if (is_mxfp_simd) {
+        // SIMD-parallel dispatch: nk0 simdgroups × 32 threads, one row per threadgroup
+        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, 32*nk0, 1, 1);
+    } else {
+        int nth = 32;
+        while (nth < nk0 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+            nth *= 2;
+        }
+        int nrptg = 1;
+        if (nth > nk0) {
+            nrptg = (nth + nk0 - 1)/nk0;
+            nth   = nk0;
+            if (nrptg*nth > ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+                nrptg--;
+            }
+        }
+        nth = std::min(nth, nk0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nrptg - 1)/nrptg, ne02, ne03, nth, nrptg, 1);
+    }
 
     return 1;
 }

@@ -169,6 +169,12 @@ static inline float e8m0_to_fp32(uint8_t x) {
     return as_type<float>(bits);
 }
 
+// Branchless variant for dequant hot paths: when x=0, returns 0.0f instead of subnormal.
+// Safe because d * any_value = 0 when d=0, giving exact zeros.
+static inline float e8m0_to_fp32_fast(uint8_t x) {
+    return as_type<float>((uint32_t)x << 23);
+}
+
 static inline float dot(float x, float y) {
     return x*y;
 }
@@ -1029,27 +1035,149 @@ void dequantize_mxfp6_e3m2_t4(device const block_mxfp6 * xb, short il, thread ty
     dequantize_mxfp6_t4_impl(xb, il, reg, fp6_e3m2_lut);
 }
 
+// ===== MXFP SoA dequantization =====
+// SoA layout per row: [qs_block0 | qs_block1 | ...][e_block0 | e_block1 | ...]
+// These read from byte-aligned contiguous qs regions, enabling vectorized loads.
+
+// SoA address helpers
+static inline device const uint8_t * mxfp_soa_qs(device const char * row, short bidx, short qs_per_block) {
+    return (device const uint8_t *)(row + bidx * qs_per_block);
+}
+static inline float mxfp_soa_scale(device const char * row, short bidx, short nblocks, short qs_per_block) {
+    return e8m0_to_fp32_fast(*(device const uint8_t *)(row + nblocks * qs_per_block + bidx));
+}
+
+// MXFP4 SoA dequant (4x4: 16 values, il=0..1) — LUT decode with SoA layout
+template <typename type4x4>
+void dequantize_mxfp4_soa(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg) {
+    device const uint8_t * qs = mxfp_soa_qs(row, bidx, MXFP4_SOA_QS_PER_BLOCK);
+    const float d = mxfp_soa_scale(row, bidx, nblocks, MXFP4_SOA_QS_PER_BLOCK);
+    const uint8_t shr = il >= 1 ? 4 : 0;
+
+    float4x4 reg_f;
+    for (int i = 0; i < 4; ++i) {
+        reg_f[i][0] = d * kvalues_mxfp4_f[(qs[4*i + 0] >> shr) & 0x0F];
+        reg_f[i][1] = d * kvalues_mxfp4_f[(qs[4*i + 1] >> shr) & 0x0F];
+        reg_f[i][2] = d * kvalues_mxfp4_f[(qs[4*i + 2] >> shr) & 0x0F];
+        reg_f[i][3] = d * kvalues_mxfp4_f[(qs[4*i + 3] >> shr) & 0x0F];
+    }
+    reg = (type4x4) reg_f;
+}
+
+// MXFP4 SoA dequant (t4: 4 values, il=0..7) — LUT decode with SoA layout
+template <typename type4>
+void dequantize_mxfp4_t4_soa(device const char * row, short bidx, short nblocks, short il, thread type4 & reg) {
+    device const uint8_t * qs = mxfp_soa_qs(row, bidx, MXFP4_SOA_QS_PER_BLOCK);
+    const float d = mxfp_soa_scale(row, bidx, nblocks, MXFP4_SOA_QS_PER_BLOCK);
+    const short il4 = il % 4;
+    const uint8_t shr = il >= 4 ? 4 : 0;
+
+    float4 reg_f;
+    reg_f[0] = d * kvalues_mxfp4_f[(qs[4*il4 + 0] >> shr) & 0x0F];
+    reg_f[1] = d * kvalues_mxfp4_f[(qs[4*il4 + 1] >> shr) & 0x0F];
+    reg_f[2] = d * kvalues_mxfp4_f[(qs[4*il4 + 2] >> shr) & 0x0F];
+    reg_f[3] = d * kvalues_mxfp4_f[(qs[4*il4 + 3] >> shr) & 0x0F];
+    reg = (type4) reg_f;
+}
+
+// MXFP8 SoA dequant (4x4, il=0..1)
+template <typename type4x4>
+static inline void dequantize_mxfp8_soa_impl(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg, constant float * lut) {
+    device const uint8_t * qs = mxfp_soa_qs(row, bidx, MXFP8_SOA_QS_PER_BLOCK);
+    const float d = mxfp_soa_scale(row, bidx, nblocks, MXFP8_SOA_QS_PER_BLOCK);
+    const short offset = il * 16;
+    float4x4 reg_f;
+    for (int i = 0; i < 4; ++i) {
+        reg_f[i][0] = d * lut[qs[offset + 4*i + 0]];
+        reg_f[i][1] = d * lut[qs[offset + 4*i + 1]];
+        reg_f[i][2] = d * lut[qs[offset + 4*i + 2]];
+        reg_f[i][3] = d * lut[qs[offset + 4*i + 3]];
+    }
+    reg = (type4x4) reg_f;
+}
+
+// MXFP8 SoA dequant (t4, il=0..7)
+template <typename type4>
+static inline void dequantize_mxfp8_t4_soa_impl(device const char * row, short bidx, short nblocks, short il, thread type4 & reg, constant float * lut) {
+    const float d = mxfp_soa_scale(row, bidx, nblocks, MXFP8_SOA_QS_PER_BLOCK);
+    const uint32_t qs4 = *(device const uint32_t *)(row + bidx * MXFP8_SOA_QS_PER_BLOCK + 4*il);
+    float4 reg_f;
+    reg_f[0] = d * lut[(qs4      ) & 0xFF];
+    reg_f[1] = d * lut[(qs4 >>  8) & 0xFF];
+    reg_f[2] = d * lut[(qs4 >> 16) & 0xFF];
+    reg_f[3] = d * lut[(qs4 >> 24) & 0xFF];
+    reg = (type4) reg_f;
+}
+
+template <typename type4x4>
+void dequantize_mxfp8_e4m3_soa(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg) {
+    dequantize_mxfp8_soa_impl(row, bidx, nblocks, il, reg, fp8_e4m3_lut);
+}
+template <typename type4>
+void dequantize_mxfp8_e4m3_t4_soa(device const char * row, short bidx, short nblocks, short il, thread type4 & reg) {
+    dequantize_mxfp8_t4_soa_impl(row, bidx, nblocks, il, reg, fp8_e4m3_lut);
+}
+template <typename type4x4>
+void dequantize_mxfp8_e5m2_soa(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg) {
+    dequantize_mxfp8_soa_impl(row, bidx, nblocks, il, reg, fp8_e5m2_lut);
+}
+template <typename type4>
+void dequantize_mxfp8_e5m2_t4_soa(device const char * row, short bidx, short nblocks, short il, thread type4 & reg) {
+    dequantize_mxfp8_t4_soa_impl(row, bidx, nblocks, il, reg, fp8_e5m2_lut);
+}
+
+// MXFP6 SoA dequant (4x4, il=0..1)
+template <typename type4x4>
+static inline void dequantize_mxfp6_soa_impl(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg, constant float * lut) {
+    device const uint8_t * qs = mxfp_soa_qs(row, bidx, MXFP6_SOA_QS_PER_BLOCK);
+    const float d = mxfp_soa_scale(row, bidx, nblocks, MXFP6_SOA_QS_PER_BLOCK);
+    const short base_group = il * 4;
+    float4x4 reg_f;
+    for (int i = 0; i < 4; ++i) {
+        const short off = (base_group + i) * 3;
+        const uint32_t packed = (uint32_t)qs[off] | ((uint32_t)qs[off + 1] << 8) | ((uint32_t)qs[off + 2] << 16);
+        reg_f[i][0] = d * lut[packed & 0x3F];
+        reg_f[i][1] = d * lut[(packed >> 6) & 0x3F];
+        reg_f[i][2] = d * lut[(packed >> 12) & 0x3F];
+        reg_f[i][3] = d * lut[(packed >> 18) & 0x3F];
+    }
+    reg = (type4x4) reg_f;
+}
+
+// MXFP6 SoA dequant (t4, il=0..7)
+template <typename type4>
+static inline void dequantize_mxfp6_t4_soa_impl(device const char * row, short bidx, short nblocks, short il, thread type4 & reg, constant float * lut) {
+    device const uint8_t * qs = mxfp_soa_qs(row, bidx, MXFP6_SOA_QS_PER_BLOCK);
+    const float d = mxfp_soa_scale(row, bidx, nblocks, MXFP6_SOA_QS_PER_BLOCK);
+    const short off = il * 3;
+    const uint32_t packed = (uint32_t)qs[off] | ((uint32_t)qs[off + 1] << 8) | ((uint32_t)qs[off + 2] << 16);
+    float4 reg_f;
+    reg_f[0] = d * lut[packed & 0x3F];
+    reg_f[1] = d * lut[(packed >> 6) & 0x3F];
+    reg_f[2] = d * lut[(packed >> 12) & 0x3F];
+    reg_f[3] = d * lut[(packed >> 18) & 0x3F];
+    reg = (type4) reg_f;
+}
+
+template <typename type4x4>
+void dequantize_mxfp6_e2m3_soa(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg) {
+    dequantize_mxfp6_soa_impl(row, bidx, nblocks, il, reg, fp6_e2m3_lut);
+}
+template <typename type4>
+void dequantize_mxfp6_e2m3_t4_soa(device const char * row, short bidx, short nblocks, short il, thread type4 & reg) {
+    dequantize_mxfp6_t4_soa_impl(row, bidx, nblocks, il, reg, fp6_e2m3_lut);
+}
+template <typename type4x4>
+void dequantize_mxfp6_e3m2_soa(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg) {
+    dequantize_mxfp6_soa_impl(row, bidx, nblocks, il, reg, fp6_e3m2_lut);
+}
+template <typename type4>
+void dequantize_mxfp6_e3m2_t4_soa(device const char * row, short bidx, short nblocks, short il, thread type4 & reg) {
+    dequantize_mxfp6_t4_soa_impl(row, bidx, nblocks, il, reg, fp6_e3m2_lut);
+}
+
 // ===== MXFP serial quantize functions (for set_rows) =====
 // Templatized on SRC_PTR to support both device and thread address spaces.
-
-// Serial Hadamard rotation for a 32-element block (single thread, thread-local memory).
-// 5 butterfly stages + 1/sqrt(32) normalization. Matches CPU hadamard_32_inplace exactly.
-static inline void hadamard_32_serial(thread float * vals) {
-    for (int stride = 1; stride < 32; stride *= 2) {
-        for (int i = 0; i < 32; i += 2 * stride) {
-            for (int j = 0; j < stride; ++j) {
-                const float a = vals[i + j];
-                const float b = vals[i + j + stride];
-                vals[i + j]          = a + b;
-                vals[i + j + stride] = a - b;
-            }
-        }
-    }
-    const float norm = 0.17677669529663689f; // 1/sqrt(32)
-    for (int i = 0; i < 32; ++i) {
-        vals[i] *= norm;
-    }
-}
 
 // Serial E8M0 computation for a block of 32 floats (single thread, no simd).
 // MSE-optimal: round(log2(amax)) ±R search using type-specific round-trip.
@@ -1252,23 +1380,6 @@ void quantize_mxfp6_e3m2(device const float * src, device block_mxfp6 & dst) {
     quantize_mxfp6_e3m2_impl(src, dst);
 }
 
-// Thread-space MXFP quantize wrappers (for kernel_set_rows_mxfp with Hadamard).
-void quantize_mxfp4_t(thread const float * src, device block_mxfp4 & dst) {
-    quantize_mxfp4_impl(src, dst);
-}
-void quantize_mxfp8_e4m3_t(thread const float * src, device block_mxfp8 & dst) {
-    quantize_mxfp8_e4m3_impl(src, dst);
-}
-void quantize_mxfp8_e5m2_t(thread const float * src, device block_mxfp8 & dst) {
-    quantize_mxfp8_e5m2_impl(src, dst);
-}
-void quantize_mxfp6_e2m3_t(thread const float * src, device block_mxfp6 & dst) {
-    quantize_mxfp6_e2m3_impl(src, dst);
-}
-void quantize_mxfp6_e3m2_t(thread const float * src, device block_mxfp6 & dst) {
-    quantize_mxfp6_e3m2_impl(src, dst);
-}
-
 // ===== MXFP8/MXFP6 Q preprocessing for flash attention =====
 // Generic MXFP round-trip: quantize element to type, then dequantize back to float.
 template <uint8_t (*quant)(float), float (*dequant)(uint8_t)>
@@ -1372,6 +1483,31 @@ static inline void dequant_v_t4_dispatch(device const char * v_data, short il, t
         case 5: dequantize_mxfp6_e3m2_t4((device const block_mxfp6 *) v_data, il, reg); break;
         case 6: dequantize_q4_0_t4(      (device const block_q4_0  *) v_data, il, reg); break;
         case 7: dequantize_q8_0_t4(      (device const block_q8_0  *) v_data, il, reg); break;
+        default: break;
+    }
+}
+
+// SoA dispatch: MXFP types only (1-5). For q4_0/q8_0 (6-7), use AoS dispatch above.
+template <typename type4x4>
+static inline void dequant_4x4_soa_dispatch(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg, int32_t mxfp_type) {
+    switch (mxfp_type) {
+        case 1: dequantize_mxfp4_soa(     row, bidx, nblocks, il, reg); break;
+        case 2: dequantize_mxfp8_e4m3_soa(row, bidx, nblocks, il, reg); break;
+        case 3: dequantize_mxfp8_e5m2_soa(row, bidx, nblocks, il, reg); break;
+        case 4: dequantize_mxfp6_e2m3_soa(row, bidx, nblocks, il, reg); break;
+        case 5: dequantize_mxfp6_e3m2_soa(row, bidx, nblocks, il, reg); break;
+        default: break;
+    }
+}
+
+template <typename type4>
+static inline void dequant_t4_soa_dispatch(device const char * row, short bidx, short nblocks, short il, thread type4 & reg, int32_t mxfp_type) {
+    switch (mxfp_type) {
+        case 1: dequantize_mxfp4_t4_soa(     row, bidx, nblocks, il, reg); break;
+        case 2: dequantize_mxfp8_e4m3_t4_soa(row, bidx, nblocks, il, reg); break;
+        case 3: dequantize_mxfp8_e5m2_t4_soa(row, bidx, nblocks, il, reg); break;
+        case 4: dequantize_mxfp6_e2m3_t4_soa(row, bidx, nblocks, il, reg); break;
+        case 5: dequantize_mxfp6_e3m2_t4_soa(row, bidx, nblocks, il, reg); break;
         default: break;
     }
 }
@@ -6618,14 +6754,22 @@ void kernel_flash_attn_ext_impl(
 
                     qk8x8_t mqk = make_filled_simdgroup_matrix<qk_t, 8>((qk_t) 0.0f);
 
-                    for (short ii = 0; ii < DK16; ii += 4) {
-                        device const kd4x4_t * pk4x4 = (device const kd4x4_t *) (k + ((ic + 8*cc + ty)*args.nb11));
+                    constexpr short nblocks_k = DK / 32;
+                    constexpr short nl_k_eff = 2; // 32 elems / 16 per 4x4
 
+                    for (short ii = 0; ii < DK16; ii += 4) {
                         if (DK16%4 == 0) {
                             // the head is evenly divisible by 4*16 = 64, so no need for bound checks
                             {
                                 k4x4_t tmp;
-                                deq_k(pk4x4 + (ii + tx)/nl_k, (ii + tx)%nl_k, tmp);
+                                if (FC_flash_attn_ext_mxfp_type > 0) {
+                                    device const char * k_row = k + ((ic + 8*cc + ty)*args.nb11);
+                                    dequant_4x4_soa_dispatch(k_row, (ii + tx)/nl_k_eff, nblocks_k,
+                                                                  (ii + tx)%nl_k_eff, tmp, FC_flash_attn_ext_mxfp_type);
+                                } else {
+                                    device const kd4x4_t * pk4x4 = (device const kd4x4_t *) (k + ((ic + 8*cc + ty)*args.nb11));
+                                    deq_k(pk4x4 + (ii + tx)/nl_k, (ii + tx)%nl_k, tmp);
+                                }
                                 sk4x4[4*ty + tx] = tmp;
                             }
 
@@ -6646,7 +6790,14 @@ void kernel_flash_attn_ext_impl(
                         } else {
                             if (ii + tx < DK16) {
                                 k4x4_t tmp;
-                                deq_k(pk4x4 + (ii + tx)/nl_k, (ii + tx)%nl_k, tmp);
+                                if (FC_flash_attn_ext_mxfp_type > 0) {
+                                    device const char * k_row = k + ((ic + 8*cc + ty)*args.nb11);
+                                    dequant_4x4_soa_dispatch(k_row, (ii + tx)/nl_k_eff, nblocks_k,
+                                                                  (ii + tx)%nl_k_eff, tmp, FC_flash_attn_ext_mxfp_type);
+                                } else {
+                                    device const kd4x4_t * pk4x4 = (device const kd4x4_t *) (k + ((ic + 8*cc + ty)*args.nb11));
+                                    deq_k(pk4x4 + (ii + tx)/nl_k, (ii + tx)%nl_k, tmp);
+                                }
                                 sk4x4[4*ty + tx] = tmp;
                             }
 
@@ -6805,12 +6956,12 @@ void kernel_flash_attn_ext_impl(
                     const short tx = tiisg%4;
                     const short ty = tiisg/4;
 
-                    // block byte size for V: use override type if mixed, else template type
-                    const short v_bs = (FC_flash_attn_ext_mxfp_v_type > 0)
-                        ? mixed_v_block_size(FC_flash_attn_ext_mxfp_v_type)
-                        : (short) sizeof(vd4x4_t);
-                    // nl for 4x4 dequant: all supported V types have nl=2 (32 elems / 16 per 4x4)
+                    // Effective V type for SoA: mixed override if set, else K type (same for non-mixed MXFP)
+                    const int32_t v_type_soa = (FC_flash_attn_ext_mxfp_v_type > 0)
+                        ? FC_flash_attn_ext_mxfp_v_type
+                        : FC_flash_attn_ext_mxfp_type;
                     constexpr short nl_v_eff = 2;
+                    constexpr short nblocks_v = DV / 32;
 
                     for (short cc = 0; cc < C/8; ++cc) {
                         s8x8_t vs;
@@ -6821,11 +6972,15 @@ void kernel_flash_attn_ext_impl(
                                 // no need for bound checks
                                 {
                                     v4x4_t tmp;
-                                    if (FC_flash_attn_ext_mxfp_v_type > 0) {
+                                    if (v_type_soa > 0 && v_type_soa <= 5) {
                                         device const char * v_row = v + ((ic + 8*cc + ty)*args.nb21);
+                                        dequant_4x4_soa_dispatch(v_row, (ii + tx)/nl_v_eff, nblocks_v,
+                                                                      (ii + tx)%nl_v_eff, tmp, v_type_soa);
+                                    } else if (v_type_soa >= 6) {
+                                        device const char * v_row = v + ((ic + 8*cc + ty)*args.nb21);
+                                        const short v_bs = mixed_v_block_size(v_type_soa);
                                         dequant_v_4x4_dispatch(v_row + ((ii + tx)/nl_v_eff)*v_bs,
-                                                                    (ii + tx)%nl_v_eff, tmp,
-                                                                    FC_flash_attn_ext_mxfp_v_type);
+                                                                    (ii + tx)%nl_v_eff, tmp, v_type_soa);
                                     } else {
                                         device const vd4x4_t * pv4x4 = (device const vd4x4_t *) (v + ((ic + 8*cc + ty)*args.nb21));
                                         deq_v(pv4x4 + (ii + tx)/nl_v, (ii + tx)%nl_v, tmp);
@@ -6853,11 +7008,15 @@ void kernel_flash_attn_ext_impl(
                             } else {
                                 if (ii + tx < DV16) {
                                     v4x4_t tmp;
-                                    if (FC_flash_attn_ext_mxfp_v_type > 0) {
+                                    if (v_type_soa > 0 && v_type_soa <= 5) {
                                         device const char * v_row = v + ((ic + 8*cc + ty)*args.nb21);
+                                        dequant_4x4_soa_dispatch(v_row, (ii + tx)/nl_v_eff, nblocks_v,
+                                                                      (ii + tx)%nl_v_eff, tmp, v_type_soa);
+                                    } else if (v_type_soa >= 6) {
+                                        device const char * v_row = v + ((ic + 8*cc + ty)*args.nb21);
+                                        const short v_bs = mixed_v_block_size(v_type_soa);
                                         dequant_v_4x4_dispatch(v_row + ((ii + tx)/nl_v_eff)*v_bs,
-                                                                    (ii + tx)%nl_v_eff, tmp,
-                                                                    FC_flash_attn_ext_mxfp_v_type);
+                                                                    (ii + tx)%nl_v_eff, tmp, v_type_soa);
                                     } else {
                                         device const vd4x4_t * pv4x4 = (device const vd4x4_t *) (v + ((ic + 8*cc + ty)*args.nb21));
                                         deq_v(pv4x4 + (ii + tx)/nl_v, (ii + tx)%nl_v, tmp);
@@ -7481,10 +7640,58 @@ kernel void kernel_flash_attn_ext_vec(
                 qk_t mqk[C/NE] = { [ 0 ... C/NE - 1] = 0.0f };
 
                 // each simdgroup processes 1 query and NE (NW/NL) cache elements
-                FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                _Pragma("clang loop unroll_count(8)")
+                for (short cc = 0; cc < C/NE; ++cc) {
                     if (is_same<kd4_t, k4_t>::value) {
                         FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
                             mqk[cc] += dot((float4) pk4[cc*NE*NS10/4 +  ii*NL], (float4) pq4[ii*NL]);
+                        }
+                    } else if (FC_flash_attn_ext_vec_mxfp_type > 0) {
+                        // MXFP K with SoA layout
+                        device const char * k_row = k + ((ic + NE*cc + ty)*args.nb11);
+                        constexpr short nblocks_k = DK / 32;
+
+                        FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                            const short i = ii*NL + tx;
+                            const short blk = i / 8;
+                            const short il = i % 8;
+
+                            float4 k_vals;
+                            if (FC_flash_attn_ext_vec_mxfp_type == 1) {
+                                // MXFP4: constant LUT decode
+                                const float d = e8m0_to_fp32_fast(*((device const uint8_t *)(k_row + nblocks_k * MXFP4_SOA_QS_PER_BLOCK + blk)));
+                                const short il4 = il % 4;
+                                const uint8_t shr = (il >= 4) ? 4 : 0;
+                                const uint32_t qs4 = *(device const uint32_t *)(k_row + blk * MXFP4_SOA_QS_PER_BLOCK + 4*il4);
+                                k_vals = float4(
+                                    kvalues_mxfp4_f[(qs4 >> (shr     )) & 0x0F],
+                                    kvalues_mxfp4_f[(qs4 >> (shr +  8)) & 0x0F],
+                                    kvalues_mxfp4_f[(qs4 >> (shr + 16)) & 0x0F],
+                                    kvalues_mxfp4_f[(qs4 >> (shr + 24)) & 0x0F]);
+                                mqk[cc] += d * dot(k_vals, (float4) sq4[i]);
+                            } else if (FC_flash_attn_ext_vec_mxfp_type <= 3) {
+                                const float d = e8m0_to_fp32_fast(*((device const uint8_t *)(k_row + nblocks_k * MXFP8_SOA_QS_PER_BLOCK + blk)));
+                                constant float * lut = (FC_flash_attn_ext_vec_mxfp_type == 2) ? fp8_e4m3_lut : fp8_e5m2_lut;
+                                const uint32_t qs4 = *(device const uint32_t *)(k_row + blk * MXFP8_SOA_QS_PER_BLOCK + 4*il);
+                                k_vals = float4(
+                                    lut[(qs4      ) & 0xFF],
+                                    lut[(qs4 >>  8) & 0xFF],
+                                    lut[(qs4 >> 16) & 0xFF],
+                                    lut[(qs4 >> 24) & 0xFF]);
+                                mqk[cc] += d * dot(k_vals, (float4) sq4[i]);
+                            } else {
+                                const float d = e8m0_to_fp32_fast(*((device const uint8_t *)(k_row + nblocks_k * MXFP6_SOA_QS_PER_BLOCK + blk)));
+                                constant float * lut = (FC_flash_attn_ext_vec_mxfp_type == 4) ? fp6_e2m3_lut : fp6_e3m2_lut;
+                                device const uint8_t * qs = (device const uint8_t *)(k_row + blk * MXFP6_SOA_QS_PER_BLOCK);
+                                const short off = il * 3;
+                                const uint32_t packed = (uint32_t)qs[off] | ((uint32_t)qs[off + 1] << 8) | ((uint32_t)qs[off + 2] << 16);
+                                k_vals = float4(
+                                    lut[packed & 0x3F],
+                                    lut[(packed >> 6) & 0x3F],
+                                    lut[(packed >> 12) & 0x3F],
+                                    lut[(packed >> 18) & 0x3F]);
+                                mqk[cc] += d * dot(k_vals, (float4) sq4[i]);
+                            }
                         }
                     } else {
                         device const kd4_t * pk = (device const kd4_t *) (k + ((ic + NE*cc + ty)*args.nb11));
@@ -7597,29 +7804,87 @@ kernel void kernel_flash_attn_ext_vec(
                         }
                     }
                 } else {
-                    // block byte size for V: use override type if mixed, else template type
-                    const short v_bs = (FC_flash_attn_ext_vec_mxfp_v_type > 0)
-                        ? mixed_v_block_size(FC_flash_attn_ext_vec_mxfp_v_type)
-                        : (short) sizeof(vd4_t);
-                    // nl for t4 dequant: all supported V types have nl=8 (32 elems / 4 per t4)
-                    constexpr short nl_v_eff = 8;
+                    // Effective V type: use mixed override if set, else K type (same for non-mixed MXFP)
+                    const int32_t v_type_soa = (FC_flash_attn_ext_vec_mxfp_v_type > 0)
+                        ? FC_flash_attn_ext_vec_mxfp_v_type
+                        : FC_flash_attn_ext_vec_mxfp_type;
+                    constexpr short nblocks_v = DV / 32;
 
-                    FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
-                        FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
-                            const short i = ii*NL + tx;
+                    _Pragma("clang loop unroll_count(8)")
+                    for (short cc = 0; cc < C/NE; ++cc) {
+                        device const char * v_row = v + ((ic + NE*cc + ty)*args.nb21);
+                        const float sv = ss[NE*cc + ty];
 
-                            v4_t mv;
-                            if (FC_flash_attn_ext_vec_mxfp_v_type > 0) {
-                                device const char * v_row = v + ((ic + NE*cc + ty)*args.nb21);
-                                dequant_v_t4_dispatch(v_row + (i/nl_v_eff)*v_bs,
-                                                           i%nl_v_eff, mv,
-                                                           FC_flash_attn_ext_vec_mxfp_v_type);
-                            } else {
-                                device const vd4_t * pv4 = (device const vd4_t *) (v + ((ic + NE*cc + ty)*args.nb21));
-                                deq_v_t4(pv4 + i/nl_v, i%nl_v, mv);
+                        if (v_type_soa == 1) {
+                            // MXFP4 V: constant LUT decode with SoA layout
+                            FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                                const short i = ii*NL + tx;
+                                const short blk = i / 8;
+                                const short il = i % 8;
+                                const short il4 = il % 4;
+                                const uint8_t shr = (il >= 4) ? 4 : 0;
+
+                                const float d_sv = e8m0_to_fp32_fast(*((device const uint8_t *)(v_row + nblocks_v * MXFP4_SOA_QS_PER_BLOCK + blk))) * sv;
+                                const uint32_t vqs4 = *(device const uint32_t *)(v_row + blk * MXFP4_SOA_QS_PER_BLOCK + 4*il4);
+
+                                lo[ii][0] += d_sv * kvalues_mxfp4_f[(vqs4 >> (shr     )) & 0x0F];
+                                lo[ii][1] += d_sv * kvalues_mxfp4_f[(vqs4 >> (shr +  8)) & 0x0F];
+                                lo[ii][2] += d_sv * kvalues_mxfp4_f[(vqs4 >> (shr + 16)) & 0x0F];
+                                lo[ii][3] += d_sv * kvalues_mxfp4_f[(vqs4 >> (shr + 24)) & 0x0F];
                             }
+                        } else if (v_type_soa >= 2 && v_type_soa <= 3) {
+                            // MXFP8 V: fused dequant + accumulate, vectorized loads
+                            constant float * lut = (v_type_soa == 2) ? fp8_e4m3_lut : fp8_e5m2_lut;
+                            FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                                const short i = ii*NL + tx;
+                                const short blk = i / 8;
+                                const short il = i % 8;
 
-                            lo[ii] += o4_t(float4(mv)*float4(ss[NE*cc + ty]));
+                                const float d_sv = e8m0_to_fp32_fast(*((device const uint8_t *)(v_row + nblocks_v * MXFP8_SOA_QS_PER_BLOCK + blk))) * sv;
+                                const uint32_t qs4 = *(device const uint32_t *)(v_row + blk * MXFP8_SOA_QS_PER_BLOCK + 4*il);
+
+                                lo[ii][0] += d_sv * lut[(qs4      ) & 0xFF];
+                                lo[ii][1] += d_sv * lut[(qs4 >>  8) & 0xFF];
+                                lo[ii][2] += d_sv * lut[(qs4 >> 16) & 0xFF];
+                                lo[ii][3] += d_sv * lut[(qs4 >> 24) & 0xFF];
+                            }
+                        } else if (v_type_soa >= 4 && v_type_soa <= 5) {
+                            // MXFP6 V: fused dequant + accumulate
+                            constant float * lut = (v_type_soa == 4) ? fp6_e2m3_lut : fp6_e3m2_lut;
+                            FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                                const short i = ii*NL + tx;
+                                const short blk = i / 8;
+                                const short il = i % 8;
+
+                                const float d_sv = e8m0_to_fp32_fast(*((device const uint8_t *)(v_row + nblocks_v * MXFP6_SOA_QS_PER_BLOCK + blk))) * sv;
+                                device const uint8_t * qs = (device const uint8_t *)(v_row + blk * MXFP6_SOA_QS_PER_BLOCK);
+                                const short off = il * 3;
+                                const uint32_t packed = (uint32_t)qs[off] | ((uint32_t)qs[off + 1] << 8) | ((uint32_t)qs[off + 2] << 16);
+
+                                lo[ii][0] += d_sv * lut[packed & 0x3F];
+                                lo[ii][1] += d_sv * lut[(packed >> 6) & 0x3F];
+                                lo[ii][2] += d_sv * lut[(packed >> 12) & 0x3F];
+                                lo[ii][3] += d_sv * lut[(packed >> 18) & 0x3F];
+                            }
+                        } else if (v_type_soa >= 6) {
+                            // Non-MXFP mixed (q4_0/q8_0, AoS)
+                            constexpr short nl_v_eff = 8;
+                            FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                                const short i = ii*NL + tx;
+                                v4_t mv;
+                                const short v_bs = mixed_v_block_size(v_type_soa);
+                                dequant_v_t4_dispatch(v_row + (i/nl_v_eff)*v_bs, i%nl_v_eff, mv, v_type_soa);
+                                lo[ii] += o4_t(float4(mv)*sv);
+                            }
+                        } else {
+                            // Non-MXFP, non-mixed
+                            device const vd4_t * pv4 = (device const vd4_t *) v_row;
+                            FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                                const short i = ii*NL + tx;
+                                v4_t mv;
+                                deq_v_t4(pv4 + i/nl_v, i%nl_v, mv);
+                                lo[ii] += o4_t(float4(mv)*sv);
+                            }
                         }
                     }
                 }
@@ -9963,43 +10228,175 @@ kernel void kernel_set_rows_q32(
     }
 }
 
-// MXFP-aware set_rows: copies 32 floats to thread-local memory, optionally applies
-// Hadamard rotation (for K cache), then quantizes using thread-space quantize impl.
-template<typename TI, typename block_q, void (*quantize_func)(thread const float *, device block_q &)>
-kernel void kernel_set_rows_mxfp(
+// SIMD-parallel MXFP4 set_rows: 32 threads cooperate on each 32-element block.
+// ~10x faster than serial version by using simd_max, simd_shuffle_xor (Hadamard), etc.
+template<typename TI>
+kernel void kernel_set_rows_mxfp4_simd(
         constant ggml_metal_kargs_set_rows & args,
         device const  void * src0,
         device const  void * src1,
         device       float * dst,
         uint3                tgpig[[threadgroup_position_in_grid]],
-        uint                 tiitg[[thread_index_in_threadgroup]],
-        uint3                tptg [[threads_per_threadgroup]]) {
+        ushort               tiisg[[thread_index_in_simdgroup]],
+        ushort               sgitg[[simdgroup_index_in_threadgroup]]) {
     const int32_t i03 = tgpig.z;
     const int32_t i02 = tgpig.y;
+    const int32_t i01 = tgpig.x;
+
+    if (i01 >= args.ne01) return;
 
     const int32_t i12 = i03%args.ne12;
     const int32_t i11 = i02%args.ne11;
-
-    const int32_t i01 = tgpig.x*tptg.y + tiitg/tptg.x;
-    if (i01 >= args.ne01) {
-        return;
-    }
-
     const int32_t i10 = i01;
     const TI      i1  = ((const device TI *) ((const device char *) src1 + i10*args.nb10 + i11*args.nb11 + i12*args.nb12))[0];
 
-          device block_q * dst_row = (      device block_q *) ((      device char *) dst  +  i1*args.nb1  + i02*args.nb2  + i03*args.nb3);
-    const device float   * src_row = (const device float   *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
+          device char  * dst_row = ((device char *) dst + i1*args.nb1 + i02*args.nb2 + i03*args.nb3);
+    const device float * src_row = (const device float *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
 
-    for (int ind = tiitg%tptg.x; ind < args.nk0; ind += tptg.x) {
-        thread float tmp[32];
-        for (int j = 0; j < 32; ++j) {
-            tmp[j] = src_row[32*ind + j];
+    const int ind = sgitg;
+    if (ind >= args.nk0) return;
+
+    // 1. Each thread loads one element
+    float val = src_row[32*ind + tiisg];
+
+    // 2. SIMD-parallel Hadamard butterfly
+    if (args.apply_hadamard) {
+        for (ushort stride = 1; stride < 32; stride <<= 1) {
+            float partner = simd_shuffle_xor(val, stride);
+            val = (tiisg & stride) ? (partner - val) : (partner + val);
         }
-        if (args.apply_hadamard) {
-            hadamard_32_serial(tmp);
+        val *= 0.17677669529663689f; // 1/sqrt(32)
+    }
+
+    // 3. SIMD-parallel e8m0 computation
+    float amax = simd_max(abs(val));
+    uint8_t e = 0;
+    if (amax > 0.0f) {
+        uint32_t amax_bits = as_type<uint32_t>(amax);
+        int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
+        int round_up = ((amax_bits & 0x7FFFFF) >= 0x3504F3) ? 1 : 0;
+        int e_int = floor_log2 + round_up - MXFP4_E2M1_EMAX_OFFSET + 127;
+        e = (uint8_t)clamp(e_int, 0, 255);
+    }
+
+    // 4. Each thread quantizes its own element
+    float scale = ggml_e8m0_to_f32(e);
+    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+    uint8_t nibble = best_index_mxfp4_metal(val, inv_scale);
+
+    // 5. Pack nibbles into bytes and write SoA qs
+    // Byte j = nibble[j] | (nibble[j+16] << 4)
+    uint8_t partner_nibble = (uint8_t)simd_shuffle(nibble, (tiisg + 16) & 31);
+    if (tiisg < 16) {
+        device uint8_t * qs_dst = (device uint8_t *)(dst_row + ind * MXFP4_SOA_QS_PER_BLOCK);
+        qs_dst[tiisg] = nibble | (partner_nibble << 4);
+    }
+
+    // 6. Write E8M0 scale
+    if (tiisg == 0) {
+        *(dst_row + args.nk0 * MXFP4_SOA_QS_PER_BLOCK + ind) = (char)e;
+    }
+}
+
+// SIMD-parallel MXFP set_rows: 32 threads cooperate on each 32-element block.
+// MXFP_TYPE: 2=e4m3, 3=e5m2, 4=e2m3, 5=e3m2
+// For MXFP8 (types 2,3): each thread writes 1 byte. QS_PER_BLOCK=32.
+// For MXFP6 (types 4,5): 6-bit packing in groups of 4. QS_PER_BLOCK=24.
+template<typename TI, int MXFP_TYPE>
+kernel void kernel_set_rows_mxfp_simd(
+        constant ggml_metal_kargs_set_rows & args,
+        device const  void * src0,
+        device const  void * src1,
+        device       float * dst,
+        uint3                tgpig[[threadgroup_position_in_grid]],
+        ushort               tiisg[[thread_index_in_simdgroup]],
+        ushort               sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int32_t i03 = tgpig.z;
+    const int32_t i02 = tgpig.y;
+    const int32_t i01 = tgpig.x;
+
+    if (i01 >= args.ne01) return;
+
+    const int32_t i12 = i03%args.ne12;
+    const int32_t i11 = i02%args.ne11;
+    const int32_t i10 = i01;
+    const TI      i1  = ((const device TI *) ((const device char *) src1 + i10*args.nb10 + i11*args.nb11 + i12*args.nb12))[0];
+
+          device char  * dst_row = ((device char *) dst + i1*args.nb1 + i02*args.nb2 + i03*args.nb3);
+    const device float * src_row = (const device float *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
+
+    const int ind = sgitg;
+    if (ind >= args.nk0) return;
+
+    float val = src_row[32*ind + tiisg];
+
+    if (args.apply_hadamard) {
+        for (ushort stride = 1; stride < 32; stride <<= 1) {
+            float partner = simd_shuffle_xor(val, stride);
+            val = (tiisg & stride) ? (partner - val) : (partner + val);
         }
-        quantize_func(tmp, dst_row[ind]);
+        val *= 0.17677669529663689f;
+    }
+
+    // EMAX_OFFSET per type
+    const int EMAX_OFFSET = (MXFP_TYPE == 2) ? MXFP8_E4M3_EMAX_OFFSET :
+                            (MXFP_TYPE == 3) ? MXFP8_E5M2_EMAX_OFFSET :
+                            (MXFP_TYPE == 4) ? MXFP6_E2M3_EMAX_OFFSET :
+                                               MXFP6_E3M2_EMAX_OFFSET;
+
+    float amax = simd_max(abs(val));
+    uint8_t e = 0;
+    if (amax > 0.0f) {
+        uint32_t amax_bits = as_type<uint32_t>(amax);
+        int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
+        int round_up = ((amax_bits & 0x7FFFFF) >= 0x3504F3) ? 1 : 0;
+        int e_int = floor_log2 + round_up - EMAX_OFFSET + 127;
+        e = (uint8_t)clamp(e_int, 0, 255);
+    }
+
+    float scale = ggml_e8m0_to_f32(e);
+    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+    float scaled_val = val * inv_scale;
+
+    // QS_PER_BLOCK per type category
+    const int QS_PER_BLOCK = (MXFP_TYPE <= 3) ? MXFP8_SOA_QS_PER_BLOCK : MXFP6_SOA_QS_PER_BLOCK;
+
+    if (MXFP_TYPE <= 3) {
+        // MXFP8: each thread writes 1 byte
+        uint8_t qval;
+        if (MXFP_TYPE == 2) {
+            qval = float_to_fp8_e4m3_rn(scaled_val);
+        } else {
+            qval = float_to_fp8_e5m2_rn(scaled_val);
+        }
+        device uint8_t * qs_dst = (device uint8_t *)(dst_row + ind * QS_PER_BLOCK);
+        qs_dst[tiisg] = qval;
+    } else {
+        // MXFP6: pack 4 six-bit values → 3 bytes using simd_shuffle
+        uint8_t q6;
+        if (MXFP_TYPE == 4) {
+            q6 = float_to_fp6_e2m3_rn(scaled_val);
+        } else {
+            q6 = float_to_fp6_e3m2_rn(scaled_val);
+        }
+
+        ushort group = tiisg >> 2;
+        ushort lane   = tiisg & 3;
+
+        uint32_t v0 = (uint32_t)(simd_shuffle(q6, group * 4 + 0) & 0x3F);
+        uint32_t v1 = (uint32_t)(simd_shuffle(q6, group * 4 + 1) & 0x3F);
+        uint32_t v2 = (uint32_t)(simd_shuffle(q6, group * 4 + 2) & 0x3F);
+        uint32_t v3 = (uint32_t)(simd_shuffle(q6, group * 4 + 3) & 0x3F);
+        uint32_t packed = v0 | (v1 << 6) | (v2 << 12) | (v3 << 18);
+
+        device uint8_t * qs_dst = (device uint8_t *)(dst_row + ind * QS_PER_BLOCK);
+        if (lane < 3) {
+            qs_dst[group * 3 + lane] = (uint8_t)((packed >> (lane * 8)) & 0xFF);
+        }
+    }
+
+    if (tiisg == 0) {
+        *(dst_row + args.nk0 * QS_PER_BLOCK + ind) = (char)e;
     }
 }
 
@@ -10809,18 +11206,19 @@ template [[host_name("kernel_set_rows_q5_1_i32")]]   kernel set_rows_q32_t kerne
 template [[host_name("kernel_set_rows_iq4_nl_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_iq4_nl, quantize_iq4_nl>;
 template [[host_name("kernel_set_rows_iq4_nl_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_iq4_nl, quantize_iq4_nl>;
 
-typedef decltype(kernel_set_rows_mxfp<int64_t, block_mxfp4, quantize_mxfp4_t>) set_rows_mxfp_t;
+typedef decltype(kernel_set_rows_mxfp4_simd<int64_t>) set_rows_mxfp4_simd_t;
+template [[host_name("kernel_set_rows_mxfp4_e2m1_i64")]]  kernel set_rows_mxfp4_simd_t kernel_set_rows_mxfp4_simd<int64_t>;
+template [[host_name("kernel_set_rows_mxfp4_e2m1_i32")]]  kernel set_rows_mxfp4_simd_t kernel_set_rows_mxfp4_simd<int32_t>;
 
-template [[host_name("kernel_set_rows_mxfp4_e2m1_i64")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int64_t, block_mxfp4, quantize_mxfp4_t>;
-template [[host_name("kernel_set_rows_mxfp4_e2m1_i32")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int32_t, block_mxfp4, quantize_mxfp4_t>;
-template [[host_name("kernel_set_rows_mxfp8_e4m3_i64")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int64_t, block_mxfp8, quantize_mxfp8_e4m3_t>;
-template [[host_name("kernel_set_rows_mxfp8_e4m3_i32")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int32_t, block_mxfp8, quantize_mxfp8_e4m3_t>;
-template [[host_name("kernel_set_rows_mxfp8_e5m2_i64")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int64_t, block_mxfp8, quantize_mxfp8_e5m2_t>;
-template [[host_name("kernel_set_rows_mxfp8_e5m2_i32")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int32_t, block_mxfp8, quantize_mxfp8_e5m2_t>;
-template [[host_name("kernel_set_rows_mxfp6_e2m3_i64")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int64_t, block_mxfp6, quantize_mxfp6_e2m3_t>;
-template [[host_name("kernel_set_rows_mxfp6_e2m3_i32")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int32_t, block_mxfp6, quantize_mxfp6_e2m3_t>;
-template [[host_name("kernel_set_rows_mxfp6_e3m2_i64")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int64_t, block_mxfp6, quantize_mxfp6_e3m2_t>;
-template [[host_name("kernel_set_rows_mxfp6_e3m2_i32")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int32_t, block_mxfp6, quantize_mxfp6_e3m2_t>;
+typedef decltype(kernel_set_rows_mxfp_simd<int64_t, 2>) set_rows_mxfp_simd_t;
+template [[host_name("kernel_set_rows_mxfp8_e4m3_i64")]]  kernel set_rows_mxfp_simd_t kernel_set_rows_mxfp_simd<int64_t, 2>;
+template [[host_name("kernel_set_rows_mxfp8_e4m3_i32")]]  kernel set_rows_mxfp_simd_t kernel_set_rows_mxfp_simd<int32_t, 2>;
+template [[host_name("kernel_set_rows_mxfp8_e5m2_i64")]]  kernel set_rows_mxfp_simd_t kernel_set_rows_mxfp_simd<int64_t, 3>;
+template [[host_name("kernel_set_rows_mxfp8_e5m2_i32")]]  kernel set_rows_mxfp_simd_t kernel_set_rows_mxfp_simd<int32_t, 3>;
+template [[host_name("kernel_set_rows_mxfp6_e2m3_i64")]]  kernel set_rows_mxfp_simd_t kernel_set_rows_mxfp_simd<int64_t, 4>;
+template [[host_name("kernel_set_rows_mxfp6_e2m3_i32")]]  kernel set_rows_mxfp_simd_t kernel_set_rows_mxfp_simd<int32_t, 4>;
+template [[host_name("kernel_set_rows_mxfp6_e3m2_i64")]]  kernel set_rows_mxfp_simd_t kernel_set_rows_mxfp_simd<int64_t, 5>;
+template [[host_name("kernel_set_rows_mxfp6_e3m2_i32")]]  kernel set_rows_mxfp_simd_t kernel_set_rows_mxfp_simd<int32_t, 5>;
 
 //
 // matrix-matrix multiplication
