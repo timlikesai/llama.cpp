@@ -237,6 +237,13 @@ typedef struct {
 } block_mxfp6;
 static_assert(sizeof(block_mxfp6) == sizeof(uint8_t) + QK_MXFP6 * 6 / 8, "wrong mxfp6 block size/padding");
 
+// SoA (Struct-of-Arrays) layout constants for MXFP KV cache.
+// Per row: [qs_block0|qs_block1|...][e8m0_0|e8m0_1|...]
+// Total bytes per row is IDENTICAL to AoS — same tensor strides, just rearranged.
+#define MXFP4_SOA_QS_PER_BLOCK  (QK_MXFP4 / 2)       // 16 bytes
+#define MXFP8_SOA_QS_PER_BLOCK  (QK_MXFP8)            // 32 bytes
+#define MXFP6_SOA_QS_PER_BLOCK  (QK_MXFP6 * 6 / 8)   // 24 bytes
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta

@@ -1360,7 +1360,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
                 ggml_type_name(op->src[1]->type),
                 ggml_type_name(op->src[2]->type),
                 dk, dv);
-        mxfp_v_type = 0; // native kernel handles V type via template
+        // Keep mxfp_v_type for all MXFP V types (SoA dequant dispatch needs it)
+        if (!ggml_is_type_mxfp(op->src[2]->type)) {
+            mxfp_v_type = 0;
+        }
     } else {
         snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
                 "flash_attn_ext",
@@ -1472,7 +1475,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
                 ggml_type_name(op->src[1]->type),
                 ggml_type_name(op->src[2]->type),
                 dk, dv);
-        mxfp_v_type = 0; // native kernel handles V type via template
+        // Keep mxfp_v_type for all MXFP V types (SoA dequant dispatch needs it)
+        if (!ggml_is_type_mxfp(op->src[2]->type)) {
+            mxfp_v_type = 0;
+        }
     } else {
         snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
                 "flash_attn_ext_vec",

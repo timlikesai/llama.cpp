@@ -163,6 +163,7 @@ static inline float e8m0_to_fp32(uint8_t x) {
     if (x == 0) {
         bits = 0x00400000;
     } else {
+        // no clamping — scale overflow handled by clamping dequant output to half range
         bits = (uint32_t) x << 23;
     }
 
@@ -657,6 +658,202 @@ void dequantize_mxfp4_t4(device const block_mxfp4 * xb, short il, thread type4 &
     reg = (type4) reg_f;
 }
 
+// ===== SoA dequant for MXFP4 =====
+// SoA row layout: [qs_block0[16]|qs_block1[16]|...][e8m0_0|e8m0_1|...]
+// qs bytes have identical packing to AoS: byte[j] = elem[j](low nibble) | elem[j+16](high nibble)
+
+// SoA MXFP4 dequant (4x4: 16 values, il=0 for low nibbles, il=1 for high)
+// DEBUG: try AoS offsets (17-byte stride) to check if data is actually AoS
+template <typename type4x4>
+void dequantize_mxfp4_soa(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg) {
+    // AoS offsets: block starts at bidx*17, e8m0 at byte 0, qs at bytes 1-16
+    device const uint8_t * qs = (device const uint8_t *)(row + bidx * 17 + 1);
+    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + bidx * 17));
+    const uint8_t shr = il >= 1 ? 4 : 0;
+
+    float4x4 reg_f;
+    for (int i = 0; i < 4; ++i) {
+        reg_f[i][0] = d * kvalues_mxfp4_f[(qs[4*i + 0] >> shr) & 0x0F];
+        reg_f[i][1] = d * kvalues_mxfp4_f[(qs[4*i + 1] >> shr) & 0x0F];
+        reg_f[i][2] = d * kvalues_mxfp4_f[(qs[4*i + 2] >> shr) & 0x0F];
+        reg_f[i][3] = d * kvalues_mxfp4_f[(qs[4*i + 3] >> shr) & 0x0F];
+    }
+    reg = (type4x4) reg_f;
+}
+
+// SoA MXFP4 dequant (t4: 4 values, il=0..7)
+// Single aligned uint32_t load (cf. CUDA dequantize_V_mxfp4_soa ne=4 path)
+template <typename type4>
+void dequantize_mxfp4_t4_soa(device const char * row, short bidx, short nblocks, short il, thread type4 & reg) {
+    const short il4 = il % 4;
+    const uint32_t p = *(device const uint32_t *)(row + bidx * MXFP4_SOA_QS_PER_BLOCK + il4 * 4);
+    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + nblocks * MXFP4_SOA_QS_PER_BLOCK + bidx));
+    const uint shr = il >= 4 ? 4 : 0;
+
+    float4 reg_f;
+    reg_f[0] = d * kvalues_mxfp4_f[(p >> ( 0 + shr)) & 0x0F];
+    reg_f[1] = d * kvalues_mxfp4_f[(p >> ( 8 + shr)) & 0x0F];
+    reg_f[2] = d * kvalues_mxfp4_f[(p >> (16 + shr)) & 0x0F];
+    reg_f[3] = d * kvalues_mxfp4_f[(p >> (24 + shr)) & 0x0F];
+    reg = (type4) reg_f;
+}
+
+// ===== SoA dequant for MXFP8 =====
+// SoA row layout: [qs_block0[32]|qs_block1[32]|...][e8m0_0|e8m0_1|...]
+// Each element is 1 byte — aligned uint32_t loads (4 elements at a time)
+// Uses 256-entry constant LUT (faster than arithmetic on Apple GPU).
+
+// SoA MXFP8 dequant (4x4: 16 values, il=0..1)
+template <typename type4x4>
+void dequantize_mxfp8_soa(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg, constant float * lut) {
+    device const uint32_t * qs32 = (device const uint32_t *)(row + bidx * MXFP8_SOA_QS_PER_BLOCK + il * 16);
+    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + nblocks * MXFP8_SOA_QS_PER_BLOCK + bidx));
+
+    float4x4 reg_f;
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t p = qs32[i];
+        reg_f[i][0] = d * lut[(p >>  0) & 0xFF];
+        reg_f[i][1] = d * lut[(p >>  8) & 0xFF];
+        reg_f[i][2] = d * lut[(p >> 16) & 0xFF];
+        reg_f[i][3] = d * lut[(p >> 24) & 0xFF];
+    }
+    reg = (type4x4) reg_f;
+}
+
+// SoA MXFP8 dequant (t4: 4 values, il=0..7)
+template <typename type4>
+void dequantize_mxfp8_t4_soa(device const char * row, short bidx, short nblocks, short il, thread type4 & reg, constant float * lut) {
+    const uint32_t p = *(device const uint32_t *)(row + bidx * MXFP8_SOA_QS_PER_BLOCK + il * 4);
+    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + nblocks * MXFP8_SOA_QS_PER_BLOCK + bidx));
+
+    float4 reg_f;
+    reg_f[0] = d * lut[(p >>  0) & 0xFF];
+    reg_f[1] = d * lut[(p >>  8) & 0xFF];
+    reg_f[2] = d * lut[(p >> 16) & 0xFF];
+    reg_f[3] = d * lut[(p >> 24) & 0xFF];
+    reg = (type4) reg_f;
+}
+
+template <typename type4x4>
+void dequantize_mxfp8_e4m3_soa(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg) {
+    dequantize_mxfp8_soa(row, bidx, nblocks, il, reg, fp8_e4m3_lut);
+}
+template <typename type4>
+void dequantize_mxfp8_e4m3_t4_soa(device const char * row, short bidx, short nblocks, short il, thread type4 & reg) {
+    dequantize_mxfp8_t4_soa(row, bidx, nblocks, il, reg, fp8_e4m3_lut);
+}
+template <typename type4x4>
+void dequantize_mxfp8_e5m2_soa(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg) {
+    dequantize_mxfp8_soa(row, bidx, nblocks, il, reg, fp8_e5m2_lut);
+}
+template <typename type4>
+void dequantize_mxfp8_e5m2_t4_soa(device const char * row, short bidx, short nblocks, short il, thread type4 & reg) {
+    dequantize_mxfp8_t4_soa(row, bidx, nblocks, il, reg, fp8_e5m2_lut);
+}
+
+// ===== SoA dequant for MXFP6 =====
+// SoA row layout: [qs_block0[24]|qs_block1[24]|...][e8m0_0|e8m0_1|...]
+// 4 elements packed as 6-bit values into 3 bytes (4×6=24 bits)
+
+// SoA MXFP6 dequant (4x4: 16 values, il=0..1)
+// bidx*24 is always 4-byte aligned, il*12 is always 4-byte aligned → 3x uint32_t loads
+template <typename type4x4>
+void dequantize_mxfp6_soa(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg, constant float * lut) {
+    device const uint32_t * qs32 = (device const uint32_t *)(row + bidx * MXFP6_SOA_QS_PER_BLOCK + il * 12);
+    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + nblocks * MXFP6_SOA_QS_PER_BLOCK + bidx));
+
+    const uint32_t w0 = qs32[0];
+    const uint32_t w1 = qs32[1];
+    const uint32_t w2 = qs32[2];
+
+    // Extract 4 packed groups from 12 bytes loaded as 3 words
+    const uint32_t packed0 =  w0 & 0x00FFFFFF;
+    const uint32_t packed1 = (w0 >> 24) | ((w1 & 0xFFFF) << 8);
+    const uint32_t packed2 = (w1 >> 16) | ((w2 & 0xFF) << 16);
+    const uint32_t packed3 =  w2 >> 8;
+
+    float4x4 reg_f;
+    reg_f[0][0] = d * lut[ packed0        & 0x3F]; reg_f[0][1] = d * lut[(packed0 >>  6) & 0x3F];
+    reg_f[0][2] = d * lut[(packed0 >> 12) & 0x3F]; reg_f[0][3] = d * lut[(packed0 >> 18) & 0x3F];
+    reg_f[1][0] = d * lut[ packed1        & 0x3F]; reg_f[1][1] = d * lut[(packed1 >>  6) & 0x3F];
+    reg_f[1][2] = d * lut[(packed1 >> 12) & 0x3F]; reg_f[1][3] = d * lut[(packed1 >> 18) & 0x3F];
+    reg_f[2][0] = d * lut[ packed2        & 0x3F]; reg_f[2][1] = d * lut[(packed2 >>  6) & 0x3F];
+    reg_f[2][2] = d * lut[(packed2 >> 12) & 0x3F]; reg_f[2][3] = d * lut[(packed2 >> 18) & 0x3F];
+    reg_f[3][0] = d * lut[ packed3        & 0x3F]; reg_f[3][1] = d * lut[(packed3 >>  6) & 0x3F];
+    reg_f[3][2] = d * lut[(packed3 >> 12) & 0x3F]; reg_f[3][3] = d * lut[(packed3 >> 18) & 0x3F];
+    reg = (type4x4) reg_f;
+}
+
+// SoA MXFP6 dequant (t4: 4 values, il=0..7)
+template <typename type4>
+void dequantize_mxfp6_t4_soa(device const char * row, short bidx, short nblocks, short il, thread type4 & reg, constant float * lut) {
+    const uint32_t packed = *(device const uint32_t *)(row + bidx * MXFP6_SOA_QS_PER_BLOCK + il * 3) & 0x00FFFFFF;
+    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + nblocks * MXFP6_SOA_QS_PER_BLOCK + bidx));
+
+    float4 reg_f;
+    reg_f[0] = d * lut[ packed        & 0x3F];
+    reg_f[1] = d * lut[(packed >>  6) & 0x3F];
+    reg_f[2] = d * lut[(packed >> 12) & 0x3F];
+    reg_f[3] = d * lut[(packed >> 18) & 0x3F];
+    reg = (type4) reg_f;
+}
+
+template <typename type4x4>
+void dequantize_mxfp6_e2m3_soa(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg) {
+    dequantize_mxfp6_soa(row, bidx, nblocks, il, reg, fp6_e2m3_lut);
+}
+template <typename type4>
+void dequantize_mxfp6_e2m3_t4_soa(device const char * row, short bidx, short nblocks, short il, thread type4 & reg) {
+    dequantize_mxfp6_t4_soa(row, bidx, nblocks, il, reg, fp6_e2m3_lut);
+}
+template <typename type4x4>
+void dequantize_mxfp6_e3m2_soa(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg) {
+    dequantize_mxfp6_soa(row, bidx, nblocks, il, reg, fp6_e3m2_lut);
+}
+template <typename type4>
+void dequantize_mxfp6_e3m2_t4_soa(device const char * row, short bidx, short nblocks, short il, thread type4 & reg) {
+    dequantize_mxfp6_t4_soa(row, bidx, nblocks, il, reg, fp6_e3m2_lut);
+}
+
+// ===== Unified SoA MXFP dequant dispatch =====
+// Single entry point for all MXFP SoA types — makes it hard to forget aligned loads.
+// mxfp_type: 1=mxfp4, 2=mxfp8_e4m3, 3=mxfp8_e5m2, 4=mxfp6_e2m3, 5=mxfp6_e3m2
+// Function constants resolve the switch at PSO compile time.
+
+template <typename type4x4>
+static inline void dequant_mxfp_soa_4x4(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg, int32_t mxfp_type) {
+    switch (mxfp_type) {
+        case 1: dequantize_mxfp4_soa(row, bidx, nblocks, il, reg); break;
+        case 2: dequantize_mxfp8_e4m3_soa(row, bidx, nblocks, il, reg); break;
+        case 3: dequantize_mxfp8_e5m2_soa(row, bidx, nblocks, il, reg); break;
+        case 4: dequantize_mxfp6_e2m3_soa(row, bidx, nblocks, il, reg); break;
+        case 5: dequantize_mxfp6_e3m2_soa(row, bidx, nblocks, il, reg); break;
+    }
+    // Clamp to half range to prevent Inf from float→half cast.
+    // MXFP dequant computes d*kvalues in float, but FA stores K/V in half shared mem.
+    // When d is large (e8m0 >= 141 for MXFP4), d*max_kvalues can exceed half max (65504).
+    float4x4 r = (float4x4) reg;
+    for (int i = 0; i < 4; ++i) {
+        r[i] = clamp(r[i], float4(-65504.0f), float4(65504.0f));
+    }
+    reg = (type4x4) r;
+}
+
+template <typename type4>
+static inline void dequant_mxfp_soa_t4(device const char * row, short bidx, short nblocks, short il, thread type4 & reg, int32_t mxfp_type) {
+    switch (mxfp_type) {
+        case 1: dequantize_mxfp4_t4_soa(row, bidx, nblocks, il, reg); break;
+        case 2: dequantize_mxfp8_e4m3_t4_soa(row, bidx, nblocks, il, reg); break;
+        case 3: dequantize_mxfp8_e5m2_t4_soa(row, bidx, nblocks, il, reg); break;
+        case 4: dequantize_mxfp6_e2m3_t4_soa(row, bidx, nblocks, il, reg); break;
+        case 5: dequantize_mxfp6_e3m2_t4_soa(row, bidx, nblocks, il, reg); break;
+    }
+    // Clamp to half range (see above)
+    float4 r = (float4) reg;
+    r = clamp(r, float4(-65504.0f), float4(65504.0f));
+    reg = (type4) r;
+}
+
 // ===== MXFP Q preprocessing for flash attention =====
 // Applies Hadamard rotation + MXFP quantize/dequantize round-trip to Q,
 // matching the GPU MMA and CPU paths for consistent perplexity results.
@@ -683,8 +880,8 @@ static inline uint8_t mxfp4_compute_e8m0(float val) {
     int e_base = floor_log2 + round_up - MXFP4_E2M1_EMAX_OFFSET + 127;
 
     int e_lo = max(e_base - MXFP_E8M0_MSE_RANGE, 1);
-    int e_hi = min(e_base + MXFP_E8M0_MSE_RANGE, 255);
-    int best_e = clamp(e_base, 0, 255);
+    int e_hi = min(e_base + MXFP_E8M0_MSE_RANGE, 254);
+    int best_e = clamp(e_base, 0, 254);
     float best_mse = 1e30f;
 
     for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
@@ -1030,109 +1227,6 @@ void dequantize_mxfp6_e3m2_t4(device const block_mxfp6 * xb, short il, thread ty
 }
 
 // ===== MXFP serial quantize functions (for set_rows) =====
-// Templatized on SRC_PTR to support both device and thread address spaces.
-
-// Serial Hadamard rotation for a 32-element block (single thread, thread-local memory).
-// 5 butterfly stages + 1/sqrt(32) normalization. Matches CPU hadamard_32_inplace exactly.
-static inline void hadamard_32_serial(thread float * vals) {
-    for (int stride = 1; stride < 32; stride *= 2) {
-        for (int i = 0; i < 32; i += 2 * stride) {
-            for (int j = 0; j < stride; ++j) {
-                const float a = vals[i + j];
-                const float b = vals[i + j + stride];
-                vals[i + j]          = a + b;
-                vals[i + j + stride] = a - b;
-            }
-        }
-    }
-    const float norm = 0.17677669529663689f; // 1/sqrt(32)
-    for (int i = 0; i < 32; ++i) {
-        vals[i] *= norm;
-    }
-}
-
-// Serial E8M0 computation for a block of 32 floats (single thread, no simd).
-// MSE-optimal: round(log2(amax)) ±R search using type-specific round-trip.
-template <int EMAX_OFFSET, uint8_t (*elem_quant)(float), float (*elem_dequant)(uint8_t), typename SRC_PTR>
-static inline uint8_t mxfp_compute_e8m0_serial(SRC_PTR src) {
-    float amax = 0.0f;
-    for (int j = 0; j < 32; ++j) {
-        amax = max(amax, abs(src[j]));
-    }
-    if (amax == 0.0f) return 0;
-
-    uint32_t amax_bits = as_type<uint32_t>(amax);
-    int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
-    int round_up = ((amax_bits & 0x7FFFFF) >= 0x3504F3) ? 1 : 0;
-    int e_base = floor_log2 + round_up - EMAX_OFFSET + 127;
-
-    int e_lo = max(e_base - MXFP_E8M0_MSE_RANGE, 1);
-    int e_hi = min(e_base + MXFP_E8M0_MSE_RANGE, 255);
-    int best_e = clamp(e_base, 0, 255);
-    float best_mse = 1e30f;
-
-    for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
-        float test_scale = e8m0_to_fp32((uint8_t)test_e);
-        float test_inv = test_scale > 0.0f ? 1.0f / test_scale : 0.0f;
-        float mse = 0.0f;
-        for (int j = 0; j < 32; ++j) {
-            float recon = elem_dequant(elem_quant(src[j] * test_inv)) * test_scale;
-            float err = src[j] - recon;
-            mse += err * err;
-        }
-        if (mse < best_mse) {
-            best_mse = mse;
-            best_e = test_e;
-        }
-    }
-    return (uint8_t)best_e;
-}
-
-// Serial E8M0 computation specialized for MXFP4 (uses lookup table, half-scale).
-template <typename SRC_PTR>
-static inline uint8_t mxfp4_compute_e8m0_serial(SRC_PTR src) {
-    float amax = 0.0f;
-    for (int j = 0; j < 32; ++j) {
-        amax = max(amax, abs(src[j]));
-    }
-    if (amax == 0.0f) return 0;
-
-    uint32_t amax_bits = as_type<uint32_t>(amax);
-    int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
-    int round_up = ((amax_bits & 0x7FFFFF) >= 0x3504F3) ? 1 : 0;
-    int e_base = floor_log2 + round_up - MXFP4_E2M1_EMAX_OFFSET + 127;
-
-    int e_lo = max(e_base - MXFP_E8M0_MSE_RANGE, 1);
-    int e_hi = min(e_base + MXFP_E8M0_MSE_RANGE, 255);
-    int best_e = clamp(e_base, 0, 255);
-    float best_mse = 1e30f;
-
-    for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
-        float test_scale = e8m0_to_fp32((uint8_t)test_e);
-        float inv_scale = test_scale > 0.0f ? 1.0f / test_scale : 0.0f;
-        float mse = 0.0f;
-        for (int j = 0; j < 32; ++j) {
-            float normalized = abs(src[j]) * inv_scale;
-            float qval;
-            if      (normalized < 0.25f) qval = 0.0f;
-            else if (normalized < 0.75f) qval = 0.5f;
-            else if (normalized < 1.25f) qval = 1.0f;
-            else if (normalized < 1.75f) qval = 1.5f;
-            else if (normalized < 2.50f) qval = 2.0f;
-            else if (normalized < 3.50f) qval = 3.0f;
-            else if (normalized < 5.00f) qval = 4.0f;
-            else                         qval = 6.0f;
-            float min_err = abs(qval * test_scale - abs(src[j]));
-            mse += min_err * min_err;
-        }
-        if (mse < best_mse) {
-            best_mse = mse;
-            best_e = test_e;
-        }
-    }
-    return (uint8_t)best_e;
-}
-
 // Find best MXFP4 index for a value given scale.
 static inline uint8_t best_index_mxfp4_metal(float x, float inv_scale) {
     // Decision boundary quantization: 7 comparisons instead of 16-element scan.
@@ -1151,123 +1245,6 @@ static inline uint8_t best_index_mxfp4_metal(float x, float inv_scale) {
     return (x < 0.0f) ? (idx + 8) : idx;
 }
 
-template <typename SRC_PTR>
-void quantize_mxfp4_impl(SRC_PTR src, device block_mxfp4 & dst) {
-    uint8_t e = mxfp4_compute_e8m0_serial(src);
-    float scale = e8m0_to_fp32(e);
-    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
-    dst.e = e;
-
-    for (int j = 0; j < 16; ++j) {
-        uint8_t x0 = best_index_mxfp4_metal(src[j],     inv_scale);
-        uint8_t x1 = best_index_mxfp4_metal(src[j + 16], inv_scale);
-        dst.qs[j] = x0 | (x1 << 4);
-    }
-}
-
-void quantize_mxfp4(device const float * src, device block_mxfp4 & dst) {
-    quantize_mxfp4_impl(src, dst);
-}
-
-template <typename SRC_PTR>
-void quantize_mxfp8_e4m3_impl(SRC_PTR src, device block_mxfp8 & dst) {
-    uint8_t e = mxfp_compute_e8m0_serial<8, float_to_fp8_e4m3_rn, fp8_e4m3_to_float>(src);
-    float scale = e8m0_to_fp32(e);
-    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
-    dst.e = e;
-
-    for (int j = 0; j < 32; ++j) {
-        dst.qs[j] = float_to_fp8_e4m3_rn(src[j] * inv_scale);
-    }
-}
-
-void quantize_mxfp8_e4m3(device const float * src, device block_mxfp8 & dst) {
-    quantize_mxfp8_e4m3_impl(src, dst);
-}
-
-template <typename SRC_PTR>
-void quantize_mxfp8_e5m2_impl(SRC_PTR src, device block_mxfp8 & dst) {
-    uint8_t e = mxfp_compute_e8m0_serial<16, float_to_fp8_e5m2_rn, fp8_e5m2_to_float>(src);
-    float scale = e8m0_to_fp32(e);
-    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
-    dst.e = e;
-
-    for (int j = 0; j < 32; ++j) {
-        dst.qs[j] = float_to_fp8_e5m2_rn(src[j] * inv_scale);
-    }
-}
-
-void quantize_mxfp8_e5m2(device const float * src, device block_mxfp8 & dst) {
-    quantize_mxfp8_e5m2_impl(src, dst);
-}
-
-// Pack 4 six-bit values into 3 bytes (for quantization).
-static inline void pack_fp6x4_metal(thread uint8_t v[4], device uint8_t * out) {
-    uint32_t packed = (uint32_t)(v[0] & 0x3F)
-                    | ((uint32_t)(v[1] & 0x3F) << 6)
-                    | ((uint32_t)(v[2] & 0x3F) << 12)
-                    | ((uint32_t)(v[3] & 0x3F) << 18);
-    out[0] = (uint8_t)(packed & 0xFF);
-    out[1] = (uint8_t)((packed >> 8) & 0xFF);
-    out[2] = (uint8_t)((packed >> 16) & 0xFF);
-}
-
-template <typename SRC_PTR>
-void quantize_mxfp6_e2m3_impl(SRC_PTR src, device block_mxfp6 & dst) {
-    uint8_t e = mxfp_compute_e8m0_serial<3, float_to_fp6_e2m3_rn, fp6_e2m3_to_float>(src);
-    float scale = e8m0_to_fp32(e);
-    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
-    dst.e = e;
-
-    for (int j = 0; j < 32; j += 4) {
-        uint8_t vals[4];
-        for (int jj = 0; jj < 4; ++jj) {
-            vals[jj] = float_to_fp6_e2m3_rn(src[j + jj] * inv_scale);
-        }
-        pack_fp6x4_metal(vals, &dst.qs[j * 3 / 4]);
-    }
-}
-
-void quantize_mxfp6_e2m3(device const float * src, device block_mxfp6 & dst) {
-    quantize_mxfp6_e2m3_impl(src, dst);
-}
-
-template <typename SRC_PTR>
-void quantize_mxfp6_e3m2_impl(SRC_PTR src, device block_mxfp6 & dst) {
-    uint8_t e = mxfp_compute_e8m0_serial<5, float_to_fp6_e3m2_rn, fp6_e3m2_to_float>(src);
-    float scale = e8m0_to_fp32(e);
-    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
-    dst.e = e;
-
-    for (int j = 0; j < 32; j += 4) {
-        uint8_t vals[4];
-        for (int jj = 0; jj < 4; ++jj) {
-            vals[jj] = float_to_fp6_e3m2_rn(src[j + jj] * inv_scale);
-        }
-        pack_fp6x4_metal(vals, &dst.qs[j * 3 / 4]);
-    }
-}
-
-void quantize_mxfp6_e3m2(device const float * src, device block_mxfp6 & dst) {
-    quantize_mxfp6_e3m2_impl(src, dst);
-}
-
-// Thread-space MXFP quantize wrappers (for kernel_set_rows_mxfp with Hadamard).
-void quantize_mxfp4_t(thread const float * src, device block_mxfp4 & dst) {
-    quantize_mxfp4_impl(src, dst);
-}
-void quantize_mxfp8_e4m3_t(thread const float * src, device block_mxfp8 & dst) {
-    quantize_mxfp8_e4m3_impl(src, dst);
-}
-void quantize_mxfp8_e5m2_t(thread const float * src, device block_mxfp8 & dst) {
-    quantize_mxfp8_e5m2_impl(src, dst);
-}
-void quantize_mxfp6_e2m3_t(thread const float * src, device block_mxfp6 & dst) {
-    quantize_mxfp6_e2m3_impl(src, dst);
-}
-void quantize_mxfp6_e3m2_t(thread const float * src, device block_mxfp6 & dst) {
-    quantize_mxfp6_e3m2_impl(src, dst);
-}
 
 // ===== MXFP8/MXFP6 Q preprocessing for flash attention =====
 // Generic MXFP round-trip: quantize element to type, then dequantize back to float.
@@ -1290,8 +1267,8 @@ static inline uint8_t mxfp_compute_e8m0_mse(float val) {
     int e_base = floor_log2 + round_up - EMAX_OFFSET + 127;
 
     int e_lo = max(e_base - MXFP_E8M0_MSE_RANGE, 1);
-    int e_hi = min(e_base + MXFP_E8M0_MSE_RANGE, 255);
-    int best_e = clamp(e_base, 0, 255);
+    int e_hi = min(e_base + MXFP_E8M0_MSE_RANGE, 254);
+    int best_e = clamp(e_base, 0, 254);
     float best_mse = 1e30f;
 
     for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
@@ -1344,34 +1321,31 @@ static inline short mixed_v_block_size(int32_t v_type) {
     }
 }
 
-// Dispatch mixed V dequant by v_type function constant (4x4 variant for main kernel).
-// Reads raw bytes from device memory and dequantizes based on the V type.
-// The function constant is resolved at PSO creation time, so the switch compiles away.
+// Dispatch mixed V dequant by v_type function constant.
 template <typename type4x4>
 static inline void dequant_v_4x4_dispatch(device const char * v_data, short il, thread type4x4 & reg, int32_t v_type) {
     switch (v_type) {
-        case 1: dequantize_mxfp4(     (device const block_mxfp4 *) v_data, il, reg); break;
+        case 1: dequantize_mxfp4((device const block_mxfp4 *) v_data, il, reg); break;
         case 2: dequantize_mxfp8_e4m3((device const block_mxfp8 *) v_data, il, reg); break;
         case 3: dequantize_mxfp8_e5m2((device const block_mxfp8 *) v_data, il, reg); break;
         case 4: dequantize_mxfp6_e2m3((device const block_mxfp6 *) v_data, il, reg); break;
         case 5: dequantize_mxfp6_e3m2((device const block_mxfp6 *) v_data, il, reg); break;
-        case 6: dequantize_q4_0(      (device const block_q4_0  *) v_data, il, reg); break;
-        case 7: dequantize_q8_0(      (device const block_q8_0  *) v_data, il, reg); break;
+        case 6: dequantize_q4_0((device const block_q4_0 *) v_data, il, reg); break;
+        case 7: dequantize_q8_0((device const block_q8_0 *) v_data, il, reg); break;
         default: break;
     }
 }
 
-// Dispatch mixed V dequant by v_type function constant (t4 variant for vec kernel).
 template <typename type4>
 static inline void dequant_v_t4_dispatch(device const char * v_data, short il, thread type4 & reg, int32_t v_type) {
     switch (v_type) {
-        case 1: dequantize_mxfp4_t4(     (device const block_mxfp4 *) v_data, il, reg); break;
+        case 1: dequantize_mxfp4_t4((device const block_mxfp4 *) v_data, il, reg); break;
         case 2: dequantize_mxfp8_e4m3_t4((device const block_mxfp8 *) v_data, il, reg); break;
         case 3: dequantize_mxfp8_e5m2_t4((device const block_mxfp8 *) v_data, il, reg); break;
         case 4: dequantize_mxfp6_e2m3_t4((device const block_mxfp6 *) v_data, il, reg); break;
         case 5: dequantize_mxfp6_e3m2_t4((device const block_mxfp6 *) v_data, il, reg); break;
-        case 6: dequantize_q4_0_t4(      (device const block_q4_0  *) v_data, il, reg); break;
-        case 7: dequantize_q8_0_t4(      (device const block_q8_0  *) v_data, il, reg); break;
+        case 6: dequantize_q4_0_t4((device const block_q4_0 *) v_data, il, reg); break;
+        case 7: dequantize_q8_0_t4((device const block_q8_0 *) v_data, il, reg); break;
         default: break;
     }
 }
@@ -6412,7 +6386,6 @@ void kernel_flash_attn_ext_impl(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // MXFP Q preprocessing: Hadamard rotation + quantize/dequantize round-trip.
-    // This captures the same quantization loss as the GPU MMA path.
     // Hadamard is applied when DK == DV (skip for MLA where V is a view of K).
     if (FC_flash_attn_ext_mxfp_type > 0) {
         FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
@@ -6680,7 +6653,7 @@ void kernel_flash_attn_ext_impl(
                 const float m = M[jj];
 
                 // scale and apply the logitcap / mask
-                float2 s2 = ss2[j*SH/2 + tiisg]*args.scale;
+                float2 s2 = (float2)(ss2[j*SH/2 + tiisg]*args.scale);
 
                 if (FC_flash_attn_ext_has_scap) {
                     s2 = args.logit_softcap*precise::tanh(s2);
@@ -7391,7 +7364,8 @@ kernel void kernel_flash_attn_ext_vec(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // MXFP Q preprocessing: Hadamard rotation + quantize/dequantize round-trip.
-    if (FC_flash_attn_ext_vec_mxfp_type > 0) {
+    // DEBUG: temporarily disabled to isolate NaN bug
+    if (false && FC_flash_attn_ext_vec_mxfp_type > 0) {
         if (sgitg == 0 && iq1 < args.ne01) {
             threadgroup half * sq = (threadgroup half *)sq4;
             for (short b = 0; b < DK/32; ++b) {
@@ -7825,7 +7799,7 @@ template [[host_name("kernel_flash_attn_ext_vec_q4_1_dk128_dv128")]] kernel flas
 template [[host_name("kernel_flash_attn_ext_vec_q5_0_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     block_q5_0, 8, dequantize_q5_0_t4, block_q5_0,  8, dequantize_q5_0_t4, 128, 128, 1>;
 template [[host_name("kernel_flash_attn_ext_vec_q5_1_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     block_q5_1, 8, dequantize_q5_1_t4, block_q5_1,  8, dequantize_q5_1_t4, 128, 128, 1>;
 template [[host_name("kernel_flash_attn_ext_vec_q8_0_dk128_dv128")]]       kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     block_q8_0,  8, dequantize_q8_0_t4,  block_q8_0,  8, dequantize_q8_0_t4,  128, 128, 1>;
-template [[host_name("kernel_flash_attn_ext_vec_mxfp4_e2m1_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     block_mxfp4, 8, dequantize_mxfp4_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 128, 128, 1>;
+template [[host_name("kernel_flash_attn_ext_vec_mxfp4_e2m1_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     block_mxfp4, 8, dequantize_mxfp4_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 128, 128, 4>;
 
 template [[host_name("kernel_flash_attn_ext_vec_f32_dk192_dv192")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES_F32, float4,     1, dequantize_f32_t4,  float4,      1, dequantize_f32_t4,  192, 192, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_f16_dk192_dv192")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     half4,      1, dequantize_f16_t4,  half4,       1, dequantize_f16_t4,  192, 192, 2>;
@@ -7878,7 +7852,7 @@ template [[host_name("kernel_flash_attn_ext_vec_mxfp4_e2m1_dk576_dv512")]] kerne
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_dk32_dv32")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, 32, 32, 4>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_dk64_dv64")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, 64, 64, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_dk96_dv96")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, 96, 96, 4>;
-template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, 128, 128, 1>;
+template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, 128, 128, 4>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_dk192_dv192")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, 192, 192, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_dk192_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, 192, 128, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_dk256_dv256")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, 256, 256, 1>;
@@ -7887,7 +7861,7 @@ template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_dk576_dv512")]] kerne
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e5m2_dk32_dv32")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e5m2_t4, block_mxfp8, 8, dequantize_mxfp8_e5m2_t4, 32, 32, 4>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e5m2_dk64_dv64")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e5m2_t4, block_mxfp8, 8, dequantize_mxfp8_e5m2_t4, 64, 64, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e5m2_dk96_dv96")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e5m2_t4, block_mxfp8, 8, dequantize_mxfp8_e5m2_t4, 96, 96, 4>;
-template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e5m2_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e5m2_t4, block_mxfp8, 8, dequantize_mxfp8_e5m2_t4, 128, 128, 1>;
+template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e5m2_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e5m2_t4, block_mxfp8, 8, dequantize_mxfp8_e5m2_t4, 128, 128, 4>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e5m2_dk192_dv192")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e5m2_t4, block_mxfp8, 8, dequantize_mxfp8_e5m2_t4, 192, 192, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e5m2_dk192_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e5m2_t4, block_mxfp8, 8, dequantize_mxfp8_e5m2_t4, 192, 128, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e5m2_dk256_dv256")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e5m2_t4, block_mxfp8, 8, dequantize_mxfp8_e5m2_t4, 256, 256, 1>;
@@ -7896,7 +7870,7 @@ template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e5m2_dk576_dv512")]] kerne
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_dk32_dv32")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, 32, 32, 4>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_dk64_dv64")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, 64, 64, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_dk96_dv96")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, 96, 96, 4>;
-template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, 128, 128, 1>;
+template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, 128, 128, 4>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_dk192_dv192")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, 192, 192, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_dk192_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, 192, 128, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_dk256_dv256")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, 256, 256, 1>;
@@ -7905,7 +7879,7 @@ template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_dk576_dv512")]] kerne
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e3m2_dk32_dv32")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e3m2_t4, block_mxfp6, 8, dequantize_mxfp6_e3m2_t4, 32, 32, 4>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e3m2_dk64_dv64")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e3m2_t4, block_mxfp6, 8, dequantize_mxfp6_e3m2_t4, 64, 64, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e3m2_dk96_dv96")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e3m2_t4, block_mxfp6, 8, dequantize_mxfp6_e3m2_t4, 96, 96, 4>;
-template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e3m2_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e3m2_t4, block_mxfp6, 8, dequantize_mxfp6_e3m2_t4, 128, 128, 1>;
+template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e3m2_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e3m2_t4, block_mxfp6, 8, dequantize_mxfp6_e3m2_t4, 128, 128, 4>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e3m2_dk192_dv192")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e3m2_t4, block_mxfp6, 8, dequantize_mxfp6_e3m2_t4, 192, 192, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e3m2_dk192_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e3m2_t4, block_mxfp6, 8, dequantize_mxfp6_e3m2_t4, 192, 128, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e3m2_dk256_dv256")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e3m2_t4, block_mxfp6, 8, dequantize_mxfp6_e3m2_t4, 256, 256, 1>;
@@ -7915,7 +7889,7 @@ template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e3m2_dk576_dv512")]] kerne
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_v_mxfp4_e2m1_dk32_dv32")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 32, 32, 4>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_v_mxfp4_e2m1_dk64_dv64")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 64, 64, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_v_mxfp4_e2m1_dk96_dv96")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 96, 96, 4>;
-template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_v_mxfp4_e2m1_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 128, 128, 1>;
+template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_v_mxfp4_e2m1_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 128, 128, 4>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_v_mxfp4_e2m1_dk192_dv192")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 192, 192, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_v_mxfp4_e2m1_dk192_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 192, 128, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_v_mxfp4_e2m1_dk256_dv256")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp8, 8, dequantize_mxfp8_e4m3_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 256, 256, 1>;
@@ -7925,7 +7899,7 @@ template [[host_name("kernel_flash_attn_ext_vec_mxfp8_e4m3_v_mxfp4_e2m1_dk576_dv
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_v_mxfp4_e2m1_dk32_dv32")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 32, 32, 4>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_v_mxfp4_e2m1_dk64_dv64")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 64, 64, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_v_mxfp4_e2m1_dk96_dv96")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 96, 96, 4>;
-template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_v_mxfp4_e2m1_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 128, 128, 1>;
+template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_v_mxfp4_e2m1_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 128, 128, 4>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_v_mxfp4_e2m1_dk192_dv192")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 192, 192, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_v_mxfp4_e2m1_dk192_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 192, 128, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_v_mxfp4_e2m1_dk256_dv256")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_mxfp6, 8, dequantize_mxfp6_e2m3_t4, block_mxfp4, 8, dequantize_mxfp4_t4, 256, 256, 1>;
@@ -7935,7 +7909,7 @@ template [[host_name("kernel_flash_attn_ext_vec_mxfp6_e2m3_v_mxfp4_e2m1_dk576_dv
 template [[host_name("kernel_flash_attn_ext_vec_q8_0_v_q4_0_dk32_dv32")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_q8_0, 8, dequantize_q8_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 32, 32, 4>;
 template [[host_name("kernel_flash_attn_ext_vec_q8_0_v_q4_0_dk64_dv64")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_q8_0, 8, dequantize_q8_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 64, 64, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_q8_0_v_q4_0_dk96_dv96")]]   kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_q8_0, 8, dequantize_q8_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 96, 96, 4>;
-template [[host_name("kernel_flash_attn_ext_vec_q8_0_v_q4_0_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_q8_0, 8, dequantize_q8_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 128, 128, 1>;
+template [[host_name("kernel_flash_attn_ext_vec_q8_0_v_q4_0_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_q8_0, 8, dequantize_q8_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 128, 128, 4>;
 template [[host_name("kernel_flash_attn_ext_vec_q8_0_v_q4_0_dk192_dv192")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_q8_0, 8, dequantize_q8_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 192, 192, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_q8_0_v_q4_0_dk192_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_q8_0, 8, dequantize_q8_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 192, 128, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_q8_0_v_q4_0_dk256_dv256")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_q8_0, 8, dequantize_q8_0_t4, block_q4_0, 8, dequantize_q4_0_t4, 256, 256, 1>;
@@ -9963,43 +9937,204 @@ kernel void kernel_set_rows_q32(
     }
 }
 
-// MXFP-aware set_rows: copies 32 floats to thread-local memory, optionally applies
-// Hadamard rotation (for K cache), then quantizes using thread-space quantize impl.
-template<typename TI, typename block_q, void (*quantize_func)(thread const float *, device block_q &)>
-kernel void kernel_set_rows_mxfp(
+// SIMD-parallel MXFP4 set_rows: 32 threads cooperate on each 32-element block.
+// Writes SoA layout: [qs_block0|qs_block1|...][e8m0_0|e8m0_1|...]
+// Total row size is identical to AoS (nk0*16 + nk0*1 = nk0*17 bytes).
+template<typename TI>
+kernel void kernel_set_rows_mxfp4_simd(
         constant ggml_metal_kargs_set_rows & args,
         device const  void * src0,
         device const  void * src1,
         device       float * dst,
         uint3                tgpig[[threadgroup_position_in_grid]],
-        uint                 tiitg[[thread_index_in_threadgroup]],
-        uint3                tptg [[threads_per_threadgroup]]) {
+        ushort               tiisg[[thread_index_in_simdgroup]],
+        ushort               sgitg[[simdgroup_index_in_threadgroup]]) {
     const int32_t i03 = tgpig.z;
     const int32_t i02 = tgpig.y;
+    const int32_t i01 = tgpig.x;
+
+    if (i01 >= args.ne01) return;
 
     const int32_t i12 = i03%args.ne12;
     const int32_t i11 = i02%args.ne11;
-
-    const int32_t i01 = tgpig.x*tptg.y + tiitg/tptg.x;
-    if (i01 >= args.ne01) {
-        return;
-    }
-
     const int32_t i10 = i01;
     const TI      i1  = ((const device TI *) ((const device char *) src1 + i10*args.nb10 + i11*args.nb11 + i12*args.nb12))[0];
 
-          device block_q * dst_row = (      device block_q *) ((      device char *) dst  +  i1*args.nb1  + i02*args.nb2  + i03*args.nb3);
-    const device float   * src_row = (const device float   *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
+    device char  * dst_row = ((device char *) dst + i1*args.nb1 + i02*args.nb2 + i03*args.nb3);
+    const device float * src_row = (const device float *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
 
-    for (int ind = tiitg%tptg.x; ind < args.nk0; ind += tptg.x) {
-        thread float tmp[32];
-        for (int j = 0; j < 32; ++j) {
-            tmp[j] = src_row[32*ind + j];
+    const int ind = sgitg;
+    if (ind >= args.nk0) return;
+
+    float val = src_row[32*ind + tiisg];
+
+    if (args.apply_hadamard) {
+        for (ushort stride = 1; stride < 32; stride <<= 1) {
+            float partner = simd_shuffle_xor(val, stride);
+            val = (tiisg & stride) ? (partner - val) : (partner + val);
         }
-        if (args.apply_hadamard) {
-            hadamard_32_serial(tmp);
+        val *= 0.17677669529663689f; // 1/sqrt(32)
+    }
+
+    float amax = simd_max(abs(val));
+    uint8_t e = 0;
+    if (amax > 0.0f) {
+        uint32_t amax_bits = as_type<uint32_t>(amax);
+        int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
+        int round_up = ((amax_bits & 0x7FFFFF) >= 0x3504F3) ? 1 : 0;
+        int e_int = floor_log2 + round_up - MXFP4_E2M1_EMAX_OFFSET + 127;
+        e = (uint8_t)clamp(e_int, 0, 254);
+    }
+
+    float scale = e8m0_to_fp32(e);
+    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+    uint8_t nibble = best_index_mxfp4_metal(val, inv_scale);
+
+    // Pack nibbles: byte[j] = element[j] (low) | element[j+16] (high)
+    uint8_t partner_nibble = (uint8_t)simd_shuffle(nibble, (tiisg + 16) & 31);
+
+    // Write AoS: block_mxfp4 = { e, qs[16] } = 17 bytes per block
+    if (tiisg < 16) {
+        device uint8_t * qs_dst = (device uint8_t *)(dst_row + ind * 17 + 1);
+        qs_dst[tiisg] = nibble | (partner_nibble << 4);
+    }
+    if (tiisg == 0) {
+        *(dst_row + ind * 17) = (char)e;
+    }
+}
+
+// Shared SIMD E8M0 computation for all MXFP types.
+// Simple round(log2(amax)) — fast, no MSE search.
+static inline uint8_t mxfp_simd_e8m0(float amax, int emax_offset) {
+    if (amax <= 0.0f) return 0;
+    uint32_t amax_bits = as_type<uint32_t>(amax);
+    int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
+    int round_up = ((amax_bits & 0x7FFFFF) >= 0x3504F3) ? 1 : 0;
+    int e_int = floor_log2 + round_up - emax_offset + 127;
+    return (uint8_t)clamp(e_int, 0, 254);
+}
+
+// SIMD-parallel MXFP8 set_rows: 32 threads cooperate on each 32-element block.
+// Writes SoA layout: [qs_block0[32]|qs_block1[32]|...][e8m0_0|e8m0_1|...]
+// MXFP_SUBTYPE: 2=E4M3, 3=E5M2 (matches dequant dispatch IDs)
+template<typename TI, int MXFP_SUBTYPE>
+kernel void kernel_set_rows_mxfp8_simd(
+        constant ggml_metal_kargs_set_rows & args,
+        device const  void * src0,
+        device const  void * src1,
+        device       float * dst,
+        uint3                tgpig[[threadgroup_position_in_grid]],
+        ushort               tiisg[[thread_index_in_simdgroup]],
+        ushort               sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int32_t i03 = tgpig.z;
+    const int32_t i02 = tgpig.y;
+    const int32_t i01 = tgpig.x;
+
+    if (i01 >= args.ne01) return;
+
+    const int32_t i12 = i03%args.ne12;
+    const int32_t i11 = i02%args.ne11;
+    const int32_t i10 = i01;
+    const TI      i1  = ((const device TI *) ((const device char *) src1 + i10*args.nb10 + i11*args.nb11 + i12*args.nb12))[0];
+
+    device char  * dst_row = ((device char *) dst + i1*args.nb1 + i02*args.nb2 + i03*args.nb3);
+    const device float * src_row = (const device float *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
+
+    const int ind = sgitg;
+    if (ind >= args.nk0) return;
+
+    float val = src_row[32*ind + tiisg];
+
+    if (args.apply_hadamard) {
+        for (ushort stride = 1; stride < 32; stride <<= 1) {
+            float partner = simd_shuffle_xor(val, stride);
+            val = (tiisg & stride) ? (partner - val) : (partner + val);
         }
-        quantize_func(tmp, dst_row[ind]);
+        val *= 0.17677669529663689f; // 1/sqrt(32)
+    }
+
+    float amax = simd_max(abs(val));
+    uint8_t e = mxfp_simd_e8m0(amax, (MXFP_SUBTYPE == 2) ? 8 : 16);
+
+    float scale = e8m0_to_fp32(e);
+    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+    uint8_t fp8 = (MXFP_SUBTYPE == 2) ? float_to_fp8_e4m3_rn(val * inv_scale)
+                                       : float_to_fp8_e5m2_rn(val * inv_scale);
+
+    // Write AoS: block_mxfp8 = { e, qs[32] } = 33 bytes per block
+    *(device uint8_t *)(dst_row + ind * 33 + 1 + tiisg) = fp8;
+    if (tiisg == 0) {
+        *(dst_row + ind * 33) = (char)e;
+    }
+}
+
+// SIMD-parallel MXFP6 set_rows: 32 threads cooperate on each 32-element block.
+// Writes SoA layout: [qs_block0[24]|qs_block1[24]|...][e8m0_0|e8m0_1|...]
+// 4 threads cooperate to pack 4×6-bit values into 3 bytes via SIMD shuffle.
+// MXFP_SUBTYPE: 4=E2M3, 5=E3M2 (matches dequant dispatch IDs)
+template<typename TI, int MXFP_SUBTYPE>
+kernel void kernel_set_rows_mxfp6_simd(
+        constant ggml_metal_kargs_set_rows & args,
+        device const  void * src0,
+        device const  void * src1,
+        device       float * dst,
+        uint3                tgpig[[threadgroup_position_in_grid]],
+        ushort               tiisg[[thread_index_in_simdgroup]],
+        ushort               sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int32_t i03 = tgpig.z;
+    const int32_t i02 = tgpig.y;
+    const int32_t i01 = tgpig.x;
+
+    if (i01 >= args.ne01) return;
+
+    const int32_t i12 = i03%args.ne12;
+    const int32_t i11 = i02%args.ne11;
+    const int32_t i10 = i01;
+    const TI      i1  = ((const device TI *) ((const device char *) src1 + i10*args.nb10 + i11*args.nb11 + i12*args.nb12))[0];
+
+    device char  * dst_row = ((device char *) dst + i1*args.nb1 + i02*args.nb2 + i03*args.nb3);
+    const device float * src_row = (const device float *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
+
+    const int ind = sgitg;
+    if (ind >= args.nk0) return;
+
+    float val = src_row[32*ind + tiisg];
+
+    if (args.apply_hadamard) {
+        for (ushort stride = 1; stride < 32; stride <<= 1) {
+            float partner = simd_shuffle_xor(val, stride);
+            val = (tiisg & stride) ? (partner - val) : (partner + val);
+        }
+        val *= 0.17677669529663689f; // 1/sqrt(32)
+    }
+
+    float amax = simd_max(abs(val));
+    uint8_t e = mxfp_simd_e8m0(amax, (MXFP_SUBTYPE == 4) ? 3 : 5);
+
+    float scale = e8m0_to_fp32(e);
+    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+    uint8_t fp6 = (MXFP_SUBTYPE == 4) ? float_to_fp6_e2m3_rn(val * inv_scale)
+                                       : float_to_fp6_e3m2_rn(val * inv_scale);
+
+    // Pack 4×6-bit values into 3 bytes: groups of 4 threads cooperate
+    const ushort group = tiisg / 4;
+    const ushort lane = tiisg % 4;
+
+    uint8_t v0 = (uint8_t)simd_shuffle((uint)fp6, group * 4 + 0);
+    uint8_t v1 = (uint8_t)simd_shuffle((uint)fp6, group * 4 + 1);
+    uint8_t v2 = (uint8_t)simd_shuffle((uint)fp6, group * 4 + 2);
+    uint8_t v3 = (uint8_t)simd_shuffle((uint)fp6, group * 4 + 3);
+
+    // Write AoS: block_mxfp6 = { e, qs[24] } = 25 bytes per block
+    if (lane == 0) {
+        uint32_t packed = (v0 & 0x3F) | ((v1 & 0x3F) << 6) | ((v2 & 0x3F) << 12) | ((v3 & 0x3F) << 18);
+        device uint8_t * qs_dst = (device uint8_t *)(dst_row + ind * 25 + 1 + group * 3);
+        qs_dst[0] = (uint8_t)(packed);
+        qs_dst[1] = (uint8_t)(packed >> 8);
+        qs_dst[2] = (uint8_t)(packed >> 16);
+    }
+    if (tiisg == 0) {
+        *(dst_row + ind * 25) = (char)e;
     }
 }
 
@@ -10809,18 +10944,21 @@ template [[host_name("kernel_set_rows_q5_1_i32")]]   kernel set_rows_q32_t kerne
 template [[host_name("kernel_set_rows_iq4_nl_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_iq4_nl, quantize_iq4_nl>;
 template [[host_name("kernel_set_rows_iq4_nl_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_iq4_nl, quantize_iq4_nl>;
 
-typedef decltype(kernel_set_rows_mxfp<int64_t, block_mxfp4, quantize_mxfp4_t>) set_rows_mxfp_t;
+typedef decltype(kernel_set_rows_mxfp4_simd<int64_t>) set_rows_mxfp4_simd_t;
+template [[host_name("kernel_set_rows_mxfp4_e2m1_i64")]]  kernel set_rows_mxfp4_simd_t kernel_set_rows_mxfp4_simd<int64_t>;
+template [[host_name("kernel_set_rows_mxfp4_e2m1_i32")]]  kernel set_rows_mxfp4_simd_t kernel_set_rows_mxfp4_simd<int32_t>;
 
-template [[host_name("kernel_set_rows_mxfp4_e2m1_i64")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int64_t, block_mxfp4, quantize_mxfp4_t>;
-template [[host_name("kernel_set_rows_mxfp4_e2m1_i32")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int32_t, block_mxfp4, quantize_mxfp4_t>;
-template [[host_name("kernel_set_rows_mxfp8_e4m3_i64")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int64_t, block_mxfp8, quantize_mxfp8_e4m3_t>;
-template [[host_name("kernel_set_rows_mxfp8_e4m3_i32")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int32_t, block_mxfp8, quantize_mxfp8_e4m3_t>;
-template [[host_name("kernel_set_rows_mxfp8_e5m2_i64")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int64_t, block_mxfp8, quantize_mxfp8_e5m2_t>;
-template [[host_name("kernel_set_rows_mxfp8_e5m2_i32")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int32_t, block_mxfp8, quantize_mxfp8_e5m2_t>;
-template [[host_name("kernel_set_rows_mxfp6_e2m3_i64")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int64_t, block_mxfp6, quantize_mxfp6_e2m3_t>;
-template [[host_name("kernel_set_rows_mxfp6_e2m3_i32")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int32_t, block_mxfp6, quantize_mxfp6_e2m3_t>;
-template [[host_name("kernel_set_rows_mxfp6_e3m2_i64")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int64_t, block_mxfp6, quantize_mxfp6_e3m2_t>;
-template [[host_name("kernel_set_rows_mxfp6_e3m2_i32")]]  kernel set_rows_mxfp_t kernel_set_rows_mxfp<int32_t, block_mxfp6, quantize_mxfp6_e3m2_t>;
+typedef decltype(kernel_set_rows_mxfp8_simd<int64_t, 2>) set_rows_mxfp8_simd_t;
+template [[host_name("kernel_set_rows_mxfp8_e4m3_i64")]]  kernel set_rows_mxfp8_simd_t kernel_set_rows_mxfp8_simd<int64_t, 2>;
+template [[host_name("kernel_set_rows_mxfp8_e4m3_i32")]]  kernel set_rows_mxfp8_simd_t kernel_set_rows_mxfp8_simd<int32_t, 2>;
+template [[host_name("kernel_set_rows_mxfp8_e5m2_i64")]]  kernel set_rows_mxfp8_simd_t kernel_set_rows_mxfp8_simd<int64_t, 3>;
+template [[host_name("kernel_set_rows_mxfp8_e5m2_i32")]]  kernel set_rows_mxfp8_simd_t kernel_set_rows_mxfp8_simd<int32_t, 3>;
+
+typedef decltype(kernel_set_rows_mxfp6_simd<int64_t, 4>) set_rows_mxfp6_simd_t;
+template [[host_name("kernel_set_rows_mxfp6_e2m3_i64")]]  kernel set_rows_mxfp6_simd_t kernel_set_rows_mxfp6_simd<int64_t, 4>;
+template [[host_name("kernel_set_rows_mxfp6_e2m3_i32")]]  kernel set_rows_mxfp6_simd_t kernel_set_rows_mxfp6_simd<int32_t, 4>;
+template [[host_name("kernel_set_rows_mxfp6_e3m2_i64")]]  kernel set_rows_mxfp6_simd_t kernel_set_rows_mxfp6_simd<int64_t, 5>;
+template [[host_name("kernel_set_rows_mxfp6_e3m2_i32")]]  kernel set_rows_mxfp6_simd_t kernel_set_rows_mxfp6_simd<int32_t, 5>;
 
 //
 // matrix-matrix multiplication

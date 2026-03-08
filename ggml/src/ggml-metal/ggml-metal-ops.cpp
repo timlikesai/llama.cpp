@@ -1212,13 +1212,24 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
         /*.apply_hadamard =*/ ((const int32_t *)op->op_params)[0],
     };
 
+    const bool is_mxfp_simd = (op->type == GGML_TYPE_MXFP4_E2M1 ||
+                               op->type == GGML_TYPE_MXFP8_E4M3 ||
+                               op->type == GGML_TYPE_MXFP8_E5M2 ||
+                               op->type == GGML_TYPE_MXFP6_E2M3 ||
+                               op->type == GGML_TYPE_MXFP6_E3M2);
+
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nrptg - 1)/nrptg, ne02, ne03, nth, nrptg, 1);
+    if (is_mxfp_simd) {
+        // SIMD dispatch: nk0 simdgroups × 32 threads, one row per threadgroup
+        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, 32*nk0, 1, 1);
+    } else {
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nrptg - 1)/nrptg, ne02, ne03, nth, nrptg, 1);
+    }
 
     return 1;
 }
