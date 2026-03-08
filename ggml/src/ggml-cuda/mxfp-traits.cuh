@@ -38,15 +38,18 @@ static __host__ __device__ __forceinline__ bool ggml_is_type_mxfp_enabled(ggml_t
     return false;
 }
 
-// SoA head offset calculation (CUDA template specialization for compile-time resolution).
-// Uses shared constants from ggml-common.h (MXFP*_SOA_QS_PER_BLOCK).
-// See ggml_mxfp_soa_head_offsets() in ggml-common.h for the portable runtime version.
+// SoA head offset calculation:
+// Computes qs and E8M0 byte offsets for a given head in a SoA-layout MXFP row.
+// Layout: [qs_block0 | qs_block1 | ... | e_block0 | e_block1 | ...]
+// Defined outside CUDART guard so it works on HIP/MUSA too.
 template<ggml_type type, int D>
 static __device__ __forceinline__ void mxfp_soa_head_offsets(
         const int nb_row, const int head, const int gqa_ratio,
         int & qs_off, int & e_off) {
-    constexpr int qs_per_block = (type == GGML_TYPE_MXFP4_E2M1) ? MXFP4_SOA_QS_PER_BLOCK :
-                                 (type == GGML_TYPE_MXFP8_E4M3 || type == GGML_TYPE_MXFP8_E5M2) ? MXFP8_SOA_QS_PER_BLOCK : MXFP6_SOA_QS_PER_BLOCK;
+    // block_size and qs_per_block derived from ggml-common.h struct definitions:
+    //   MXFP4: block=17 (1+16), qs=16    MXFP8: block=33 (1+32), qs=32    MXFP6: block=25 (1+24), qs=24
+    constexpr int qs_per_block = (type == GGML_TYPE_MXFP4_E2M1) ? 16 :
+                                 (type == GGML_TYPE_MXFP8_E4M3 || type == GGML_TYPE_MXFP8_E5M2) ? 32 : 24;
     constexpr int block_size   = qs_per_block + 1;  // +1 byte for E8M0 scale
     constexpr int blocks_per_head = D / 32;
     const int stride_blocks = nb_row / block_size;
