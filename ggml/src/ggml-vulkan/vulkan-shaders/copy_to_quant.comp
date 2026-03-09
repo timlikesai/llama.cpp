@@ -16,7 +16,11 @@ layout (binding = 0) readonly buffer S {float data_s[];};
 #if defined(SET_ROWS)
 #include "generic_binary_head.glsl"
 layout (binding = 1) readonly buffer C {B_TYPE data_i[];};
+#if defined(DATA_A_MXFP4) || defined(DATA_A_MXFP8_E4M3) || defined(DATA_A_MXFP8_E5M2) || defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
+layout (binding = 2) buffer Q_SOA {uint8_t q_soa_bytes[];};
+#else
 layout (binding = 2) writeonly buffer Q {A_TYPE data_q[];};
+#endif
 
 #if B_SIZE == 64
 #define DATA_I_SWIZZLE .x
@@ -330,12 +334,24 @@ void quantize(uint dst_idx, uint src_idx) {
         e = best_e;
     }
     float d = e8m0_to_fp32(e) * 0.5;
+#if defined(SET_ROWS)
+    const uint NPR = p.nb21;
+    const uint bwr = dst_idx % NPR;
+    const uint row_byte = (dst_idx - bwr) * 17u;
+    q_soa_bytes[row_byte + NPR * 16u + bwr] = uint8_t(e);
+    for (int j = 0; j < 16; ++j) {
+        uint x0 = best_index_mxfp4(vals[j],      d);
+        uint x1 = best_index_mxfp4(vals[j + 16],  d);
+        q_soa_bytes[row_byte + bwr * 16u + uint(j)] = uint8_t(x0 | (x1 << 4));
+    }
+#else
     data_q[dst_idx].e = uint8_t(e);
     for (int j = 0; j < 16; ++j) {
         uint x0 = best_index_mxfp4(vals[j],      d);
         uint x1 = best_index_mxfp4(vals[j + 16],  d);
         data_q[dst_idx].qs[j] = uint8_t(x0 | (x1 << 4));
     }
+#endif
 }
 #endif
 
@@ -405,10 +421,20 @@ void quantize(uint dst_idx, uint src_idx) {
     }
     float d = e8m0_to_fp32(e);
     float inv_d = d > 0.0 ? 1.0 / d : 0.0;
+#if defined(SET_ROWS)
+    const uint NPR = p.nb21;
+    const uint bwr = dst_idx % NPR;
+    const uint row_byte = (dst_idx - bwr) * 33u;
+    q_soa_bytes[row_byte + NPR * 32u + bwr] = uint8_t(e);
+    for (int j = 0; j < 32; ++j) {
+        q_soa_bytes[row_byte + bwr * 32u + uint(j)] = uint8_t(float_to_fp8_e4m3(vals[j] * inv_d));
+    }
+#else
     data_q[dst_idx].e = uint8_t(e);
     for (int j = 0; j < 32; ++j) {
         data_q[dst_idx].qs[j] = float_to_fp8_e4m3(vals[j] * inv_d);
     }
+#endif
 }
 #endif
 
@@ -478,10 +504,20 @@ void quantize(uint dst_idx, uint src_idx) {
     }
     float d = e8m0_to_fp32(e);
     float inv_d = d > 0.0 ? 1.0 / d : 0.0;
+#if defined(SET_ROWS)
+    const uint NPR = p.nb21;
+    const uint bwr = dst_idx % NPR;
+    const uint row_byte = (dst_idx - bwr) * 33u;
+    q_soa_bytes[row_byte + NPR * 32u + bwr] = uint8_t(e);
+    for (int j = 0; j < 32; ++j) {
+        q_soa_bytes[row_byte + bwr * 32u + uint(j)] = uint8_t(float_to_fp8_e5m2(vals[j] * inv_d));
+    }
+#else
     data_q[dst_idx].e = uint8_t(e);
     for (int j = 0; j < 32; ++j) {
         data_q[dst_idx].qs[j] = float_to_fp8_e5m2(vals[j] * inv_d);
     }
+#endif
 }
 #endif
 
@@ -548,6 +584,24 @@ void quantize(uint dst_idx, uint src_idx) {
     }
     float d = e8m0_to_fp32(e);
     float inv_d = d > 0.0 ? 1.0 / d : 0.0;
+#if defined(SET_ROWS)
+    const uint NPR = p.nb21;
+    const uint bwr = dst_idx % NPR;
+    const uint row_byte = (dst_idx - bwr) * 25u;
+    q_soa_bytes[row_byte + NPR * 24u + bwr] = uint8_t(e);
+    for (int j = 0; j < 32; j += 4) {
+        uint v0 = float_to_fp6_e2m3(vals[j + 0] * inv_d);
+        uint v1 = float_to_fp6_e2m3(vals[j + 1] * inv_d);
+        uint v2 = float_to_fp6_e2m3(vals[j + 2] * inv_d);
+        uint v3 = float_to_fp6_e2m3(vals[j + 3] * inv_d);
+        uint base = j * 3u / 4u;
+        uint8_t b0, b1, b2;
+        pack_fp6x4(v0, v1, v2, v3, b0, b1, b2);
+        q_soa_bytes[row_byte + bwr * 24u + base]      = b0;
+        q_soa_bytes[row_byte + bwr * 24u + base + 1u]  = b1;
+        q_soa_bytes[row_byte + bwr * 24u + base + 2u]  = b2;
+    }
+#else
     data_q[dst_idx].e = uint8_t(e);
     for (int j = 0; j < 32; j += 4) {
         uint v0 = float_to_fp6_e2m3(vals[j + 0] * inv_d);
@@ -557,6 +611,7 @@ void quantize(uint dst_idx, uint src_idx) {
         uint base = j * 3 / 4;
         pack_fp6x4(v0, v1, v2, v3, data_q[dst_idx].qs[base], data_q[dst_idx].qs[base + 1u], data_q[dst_idx].qs[base + 2u]);
     }
+#endif
 }
 #endif
 
@@ -628,6 +683,24 @@ void quantize(uint dst_idx, uint src_idx) {
     }
     float d = e8m0_to_fp32(e);
     float inv_d = d > 0.0 ? 1.0 / d : 0.0;
+#if defined(SET_ROWS)
+    const uint NPR = p.nb21;
+    const uint bwr = dst_idx % NPR;
+    const uint row_byte = (dst_idx - bwr) * 25u;
+    q_soa_bytes[row_byte + NPR * 24u + bwr] = uint8_t(e);
+    for (int j = 0; j < 32; j += 4) {
+        uint v0 = float_to_fp6_e3m2(vals[j + 0] * inv_d);
+        uint v1 = float_to_fp6_e3m2(vals[j + 1] * inv_d);
+        uint v2 = float_to_fp6_e3m2(vals[j + 2] * inv_d);
+        uint v3 = float_to_fp6_e3m2(vals[j + 3] * inv_d);
+        uint base = j * 3u / 4u;
+        uint8_t b0, b1, b2;
+        pack_fp6x4(v0, v1, v2, v3, b0, b1, b2);
+        q_soa_bytes[row_byte + bwr * 24u + base]      = b0;
+        q_soa_bytes[row_byte + bwr * 24u + base + 1u]  = b1;
+        q_soa_bytes[row_byte + bwr * 24u + base + 2u]  = b2;
+    }
+#else
     data_q[dst_idx].e = uint8_t(e);
     for (int j = 0; j < 32; j += 4) {
         uint v0 = float_to_fp6_e3m2(vals[j + 0] * inv_d);
@@ -637,6 +710,7 @@ void quantize(uint dst_idx, uint src_idx) {
         uint base = j * 3 / 4;
         pack_fp6x4(v0, v1, v2, v3, data_q[dst_idx].qs[base], data_q[dst_idx].qs[base + 1u], data_q[dst_idx].qs[base + 2u]);
     }
+#endif
 }
 #endif
 

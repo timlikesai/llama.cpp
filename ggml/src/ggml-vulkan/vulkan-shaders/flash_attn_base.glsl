@@ -183,13 +183,17 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     // iqs is element index (0-31 in steps of 4).
     const uint iqs0 = iqs & 0xFu;           // byte index (wraps at 16)
     const uint shift = (iqs & 0x10u) >> 2;   // 0 for elements 0-15, 4 for 16-31
-    // Load 4 qs bytes as one uint32 via unaligned read (1-2 loads vs 4 byte loads).
-    // Scale byte at struct offset 0, qs at offset 1.
-    const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + iqs0;
+    // SoA layout: [all_qs_contiguous][all_e8m0_contiguous] per row
     if (binding_idx == BINDING_IDX_K) {
-        const float d = e8m0_to_fp32(k_raw.k_data[idx].e);
-        const uint w = byte_off >> 2u;
-        const uint s = (byte_off & 3u) << 3u;
+        const uint bwr = idx % k_stride;
+        const uint row_byte = (idx - bwr) * 17u;
+        const uint qs_byte_off = row_byte + bwr * 16u + iqs0;
+        const uint e8m0_byte_off = row_byte + k_stride * 16u + bwr;
+        uint ew = e8m0_byte_off >> 2u;
+        uint es = (e8m0_byte_off & 3u) << 3u;
+        const float d = e8m0_to_fp32(uint8_t((k_raw_u32.k_u32[ew] >> es) & 0xFFu));
+        const uint w = qs_byte_off >> 2u;
+        const uint s = (qs_byte_off & 3u) << 3u;
         uint packed = k_raw_u32.k_u32[w] >> s;
         if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
         return FLOAT_TYPEV4(
@@ -199,12 +203,15 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             fp4_e2m1_to_float((packed >> 24) >> shift & 0xFu) * d
         );
     } else {
-        const uint v_byte_off = idx * BLOCK_BYTE_SIZE;
-        const uint ew = v_byte_off >> 2u;
-        const uint es = (v_byte_off & 3u) << 3u;
+        const uint bwr = idx % v_stride;
+        const uint row_byte = (idx - bwr) * 17u;
+        const uint qs_byte_off = row_byte + bwr * 16u + iqs0;
+        const uint e8m0_byte_off = row_byte + v_stride * 16u + bwr;
+        const uint ew = e8m0_byte_off >> 2u;
+        const uint es = (e8m0_byte_off & 3u) << 3u;
         const float d = e8m0_to_fp32(uint8_t((v_raw_u32.v_u32[ew] >> es) & 0xFFu));
-        const uint w = byte_off >> 2u;
-        const uint s = (byte_off & 3u) << 3u;
+        const uint w = qs_byte_off >> 2u;
+        const uint s = (qs_byte_off & 3u) << 3u;
         uint packed = v_raw_u32.v_u32[w] >> s;
         if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
         return FLOAT_TYPEV4(
@@ -221,12 +228,17 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 #define BLOCK_BYTE_SIZE 33
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     const uint idx = a_offset + ib;
+    // SoA layout: [all_qs_contiguous][all_e8m0_contiguous] per row
     if (binding_idx == BINDING_IDX_K) {
-        const float d = e8m0_to_fp32(k_raw.k_data[idx].e);
-        // Load 4 consecutive qs bytes as one uint32
-        const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + iqs;
-        const uint w = byte_off >> 2u;
-        const uint s = (byte_off & 3u) << 3u;
+        const uint bwr = idx % k_stride;
+        const uint row_byte = (idx - bwr) * 33u;
+        const uint qs_byte_off = row_byte + bwr * 32u + iqs;
+        const uint e8m0_byte_off = row_byte + k_stride * 32u + bwr;
+        uint ew = e8m0_byte_off >> 2u;
+        uint es = (e8m0_byte_off & 3u) << 3u;
+        const float d = e8m0_to_fp32(uint8_t((k_raw_u32.k_u32[ew] >> es) & 0xFFu));
+        const uint w = qs_byte_off >> 2u;
+        const uint s = (qs_byte_off & 3u) << 3u;
         uint packed = k_raw_u32.k_u32[w] >> s;
         if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
         return FLOAT_TYPEV4(
@@ -236,13 +248,15 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             d * fp8_e4m3_to_float((packed >> 24) & 0xFFu)
         );
     } else {
-        const uint v_byte_off = idx * BLOCK_BYTE_SIZE;
-        const uint ew = v_byte_off >> 2u;
-        const uint es = (v_byte_off & 3u) << 3u;
+        const uint bwr = idx % v_stride;
+        const uint row_byte = (idx - bwr) * 33u;
+        const uint qs_byte_off = row_byte + bwr * 32u + iqs;
+        const uint e8m0_byte_off = row_byte + v_stride * 32u + bwr;
+        const uint ew = e8m0_byte_off >> 2u;
+        const uint es = (e8m0_byte_off & 3u) << 3u;
         const float d = e8m0_to_fp32(uint8_t((v_raw_u32.v_u32[ew] >> es) & 0xFFu));
-        const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + iqs;
-        const uint w = byte_off >> 2u;
-        const uint s = (byte_off & 3u) << 3u;
+        const uint w = qs_byte_off >> 2u;
+        const uint s = (qs_byte_off & 3u) << 3u;
         uint packed = v_raw_u32.v_u32[w] >> s;
         if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
         return FLOAT_TYPEV4(
@@ -259,11 +273,17 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 #define BLOCK_BYTE_SIZE 33
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     const uint idx = a_offset + ib;
+    // SoA layout: [all_qs_contiguous][all_e8m0_contiguous] per row
     if (binding_idx == BINDING_IDX_K) {
-        const float d = e8m0_to_fp32(k_raw.k_data[idx].e);
-        const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + iqs;
-        const uint w = byte_off >> 2u;
-        const uint s = (byte_off & 3u) << 3u;
+        const uint bwr = idx % k_stride;
+        const uint row_byte = (idx - bwr) * 33u;
+        const uint qs_byte_off = row_byte + bwr * 32u + iqs;
+        const uint e8m0_byte_off = row_byte + k_stride * 32u + bwr;
+        uint ew = e8m0_byte_off >> 2u;
+        uint es = (e8m0_byte_off & 3u) << 3u;
+        const float d = e8m0_to_fp32(uint8_t((k_raw_u32.k_u32[ew] >> es) & 0xFFu));
+        const uint w = qs_byte_off >> 2u;
+        const uint s = (qs_byte_off & 3u) << 3u;
         uint packed = k_raw_u32.k_u32[w] >> s;
         if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
         return FLOAT_TYPEV4(
@@ -273,13 +293,15 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             d * fp8_e5m2_to_float((packed >> 24) & 0xFFu)
         );
     } else {
-        const uint v_byte_off = idx * BLOCK_BYTE_SIZE;
-        const uint ew = v_byte_off >> 2u;
-        const uint es = (v_byte_off & 3u) << 3u;
+        const uint bwr = idx % v_stride;
+        const uint row_byte = (idx - bwr) * 33u;
+        const uint qs_byte_off = row_byte + bwr * 32u + iqs;
+        const uint e8m0_byte_off = row_byte + v_stride * 32u + bwr;
+        const uint ew = e8m0_byte_off >> 2u;
+        const uint es = (e8m0_byte_off & 3u) << 3u;
         const float d = e8m0_to_fp32(uint8_t((v_raw_u32.v_u32[ew] >> es) & 0xFFu));
-        const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + iqs;
-        const uint w = byte_off >> 2u;
-        const uint s = (byte_off & 3u) << 3u;
+        const uint w = qs_byte_off >> 2u;
+        const uint s = (qs_byte_off & 3u) << 3u;
         uint packed = v_raw_u32.v_u32[w] >> s;
         if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
         return FLOAT_TYPEV4(
@@ -298,12 +320,17 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     const uint idx = a_offset + ib;
     const uint group = iqs / 4u;
     const uint base = group * 3u;
+    // SoA layout: [all_qs_contiguous][all_e8m0_contiguous] per row
     if (binding_idx == BINDING_IDX_K) {
-        const float d = e8m0_to_fp32(k_raw.k_data[idx].e);
-        // Load 3 packed bytes as uint32 and extract
-        const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + base;
-        const uint w = byte_off >> 2u;
-        const uint s = (byte_off & 3u) << 3u;
+        const uint bwr = idx % k_stride;
+        const uint row_byte = (idx - bwr) * 25u;
+        const uint qs_byte_off = row_byte + bwr * 24u + base;
+        const uint e8m0_byte_off = row_byte + k_stride * 24u + bwr;
+        uint ew = e8m0_byte_off >> 2u;
+        uint es = (e8m0_byte_off & 3u) << 3u;
+        const float d = e8m0_to_fp32(uint8_t((k_raw_u32.k_u32[ew] >> es) & 0xFFu));
+        const uint w = qs_byte_off >> 2u;
+        const uint s = (qs_byte_off & 3u) << 3u;
         uint raw = k_raw_u32.k_u32[w] >> s;
         if (s > 8u) raw |= k_raw_u32.k_u32[w + 1u] << (32u - s);
         uint v0, v1, v2, v3;
@@ -315,13 +342,15 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             d * fp6_e2m3_to_float(v3)
         );
     } else {
-        const uint v_byte_off = idx * BLOCK_BYTE_SIZE;
-        const uint ew = v_byte_off >> 2u;
-        const uint es = (v_byte_off & 3u) << 3u;
+        const uint bwr = idx % v_stride;
+        const uint row_byte = (idx - bwr) * 25u;
+        const uint qs_byte_off = row_byte + bwr * 24u + base;
+        const uint e8m0_byte_off = row_byte + v_stride * 24u + bwr;
+        const uint ew = e8m0_byte_off >> 2u;
+        const uint es = (e8m0_byte_off & 3u) << 3u;
         const float d = e8m0_to_fp32(uint8_t((v_raw_u32.v_u32[ew] >> es) & 0xFFu));
-        const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + base;
-        const uint w = byte_off >> 2u;
-        const uint s = (byte_off & 3u) << 3u;
+        const uint w = qs_byte_off >> 2u;
+        const uint s = (qs_byte_off & 3u) << 3u;
         uint raw = v_raw_u32.v_u32[w] >> s;
         if (s > 8u) raw |= v_raw_u32.v_u32[w + 1u] << (32u - s);
         uint v0, v1, v2, v3;
@@ -342,11 +371,17 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     const uint idx = a_offset + ib;
     const uint group = iqs / 4u;
     const uint base = group * 3u;
+    // SoA layout: [all_qs_contiguous][all_e8m0_contiguous] per row
     if (binding_idx == BINDING_IDX_K) {
-        const float d = e8m0_to_fp32(k_raw.k_data[idx].e);
-        const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + base;
-        const uint w = byte_off >> 2u;
-        const uint s = (byte_off & 3u) << 3u;
+        const uint bwr = idx % k_stride;
+        const uint row_byte = (idx - bwr) * 25u;
+        const uint qs_byte_off = row_byte + bwr * 24u + base;
+        const uint e8m0_byte_off = row_byte + k_stride * 24u + bwr;
+        uint ew = e8m0_byte_off >> 2u;
+        uint es = (e8m0_byte_off & 3u) << 3u;
+        const float d = e8m0_to_fp32(uint8_t((k_raw_u32.k_u32[ew] >> es) & 0xFFu));
+        const uint w = qs_byte_off >> 2u;
+        const uint s = (qs_byte_off & 3u) << 3u;
         uint raw = k_raw_u32.k_u32[w] >> s;
         if (s > 8u) raw |= k_raw_u32.k_u32[w + 1u] << (32u - s);
         uint v0, v1, v2, v3;
@@ -358,13 +393,15 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             d * fp6_e3m2_to_float(v3)
         );
     } else {
-        const uint v_byte_off = idx * BLOCK_BYTE_SIZE;
-        const uint ew = v_byte_off >> 2u;
-        const uint es = (v_byte_off & 3u) << 3u;
+        const uint bwr = idx % v_stride;
+        const uint row_byte = (idx - bwr) * 25u;
+        const uint qs_byte_off = row_byte + bwr * 24u + base;
+        const uint e8m0_byte_off = row_byte + v_stride * 24u + bwr;
+        const uint ew = e8m0_byte_off >> 2u;
+        const uint es = (e8m0_byte_off & 3u) << 3u;
         const float d = e8m0_to_fp32(uint8_t((v_raw_u32.v_u32[ew] >> es) & 0xFFu));
-        const uint byte_off = idx * BLOCK_BYTE_SIZE + 1u + base;
-        const uint w = byte_off >> 2u;
-        const uint s = (byte_off & 3u) << 3u;
+        const uint w = qs_byte_off >> 2u;
+        const uint s = (qs_byte_off & 3u) << 3u;
         uint raw = v_raw_u32.v_u32[w] >> s;
         if (s > 8u) raw |= v_raw_u32.v_u32[w + 1u] << (32u - s);
         uint v0, v1, v2, v3;
@@ -401,8 +438,11 @@ uint v_read_u32(uint byte_off) {
 FLOAT_TYPEV4 dequantize4_v_mxfp4(uint idx, uint iqs) {
     const uint iqs0 = iqs & 0xFu;
     const uint shift = (iqs & 0x10u) >> 2;
-    const float d = v_e8m0_scale(idx * 17u);
-    uint packed = v_read_u32(idx * 17u + 1u + iqs0);
+    // SoA layout: [all_qs_contiguous][all_e8m0_contiguous] per row
+    const uint bwr = idx % v_stride;
+    const uint row_byte = (idx - bwr) * 17u;
+    const float d = v_e8m0_scale(row_byte + v_stride * 16u + bwr);
+    uint packed = v_read_u32(row_byte + bwr * 16u + iqs0);
     return FLOAT_TYPEV4(
         fp4_e2m1_to_float((packed >>  0) >> shift & 0xFu) * d,
         fp4_e2m1_to_float((packed >>  8) >> shift & 0xFu) * d,
@@ -412,8 +452,11 @@ FLOAT_TYPEV4 dequantize4_v_mxfp4(uint idx, uint iqs) {
 }
 
 FLOAT_TYPEV4 dequantize4_v_mxfp8_e4m3(uint idx, uint iqs) {
-    const float d = v_e8m0_scale(idx * 33u);
-    uint packed = v_read_u32(idx * 33u + 1u + iqs);
+    // SoA layout: [all_qs_contiguous][all_e8m0_contiguous] per row
+    const uint bwr = idx % v_stride;
+    const uint row_byte = (idx - bwr) * 33u;
+    const float d = v_e8m0_scale(row_byte + v_stride * 32u + bwr);
+    uint packed = v_read_u32(row_byte + bwr * 32u + iqs);
     return FLOAT_TYPEV4(
         d * fp8_e4m3_to_float(packed & 0xFFu),
         d * fp8_e4m3_to_float((packed >> 8) & 0xFFu),
@@ -423,8 +466,11 @@ FLOAT_TYPEV4 dequantize4_v_mxfp8_e4m3(uint idx, uint iqs) {
 }
 
 FLOAT_TYPEV4 dequantize4_v_mxfp8_e5m2(uint idx, uint iqs) {
-    const float d = v_e8m0_scale(idx * 33u);
-    uint packed = v_read_u32(idx * 33u + 1u + iqs);
+    // SoA layout: [all_qs_contiguous][all_e8m0_contiguous] per row
+    const uint bwr = idx % v_stride;
+    const uint row_byte = (idx - bwr) * 33u;
+    const float d = v_e8m0_scale(row_byte + v_stride * 32u + bwr);
+    uint packed = v_read_u32(row_byte + bwr * 32u + iqs);
     return FLOAT_TYPEV4(
         d * fp8_e5m2_to_float(packed & 0xFFu),
         d * fp8_e5m2_to_float((packed >> 8) & 0xFFu),
@@ -436,10 +482,13 @@ FLOAT_TYPEV4 dequantize4_v_mxfp8_e5m2(uint idx, uint iqs) {
 FLOAT_TYPEV4 dequantize4_v_mxfp6_e2m3(uint idx, uint iqs) {
     const uint group = iqs / 4u;
     const uint base = group * 3u;
-    const float d = v_e8m0_scale(idx * 25u);
-    const uint byte_off = idx * 25u + 1u + base;
-    uint w = byte_off >> 2u;
-    uint s = (byte_off & 3u) << 3u;
+    // SoA layout: [all_qs_contiguous][all_e8m0_contiguous] per row
+    const uint bwr = idx % v_stride;
+    const uint row_byte = (idx - bwr) * 25u;
+    const float d = v_e8m0_scale(row_byte + v_stride * 24u + bwr);
+    const uint qs_byte_off = row_byte + bwr * 24u + base;
+    uint w = qs_byte_off >> 2u;
+    uint s = (qs_byte_off & 3u) << 3u;
     uint raw = v_raw_u32.v_u32[w] >> s;
     if (s > 8u) raw |= v_raw_u32.v_u32[w + 1u] << (32u - s);
     uint v0, v1, v2, v3;
@@ -455,10 +504,13 @@ FLOAT_TYPEV4 dequantize4_v_mxfp6_e2m3(uint idx, uint iqs) {
 FLOAT_TYPEV4 dequantize4_v_mxfp6_e3m2(uint idx, uint iqs) {
     const uint group = iqs / 4u;
     const uint base = group * 3u;
-    const float d = v_e8m0_scale(idx * 25u);
-    const uint byte_off = idx * 25u + 1u + base;
-    uint w = byte_off >> 2u;
-    uint s = (byte_off & 3u) << 3u;
+    // SoA layout: [all_qs_contiguous][all_e8m0_contiguous] per row
+    const uint bwr = idx % v_stride;
+    const uint row_byte = (idx - bwr) * 25u;
+    const float d = v_e8m0_scale(row_byte + v_stride * 24u + bwr);
+    const uint qs_byte_off = row_byte + bwr * 24u + base;
+    uint w = qs_byte_off >> 2u;
+    uint s = (qs_byte_off & 3u) << 3u;
     uint raw = v_raw_u32.v_u32[w] >> s;
     if (s > 8u) raw |= v_raw_u32.v_u32[w + 1u] << (32u - s);
     uint v0, v1, v2, v3;
