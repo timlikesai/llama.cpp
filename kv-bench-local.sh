@@ -46,7 +46,7 @@ CHUNKS=16
 REPEATS=3
 PP=512
 TG=128
-CONFIGS=(f16 q8_0 q8_0+q4_0 mxfp8_e4m3 mxfp8_e5m2 mxfp6_e2m3 mxfp6_e3m2 mxfp4)
+CONFIGS=(f16 q8_0 q4_0 q8_0+q4_0 mxfp8_e4m3 mxfp8_e5m2 mxfp6_e2m3 mxfp6_e3m2 mxfp4)
 MODEL_INPUTS=()
 
 # ── Argument Parsing ─────────────────────────────────────────────────────────
