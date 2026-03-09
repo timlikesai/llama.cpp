@@ -1344,14 +1344,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
     }
 
     // Check if we have a native mixed K/V kernel (avoids dispatch overhead)
+    // Only q8_0+q4_0 has a native template; MXFP mixed types use f16 base + SoA function constants
     bool native_mixed = false;
     if (mxfp_v_type != 0) {
         const auto kt = op->src[1]->type;
         const auto vt = op->src[2]->type;
         native_mixed =
-            (kt == GGML_TYPE_MXFP8_E4M3 && vt == GGML_TYPE_MXFP4_E2M1) ||
-            (kt == GGML_TYPE_MXFP6_E2M3 && vt == GGML_TYPE_MXFP4_E2M1) ||
-            (kt == GGML_TYPE_Q8_0       && vt == GGML_TYPE_Q4_0);
+            (kt == GGML_TYPE_Q8_0 && vt == GGML_TYPE_Q4_0);
     }
 
     if (native_mixed) {
@@ -1360,10 +1359,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
                 ggml_type_name(op->src[1]->type),
                 ggml_type_name(op->src[2]->type),
                 dk, dv);
-        // Keep mxfp_v_type for all MXFP V types (SoA dequant dispatch needs it)
-        if (!ggml_is_type_mxfp(op->src[2]->type)) {
-            mxfp_v_type = 0;
-        }
+        mxfp_v_type = 0;
+    } else if (mxfp_type > 0) {
+        // MXFP types use f16 base pipeline + function constant dispatch for SoA dequant
+        snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
+                "flash_attn_ext",
+                "f16",
+                dk, dv);
     } else {
         snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
                 "flash_attn_ext",
@@ -1459,14 +1461,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     }
 
     // Check if we have a native mixed K/V kernel (avoids dispatch overhead)
+    // Only q8_0+q4_0 has a native template; MXFP mixed types use f16 base + SoA function constants
     bool native_mixed = false;
     if (mxfp_v_type != 0) {
         const auto kt = op->src[1]->type;
         const auto vt = op->src[2]->type;
         native_mixed =
-            (kt == GGML_TYPE_MXFP8_E4M3 && vt == GGML_TYPE_MXFP4_E2M1) ||
-            (kt == GGML_TYPE_MXFP6_E2M3 && vt == GGML_TYPE_MXFP4_E2M1) ||
-            (kt == GGML_TYPE_Q8_0       && vt == GGML_TYPE_Q4_0);
+            (kt == GGML_TYPE_Q8_0 && vt == GGML_TYPE_Q4_0);
     }
 
     if (native_mixed) {
@@ -1475,10 +1476,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
                 ggml_type_name(op->src[1]->type),
                 ggml_type_name(op->src[2]->type),
                 dk, dv);
-        // Keep mxfp_v_type for all MXFP V types (SoA dequant dispatch needs it)
-        if (!ggml_is_type_mxfp(op->src[2]->type)) {
-            mxfp_v_type = 0;
-        }
+        mxfp_v_type = 0;
+    } else if (mxfp_type > 0) {
+        // MXFP types use f16 base pipeline + function constant dispatch for SoA dequant
+        snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
+                "flash_attn_ext_vec",
+                "f16",
+                dk, dv);
     } else {
         snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
                 "flash_attn_ext_vec",
