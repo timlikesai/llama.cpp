@@ -140,7 +140,7 @@ RESULTS_DIR="$SCRIPT_DIR/test-results/kv-bench-local-${MODEL_NAME}-$(date +%Y%m%
 mkdir -p "$RESULTS_DIR"
 
 # Storage: parallel arrays (zsh-compatible, no bash 4+ needed)
-typeset -A R_PP R_TG R_PPL
+typeset -A R_PP R_TG R_PPL R_KV100K
 f16_tg=""
 
 total=${#CONFIGS[@]}
@@ -174,9 +174,21 @@ for config in "${CONFIGS[@]}"; do
         ppl=$(grep -oE 'Final estimate: PPL = [0-9.]+' "$ppl_log" | grep -oE '[0-9.]+$' || echo "N/A")
         R_PPL[$config]="$ppl"
         echo "        PPL: ${ppl}"
+
+        # Extract KV cache size → scale to 100k tokens, single sequence
+        local kv_line=$(grep 'llama_kv_cache: size =' "$ppl_log" || echo "")
+        if [[ -n "$kv_line" ]]; then
+            local kv_total=$(echo "$kv_line" | grep -oE 'size = +[0-9.]+' | grep -oE '[0-9.]+')
+            local kv_cells=$(echo "$kv_line" | grep -oE '[0-9]+ cells' | grep -oE '[0-9]+')
+            local kv_seqs=$(echo "$kv_line" | grep -oE '[0-9]+/[0-9]+ seqs' | grep -oE '^[0-9]+')
+            R_KV100K[$config]=$(awk "BEGIN { printf \"%.1f\", $kv_total * (100000 / $kv_cells) / $kv_seqs / 1024 }")
+        else
+            R_KV100K[$config]="N/A"
+        fi
     else
         echo "        ERROR (see $ppl_log)"
         R_PPL[$config]="N/A"
+        R_KV100K[$config]="N/A"
     fi
 
     # ── Throughput ─────────────────────────────────────────────────
@@ -213,9 +225,9 @@ echo ""
 echo "  ${MODEL_NAME} — $(timestamp)"
 echo ""
 
-echo "  ┌────────────┬─────────┬────────┬────────┬────────┬────────┬────────┐"
-printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %6s │ %6s │\n" "K type" "V type" "PPL" "Δ F16" "pp${PP}" "tg${TG}" "tg%f16"
-echo "  ├────────────┼─────────┼────────┼────────┼────────┼────────┼────────┤"
+echo "  ┌────────────┬─────────┬────────┬────────┬────────┬────────┬────────┬─────────┐"
+printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %6s │ %6s │ %7s │\n" "K type" "V type" "PPL" "Δ F16" "pp${PP}" "tg${TG}" "tg%f16" "KV@100k"
+echo "  ├────────────┼─────────┼────────┼────────┼────────┼────────┼────────┼─────────┤"
 
 first=true
 for config in "${CONFIGS[@]}"; do
@@ -238,8 +250,14 @@ for config in "${CONFIGS[@]}"; do
         fi
     fi
 
+    kv_raw="${R_KV100K[$config]:-N/A}"
+    kv_fmt="-"
+    if [[ "$kv_raw" != "N/A" ]]; then
+        kv_fmt="${kv_raw} G"
+    fi
+
     if $first; then first=false; else
-        echo "  ├────────────┼─────────┼────────┼────────┼────────┼────────┼────────┤"
+        echo "  ├────────────┼─────────┼────────┼────────┼────────┼────────┼────────┼─────────┤"
     fi
 
     ppl_raw="${R_PPL[$config]:-N/A}"
@@ -252,10 +270,10 @@ for config in "${CONFIGS[@]}"; do
             delta_fmt=$(awk "BEGIN { printf \"%+.2f\", $ppl_raw - $f16_ppl }")
         fi
     fi
-    printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %6s │ %5s%% │\n" "$TYPE_K" "$TYPE_V" "$ppl_fmt" "$delta_fmt" "$pp_fmt" "$tg_fmt" "$tg_pct"
+    printf "  │ %-10s │ %-7s │ %6s │ %6s │ %6s │ %6s │ %5s%% │ %7s │\n" "$TYPE_K" "$TYPE_V" "$ppl_fmt" "$delta_fmt" "$pp_fmt" "$tg_fmt" "$tg_pct" "$kv_fmt"
 done
 
-echo "  └────────────┴─────────┴────────┴────────┴────────┴────────┴────────┘"
+echo "  └────────────┴─────────┴────────┴────────┴────────┴────────┴────────┴─────────┘"
 
 echo ""
 echo "  Raw logs: $RESULTS_DIR/"

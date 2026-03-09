@@ -1479,10 +1479,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         mxfp_v_type = 0;
     } else if (mxfp_type > 0) {
         // MXFP types use f16 base pipeline + function constant dispatch for SoA dequant
-        snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
-                "flash_attn_ext_vec",
-                "f16",
-                dk, dv);
+        // dk128: NE=4 variant for memory-level parallelism during dequant
+        if (dk == 128 && dv == 128) {
+            snprintf(base, 256, "kernel_flash_attn_ext_vec_f16_mxfp_dk128_dv128");
+        } else {
+            snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
+                    "flash_attn_ext_vec",
+                    "f16",
+                    dk, dv);
+        }
     } else {
         snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
                 "flash_attn_ext_vec",

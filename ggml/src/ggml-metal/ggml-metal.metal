@@ -7441,8 +7441,51 @@ kernel void kernel_flash_attn_ext_vec(
                                 kv[3] = kvalues_mxfp4_f[(p >> (24 + shr)) & 0x0F];
                                 mqk[cc] = fma(k_scale, dot(kv, (float4) sq4[i]), mqk[cc]);
                             }
+                        } else if (FC_flash_attn_ext_vec_mxfp_type == 2 || FC_flash_attn_ext_vec_mxfp_type == 3) {
+                            // Inline MXFP8 K dequant with scale factoring (saves 3 muls/iter vs generic dispatch)
+                            device const char * k_row_full = k_row - k_head_byte_off;
+                            device const char * qs_base = k_row_full;
+                            device const uint8_t * e_base = (device const uint8_t *)(k_row_full + NS10 * MXFP8_SOA_QS_PER_BLOCK);
+                            constant float * lut = (FC_flash_attn_ext_vec_mxfp_type == 2) ? fp8_e4m3_lut : fp8_e5m2_lut;
+
+                            FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                                const short i = ii*NL + tx;
+                                const short il = i % 8;
+                                const short bidx = mxfp_head_k_boff + i / 8;
+
+                                const float k_scale = e8m0_to_fp32(e_base[bidx]);
+                                const uint32_t p = *(device const uint32_t *)(qs_base + bidx * MXFP8_SOA_QS_PER_BLOCK + il * 4);
+                                float4 kv;
+                                kv[0] = lut[(p >>  0) & 0xFF];
+                                kv[1] = lut[(p >>  8) & 0xFF];
+                                kv[2] = lut[(p >> 16) & 0xFF];
+                                kv[3] = lut[(p >> 24) & 0xFF];
+                                mqk[cc] = fma(k_scale, dot(kv, (float4) sq4[i]), mqk[cc]);
+                            }
+                        } else if (FC_flash_attn_ext_vec_mxfp_type == 4 || FC_flash_attn_ext_vec_mxfp_type == 5) {
+                            // Inline MXFP6 K dequant with scale factoring (saves 3 muls/iter vs generic dispatch)
+                            device const char * k_row_full = k_row - k_head_byte_off;
+                            device const char * qs_base = k_row_full;
+                            device const uint8_t * e_base = (device const uint8_t *)(k_row_full + NS10 * MXFP6_SOA_QS_PER_BLOCK);
+                            constant float * lut = (FC_flash_attn_ext_vec_mxfp_type == 4) ? fp6_e2m3_lut : fp6_e3m2_lut;
+
+                            FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                                const short i = ii*NL + tx;
+                                const short il = i % 8;
+                                const short bidx = mxfp_head_k_boff + i / 8;
+
+                                const float k_scale = e8m0_to_fp32(e_base[bidx]);
+                                device const uint8_t * pb = (device const uint8_t *)(qs_base + bidx * MXFP6_SOA_QS_PER_BLOCK + il * 3);
+                                const uint32_t packed = (uint32_t)pb[0] | ((uint32_t)pb[1] << 8) | ((uint32_t)pb[2] << 16);
+                                float4 kv;
+                                kv[0] = lut[ packed        & 0x3F];
+                                kv[1] = lut[(packed >>  6) & 0x3F];
+                                kv[2] = lut[(packed >> 12) & 0x3F];
+                                kv[3] = lut[(packed >> 18) & 0x3F];
+                                mqk[cc] = fma(k_scale, dot(kv, (float4) sq4[i]), mqk[cc]);
+                            }
                         } else if (FC_flash_attn_ext_vec_mxfp_type > 0) {
-                            // Generic MXFP SoA path (MXFP6/8): full-row pointer + absolute block index (matches CUDA)
+                            // Generic MXFP SoA fallback for future types
                             device const char * k_row_full = k_row - k_head_byte_off;
                             float4 mk_f;
 
@@ -7818,6 +7861,8 @@ template [[host_name("kernel_flash_attn_ext_vec_q8_0_dk96_dv96")]]       kernel 
 
 template [[host_name("kernel_flash_attn_ext_vec_f32_dk128_dv128")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES_F32, float4,     1, dequantize_f32_t4,  float4,      1, dequantize_f32_t4,  128, 128, 1>;
 template [[host_name("kernel_flash_attn_ext_vec_f16_dk128_dv128")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     half4,      1, dequantize_f16_t4,  half4,       1, dequantize_f16_t4,  128, 128, 1>;
+// MXFP-optimized: NE=4 for memory-level parallelism during dequant (4 KV positions simultaneously)
+template [[host_name("kernel_flash_attn_ext_vec_f16_mxfp_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 128, 128, 4>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_flash_attn_ext_vec_bf16_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     bfloat4,    1, dequantize_bf16_t4, bfloat4,     1, dequantize_bf16_t4, 128, 128, 1>;
 #endif
