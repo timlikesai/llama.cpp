@@ -313,7 +313,7 @@ void quantize(uint dst_idx, uint src_idx) {
     // ±R MSE search: test 2R+1 candidates, pick lowest total round-trip error.
     {
         int e_lo = max(1, int(e) - MXFP_E8M0_MSE_RANGE);
-        int e_hi = min(254, int(e) + MXFP_E8M0_MSE_RANGE);
+        int e_hi = max(1, min(254, int(e) + MXFP_E8M0_MSE_RANGE));
         uint best_e = clamp(e, 0u, 254u);
         float best_mse = 1e30;
         for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
@@ -387,7 +387,7 @@ void quantize(uint dst_idx, uint src_idx) {
     // ±R MSE search: test 2R+1 candidates, pick lowest total round-trip error.
     {
         int e_lo = max(1, int(e) - MXFP_E8M0_MSE_RANGE);
-        int e_hi = min(254, int(e) + MXFP_E8M0_MSE_RANGE);
+        int e_hi = max(1, min(254, int(e) + MXFP_E8M0_MSE_RANGE));
         uint best_e = clamp(e, 0u, 254u);
         float best_mse = 1e30;
         for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
@@ -460,7 +460,7 @@ void quantize(uint dst_idx, uint src_idx) {
     // ±R MSE search: test 2R+1 candidates, pick lowest total round-trip error.
     {
         int e_lo = max(1, int(e) - MXFP_E8M0_MSE_RANGE);
-        int e_hi = min(254, int(e) + MXFP_E8M0_MSE_RANGE);
+        int e_hi = max(1, min(254, int(e) + MXFP_E8M0_MSE_RANGE));
         uint best_e = clamp(e, 0u, 254u);
         float best_mse = 1e30;
         for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
@@ -530,7 +530,7 @@ void quantize(uint dst_idx, uint src_idx) {
     // ±R MSE search: test 2R+1 candidates, pick lowest total round-trip error.
     {
         int e_lo = max(1, int(e) - MXFP_E8M0_MSE_RANGE);
-        int e_hi = min(254, int(e) + MXFP_E8M0_MSE_RANGE);
+        int e_hi = max(1, min(254, int(e) + MXFP_E8M0_MSE_RANGE));
         uint best_e = clamp(e, 0u, 254u);
         float best_mse = 1e30;
         for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
@@ -610,7 +610,7 @@ void quantize(uint dst_idx, uint src_idx) {
     // ±R MSE search: test 2R+1 candidates, pick lowest total round-trip error.
     {
         int e_lo = max(1, int(e) - MXFP_E8M0_MSE_RANGE);
-        int e_hi = min(254, int(e) + MXFP_E8M0_MSE_RANGE);
+        int e_hi = max(1, min(254, int(e) + MXFP_E8M0_MSE_RANGE));
         uint best_e = clamp(e, 0u, 254u);
         float best_mse = 1e30;
         for (int test_e = e_lo; test_e <= e_hi; ++test_e) {

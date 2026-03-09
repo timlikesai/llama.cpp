@@ -889,8 +889,8 @@ static inline uint8_t mxfp4_compute_e8m0(float val) {
     int e_base = floor_log2 + round_up - MXFP4_E2M1_EMAX_OFFSET + 127;
 
     int e_lo = max(e_base - MXFP_E8M0_MSE_RANGE, 1);
-    int e_hi = min(e_base + MXFP_E8M0_MSE_RANGE, 254);
-    int best_e = clamp(e_base, 0, 254);
+    int e_hi = max(min(e_base + MXFP_E8M0_MSE_RANGE, 254), 1);
+    int best_e = clamp(e_base, 1, 254);
     float best_mse = 1e30f;
 
     for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
@@ -1273,8 +1273,8 @@ static inline uint8_t mxfp_compute_e8m0_mse(float val) {
     int e_base = floor_log2 + round_up - EMAX_OFFSET + 127;
 
     int e_lo = max(e_base - MXFP_E8M0_MSE_RANGE, 1);
-    int e_hi = min(e_base + MXFP_E8M0_MSE_RANGE, 254);
-    int best_e = clamp(e_base, 0, 254);
+    int e_hi = max(min(e_base + MXFP_E8M0_MSE_RANGE, 254), 1);
+    int best_e = clamp(e_base, 1, 254);
     float best_mse = 1e30f;
 
     for (int test_e = e_lo; test_e <= e_hi; ++test_e) {

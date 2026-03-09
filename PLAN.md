@@ -298,11 +298,42 @@ These map to Metal as: different NE/NL configs, wider loads for MXFP8
 
 ---
 
-## STEP 6: CPU SoA [TODO]
+## STEP 6: CPU SoA — Canonical Reference Implementation [IN PROGRESS]
 
-### 6a. Research current CPU MXFP implementation
-### 6b. CPU set_rows → SoA layout
-### 6c. CPU FA dequant → SoA
+CPU is THE canonical reference. CUDA and Metal implement this reference.
+SoA layout: `[qs contiguous][e8m0 contiguous]` per row. No AoS in FA. Ever.
+
+### 6a. SoA quantize/dequantize functions in ggml-quants.c [DONE]
+- [x] `quantize_row_mxfp4_soa()` / `dequantize_row_mxfp4_soa()` — MXFP4 E2M1
+- [x] `quantize_row_mxfp8_soa()` / `dequantize_row_mxfp8_soa()` — MXFP8 E4M3
+- [x] `quantize_row_mxfp8_e5m2_soa()` / `dequantize_row_mxfp8_e5m2_soa()` — MXFP8 E5M2
+- [x] `quantize_row_mxfp6_e2m3_soa()` / `dequantize_row_mxfp6_e2m3_soa()` — MXFP6 E2M3
+- [x] `quantize_row_mxfp6_e3m2_soa()` / `dequantize_row_mxfp6_e3m2_soa()` — MXFP6 E3M2
+- [x] All declared in ggml-quants.h
+- [x] Same E8M0 MSE search, same element quantization, different memory layout
+- [x] Use `void *` / `const void *` pointers (not block_mxfp* structs)
+
+### 6b. CPU set_rows → SoA layout [DONE]
+- [x] `ggml_compute_forward_set_rows_f32()` in ops.cpp detects MXFP types
+- [x] Routes to SoA quantize functions instead of AoS `from_float`
+- [x] Non-MXFP types unchanged (use standard AoS `from_float`)
+
+### 6c. CPU FA → SoA dequant [DONE]
+- [x] Scalar FA (single-query path): K and V dequant use SoA functions
+- [x] Tiled GEMM FA (multi-query path): K and V dequant use SoA functions
+- [x] Q preprocessing: SoA round-trip (quantize → dequant) captures quantization loss
+- [x] Both FA paths use type-specific SoA function pointer dispatch
+
+### 6d. e_hi clamping bug fix [DONE]
+- [x] CPU: `e_hi` clamped to `max(1, ...)` in `mxfp_compute_e8m0_mse()`
+- [x] Metal: `e_hi` clamped to `max(..., 1)` in both MSE search sites
+- [x] Vulkan: `e_hi` clamped to `max(1, ...)` in all 5 set_rows MSE search sites
+- When `e_base` is very negative, `e_hi` could become <1, causing MSE loop to not execute
+
+### 6e. Validate CPU SoA end-to-end [TODO]
+- [ ] Run kv-bench-local.sh with CPU backend for all MXFP configs
+- [ ] Compare PPL against f16 baseline
+- [ ] Verify CPU results match Metal results
 
 ---
 
