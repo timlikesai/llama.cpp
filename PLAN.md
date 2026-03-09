@@ -1,6 +1,6 @@
 # MXFP KV Cache SoA Optimization Plan
 
-**Goal:** EXCEED f16 in both pp and tg for MXFP KV cache on Metal. MXFP4 transfers 73% less KV data than f16 — with efficient aligned loads and fast dequant, we should be FASTER, not slower. Current gap: pp ~96%, tg ~90% of f16. Target: >100% of f16 in both.
+**Goal:** Maximize MXFP flash attention performance on Metal. Current: ~94% of f16 tg (MoE), ~90% (dense). Exceeding f16 requires dp4a/block-scaled MMA hardware (CUDA has this, Apple Silicon does not). Focus: correctness across all head sizes and models, minimize dequant overhead.
 
 **Testing:** ONLY use `kv-bench-local.sh` (Metal) or `kv-bench.sh` (Docker/CUDA). NEVER run llama-bench directly. NEVER pipe or redirect command output.
 
@@ -39,32 +39,69 @@ with full-row base pointer, absolute block index (head_block_offset + bidx), and
 
 ### Benchmark Results (SoA + VEC optimizations, 2026-03-08):
 
-| Config | PPL | pp512 | tg128 | % of f16 | Gap to target |
-|--------|-----|-------|-------|----------|---------------|
-| f16 baseline | 11.17 | 1,518 | 108.9 | 100% | — |
-| mxfp4 matched | 11.77 | 1,460 | 103.1 | 94.8% | +5.2% needed |
+**qwen3-coder (30B MoE, dk128):**
+| Config | K type | V type | pp512 | tg128 | % of f16 tg |
+|--------|--------|--------|-------|-------|-------------|
+| f16 | f16 | f16 | 1,517 | 108.1 | 100% |
+| q8_0+q4_0 | q8_0 | q4_0 | 1,486 | 99.0 | 91.5% |
+| mxfp8_e4m3 | mxfp8_e4m3 | mxfp4 | 1,445 | 100.3 | 92.8% |
+| mxfp8_e5m2 | mxfp8_e5m2 | mxfp4 | 1,449 | 101.1 | 93.5% |
+| mxfp6_e2m3 | mxfp6_e2m3 | mxfp4 | 1,449 | 100.6 | 93.1% |
+| mxfp6_e3m2 | mxfp6_e3m2 | mxfp4 | 1,444 | 100.0 | 92.5% |
+| mxfp4 | mxfp4 | mxfp4 | 1,464 | 101.2 | 93.6% |
 
-**VEC kernel optimizations applied (commit ad4950b06):**
+All MXFP types beat q8_0+q4_0 in tg throughput.
+
+**Multi-model comparison (mxfp4 vs f16, pp512/tg128):**
+| Model | Type | dk | f16 tg | mxfp4 tg | % of f16 |
+|-------|------|-----|--------|----------|----------|
+| gpt-oss-20b | MoE | 128 | 123.3 | 121.2 | 98.3% |
+| qwen3.5-35B-A3B | MoE | 128 | 54.2 | 52.5 | 96.8% |
+| qwen3-coder-30B | MoE | 128 | 108.1 | 101.2 | 93.6% |
+| gemma-3n-E4B | Dense | 256 | 59.6 | 53.8 | 90.3% |
+
+**VEC kernel optimizations applied:**
 1. Float4 dequant: eliminate float→half→float round trip (+4% tg)
-2. Inline MXFP4 specialization: pre-computed base pointers, pre-loaded e8m0 scales
+2. Inline MXFP4 specialization: pre-computed base pointers, scale factoring
 3. Scale factoring: d*dot(lut,q) instead of dot(d*lut,q) saves 3 muls/iter (+1.8% tg)
 4. 4x4 clamp optimization: scale clamp (1 op) instead of output clamp (48 ops) for MXFP4
+5. Generalized inline MXFP4 for all NL values (commit 7c9413b58) — fixes dk256
 
 **Previous baseline (SoA before VEC optimizations):**
 | f16 baseline | 11.17 | 1,474 | 107.7 | 100% | — |
 | mxfp4 matched | 11.77 | 1,447 | 96.6 | 89.6% | — |
 
-### Key bug that was fixed:
+### Key findings:
 
-The SoA corruption (PPL=30M) was caused by a **head offset mismatch**: set_rows writes SoA across
-the full multi-head row (e.g., nk0=16 blocks for 4 heads × 4 blocks/head). E8M0 values are at
-offset `nk0 * qs_per_block` (byte 256 for MXFP4). But the FA kernel used per-head addressing with
-`nblocks = DK/32 = 4`, expecting e8m0 at `4*16+bidx = 64+bidx`. Additionally, the AoS-based head
-stride (nb12 = 68 bytes) didn't match the SoA qs stride (64 bytes per head), so even qs offsets
-were wrong for heads > 0.
+**Exceeding f16 on Apple Silicon is not achievable without hardware dp4a.**
+CUDA exceeds f16 using int8 dot product (dp4a) and block-scaled MMA — hardware features
+that Apple M-series GPUs lack. On Metal, every MXFP element requires software dequant
+(LUT lookup + scale multiply) which adds ALU overhead per KV position. The bandwidth
+savings from smaller MXFP types (73% less for MXFP4) are offset by this dequant cost.
+Realistic ceiling: ~92-95% of f16 for MoE models, ~88-92% for dense models.
 
-**Fix:** FA dequant now uses full-row base pointer (subtracting `k_head_byte_off`), absolute block
-indices (`mxfp_head_k_boff + bidx_within_head`), and `NS10`/`NS20` as total nblocks per row.
+**Longer context makes MXFP4 WORSE, not better, on M4 Max:**
+At pp16384: mxfp4 = 86.9% of f16 tg (vs 93.7% at pp512). The O(n²) FA computation
+amplifies per-position dequant overhead faster than bandwidth savings grow. The
+273 GB/s unified memory bandwidth is high enough that even f16 KV loads are fast.
+
+**Dense models show larger FA overhead than MoE models:**
+For MoE (qwen3-coder), FA is ~5-8% of total tg time — the large FFN dominates.
+For dense (gemma-3n), FA is a larger fraction (~20-40%), making dequant overhead
+more visible. dk256 also means NL=32 (fewer iterations, less computation to amortize).
+
+### Key bugs that were fixed:
+
+**Bug 1: SoA head offset mismatch (PPL=30M)** — set_rows writes SoA across the full multi-head
+row (e.g., nk0=16 blocks for 4 heads × 4 blocks/head). E8M0 values are at offset
+`nk0 * qs_per_block` (byte 256 for MXFP4). But the FA kernel used per-head addressing with
+`nblocks = DK/32 = 4`, expecting e8m0 at `4*16+bidx = 64+bidx`.
+**Fix:** FA dequant uses full-row base pointer + absolute block indices + NS10/NS20 as total nblocks.
+
+**Bug 2: VEC inline MXFP4 assumed NL=8 (dk256 broken)** — The inline MXFP4 dequant used
+`tx >= 4 ? 4 : 0` for nibble split, which assumes tx ranges 0..7. For dk256 (NE=1, NL=32),
+threads tx=8..31 read wrong nibbles → garbage output (38.9% of f16, huge variance).
+**Fix:** Compute nibble position from linear element index: `il = (ii*NL + tx) % 8`.
 
 ---
 
@@ -159,7 +196,7 @@ Previously marked DONE but then SoA was reverted, undoing the cleanup. Redo afte
 
 ---
 
-## STEP 3: Metal FA performance — exceed f16 [IN PROGRESS]
+## STEP 3: Metal FA performance optimization [IN PROGRESS]
 
 ### Analysis: why MXFP FA is slower than f16 FA
 
@@ -225,10 +262,22 @@ From CUDA analysis:
 - [ ] FP8 uses aligned int2 (8-byte) loads for wider access
 These map to Metal as: different NE/NL configs, wider loads for MXFP8
 
-### 3m. Longer context benchmark [TODO]
-- [ ] Run bench with -p 4096 -n 128 to see if bandwidth savings show at longer context
-- [ ] Run bench with -p 8192 -n 128
-- [ ] The theoretical advantage of MXFP4 (73% less KV memory) should appear at longer ctx
+### 3m. Longer context benchmark [DONE — MXFP4 gets WORSE]
+- [x] pp4096: mxfp4 = 93.4% of f16 tg (same as pp512)
+- [x] pp16384: mxfp4 = 86.9% of f16 tg (WORSE than pp512's 93.7%)
+- [x] Conclusion: M4 Max 273 GB/s bandwidth is too fast for MXFP4 to win on bandwidth.
+  The dequant ALU overhead dominates. This is fundamentally different from discrete GPUs
+  where memory bandwidth is the bottleneck.
+
+### 3n. Generalized inline MXFP4 for all head sizes [DONE]
+- [x] Bug: inline MXFP4 VEC path assumed NL=8 (tx-based nibble split)
+- [x] Broke dk256 (NL=32, gemma-3n): 38.9% of f16 tg with huge variance
+- [x] Fix: compute nibble position from linear element index (i = ii*NL + tx)
+  using il = i%8, bidx = i/8 instead of using tx directly
+- [x] Also removed wasteful scale pre-loading (loaded DK/32 scales, used DK4/NL)
+  in favor of per-iteration inline loading
+- [x] Result: gemma-3n dk256 mxfp4 = 90.3% of f16 tg (was 38.9% broken)
+- [x] qwen3-coder dk128 unchanged at ~94%
 
 ---
 
