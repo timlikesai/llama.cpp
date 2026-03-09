@@ -4515,3 +4515,206 @@ void dequantize_row_mxfp6_e3m2_cpu(const void * GGML_RESTRICT x, float * GGML_RE
 #endif
 }
 
+// ---- MXFP SoA dequantize_row (to_float) — NEON-optimized ----
+
+#if defined(__ARM_NEON)
+static inline void dequantize_row_mxfp4_soa_neon(
+        const void * GGML_RESTRICT src, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MXFP4 == 0);
+    const int nb = k / QK_MXFP4;
+    const char * row = (const char *)src;
+    const char * qs_base   = row;
+    const char * e8m0_base = row + nb * MXFP4_SOA_QS_PER_BLOCK;
+
+    const int8x16_t values = vld1q_s8(kvalues_mxfp4);
+    const uint8x16_t m4b = vdupq_n_u8(0x0f);
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_E8M0_TO_FP32_HALF((uint8_t)e8m0_base[i]);
+        const float32x4_t v_scale = vdupq_n_f32(d);
+        const uint8_t * qs = (const uint8_t *)(qs_base + i * MXFP4_SOA_QS_PER_BLOCK);
+
+        const uint8x16_t q4bits = vld1q_u8(qs);
+
+        const int8x16_t lo = ggml_vqtbl1q_s8(values, vandq_u8(q4bits, m4b));
+        const int8x16_t hi = ggml_vqtbl1q_s8(values, vshrq_n_u8(q4bits, 4));
+
+        float * out_lo = y + i * QK_MXFP4;
+        float * out_hi = y + i * QK_MXFP4 + QK_MXFP4/2;
+
+        {
+            const int16x8_t lo16_0 = vmovl_s8(vget_low_s8(lo));
+            const int16x8_t lo16_1 = vmovl_s8(vget_high_s8(lo));
+            vst1q_f32(out_lo + 0,  vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16_0))),  v_scale));
+            vst1q_f32(out_lo + 4,  vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16_0))), v_scale));
+            vst1q_f32(out_lo + 8,  vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16_1))),  v_scale));
+            vst1q_f32(out_lo + 12, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16_1))), v_scale));
+        }
+        {
+            const int16x8_t hi16_0 = vmovl_s8(vget_low_s8(hi));
+            const int16x8_t hi16_1 = vmovl_s8(vget_high_s8(hi));
+            vst1q_f32(out_hi + 0,  vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16_0))),  v_scale));
+            vst1q_f32(out_hi + 4,  vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16_0))), v_scale));
+            vst1q_f32(out_hi + 8,  vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16_1))),  v_scale));
+            vst1q_f32(out_hi + 12, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16_1))), v_scale));
+        }
+    }
+}
+
+static inline void dequantize_row_mxfp8_soa_neon(
+        const void * GGML_RESTRICT src, float * GGML_RESTRICT y, int64_t k,
+        const uint32_t exp_mask, const uint32_t mant_mask,
+        const int exp_shift, const uint32_t ieee_exp_off,
+        const int mant_shift, const float sub_scale) {
+    assert(k % QK_MXFP8 == 0);
+    const int nb = k / QK_MXFP8;
+    const char * row = (const char *)src;
+    const char * qs_base   = row;
+    const char * e8m0_base = row + nb * MXFP8_SOA_QS_PER_BLOCK;
+
+    const uint32x4_t v_exp_mask  = vdupq_n_u32(exp_mask);
+    const uint32x4_t v_mant_mask = vdupq_n_u32(mant_mask);
+    const uint32x4_t v_ieee_off  = vdupq_n_u32(ieee_exp_off);
+    const float32x4_t v_sub_sc   = vdupq_n_f32(sub_scale);
+    const int32x4_t v_neg_exp_shift = vdupq_n_s32(-exp_shift);
+    const int32x4_t v_mant_shift_v = vdupq_n_s32(mant_shift);
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float32x4_t v_scale = vdupq_n_f32(GGML_E8M0_TO_FP32((uint8_t)e8m0_base[ib]));
+        const uint8_t * qs = (const uint8_t *)(qs_base + ib * MXFP8_SOA_QS_PER_BLOCK);
+
+        for (int j = 0; j < 32; j += 8) {
+            const uint8x8_t raw8 = vld1_u8(qs + j);
+            const uint16x8_t raw16 = vmovl_u8(raw8);
+            const uint32x4_t v_lo = vmovl_u16(vget_low_u16(raw16));
+            const uint32x4_t v_hi = vmovl_u16(vget_high_u16(raw16));
+
+            #define DEQUANT_FP8_STORE_SOA(v_raw, dst) do {                                  \
+                const uint32x4_t sign = vandq_u32(v_raw, vdupq_n_u32(0x80));               \
+                const uint32x4_t exp  = vandq_u32(                                         \
+                    vshlq_u32(v_raw, v_neg_exp_shift),                                      \
+                    v_exp_mask);                                                            \
+                const uint32x4_t mant = vandq_u32(v_raw, v_mant_mask);                     \
+                const uint32x4_t ieee = vorrq_u32(                                         \
+                    vorrq_u32(vshlq_n_u32(sign, 24),                                       \
+                              vshlq_n_u32(vaddq_u32(exp, v_ieee_off), 23)),                 \
+                    vshlq_u32(mant, v_mant_shift_v));                                       \
+                const float32x4_t normal = vreinterpretq_f32_u32(ieee);                    \
+                const float32x4_t sub_abs = vmulq_f32(vcvtq_f32_u32(mant), v_sub_sc);      \
+                const uint32x4_t  sub_bits = vorrq_u32(                                    \
+                    vreinterpretq_u32_f32(sub_abs), vshlq_n_u32(sign, 24));                 \
+                const float32x4_t sub_val = vreinterpretq_f32_u32(sub_bits);                \
+                const uint32x4_t is_sub = vceqq_u32(exp, vdupq_n_u32(0));                  \
+                const float32x4_t val = vbslq_f32(is_sub, sub_val, normal);                 \
+                vst1q_f32(dst, vmulq_f32(val, v_scale));                                    \
+            } while (0)
+
+            DEQUANT_FP8_STORE_SOA(v_lo, y + ib * QK_MXFP8 + j);
+            DEQUANT_FP8_STORE_SOA(v_hi, y + ib * QK_MXFP8 + j + 4);
+            #undef DEQUANT_FP8_STORE_SOA
+        }
+    }
+}
+
+static inline void dequantize_row_mxfp6_soa_neon(
+        const void * GGML_RESTRICT src, float * GGML_RESTRICT y, int64_t k,
+        const uint32_t exp_mask, const uint32_t mant_mask,
+        const int exp_shift, const uint32_t ieee_exp_off,
+        const int mant_shift, const float sub_scale) {
+    assert(k % QK_MXFP6 == 0);
+    const int nb = k / QK_MXFP6;
+    const char * row = (const char *)src;
+    const char * qs_base   = row;
+    const char * e8m0_base = row + nb * MXFP6_SOA_QS_PER_BLOCK;
+
+    const uint32x4_t v_exp_mask  = vdupq_n_u32(exp_mask);
+    const uint32x4_t v_mant_mask = vdupq_n_u32(mant_mask);
+    const uint32x4_t v_ieee_off  = vdupq_n_u32(ieee_exp_off);
+    const float32x4_t v_sub_sc   = vdupq_n_f32(sub_scale);
+    const int32x4_t v_neg_exp_shift = vdupq_n_s32(-exp_shift);
+    const int32x4_t v_mant_shift_v = vdupq_n_s32(mant_shift);
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float32x4_t v_scale = vdupq_n_f32(GGML_E8M0_TO_FP32((uint8_t)e8m0_base[ib]));
+        const uint8_t * qs = (const uint8_t *)(qs_base + ib * MXFP6_SOA_QS_PER_BLOCK);
+
+        for (int j = 0; j < 32; j += 4) {
+            const uint8_t * p = qs + (j * 3 / 4);
+            const uint32_t pk = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+            uint8_t unpacked[4];
+            unpacked[0] = (pk >>  0) & 0x3F;
+            unpacked[1] = (pk >>  6) & 0x3F;
+            unpacked[2] = (pk >> 12) & 0x3F;
+            unpacked[3] = (pk >> 18) & 0x3F;
+
+            const uint8x8_t raw8 = vcreate_u8(
+                (uint64_t)unpacked[0] | ((uint64_t)unpacked[1] << 8) |
+                ((uint64_t)unpacked[2] << 16) | ((uint64_t)unpacked[3] << 24));
+            const uint32x4_t v_raw = vmovl_u16(vget_low_u16(vmovl_u8(raw8)));
+
+            const uint32x4_t sign = vandq_u32(v_raw, vdupq_n_u32(0x20));
+            const uint32x4_t exp  = vandq_u32(
+                vshlq_u32(v_raw, v_neg_exp_shift),
+                v_exp_mask);
+            const uint32x4_t mant = vandq_u32(v_raw, v_mant_mask);
+
+            const uint32x4_t ieee = vorrq_u32(
+                vorrq_u32(vshlq_n_u32(sign, 26),
+                          vshlq_n_u32(vaddq_u32(exp, v_ieee_off), 23)),
+                vshlq_u32(mant, v_mant_shift_v));
+            const float32x4_t normal = vreinterpretq_f32_u32(ieee);
+
+            const float32x4_t sub_abs = vmulq_f32(vcvtq_f32_u32(mant), v_sub_sc);
+            const uint32x4_t  sub_bits = vorrq_u32(
+                vreinterpretq_u32_f32(sub_abs), vshlq_n_u32(sign, 26));
+            const float32x4_t sub_val = vreinterpretq_f32_u32(sub_bits);
+
+            const uint32x4_t is_sub = vceqq_u32(exp, vdupq_n_u32(0));
+            const float32x4_t val = vbslq_f32(is_sub, sub_val, normal);
+
+            vst1q_f32(y + ib * QK_MXFP6 + j, vmulq_f32(val, v_scale));
+        }
+    }
+}
+#endif
+
+void dequantize_row_mxfp4_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#if defined(__ARM_NEON)
+    dequantize_row_mxfp4_soa_neon(x, y, k);
+#else
+    dequantize_row_mxfp4_soa_cpu_generic(x, y, k);
+#endif
+}
+
+void dequantize_row_mxfp8_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#if defined(__ARM_NEON)
+    dequantize_row_mxfp8_soa_neon(x, y, k, 0xF, 0x7, 3, 120, 20, 1.0f/512.0f);
+#else
+    dequantize_row_mxfp8_soa_cpu_generic(x, y, k);
+#endif
+}
+
+void dequantize_row_mxfp8_e5m2_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#if defined(__ARM_NEON)
+    dequantize_row_mxfp8_soa_neon(x, y, k, 0x1F, 0x3, 2, 112, 21, 1.0f/65536.0f);
+#else
+    dequantize_row_mxfp8_e5m2_soa_cpu_generic(x, y, k);
+#endif
+}
+
+void dequantize_row_mxfp6_e2m3_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#if defined(__ARM_NEON)
+    dequantize_row_mxfp6_soa_neon(x, y, k, 0x3, 0x7, 3, 126, 20, 1.0f/8.0f);
+#else
+    dequantize_row_mxfp6_e2m3_soa_cpu_generic(x, y, k);
+#endif
+}
+
+void dequantize_row_mxfp6_e3m2_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#if defined(__ARM_NEON)
+    dequantize_row_mxfp6_soa_neon(x, y, k, 0x7, 0x3, 2, 124, 21, 1.0f/16.0f);
+#else
+    dequantize_row_mxfp6_e3m2_soa_cpu_generic(x, y, k);
+#endif
+}
+

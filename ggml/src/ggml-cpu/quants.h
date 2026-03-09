@@ -100,6 +100,19 @@ void dequantize_row_mxfp8_e5m2_cpu_generic(const void * GGML_RESTRICT x, float *
 void dequantize_row_mxfp6_e2m3_cpu_generic(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 void dequantize_row_mxfp6_e3m2_cpu_generic(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
+// SoA dequant (SIMD-optimized for FA)
+void dequantize_row_mxfp4_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void dequantize_row_mxfp8_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void dequantize_row_mxfp8_e5m2_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void dequantize_row_mxfp6_e2m3_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void dequantize_row_mxfp6_e3m2_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
+void dequantize_row_mxfp4_soa_cpu_generic(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void dequantize_row_mxfp8_soa_cpu_generic(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void dequantize_row_mxfp8_e5m2_soa_cpu_generic(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void dequantize_row_mxfp6_e2m3_soa_cpu_generic(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void dequantize_row_mxfp6_e3m2_soa_cpu_generic(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
 void ggml_vec_dot_tq1_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_tq2_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 

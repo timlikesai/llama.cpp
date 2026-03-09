@@ -337,6 +337,65 @@ SoA layout: `[qs contiguous][e8m0 contiguous]` per row. No AoS in FA. Ever.
 
 ---
 
+## STEP 7: SIMD SoA Dequant for CPU Flash Attention [TODO]
+
+CPU FA currently uses scalar SoA dequant (plain C loops from ggml-quants.c).
+This step adds ARM NEON and x86 AVX2 optimized SoA dequant for FA performance.
+
+**Dispatch pattern** (same as existing AoS dequant):
+```
+quants.h:          declare  dequantize_row_mxfp*_soa_cpu() + _generic()
+quants.c:          define   _generic() → calls scalar SoA ref in ggml-quants.c
+arch/arm/quants.c: define   _cpu() → #if __ARM_NEON → NEON impl, #else → _generic()
+arch/x86/quants.c: define   _cpu() → #if __AVX2__   → AVX2 impl, #else → _generic()
+arch-fallback.h:   #define  _generic → _cpu for all other archs
+ops.cpp:           FA calls _cpu() instead of scalar SoA ref directly
+```
+
+**Why SoA is better for SIMD than AoS:**
+- AoS: 17/25/33-byte block strides → unaligned, can't do wide loads
+- SoA: contiguous qs region → `vld1q_u8` (NEON) / `_mm256_loadu_si256` (AVX2) on aligned data
+- E8M0 separate → load once per block, broadcast to all 32 elements
+
+### 7a. ARM NEON SoA dequant [TODO]
+Functions to add in `arch/arm/quants.c`:
+- [ ] `dequantize_row_mxfp4_soa_cpu()` — LUT[nibble] × e8m0_scale, 16B qs/block
+- [ ] `dequantize_row_mxfp8_soa_cpu()` — FP8→float via IEEE bit ops, 32B qs/block
+- [ ] `dequantize_row_mxfp8_e5m2_soa_cpu()` — same pattern, E5M2 params
+- [ ] `dequantize_row_mxfp6_e2m3_soa_cpu()` — unpack 6-bit + FP6→float, 24B qs/block
+- [ ] `dequantize_row_mxfp6_e3m2_soa_cpu()` — same pattern, E3M2 params
+
+NEON approach per block:
+```
+1. Load e8m0 byte from e8m0_base[i], convert to float scale
+2. Load qs from qs_base + i*QS_PER_BLOCK as uint8x16_t / uint8x8_t
+3. MXFP4: vtbl (LUT lookup) + vmul (scale)
+   MXFP8: bit extract (vand/vshr) → IEEE float construct → vmul (scale)
+   MXFP6: byte unpack → bit extract → IEEE float construct → vmul (scale)
+4. Store float32x4_t results
+```
+
+### 7b. x86 AVX2 SoA dequant [TODO]
+Functions to add in `arch/x86/quants.c`:
+- [ ] `dequantize_row_mxfp4_soa_cpu()` — `_mm_shuffle_epi8` LUT + scale
+- [ ] `dequantize_row_mxfp8_soa_cpu()` — IEEE bit manipulation + scale
+- [ ] `dequantize_row_mxfp8_e5m2_soa_cpu()` — same, E5M2 params
+- [ ] `dequantize_row_mxfp6_e2m3_soa_cpu()` — unpack + IEEE + scale
+- [ ] `dequantize_row_mxfp6_e3m2_soa_cpu()` — same, E3M2 params
+
+### 7c. Dispatch wiring [TODO]
+- [ ] `quants.h`: declare all 10 SoA dequant functions (_cpu + _generic)
+- [ ] `quants.c`: generic wrappers calling scalar SoA ref
+- [ ] `arch-fallback.h`: add `#define _generic _cpu` for all new functions
+- [ ] `ops.cpp`: FA function pointer dispatch calls `_cpu()` variants
+
+### 7d. SIMD SoA quantize for set_rows [TODO — lower priority]
+- [ ] ARM NEON SoA quantize (5 types)
+- [ ] x86 AVX2 SoA quantize (5 types)
+- Lower priority because set_rows runs once per token, FA dequant runs per KV position
+
+---
+
 ## Cross-Backend Patterns Reference
 
 ### SoA Memory Layout (all backends, defined in ggml-common.h)

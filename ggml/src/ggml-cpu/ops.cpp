@@ -3,6 +3,7 @@
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"
+#include "quants.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -8363,11 +8364,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
     if (is_mxfp_k) {
         switch (k->type) {
-            case GGML_TYPE_MXFP4_E2M1: mxfp_q_quantize = quantize_row_mxfp4_soa;     mxfp_k_dequantize = dequantize_row_mxfp4_soa;     break;
-            case GGML_TYPE_MXFP8_E4M3: mxfp_q_quantize = quantize_row_mxfp8_soa;     mxfp_k_dequantize = dequantize_row_mxfp8_soa;     break;
-            case GGML_TYPE_MXFP8_E5M2: mxfp_q_quantize = quantize_row_mxfp8_e5m2_soa; mxfp_k_dequantize = dequantize_row_mxfp8_e5m2_soa; break;
-            case GGML_TYPE_MXFP6_E2M3: mxfp_q_quantize = quantize_row_mxfp6_e2m3_soa; mxfp_k_dequantize = dequantize_row_mxfp6_e2m3_soa; break;
-            case GGML_TYPE_MXFP6_E3M2: mxfp_q_quantize = quantize_row_mxfp6_e3m2_soa; mxfp_k_dequantize = dequantize_row_mxfp6_e3m2_soa; break;
+            case GGML_TYPE_MXFP4_E2M1: mxfp_q_quantize = quantize_row_mxfp4_soa;     mxfp_k_dequantize = dequantize_row_mxfp4_soa_cpu;     break;
+            case GGML_TYPE_MXFP8_E4M3: mxfp_q_quantize = quantize_row_mxfp8_soa;     mxfp_k_dequantize = dequantize_row_mxfp8_soa_cpu;     break;
+            case GGML_TYPE_MXFP8_E5M2: mxfp_q_quantize = quantize_row_mxfp8_e5m2_soa; mxfp_k_dequantize = dequantize_row_mxfp8_e5m2_soa_cpu; break;
+            case GGML_TYPE_MXFP6_E2M3: mxfp_q_quantize = quantize_row_mxfp6_e2m3_soa; mxfp_k_dequantize = dequantize_row_mxfp6_e2m3_soa_cpu; break;
+            case GGML_TYPE_MXFP6_E3M2: mxfp_q_quantize = quantize_row_mxfp6_e3m2_soa; mxfp_k_dequantize = dequantize_row_mxfp6_e3m2_soa_cpu; break;
             default: GGML_ABORT("unsupported MXFP K type");
         }
         kq_vec_dot = nullptr;
@@ -8379,11 +8380,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
     if (is_mxfp_v) {
         switch (v->type) {
-            case GGML_TYPE_MXFP4_E2M1: mxfp_v_dequantize = dequantize_row_mxfp4_soa;     break;
-            case GGML_TYPE_MXFP8_E4M3: mxfp_v_dequantize = dequantize_row_mxfp8_soa;     break;
-            case GGML_TYPE_MXFP8_E5M2: mxfp_v_dequantize = dequantize_row_mxfp8_e5m2_soa; break;
-            case GGML_TYPE_MXFP6_E2M3: mxfp_v_dequantize = dequantize_row_mxfp6_e2m3_soa; break;
-            case GGML_TYPE_MXFP6_E3M2: mxfp_v_dequantize = dequantize_row_mxfp6_e3m2_soa; break;
+            case GGML_TYPE_MXFP4_E2M1: mxfp_v_dequantize = dequantize_row_mxfp4_soa_cpu;     break;
+            case GGML_TYPE_MXFP8_E4M3: mxfp_v_dequantize = dequantize_row_mxfp8_soa_cpu;     break;
+            case GGML_TYPE_MXFP8_E5M2: mxfp_v_dequantize = dequantize_row_mxfp8_e5m2_soa_cpu; break;
+            case GGML_TYPE_MXFP6_E2M3: mxfp_v_dequantize = dequantize_row_mxfp6_e2m3_soa_cpu; break;
+            case GGML_TYPE_MXFP6_E3M2: mxfp_v_dequantize = dequantize_row_mxfp6_e3m2_soa_cpu; break;
             default: GGML_ABORT("unsupported MXFP V type");
         }
     } else {
@@ -8648,22 +8649,22 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
     if (is_mxfp_k) {
         switch (k_type) {
-            case GGML_TYPE_MXFP4_E2M1: mxfp_q_quantize2 = quantize_row_mxfp4_soa;     mxfp_k_dequantize2 = dequantize_row_mxfp4_soa;     break;
-            case GGML_TYPE_MXFP8_E4M3: mxfp_q_quantize2 = quantize_row_mxfp8_soa;     mxfp_k_dequantize2 = dequantize_row_mxfp8_soa;     break;
-            case GGML_TYPE_MXFP8_E5M2: mxfp_q_quantize2 = quantize_row_mxfp8_e5m2_soa; mxfp_k_dequantize2 = dequantize_row_mxfp8_e5m2_soa; break;
-            case GGML_TYPE_MXFP6_E2M3: mxfp_q_quantize2 = quantize_row_mxfp6_e2m3_soa; mxfp_k_dequantize2 = dequantize_row_mxfp6_e2m3_soa; break;
-            case GGML_TYPE_MXFP6_E3M2: mxfp_q_quantize2 = quantize_row_mxfp6_e3m2_soa; mxfp_k_dequantize2 = dequantize_row_mxfp6_e3m2_soa; break;
+            case GGML_TYPE_MXFP4_E2M1: mxfp_q_quantize2 = quantize_row_mxfp4_soa;     mxfp_k_dequantize2 = dequantize_row_mxfp4_soa_cpu;     break;
+            case GGML_TYPE_MXFP8_E4M3: mxfp_q_quantize2 = quantize_row_mxfp8_soa;     mxfp_k_dequantize2 = dequantize_row_mxfp8_soa_cpu;     break;
+            case GGML_TYPE_MXFP8_E5M2: mxfp_q_quantize2 = quantize_row_mxfp8_e5m2_soa; mxfp_k_dequantize2 = dequantize_row_mxfp8_e5m2_soa_cpu; break;
+            case GGML_TYPE_MXFP6_E2M3: mxfp_q_quantize2 = quantize_row_mxfp6_e2m3_soa; mxfp_k_dequantize2 = dequantize_row_mxfp6_e2m3_soa_cpu; break;
+            case GGML_TYPE_MXFP6_E3M2: mxfp_q_quantize2 = quantize_row_mxfp6_e3m2_soa; mxfp_k_dequantize2 = dequantize_row_mxfp6_e3m2_soa_cpu; break;
             default: GGML_ABORT("unsupported MXFP K type");
         }
     }
 
     if (is_mxfp_v) {
         switch (v_type) {
-            case GGML_TYPE_MXFP4_E2M1: mxfp_v_dequantize2 = dequantize_row_mxfp4_soa;     break;
-            case GGML_TYPE_MXFP8_E4M3: mxfp_v_dequantize2 = dequantize_row_mxfp8_soa;     break;
-            case GGML_TYPE_MXFP8_E5M2: mxfp_v_dequantize2 = dequantize_row_mxfp8_e5m2_soa; break;
-            case GGML_TYPE_MXFP6_E2M3: mxfp_v_dequantize2 = dequantize_row_mxfp6_e2m3_soa; break;
-            case GGML_TYPE_MXFP6_E3M2: mxfp_v_dequantize2 = dequantize_row_mxfp6_e3m2_soa; break;
+            case GGML_TYPE_MXFP4_E2M1: mxfp_v_dequantize2 = dequantize_row_mxfp4_soa_cpu;     break;
+            case GGML_TYPE_MXFP8_E4M3: mxfp_v_dequantize2 = dequantize_row_mxfp8_soa_cpu;     break;
+            case GGML_TYPE_MXFP8_E5M2: mxfp_v_dequantize2 = dequantize_row_mxfp8_e5m2_soa_cpu; break;
+            case GGML_TYPE_MXFP6_E2M3: mxfp_v_dequantize2 = dequantize_row_mxfp6_e2m3_soa_cpu; break;
+            case GGML_TYPE_MXFP6_E3M2: mxfp_v_dequantize2 = dequantize_row_mxfp6_e3m2_soa_cpu; break;
             default: GGML_ABORT("unsupported MXFP V type");
         }
     }
