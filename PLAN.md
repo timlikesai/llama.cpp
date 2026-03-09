@@ -37,16 +37,22 @@ with full-row base pointer, absolute block index (head_block_offset + bidx), and
 
 **Q preprocessing: ENABLED in 4x4 kernel, DISABLED in VEC kernel** (VEC costs ~2 t/s).
 
-### Benchmark Results (SoA, 2026-03-08, all perplexity correct):
+### Benchmark Results (SoA + VEC optimizations, 2026-03-08):
 
 | Config | PPL | pp512 | tg128 | % of f16 | Gap to target |
 |--------|-----|-------|-------|----------|---------------|
-| f16 baseline | 11.17 | 1,507 | 107.4 | 100% | — |
-| mxfp8_e4m3+mxfp4 | 11.21 | 1,435 | 95.8 | 89.2% | +5.8% needed |
-| mxfp8_e5m2+mxfp4 | 11.97 | 1,438 | 94.9 | 88.3% | +6.7% needed |
-| mxfp6_e2m3+mxfp4 | 11.56 | 1,440 | 95.5 | 89.0% | +6.0% needed |
-| mxfp6_e3m2+mxfp4 | 12.01 | 1,431 | 95.5 | 89.0% | +6.0% needed |
-| mxfp4 matched | 11.77 | 1,447 | 96.6 | 90.0% | +5.0% needed |
+| f16 baseline | 11.17 | 1,518 | 108.9 | 100% | — |
+| mxfp4 matched | 11.77 | 1,460 | 103.1 | 94.8% | +5.2% needed |
+
+**VEC kernel optimizations applied (commit ad4950b06):**
+1. Float4 dequant: eliminate float→half→float round trip (+4% tg)
+2. Inline MXFP4 specialization: pre-computed base pointers, pre-loaded e8m0 scales
+3. Scale factoring: d*dot(lut,q) instead of dot(d*lut,q) saves 3 muls/iter (+1.8% tg)
+4. 4x4 clamp optimization: scale clamp (1 op) instead of output clamp (48 ops) for MXFP4
+
+**Previous baseline (SoA before VEC optimizations):**
+| f16 baseline | 11.17 | 1,474 | 107.7 | 100% | — |
+| mxfp4 matched | 11.77 | 1,447 | 96.6 | 89.6% | — |
 
 ### Key bug that was fixed:
 
@@ -153,20 +159,27 @@ Previously marked DONE but then SoA was reverted, undoing the cleanup. Redo afte
 
 ---
 
-## STEP 3: Metal FA performance — close the gap to >95% [TODO — after STEP 0]
+## STEP 3: Metal FA performance — exceed f16 [IN PROGRESS]
 
 ### Analysis: why MXFP FA is slower than f16 FA
 
 The FA VEC kernel (token generation path) has three code paths for K dequant:
 1. **Path A — native template match** (q8_0, q4_0, f16): Direct `dot(float4, float4)`, zero dequant overhead.
-2. **Path B — MXFP SoA dispatch**: `dequant_mxfp_soa_t4()` switch on mxfp_type, then per-type dequant.
-3. **Path C — generic dequant**: Block-based dequant for other types.
+2. **Path B — MXFP4 inline**: Inline LUT dequant with pre-computed base pointers, float4 output.
+3. **Path C — MXFP SoA dispatch**: `dequant_mxfp_soa_t4()` for MXFP6/8, float4 output.
+
+**Remaining gap analysis (mxfp4 at 94.8% of f16):**
+- Time per token: f16 = 9.18 ms, mxfp4 = 9.71 ms → FA penalty = 0.53 ms
+- FA fraction of total time: ~5-8% (MoE model with large FFN)
+- Per-element overhead vs f16: 4 LUT lookups + 1 scale multiply + 1 e8m0 load
+- MXFP4 loads 5B per 4 elements (vs 8B for f16) but issues 2 device loads vs 1
+- At short context (512 positions), KV cache is too small to be bandwidth-bound
+- **Key insight: exceeding f16 requires longer context where bandwidth dominates**
 
 ### 3a. Research: profile FA decode [TODO]
 - [ ] Use Metal System Trace (Instruments) to get per-kernel GPU time for tg path
-- [ ] Compare FA kernel time: f16 vs mxfp4 vs mxfp8 vs mxfp6
-- [ ] Determine: is the gap ALU-bound (dequant cost) or memory-bound (SoA access pattern)?
-- [ ] Check occupancy: does MXFP dequant use more registers, reducing occupancy?
+- [ ] Compare FA kernel time: f16 vs mxfp4 at different context lengths
+- [ ] Test with longer context (4K, 8K tokens) to measure bandwidth gains
 
 ### 3b. Arithmetic MXFP8 decode [TESTED — LUT WINS on Apple GPU]
 LUT = 94.7 t/s, Arithmetic = 90.2 t/s. Keep LUT on Metal.
@@ -174,8 +187,9 @@ LUT = 94.7 t/s, Arithmetic = 90.2 t/s. Keep LUT on Metal.
 ### 3c. MXFP6 decode improvements [TODO]
 - [ ] Check if t4 MXFP6 dequant can use a single uint32_t load instead of 3 byte loads
 
-### 3d. E8M0 scale hoisting [ANALYZED — NO OPPORTUNITY]
-Each inner loop iteration hits a different block. No redundant loads.
+### 3d. E8M0 scale hoisting [DONE — pre-loaded before inner loop]
+Pre-load all e8m0 scales into register array before the ii loop.
+Marginal improvement (compiler was likely already doing this).
 
 ### 3e. Half-precision K dot product [TESTED — NO EFFECT on Apple M4]
 Apple M4 has unified ALU — same throughput for half and float.
@@ -186,9 +200,35 @@ Apple M4 has unified ALU — same throughput for half and float.
 ### 3g. NE parameter tuning [DONE — NE=4 wins]
 Applied NE=4 to all MXFP dk128 VEC instantiations. +1.3% to +2.5% across configs.
 
-### 3h. Reduce function constant dispatch overhead [TODO]
-- [ ] Compare generated assembly for Path A vs Path B
-- [ ] Consider native MXFP template specializations that inline SoA dequant
+### 3h. Reduce function constant dispatch overhead [DONE — inline MXFP4]
+Inline MXFP4 dequant in VEC kernel (FC==1 compile-time check).
+Eliminates function call, dispatch switch, and enables scale factoring.
+
+### 3i. Float4 dequant in VEC [DONE — +4% tg]
+Eliminated float→half→float round trip in VEC MXFP dequant.
+Added conditional clamp (skip when output is float4, keep for half4).
+Single biggest win for tg throughput.
+
+### 3j. Scale factoring [DONE — +1.8% tg]
+K path: `d * dot(lut, q)` instead of `dot(d*lut, q)` — saves 3 multiplies/iter.
+V path: `(d*w) * lut` instead of `(d*lut) * w` — saves 3 multiplies/iter.
+
+### 3k. 4x4 clamp optimization [DONE — minimal pp impact]
+For MXFP4: replace 48-op per-element clamp with 1-op scale clamp (d = min(d, 10917)).
+Other types keep per-element clamp due to larger value ranges.
+
+### 3l. CUDA-inspired optimizations [TODO — from agent research]
+From CUDA analysis:
+- [ ] CUDA VEC uses 16 threads for KQ (vs 32), processing 2 K/V rows per warp
+- [ ] CUDA increases V_rows_per_thread=8 for MXFP (vs 4)
+- [ ] CUDA uses `__ldg()` for cache-bypassing loads
+- [ ] FP8 uses aligned int2 (8-byte) loads for wider access
+These map to Metal as: different NE/NL configs, wider loads for MXFP8
+
+### 3m. Longer context benchmark [TODO]
+- [ ] Run bench with -p 4096 -n 128 to see if bandwidth savings show at longer context
+- [ ] Run bench with -p 8192 -n 128
+- [ ] The theoretical advantage of MXFP4 (73% less KV memory) should appear at longer ctx
 
 ---
 
