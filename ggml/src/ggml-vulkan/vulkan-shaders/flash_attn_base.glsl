@@ -780,9 +780,9 @@ float compute_e8m0_scale(float vals[32]) {
     const int emax_offset = MXFP_EMAX_OFFSET;
 
     int e_base = round_log2 - emax_offset + 127;
-    int e_lo = clamp(e_base - MXFP_E8M0_MSE_RANGE, 1, 255);
-    int e_hi = clamp(e_base + MXFP_E8M0_MSE_RANGE, 1, 255);
-    int best_e = clamp(e_base, 0, 255);
+    int e_lo = clamp(e_base - MXFP_E8M0_MSE_RANGE, 1, 254);
+    int e_hi = clamp(e_base + MXFP_E8M0_MSE_RANGE, 1, 254);
+    int best_e = clamp(e_base, 0, 254);
     float best_mse = 1.0e30;
 
     for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
@@ -813,9 +813,9 @@ float compute_e8m0_scale_subgroup(float val, float amax) {
     int round_log2 = floor_log2 + (((amax_bits & 0x7FFFFFu) >= 0x3504F3u) ? 1 : 0);
 
     int e_base = round_log2 - MXFP_EMAX_OFFSET + 127;
-    int e_lo = clamp(e_base - MXFP_E8M0_MSE_RANGE, 1, 255);
-    int e_hi = clamp(e_base + MXFP_E8M0_MSE_RANGE, 1, 255);
-    int best_e = clamp(e_base, 0, 255);
+    int e_lo = clamp(e_base - MXFP_E8M0_MSE_RANGE, 1, 254);
+    int e_hi = clamp(e_base + MXFP_E8M0_MSE_RANGE, 1, 254);
+    int best_e = clamp(e_base, 0, 254);
     float best_mse = 1.0e30;
 
     for (int test_e = e_lo; test_e <= e_hi; ++test_e) {

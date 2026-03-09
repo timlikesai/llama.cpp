@@ -571,9 +571,9 @@ static __device__ void quantize_f32_mxfp_block_soa(
         const int e_base = round_log2 - traits::e8m0_offset + 127;
 
         // MSE-optimal search: test ±R around estimate, pick lowest MSE.
-        const int e_lo = max(1, min(255, e_base - MXFP_E8M0_MSE_RANGE));
-        const int e_hi = max(1, min(255, e_base + MXFP_E8M0_MSE_RANGE));
-        int best_e = max(0, min(255, e_base));
+        const int e_lo = max(1, min(254, e_base - MXFP_E8M0_MSE_RANGE));
+        const int e_hi = max(1, min(254, e_base + MXFP_E8M0_MSE_RANGE));
+        int best_e = max(0, min(254, e_base));
         float best_mse = 1e30f;
 
         for (int test_e = e_lo; test_e <= e_hi; ++test_e) {

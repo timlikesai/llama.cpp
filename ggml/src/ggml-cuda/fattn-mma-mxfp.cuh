@@ -805,9 +805,9 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
 
             // MSE-optimal search: test ±R around estimate, pick lowest MSE.
             // Matches set-rows and CPU paths for consistent quantization quality.
-            const int e_lo = max(1, min(255, e_base - MXFP_E8M0_MSE_RANGE));
-            const int e_hi = max(1, min(255, e_base + MXFP_E8M0_MSE_RANGE));
-            int best_e = max(0, min(255, e_base));
+            const int e_lo = max(1, min(254, e_base - MXFP_E8M0_MSE_RANGE));
+            const int e_hi = max(1, min(254, e_base + MXFP_E8M0_MSE_RANGE));
+            int best_e = max(0, min(254, e_base));
             float best_mse = 1e30f;
 
 #pragma unroll

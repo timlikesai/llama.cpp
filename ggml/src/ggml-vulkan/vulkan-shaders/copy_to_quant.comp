@@ -273,7 +273,7 @@ uint compute_e8m0_uint(float vals[32], int emax_offset) {
     int round_log2 = floor_log2 + (((amax_bits & 0x7FFFFFu) >= 0x3504F3u) ? 1 : 0);
     int e_base = round_log2 - emax_offset + 127;
     if (e_base < 1)   e_base = 1;
-    if (e_base > 255) e_base = 255;
+    if (e_base > 254) e_base = 254;
     return uint(e_base);
 }
 
@@ -313,8 +313,8 @@ void quantize(uint dst_idx, uint src_idx) {
     // ±R MSE search: test 2R+1 candidates, pick lowest total round-trip error.
     {
         int e_lo = max(1, int(e) - MXFP_E8M0_MSE_RANGE);
-        int e_hi = min(255, int(e) + MXFP_E8M0_MSE_RANGE);
-        uint best_e = clamp(e, 0u, 255u);
+        int e_hi = min(254, int(e) + MXFP_E8M0_MSE_RANGE);
+        uint best_e = clamp(e, 0u, 254u);
         float best_mse = 1e30;
         for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
             float test_d = e8m0_to_fp32(uint(test_e)) * 0.5;
@@ -387,8 +387,8 @@ void quantize(uint dst_idx, uint src_idx) {
     // ±R MSE search: test 2R+1 candidates, pick lowest total round-trip error.
     {
         int e_lo = max(1, int(e) - MXFP_E8M0_MSE_RANGE);
-        int e_hi = min(255, int(e) + MXFP_E8M0_MSE_RANGE);
-        uint best_e = clamp(e, 0u, 255u);
+        int e_hi = min(254, int(e) + MXFP_E8M0_MSE_RANGE);
+        uint best_e = clamp(e, 0u, 254u);
         float best_mse = 1e30;
         for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
             float test_d = e8m0_to_fp32(uint(test_e));
@@ -460,8 +460,8 @@ void quantize(uint dst_idx, uint src_idx) {
     // ±R MSE search: test 2R+1 candidates, pick lowest total round-trip error.
     {
         int e_lo = max(1, int(e) - MXFP_E8M0_MSE_RANGE);
-        int e_hi = min(255, int(e) + MXFP_E8M0_MSE_RANGE);
-        uint best_e = clamp(e, 0u, 255u);
+        int e_hi = min(254, int(e) + MXFP_E8M0_MSE_RANGE);
+        uint best_e = clamp(e, 0u, 254u);
         float best_mse = 1e30;
         for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
             float test_d = e8m0_to_fp32(uint(test_e));
@@ -530,8 +530,8 @@ void quantize(uint dst_idx, uint src_idx) {
     // ±R MSE search: test 2R+1 candidates, pick lowest total round-trip error.
     {
         int e_lo = max(1, int(e) - MXFP_E8M0_MSE_RANGE);
-        int e_hi = min(255, int(e) + MXFP_E8M0_MSE_RANGE);
-        uint best_e = clamp(e, 0u, 255u);
+        int e_hi = min(254, int(e) + MXFP_E8M0_MSE_RANGE);
+        uint best_e = clamp(e, 0u, 254u);
         float best_mse = 1e30;
         for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
             float test_d = e8m0_to_fp32(uint(test_e));
@@ -610,8 +610,8 @@ void quantize(uint dst_idx, uint src_idx) {
     // ±R MSE search: test 2R+1 candidates, pick lowest total round-trip error.
     {
         int e_lo = max(1, int(e) - MXFP_E8M0_MSE_RANGE);
-        int e_hi = min(255, int(e) + MXFP_E8M0_MSE_RANGE);
-        uint best_e = clamp(e, 0u, 255u);
+        int e_hi = min(254, int(e) + MXFP_E8M0_MSE_RANGE);
+        uint best_e = clamp(e, 0u, 254u);
         float best_mse = 1e30;
         for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
             float test_d = e8m0_to_fp32(uint(test_e));

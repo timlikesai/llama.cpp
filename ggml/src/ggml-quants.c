@@ -475,8 +475,8 @@ static inline uint8_t mxfp_compute_e8m0_mse(const float * x, int qk, const mxfp_
     int e_lo = e_base - MXFP_E8M0_MSE_RANGE;
     int e_hi = e_base + MXFP_E8M0_MSE_RANGE;
     if (e_lo < 1)   e_lo = 1;
-    if (e_hi > 255) e_hi = 255;
-    int best_e = e_base < 0 ? 0 : (e_base > 255 ? 255 : e_base);
+    if (e_hi > 254) e_hi = 254;
+    int best_e = e_base < 0 ? 0 : (e_base > 254 ? 254 : e_base);
     float best_mse = 1e30f;
 
     for (int test_e = e_lo; test_e <= e_hi; ++test_e) {
