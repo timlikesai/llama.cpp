@@ -1,6 +1,6 @@
 # MXFP KV Cache SoA Optimization Plan
 
-**Goal:** Push all MXFP KV cache configs to >95% of f16 token generation throughput across all backends (Metal, CUDA, Vulkan, CPU), with shared patterns that make it easy to port wins between backends.
+**Goal:** EXCEED f16 in both pp and tg for MXFP KV cache on Metal. MXFP4 transfers 73% less KV data than f16 — with efficient aligned loads and fast dequant, we should be FASTER, not slower. Current gap: pp ~96%, tg ~90% of f16. Target: >100% of f16 in both.
 
 **Testing:** ONLY use `kv-bench-local.sh` (Metal) or `kv-bench.sh` (Docker/CUDA). NEVER run llama-bench directly. NEVER pipe or redirect command output.
 

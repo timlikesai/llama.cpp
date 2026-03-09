@@ -667,7 +667,8 @@ void dequantize_mxfp4_t4(device const block_mxfp4 * xb, short il, thread type4 &
 template <typename type4x4>
 void dequantize_mxfp4_soa(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg) {
     device const uint8_t * qs = (device const uint8_t *)(row + bidx * MXFP4_SOA_QS_PER_BLOCK);
-    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + nblocks * MXFP4_SOA_QS_PER_BLOCK + bidx));
+    // Clamp scale to prevent half overflow: max_lut=6, half_max=65504, max_safe_scale=10917
+    const float d = min(e8m0_to_fp32(*(device const uint8_t *)(row + nblocks * MXFP4_SOA_QS_PER_BLOCK + bidx)), 10917.0f);
     const uint8_t shr = il >= 1 ? 4 : 0;
 
     float4x4 reg_f;
@@ -829,13 +830,15 @@ static inline void dequant_mxfp_soa_4x4(device const char * row, short bidx, sho
         case 5: dequantize_mxfp6_e3m2_soa(row, bidx, nblocks, il, reg); break;
     }
     // Clamp to half range to prevent Inf from float→half cast.
-    // MXFP dequant computes d*kvalues in float, but FA stores K/V in half shared mem.
-    // When d is large (e8m0 >= 141 for MXFP4), d*max_kvalues can exceed half max (65504).
-    float4x4 r = (float4x4) reg;
-    for (int i = 0; i < 4; ++i) {
-        r[i] = clamp(r[i], float4(-65504.0f), float4(65504.0f));
+    // MXFP4 handles this via scale clamping (1 min vs 48 clamp ops).
+    // Other types need per-element clamp due to larger value ranges.
+    if (mxfp_type != 1) {
+        float4x4 r = (float4x4) reg;
+        for (int i = 0; i < 4; ++i) {
+            r[i] = clamp(r[i], float4(-65504.0f), float4(65504.0f));
+        }
+        reg = (type4x4) r;
     }
-    reg = (type4x4) r;
 }
 
 template <typename type4>
@@ -847,10 +850,13 @@ static inline void dequant_mxfp_soa_t4(device const char * row, short bidx, shor
         case 4: dequantize_mxfp6_e2m3_t4_soa(row, bidx, nblocks, il, reg); break;
         case 5: dequantize_mxfp6_e3m2_t4_soa(row, bidx, nblocks, il, reg); break;
     }
-    // Clamp to half range (see above)
-    float4 r = (float4) reg;
-    r = clamp(r, float4(-65504.0f), float4(65504.0f));
-    reg = (type4) r;
+    // Clamp to half range only when outputting to half/bfloat (prevents Inf on float→half cast).
+    // When outputting to float4 (e.g. VEC kernel), skip clamp — saves ALU in the hot loop.
+    if (!is_same<type4, float4>::value) {
+        float4 r = (float4) reg;
+        r = clamp(r, float4(-65504.0f), float4(65504.0f));
+        reg = (type4) r;
+    }
 }
 
 // ===== MXFP Q preprocessing for flash attention =====
@@ -7514,19 +7520,49 @@ kernel void kernel_flash_attn_ext_vec(
                     } else {
                         device const char * k_row = k + ((ic + NE*cc + ty)*args.nb11);
 
-                        k4_t mk;
+                        if (FC_flash_attn_ext_vec_mxfp_type == 1) {
+                            // Inline MXFP4 K dequant: pre-loaded e8m0 scales, float4
+                            device const char * k_row_full = k_row - k_head_byte_off;
+                            device const char * qs_base = k_row_full + mxfp_head_k_boff * MXFP4_SOA_QS_PER_BLOCK;
+                            device const uint8_t * e_base = (device const uint8_t *)(k_row_full + NS10 * MXFP4_SOA_QS_PER_BLOCK + mxfp_head_k_boff);
+                            const uint shr = tx >= 4 ? 4 : 0;
+                            const short qs_off = (tx % 4) * 4;
 
-                        FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
-                            const short i = ii*NL + tx;
-
-                            if (FC_flash_attn_ext_vec_mxfp_type > 0) {
-                                device const char * k_row_full = k_row - k_head_byte_off;
-                                dequant_mxfp_soa_t4(k_row_full, (short)(mxfp_head_k_boff + i/nl_k), (short)(NS10), (short)(i%nl_k), mk, FC_flash_attn_ext_vec_mxfp_type);
-                            } else {
-                                deq_k_t4((device const kd4_t *)k_row + i/nl_k, i%nl_k, mk);
+                            // Pre-load all e8m0 scales — separates e8m0 loads from qs loads for better pipelining
+                            float k_scales[DK4/NL];
+                            FOR_UNROLL (short b = 0; b < DK4/NL; ++b) {
+                                k_scales[b] = e8m0_to_fp32(e_base[b]);
                             }
 
-                            mqk[cc] += dot((float4) mk, (float4) sq4[i]);
+                            FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                                const uint32_t p = *(device const uint32_t *)(qs_base + ii * 16 + qs_off);
+                                // Factor scale out of dot: dot(d*lut, q) = d * dot(lut, q)
+                                // Saves 3 multiplies per iteration (4 → 1)
+                                float4 kv;
+                                kv[0] = kvalues_mxfp4_f[(p >> ( 0 + shr)) & 0x0F];
+                                kv[1] = kvalues_mxfp4_f[(p >> ( 8 + shr)) & 0x0F];
+                                kv[2] = kvalues_mxfp4_f[(p >> (16 + shr)) & 0x0F];
+                                kv[3] = kvalues_mxfp4_f[(p >> (24 + shr)) & 0x0F];
+                                mqk[cc] = fma(k_scales[ii], dot(kv, (float4) sq4[ii*NL + tx]), mqk[cc]);
+                            }
+                        } else if (FC_flash_attn_ext_vec_mxfp_type > 0) {
+                            // Generic MXFP SoA path (MXFP6/8): float4, no half round trip
+                            device const char * k_row_full = k_row - k_head_byte_off;
+                            float4 mk_f;
+
+                            FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                                const short i = ii*NL + tx;
+                                dequant_mxfp_soa_t4(k_row_full, (short)(mxfp_head_k_boff + i/nl_k), (short)(NS10), (short)(i%nl_k), mk_f, FC_flash_attn_ext_vec_mxfp_type);
+                                mqk[cc] += dot(mk_f, (float4) sq4[i]);
+                            }
+                        } else {
+                            k4_t mk;
+
+                            FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                                const short i = ii*NL + tx;
+                                deq_k_t4((device const kd4_t *)k_row + i/nl_k, i%nl_k, mk);
+                                mqk[cc] += dot((float4) mk, (float4) sq4[i]);
+                            }
                         }
                     }
 
@@ -7634,17 +7670,55 @@ kernel void kernel_flash_attn_ext_vec(
                     // nl for t4 dequant: all supported V types have nl=8 (32 elems / 4 per t4)
                     constexpr short nl_v_eff = 8;
 
-                    FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
-                        FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
-                            const short i = ii*NL + tx;
+                    const int32_t v_mxfp_eff = (FC_flash_attn_ext_vec_mxfp_v_type > 0) ? FC_flash_attn_ext_vec_mxfp_v_type : FC_flash_attn_ext_vec_mxfp_type;
 
-                            v4_t mv;
-                            {
-                                const int32_t v_mxfp_eff = (FC_flash_attn_ext_vec_mxfp_v_type > 0) ? FC_flash_attn_ext_vec_mxfp_v_type : FC_flash_attn_ext_vec_mxfp_type;
-                                if (v_mxfp_eff > 0 && v_mxfp_eff <= 5) {
-                                    device const char * v_row_full = v + ((ic + NE*cc + ty)*args.nb21) - v_head_byte_off;
-                                    dequant_mxfp_soa_t4(v_row_full, (short)(mxfp_head_v_boff + i/nl_v_eff), (short)(NS20), (short)(i%nl_v_eff), mv, v_mxfp_eff);
-                                } else if (FC_flash_attn_ext_vec_mxfp_v_type > 5) {
+                    if (v_mxfp_eff == 1) {
+                        // Inline MXFP4 V dequant: pre-loaded e8m0 scales, float4
+                        const uint v_shr = tx >= 4 ? 4 : 0;
+                        const short v_qs_off = (tx % 4) * 4;
+
+                        FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                            device const char * v_row_full = v + ((ic + NE*cc + ty)*args.nb21) - v_head_byte_off;
+                            device const char * v_qs_base = v_row_full + mxfp_head_v_boff * MXFP4_SOA_QS_PER_BLOCK;
+                            device const uint8_t * v_e_base = (device const uint8_t *)(v_row_full + NS20 * MXFP4_SOA_QS_PER_BLOCK + mxfp_head_v_boff);
+
+                            // Pre-load e8m0 scales for V blocks
+                            float v_scales[DV4/NL];
+                            FOR_UNROLL (short b = 0; b < DV4/NL; ++b) {
+                                v_scales[b] = e8m0_to_fp32(v_e_base[b]);
+                            }
+
+                            const float sw = float(ss[NE*cc + ty]);
+                            FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                                const uint32_t p = *(device const uint32_t *)(v_qs_base + ii * 16 + v_qs_off);
+                                // Factor: (d * lut) * w = (d * w) * lut — saves 3 multiplies
+                                const float dw = v_scales[ii] * sw;
+                                float4 vv;
+                                vv[0] = kvalues_mxfp4_f[(p >> ( 0 + v_shr)) & 0x0F];
+                                vv[1] = kvalues_mxfp4_f[(p >> ( 8 + v_shr)) & 0x0F];
+                                vv[2] = kvalues_mxfp4_f[(p >> (16 + v_shr)) & 0x0F];
+                                vv[3] = kvalues_mxfp4_f[(p >> (24 + v_shr)) & 0x0F];
+                                lo[ii] += o4_t(dw * vv);
+                            }
+                        }
+                    } else if (v_mxfp_eff > 0 && v_mxfp_eff <= 5) {
+                        // Generic MXFP SoA V path (MXFP6/8): float4, no half round trip
+                        FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                            device const char * v_row_full = v + ((ic + NE*cc + ty)*args.nb21) - v_head_byte_off;
+                            FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                                const short i = ii*NL + tx;
+                                float4 mv_f;
+                                dequant_mxfp_soa_t4(v_row_full, (short)(mxfp_head_v_boff + i/nl_v_eff), (short)(NS20), (short)(i%nl_v_eff), mv_f, v_mxfp_eff);
+                                lo[ii] += o4_t(mv_f*float4(ss[NE*cc + ty]));
+                            }
+                        }
+                    } else {
+                        FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                            FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                                const short i = ii*NL + tx;
+
+                                v4_t mv;
+                                if (FC_flash_attn_ext_vec_mxfp_v_type > 5) {
                                     device const char * v_row = v + ((ic + NE*cc + ty)*args.nb21);
                                     dequant_v_t4_dispatch(v_row + (i/nl_v_eff)*v_bs,
                                                                i%nl_v_eff, mv,
@@ -7653,9 +7727,9 @@ kernel void kernel_flash_attn_ext_vec(
                                     device const vd4_t * pv4 = (device const vd4_t *) (v + ((ic + NE*cc + ty)*args.nb21));
                                     deq_v_t4(pv4 + i/nl_v, i%nl_v, mv);
                                 }
-                            }
 
-                            lo[ii] += o4_t(float4(mv)*float4(ss[NE*cc + ty]));
+                                lo[ii] += o4_t(float4(mv)*float4(ss[NE*cc + ty]));
+                            }
                         }
                     }
                 }
