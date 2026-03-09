@@ -663,12 +663,11 @@ void dequantize_mxfp4_t4(device const block_mxfp4 * xb, short il, thread type4 &
 // qs bytes have identical packing to AoS: byte[j] = elem[j](low nibble) | elem[j+16](high nibble)
 
 // SoA MXFP4 dequant (4x4: 16 values, il=0 for low nibbles, il=1 for high)
-// DEBUG: try AoS offsets (17-byte stride) to check if data is actually AoS
+// SoA layout: qs at bidx*16, e8m0 at nblocks*16+bidx
 template <typename type4x4>
 void dequantize_mxfp4_soa(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg) {
-    // AoS offsets: block starts at bidx*17, e8m0 at byte 0, qs at bytes 1-16
-    device const uint8_t * qs = (device const uint8_t *)(row + bidx * 17 + 1);
-    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + bidx * 17));
+    device const uint8_t * qs = (device const uint8_t *)(row + bidx * MXFP4_SOA_QS_PER_BLOCK);
+    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + nblocks * MXFP4_SOA_QS_PER_BLOCK + bidx));
     const uint8_t shr = il >= 1 ? 4 : 0;
 
     float4x4 reg_f;
@@ -6345,6 +6344,14 @@ void kernel_flash_attn_ext_impl(
         blk += (((iq3%args.ne33)*args.ne32 + (iq2%args.ne32))*nblk1 + iq1/Q)*nblk0;
     }
 
+    // SoA MXFP: save head byte offset and block offset for full-row addressing.
+    // set_rows writes SoA across the full multi-head row (nk0 blocks total).
+    // FA reads per-head, so we need full-row base pointer + absolute block index.
+    int32_t k_head_byte_off = 0;
+    int32_t v_head_byte_off = 0;
+    short mxfp_head_k_boff = 0;
+    short mxfp_head_v_boff = 0;
+
     {
         q += iq1*args.nb01 + iq2*args.nb02 + iq3*args.nb03;
 
@@ -6353,6 +6360,11 @@ void kernel_flash_attn_ext_impl(
 
         k += ikv2*args.nb12 + ikv3*args.nb13;
         v += ikv2*args.nb22 + ikv3*args.nb23;
+
+        k_head_byte_off = ikv2*args.nb12;
+        v_head_byte_off = ikv2*args.nb22;
+        mxfp_head_k_boff = ikv2 * (DK/32);
+        mxfp_head_v_boff = ikv2 * (DV/32);
     }
 
     // load heads from Q to shared memory
@@ -6439,6 +6451,10 @@ void kernel_flash_attn_ext_impl(
 
                 k += (ikv2 + ikv3*args.ne_12_2)*args.nb11*C;
                 v += (ikv2 + ikv3*args.ne_12_2)*args.nb21*C;
+
+                // Pad buffer: head offset is by whole rows, not within-row
+                k_head_byte_off = 0;
+                v_head_byte_off = 0;
 
                 if (!FC_flash_attn_ext_has_mask) {
                     threadgroup half * sm = (threadgroup half *) (sm2);
@@ -6598,7 +6614,12 @@ void kernel_flash_attn_ext_impl(
                             // the head is evenly divisible by 4*16 = 64, so no need for bound checks
                             {
                                 k4x4_t tmp;
-                                deq_k(pk4x4 + (ii + tx)/nl_k, (ii + tx)%nl_k, tmp);
+                                if (FC_flash_attn_ext_mxfp_type > 0) {
+                                    device const char * k_row_full = (device const char *)pk4x4 - k_head_byte_off;
+                                    dequant_mxfp_soa_4x4(k_row_full, (short)(mxfp_head_k_boff + (ii + tx)/nl_k), (short)(NS10), (short)((ii + tx)%nl_k), tmp, FC_flash_attn_ext_mxfp_type);
+                                } else {
+                                    deq_k(pk4x4 + (ii + tx)/nl_k, (ii + tx)%nl_k, tmp);
+                                }
                                 sk4x4[4*ty + tx] = tmp;
                             }
 
@@ -6619,7 +6640,12 @@ void kernel_flash_attn_ext_impl(
                         } else {
                             if (ii + tx < DK16) {
                                 k4x4_t tmp;
-                                deq_k(pk4x4 + (ii + tx)/nl_k, (ii + tx)%nl_k, tmp);
+                                if (FC_flash_attn_ext_mxfp_type > 0) {
+                                    device const char * k_row_full = (device const char *)pk4x4 - k_head_byte_off;
+                                    dequant_mxfp_soa_4x4(k_row_full, (short)(mxfp_head_k_boff + (ii + tx)/nl_k), (short)(NS10), (short)((ii + tx)%nl_k), tmp, FC_flash_attn_ext_mxfp_type);
+                                } else {
+                                    deq_k(pk4x4 + (ii + tx)/nl_k, (ii + tx)%nl_k, tmp);
+                                }
                                 sk4x4[4*ty + tx] = tmp;
                             }
 
@@ -6794,7 +6820,12 @@ void kernel_flash_attn_ext_impl(
                                 // no need for bound checks
                                 {
                                     v4x4_t tmp;
-                                    if (FC_flash_attn_ext_mxfp_v_type > 0) {
+                                    // effective V MXFP type: use override if mixed, else same as K
+                                    const int32_t v_mxfp_eff = (FC_flash_attn_ext_mxfp_v_type > 0) ? FC_flash_attn_ext_mxfp_v_type : FC_flash_attn_ext_mxfp_type;
+                                    if (v_mxfp_eff > 0 && v_mxfp_eff <= 5) {
+                                        device const char * v_row_full = v + ((ic + 8*cc + ty)*args.nb21) - v_head_byte_off;
+                                        dequant_mxfp_soa_4x4(v_row_full, (short)(mxfp_head_v_boff + (ii + tx)/nl_v_eff), (short)(NS20), (short)((ii + tx)%nl_v_eff), tmp, v_mxfp_eff);
+                                    } else if (FC_flash_attn_ext_mxfp_v_type > 5) {
                                         device const char * v_row = v + ((ic + 8*cc + ty)*args.nb21);
                                         dequant_v_4x4_dispatch(v_row + ((ii + tx)/nl_v_eff)*v_bs,
                                                                     (ii + tx)%nl_v_eff, tmp,
@@ -6826,7 +6857,11 @@ void kernel_flash_attn_ext_impl(
                             } else {
                                 if (ii + tx < DV16) {
                                     v4x4_t tmp;
-                                    if (FC_flash_attn_ext_mxfp_v_type > 0) {
+                                    const int32_t v_mxfp_eff = (FC_flash_attn_ext_mxfp_v_type > 0) ? FC_flash_attn_ext_mxfp_v_type : FC_flash_attn_ext_mxfp_type;
+                                    if (v_mxfp_eff > 0 && v_mxfp_eff <= 5) {
+                                        device const char * v_row_full = v + ((ic + 8*cc + ty)*args.nb21) - v_head_byte_off;
+                                        dequant_mxfp_soa_4x4(v_row_full, (short)(mxfp_head_v_boff + (ii + tx)/nl_v_eff), (short)(NS20), (short)((ii + tx)%nl_v_eff), tmp, v_mxfp_eff);
+                                    } else if (FC_flash_attn_ext_mxfp_v_type > 5) {
                                         device const char * v_row = v + ((ic + 8*cc + ty)*args.nb21);
                                         dequant_v_4x4_dispatch(v_row + ((ii + tx)/nl_v_eff)*v_bs,
                                                                     (ii + tx)%nl_v_eff, tmp,
@@ -7328,6 +7363,12 @@ kernel void kernel_flash_attn_ext_vec(
     // store the result for all queries in shared memory (the O matrix from the paper)
     so4 += tiisg;
 
+    // SoA MXFP: save head byte offset and block offset for full-row addressing
+    int32_t k_head_byte_off = 0;
+    int32_t v_head_byte_off = 0;
+    short mxfp_head_k_boff = 0;
+    short mxfp_head_v_boff = 0;
+
     {
         q += iq1*args.nb01 + iq2*args.nb02 + iq3*args.nb03;
 
@@ -7336,6 +7377,11 @@ kernel void kernel_flash_attn_ext_vec(
 
         k += ikv2*args.nb12 + ikv3*args.nb13;
         v += ikv2*args.nb22 + ikv3*args.nb23;
+
+        k_head_byte_off = ikv2*args.nb12;
+        v_head_byte_off = ikv2*args.nb22;
+        mxfp_head_k_boff = ikv2 * (DK/32);
+        mxfp_head_v_boff = ikv2 * (DV/32);
     }
 
     // load heads from Q to shared memory
@@ -7363,13 +7409,14 @@ kernel void kernel_flash_attn_ext_vec(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // MXFP Q preprocessing: Hadamard rotation + quantize/dequantize round-trip.
-    // DEBUG: temporarily disabled to isolate NaN bug
+    // MXFP Q preprocessing: scale + Hadamard rotation + quantize/dequantize round-trip.
+    // TODO: re-enable after SoA. Currently costs ~2 t/s in VEC kernel.
     if (false && FC_flash_attn_ext_vec_mxfp_type > 0) {
         if (sgitg == 0 && iq1 < args.ne01) {
             threadgroup half * sq = (threadgroup half *)sq4;
             for (short b = 0; b < DK/32; ++b) {
                 float val = (float)sq[b*32 + tiisg];
+                val *= args.scale; // bake scale into Q before Hadamard + quantize round-trip (match CUDA)
                 val = mxfp_preprocess_q_dispatch(val, tiisg, DK == DV, FC_flash_attn_ext_vec_mxfp_type);
                 sq[b*32 + tiisg] = (half)val;
             }
@@ -7421,6 +7468,10 @@ kernel void kernel_flash_attn_ext_vec(
                 k += (ikv2 + ikv3*args.ne_12_2)*args.nb11*C;
                 v += (ikv2 + ikv3*args.ne_12_2)*args.nb21*C;
 
+                // Pad buffer: head offset is by whole rows, not within-row
+                k_head_byte_off = 0;
+                v_head_byte_off = 0;
+
                 if (!FC_flash_attn_ext_vec_has_mask) {
                     if (ic + tiisg >= args.ne11) {
                         sm[tiisg] = -MAXHALF;
@@ -7461,14 +7512,19 @@ kernel void kernel_flash_attn_ext_vec(
                             mqk[cc] += dot((float4) pk4[cc*NE*NS10/4 +  ii*NL], (float4) pq4[ii*NL]);
                         }
                     } else {
-                        device const kd4_t * pk = (device const kd4_t *) (k + ((ic + NE*cc + ty)*args.nb11));
+                        device const char * k_row = k + ((ic + NE*cc + ty)*args.nb11);
 
                         k4_t mk;
 
                         FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
                             const short i = ii*NL + tx;
 
-                            deq_k_t4(pk + i/nl_k, i%nl_k, mk);
+                            if (FC_flash_attn_ext_vec_mxfp_type > 0) {
+                                device const char * k_row_full = k_row - k_head_byte_off;
+                                dequant_mxfp_soa_t4(k_row_full, (short)(mxfp_head_k_boff + i/nl_k), (short)(NS10), (short)(i%nl_k), mk, FC_flash_attn_ext_vec_mxfp_type);
+                            } else {
+                                deq_k_t4((device const kd4_t *)k_row + i/nl_k, i%nl_k, mk);
+                            }
 
                             mqk[cc] += dot((float4) mk, (float4) sq4[i]);
                         }
@@ -7583,14 +7639,20 @@ kernel void kernel_flash_attn_ext_vec(
                             const short i = ii*NL + tx;
 
                             v4_t mv;
-                            if (FC_flash_attn_ext_vec_mxfp_v_type > 0) {
-                                device const char * v_row = v + ((ic + NE*cc + ty)*args.nb21);
-                                dequant_v_t4_dispatch(v_row + (i/nl_v_eff)*v_bs,
-                                                           i%nl_v_eff, mv,
-                                                           FC_flash_attn_ext_vec_mxfp_v_type);
-                            } else {
-                                device const vd4_t * pv4 = (device const vd4_t *) (v + ((ic + NE*cc + ty)*args.nb21));
-                                deq_v_t4(pv4 + i/nl_v, i%nl_v, mv);
+                            {
+                                const int32_t v_mxfp_eff = (FC_flash_attn_ext_vec_mxfp_v_type > 0) ? FC_flash_attn_ext_vec_mxfp_v_type : FC_flash_attn_ext_vec_mxfp_type;
+                                if (v_mxfp_eff > 0 && v_mxfp_eff <= 5) {
+                                    device const char * v_row_full = v + ((ic + NE*cc + ty)*args.nb21) - v_head_byte_off;
+                                    dequant_mxfp_soa_t4(v_row_full, (short)(mxfp_head_v_boff + i/nl_v_eff), (short)(NS20), (short)(i%nl_v_eff), mv, v_mxfp_eff);
+                                } else if (FC_flash_attn_ext_vec_mxfp_v_type > 5) {
+                                    device const char * v_row = v + ((ic + NE*cc + ty)*args.nb21);
+                                    dequant_v_t4_dispatch(v_row + (i/nl_v_eff)*v_bs,
+                                                               i%nl_v_eff, mv,
+                                                               FC_flash_attn_ext_vec_mxfp_v_type);
+                                } else {
+                                    device const vd4_t * pv4 = (device const vd4_t *) (v + ((ic + NE*cc + ty)*args.nb21));
+                                    deq_v_t4(pv4 + i/nl_v, i%nl_v, mv);
+                                }
                             }
 
                             lo[ii] += o4_t(float4(mv)*float4(ss[NE*cc + ty]));
@@ -9993,13 +10055,13 @@ kernel void kernel_set_rows_mxfp4_simd(
     // Pack nibbles: byte[j] = element[j] (low) | element[j+16] (high)
     uint8_t partner_nibble = (uint8_t)simd_shuffle(nibble, (tiisg + 16) & 31);
 
-    // Write AoS: block_mxfp4 = { e, qs[16] } = 17 bytes per block
+    // Write SoA: [qs_block0[16]|qs_block1[16]|...][e8m0_0|e8m0_1|...]
     if (tiisg < 16) {
-        device uint8_t * qs_dst = (device uint8_t *)(dst_row + ind * 17 + 1);
+        device uint8_t * qs_dst = (device uint8_t *)(dst_row + ind * MXFP4_SOA_QS_PER_BLOCK);
         qs_dst[tiisg] = nibble | (partner_nibble << 4);
     }
     if (tiisg == 0) {
-        *(dst_row + ind * 17) = (char)e;
+        *(dst_row + args.nk0 * MXFP4_SOA_QS_PER_BLOCK + ind) = (char)e;
     }
 }
 
@@ -10061,10 +10123,10 @@ kernel void kernel_set_rows_mxfp8_simd(
     uint8_t fp8 = (MXFP_SUBTYPE == 2) ? float_to_fp8_e4m3_rn(val * inv_scale)
                                        : float_to_fp8_e5m2_rn(val * inv_scale);
 
-    // Write AoS: block_mxfp8 = { e, qs[32] } = 33 bytes per block
-    *(device uint8_t *)(dst_row + ind * 33 + 1 + tiisg) = fp8;
+    // Write SoA: [qs_block0[32]|qs_block1[32]|...][e8m0_0|e8m0_1|...]
+    *(device uint8_t *)(dst_row + ind * MXFP8_SOA_QS_PER_BLOCK + tiisg) = fp8;
     if (tiisg == 0) {
-        *(dst_row + ind * 33) = (char)e;
+        *(dst_row + args.nk0 * MXFP8_SOA_QS_PER_BLOCK + ind) = (char)e;
     }
 }
 
@@ -10125,16 +10187,16 @@ kernel void kernel_set_rows_mxfp6_simd(
     uint8_t v2 = (uint8_t)simd_shuffle((uint)fp6, group * 4 + 2);
     uint8_t v3 = (uint8_t)simd_shuffle((uint)fp6, group * 4 + 3);
 
-    // Write AoS: block_mxfp6 = { e, qs[24] } = 25 bytes per block
+    // Write SoA: [qs_block0[24]|qs_block1[24]|...][e8m0_0|e8m0_1|...]
     if (lane == 0) {
         uint32_t packed = (v0 & 0x3F) | ((v1 & 0x3F) << 6) | ((v2 & 0x3F) << 12) | ((v3 & 0x3F) << 18);
-        device uint8_t * qs_dst = (device uint8_t *)(dst_row + ind * 25 + 1 + group * 3);
+        device uint8_t * qs_dst = (device uint8_t *)(dst_row + ind * MXFP6_SOA_QS_PER_BLOCK + group * 3);
         qs_dst[0] = (uint8_t)(packed);
         qs_dst[1] = (uint8_t)(packed >> 8);
         qs_dst[2] = (uint8_t)(packed >> 16);
     }
     if (tiisg == 0) {
-        *(dst_row + ind * 25) = (char)e;
+        *(dst_row + args.nk0 * MXFP6_SOA_QS_PER_BLOCK + ind) = (char)e;
     }
 }
 
