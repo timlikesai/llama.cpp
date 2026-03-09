@@ -666,17 +666,19 @@ void dequantize_mxfp4_t4(device const block_mxfp4 * xb, short il, thread type4 &
 // SoA layout: qs at bidx*16, e8m0 at nblocks*16+bidx
 template <typename type4x4>
 void dequantize_mxfp4_soa(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg) {
-    device const uint8_t * qs = (device const uint8_t *)(row + bidx * MXFP4_SOA_QS_PER_BLOCK);
+    // Aligned uint32_t loads (4 loads vs 16 byte loads)
+    device const uint32_t * qs32 = (device const uint32_t *)(row + bidx * MXFP4_SOA_QS_PER_BLOCK);
     // Clamp scale to prevent half overflow: max_lut=6, half_max=65504, max_safe_scale=10917
     const float d = min(e8m0_to_fp32(*(device const uint8_t *)(row + nblocks * MXFP4_SOA_QS_PER_BLOCK + bidx)), 10917.0f);
-    const uint8_t shr = il >= 1 ? 4 : 0;
+    const uint shr = il >= 1 ? 4 : 0;
 
     float4x4 reg_f;
     for (int i = 0; i < 4; ++i) {
-        reg_f[i][0] = d * kvalues_mxfp4_f[(qs[4*i + 0] >> shr) & 0x0F];
-        reg_f[i][1] = d * kvalues_mxfp4_f[(qs[4*i + 1] >> shr) & 0x0F];
-        reg_f[i][2] = d * kvalues_mxfp4_f[(qs[4*i + 2] >> shr) & 0x0F];
-        reg_f[i][3] = d * kvalues_mxfp4_f[(qs[4*i + 3] >> shr) & 0x0F];
+        const uint32_t p = qs32[i];
+        reg_f[i][0] = d * kvalues_mxfp4_f[(p >> ( 0 + shr)) & 0x0F];
+        reg_f[i][1] = d * kvalues_mxfp4_f[(p >> ( 8 + shr)) & 0x0F];
+        reg_f[i][2] = d * kvalues_mxfp4_f[(p >> (16 + shr)) & 0x0F];
+        reg_f[i][3] = d * kvalues_mxfp4_f[(p >> (24 + shr)) & 0x0F];
     }
     reg = (type4x4) reg_f;
 }
@@ -7521,29 +7523,26 @@ kernel void kernel_flash_attn_ext_vec(
                         device const char * k_row = k + ((ic + NE*cc + ty)*args.nb11);
 
                         if (FC_flash_attn_ext_vec_mxfp_type == 1) {
-                            // Inline MXFP4 K dequant: pre-loaded e8m0 scales, float4
+                            // Inline MXFP4 K dequant: float4, scale factoring, works for all NL
                             device const char * k_row_full = k_row - k_head_byte_off;
                             device const char * qs_base = k_row_full + mxfp_head_k_boff * MXFP4_SOA_QS_PER_BLOCK;
                             device const uint8_t * e_base = (device const uint8_t *)(k_row_full + NS10 * MXFP4_SOA_QS_PER_BLOCK + mxfp_head_k_boff);
-                            const uint shr = tx >= 4 ? 4 : 0;
-                            const short qs_off = (tx % 4) * 4;
-
-                            // Pre-load all e8m0 scales — separates e8m0 loads from qs loads for better pipelining
-                            float k_scales[DK4/NL];
-                            FOR_UNROLL (short b = 0; b < DK4/NL; ++b) {
-                                k_scales[b] = e8m0_to_fp32(e_base[b]);
-                            }
 
                             FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
-                                const uint32_t p = *(device const uint32_t *)(qs_base + ii * 16 + qs_off);
-                                // Factor scale out of dot: dot(d*lut, q) = d * dot(lut, q)
-                                // Saves 3 multiplies per iteration (4 → 1)
+                                const short i = ii*NL + tx;
+                                const short il = i % 8;           // position within 32-element MXFP4 block
+                                const short bidx = i / 8;         // block index within head
+                                const uint shr = il >= 4 ? 4 : 0;
+                                const short qs_off = (il % 4) * 4;
+
+                                const float k_scale = e8m0_to_fp32(e_base[bidx]);
+                                const uint32_t p = *(device const uint32_t *)(qs_base + bidx * 16 + qs_off);
                                 float4 kv;
                                 kv[0] = kvalues_mxfp4_f[(p >> ( 0 + shr)) & 0x0F];
                                 kv[1] = kvalues_mxfp4_f[(p >> ( 8 + shr)) & 0x0F];
                                 kv[2] = kvalues_mxfp4_f[(p >> (16 + shr)) & 0x0F];
                                 kv[3] = kvalues_mxfp4_f[(p >> (24 + shr)) & 0x0F];
-                                mqk[cc] = fma(k_scales[ii], dot(kv, (float4) sq4[ii*NL + tx]), mqk[cc]);
+                                mqk[cc] = fma(k_scale, dot(kv, (float4) sq4[i]), mqk[cc]);
                             }
                         } else if (FC_flash_attn_ext_vec_mxfp_type > 0) {
                             // Generic MXFP SoA path (MXFP6/8): float4, no half round trip
@@ -7673,26 +7672,24 @@ kernel void kernel_flash_attn_ext_vec(
                     const int32_t v_mxfp_eff = (FC_flash_attn_ext_vec_mxfp_v_type > 0) ? FC_flash_attn_ext_vec_mxfp_v_type : FC_flash_attn_ext_vec_mxfp_type;
 
                     if (v_mxfp_eff == 1) {
-                        // Inline MXFP4 V dequant: pre-loaded e8m0 scales, float4
-                        const uint v_shr = tx >= 4 ? 4 : 0;
-                        const short v_qs_off = (tx % 4) * 4;
+                        // Inline MXFP4 V dequant: float4, scale factoring, works for all NL
 
                         FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
                             device const char * v_row_full = v + ((ic + NE*cc + ty)*args.nb21) - v_head_byte_off;
                             device const char * v_qs_base = v_row_full + mxfp_head_v_boff * MXFP4_SOA_QS_PER_BLOCK;
                             device const uint8_t * v_e_base = (device const uint8_t *)(v_row_full + NS20 * MXFP4_SOA_QS_PER_BLOCK + mxfp_head_v_boff);
 
-                            // Pre-load e8m0 scales for V blocks
-                            float v_scales[DV4/NL];
-                            FOR_UNROLL (short b = 0; b < DV4/NL; ++b) {
-                                v_scales[b] = e8m0_to_fp32(v_e_base[b]);
-                            }
-
                             const float sw = float(ss[NE*cc + ty]);
                             FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
-                                const uint32_t p = *(device const uint32_t *)(v_qs_base + ii * 16 + v_qs_off);
-                                // Factor: (d * lut) * w = (d * w) * lut — saves 3 multiplies
-                                const float dw = v_scales[ii] * sw;
+                                const short i = ii*NL + tx;
+                                const short il = i % 8;
+                                const short bidx = i / 8;
+                                const uint v_shr = il >= 4 ? 4 : 0;
+                                const short v_qs_off = (il % 4) * 4;
+
+                                const float v_scale = e8m0_to_fp32(v_e_base[bidx]);
+                                const uint32_t p = *(device const uint32_t *)(v_qs_base + bidx * 16 + v_qs_off);
+                                const float dw = v_scale * sw;
                                 float4 vv;
                                 vv[0] = kvalues_mxfp4_f[(p >> ( 0 + v_shr)) & 0x0F];
                                 vv[1] = kvalues_mxfp4_f[(p >> ( 8 + v_shr)) & 0x0F];
