@@ -9987,15 +9987,7 @@ kernel void kernel_set_rows_mxfp4_simd(
         val *= 0.17677669529663689f; // 1/sqrt(32)
     }
 
-    float amax = simd_max(abs(val));
-    uint8_t e = 0;
-    if (amax > 0.0f) {
-        uint32_t amax_bits = as_type<uint32_t>(amax);
-        int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
-        int round_up = ((amax_bits & 0x7FFFFF) >= 0x3504F3) ? 1 : 0;
-        int e_int = floor_log2 + round_up - MXFP4_E2M1_EMAX_OFFSET + 127;
-        e = (uint8_t)clamp(e_int, 0, 254);
-    }
+    uint8_t e = mxfp4_compute_e8m0(val);
 
     float scale = e8m0_to_fp32(e);
     float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
@@ -10012,17 +10004,6 @@ kernel void kernel_set_rows_mxfp4_simd(
     if (tiisg == 0) {
         *(dst_row + args.nk0 * MXFP4_SOA_QS_PER_BLOCK + ind) = (char)e;
     }
-}
-
-// Shared SIMD E8M0 computation for all MXFP types.
-// Simple round(log2(amax)) — fast, no MSE search.
-static inline uint8_t mxfp_simd_e8m0(float amax, int emax_offset) {
-    if (amax <= 0.0f) return 0;
-    uint32_t amax_bits = as_type<uint32_t>(amax);
-    int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
-    int round_up = ((amax_bits & 0x7FFFFF) >= 0x3504F3) ? 1 : 0;
-    int e_int = floor_log2 + round_up - emax_offset + 127;
-    return (uint8_t)clamp(e_int, 0, 254);
 }
 
 // SIMD-parallel MXFP8 set_rows: 32 threads cooperate on each 32-element block.
@@ -10064,8 +10045,12 @@ kernel void kernel_set_rows_mxfp8_simd(
         val *= 0.17677669529663689f; // 1/sqrt(32)
     }
 
-    float amax = simd_max(abs(val));
-    uint8_t e = mxfp_simd_e8m0(amax, (MXFP_SUBTYPE == 2) ? 8 : 16);
+    uint8_t e;
+    if (MXFP_SUBTYPE == 2) {
+        e = mxfp_compute_e8m0_mse<8, mxfp_roundtrip<float_to_fp8_e4m3_rn, fp8_e4m3_to_float>>(val);
+    } else {
+        e = mxfp_compute_e8m0_mse<16, mxfp_roundtrip<float_to_fp8_e5m2_rn, fp8_e5m2_to_float>>(val);
+    }
 
     float scale = e8m0_to_fp32(e);
     float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
@@ -10119,8 +10104,12 @@ kernel void kernel_set_rows_mxfp6_simd(
         val *= 0.17677669529663689f; // 1/sqrt(32)
     }
 
-    float amax = simd_max(abs(val));
-    uint8_t e = mxfp_simd_e8m0(amax, (MXFP_SUBTYPE == 4) ? 3 : 5);
+    uint8_t e;
+    if (MXFP_SUBTYPE == 4) {
+        e = mxfp_compute_e8m0_mse<3, mxfp_roundtrip<float_to_fp6_e2m3_rn, fp6_e2m3_to_float>>(val);
+    } else {
+        e = mxfp_compute_e8m0_mse<5, mxfp_roundtrip<float_to_fp6_e3m2_rn, fp6_e3m2_to_float>>(val);
+    }
 
     float scale = e8m0_to_fp32(e);
     float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
