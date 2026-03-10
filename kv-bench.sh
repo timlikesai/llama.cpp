@@ -86,10 +86,10 @@ CONFIGS=(
     "q4_0"
     "q8_0+q4_0"
     "mxfp8"
-    "mxfp8_e5m2"
     "mxfp6"
-    "mxfp6_e3m2"
     "mxfp4"
+    "mxfp8+mxfp8"
+    "mxfp6+mxfp6"
 )
 MODEL_INPUTS=()
 _config_overridden=false
@@ -279,11 +279,16 @@ config_types() {
         q8_0)         TYPE_K="q8_0";        TYPE_V="q8_0";   CLI_K="q8_0";      CLI_V="q8_0"      ;;
         q4_0)         TYPE_K="q4_0";        TYPE_V="q4_0";   CLI_K="q4_0";      CLI_V="q4_0"      ;;
         q8_0+q4_0)    TYPE_K="q8_0";        TYPE_V="q4_0";   CLI_K="q8_0";      CLI_V="q4_0"      ;;
-        mxfp8|mxfp8_e4m3)   TYPE_K="mxfp8_e4m3";  TYPE_V="mxfp4";  CLI_K="mxfp8";     CLI_V="mxfp4"     ;;
-        mxfp8_e5m2)         TYPE_K="mxfp8_e5m2";  TYPE_V="mxfp4";  CLI_K="mxfp8_e5m2"; CLI_V="mxfp4"     ;;
-        mxfp6|mxfp6_e2m3)   TYPE_K="mxfp6_e2m3";  TYPE_V="mxfp4";  CLI_K="mxfp6";      CLI_V="mxfp4"     ;;
-        mxfp6_e3m2)         TYPE_K="mxfp6_e3m2";  TYPE_V="mxfp4";  CLI_K="mxfp6_e3m2"; CLI_V="mxfp4"     ;;
-        mxfp4)        TYPE_K="mxfp4";        TYPE_V="mxfp4";  CLI_K="mxfp4";     CLI_V="mxfp4"     ;;
+        mxfp8|mxfp8_e4m3)   TYPE_K="mxfp8";       TYPE_V="mxfp4";  CLI_K="mxfp8";     CLI_V="mxfp4"     ;;
+        mxfp8_e5m2)         TYPE_K="mxfp8_e5m2"; TYPE_V="mxfp4";  CLI_K="mxfp8_e5m2"; CLI_V="mxfp4"     ;;
+        mxfp6|mxfp6_e2m3)   TYPE_K="mxfp6";       TYPE_V="mxfp4";  CLI_K="mxfp6";      CLI_V="mxfp4"     ;;
+        mxfp6_e3m2)         TYPE_K="mxfp6_e3m2"; TYPE_V="mxfp4";  CLI_K="mxfp6_e3m2"; CLI_V="mxfp4"     ;;
+        mxfp4)              TYPE_K="mxfp4";       TYPE_V="mxfp4";  CLI_K="mxfp4";     CLI_V="mxfp4"     ;;
+        # Matched K/V configs — tests the FP8/FP6 V dequant paths (not just MXFP4 V).
+        mxfp8+mxfp8|mxfp8_e4m3+mxfp8_e4m3)   TYPE_K="mxfp8";       TYPE_V="mxfp8";       CLI_K="mxfp8";      CLI_V="mxfp8"      ;;
+        mxfp8_e5m2+mxfp8_e5m2)               TYPE_K="mxfp8_e5m2"; TYPE_V="mxfp8_e5m2"; CLI_K="mxfp8_e5m2"; CLI_V="mxfp8_e5m2"  ;;
+        mxfp6+mxfp6|mxfp6_e2m3+mxfp6_e2m3)   TYPE_K="mxfp6";       TYPE_V="mxfp6";       CLI_K="mxfp6";      CLI_V="mxfp6"       ;;
+        mxfp6_e3m2+mxfp6_e3m2)               TYPE_K="mxfp6_e3m2"; TYPE_V="mxfp6_e3m2"; CLI_K="mxfp6_e3m2"; CLI_V="mxfp6_e3m2"  ;;
         *)
             echo "Unknown config: $1"
             exit 1

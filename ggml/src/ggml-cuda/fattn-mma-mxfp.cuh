@@ -892,19 +892,42 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
             }
         } else {
             // FP6/FP8: pack 32 quantized values into 8 ints (byte-padded format for MMA).
-            // FP6: mask to 6 bits (byte-padded: 00xxxxxx). FP8: full 8 bits (mask is no-op).
-            constexpr bool is_fp6 = (mxfp_type == GGML_TYPE_MXFP6_E2M3 || mxfp_type == GGML_TYPE_MXFP6_E3M2);
-            constexpr uint8_t elem_mask = is_fp6 ? 0x3F : 0xFF;
             if (active) {
 #pragma unroll
                 for (int i = 0; i < vals_per_block / 4; ++i) {
                     const int int_idx = block_idx * (vals_per_block / 4) + i;
-                    uint8_t bytes[4];
+                    const float4 f4 = make_float4(
+                        vals[4 * i + 0] * inv_d, vals[4 * i + 1] * inv_d,
+                        vals[4 * i + 2] * inv_d, vals[4 * i + 3] * inv_d);
+                    uint32_t packed;
+#if CUDART_VERSION >= 12080
+                    if constexpr (mxfp_type == GGML_TYPE_MXFP6_E2M3) {
+                        // x4 vectorized: float4 → 4 byte-padded FP6 values in uint32.
+                        __nv_fp6x4_e2m3 fp6(f4); packed = fp6.__x;
+                    } else if constexpr (mxfp_type == GGML_TYPE_MXFP6_E3M2) {
+                        __nv_fp6x4_e3m2 fp6(f4); packed = fp6.__x;
+                    } else
+#endif
+#if CUDART_VERSION >= 12050
+                    if constexpr (mxfp_type == GGML_TYPE_MXFP8_E4M3) {
+                        // x4 vectorized: float4 → 4 FP8 values in uint32.
+                        __nv_fp8x4_e4m3 fp8(f4); packed = fp8.__x;
+                    } else if constexpr (mxfp_type == GGML_TYPE_MXFP8_E5M2) {
+                        __nv_fp8x4_e5m2 fp8(f4); packed = fp8.__x;
+                    } else
+#endif
+                    {
+                        // Scalar fallback for older CUDA.
+                        constexpr bool is_fp6 = (mxfp_type == GGML_TYPE_MXFP6_E2M3 || mxfp_type == GGML_TYPE_MXFP6_E3M2);
+                        constexpr uint8_t elem_mask = is_fp6 ? 0x3F : 0xFF;
+                        uint8_t bytes[4];
 #pragma unroll
-                    for (int v = 0; v < 4; ++v) {
-                        bytes[v] = mxfp_traits<mxfp_type>::quantize_elem(vals[4 * i + v] * inv_d) & elem_mask;
+                        for (int v = 0; v < 4; ++v) {
+                            bytes[v] = mxfp_traits<mxfp_type>::quantize_elem((&f4.x)[v]) & elem_mask;
+                        }
+                        packed = *reinterpret_cast<uint32_t *>(bytes);
                     }
-                    tile_Q_qs[jc * stride_q_qs + int_idx] = *reinterpret_cast<uint32_t *>(bytes);
+                    tile_Q_qs[jc * stride_q_qs + int_idx] = packed;
                 }
             }
 

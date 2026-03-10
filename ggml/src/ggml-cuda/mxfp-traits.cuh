@@ -81,11 +81,19 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP4_E2M1> {
             const float * __restrict__ src, char * __restrict__ row_base,
             int block_idx, int /*blocks_per_row_total*/, float inv_d) {
         uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * qs_per_block);
+#if CUDART_VERSION >= 12080
+        // Vectorized: quantize lo+hi pair → byte via x2 intrinsic (lo→low nibble, hi→high nibble).
+        for (int j = 0; j < QK_MXFP4/2; ++j) {
+            __nv_fp4x2_e2m1 fp4(make_float2(src[j] * inv_d, src[QK_MXFP4/2 + j] * inv_d));
+            qs_dst[j] = fp4.__x;
+        }
+#else
         for (int j = 0; j < QK_MXFP4/2; ++j) {
             const uint8_t lo = ggml_cuda_float_to_fp4_e2m1(src[j], inv_d);
             const uint8_t hi = ggml_cuda_float_to_fp4_e2m1(src[QK_MXFP4/2 + j], inv_d);
             qs_dst[j] = lo | (hi << 4);
         }
+#endif
     }
 };
 
@@ -363,13 +371,17 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E2M3> {
         uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * qs_per_block);
         for (int j = 0; j < 32; j += 4) {
             uint8_t vals[4];
-            for (int jj = 0; jj < 4; ++jj) {
 #if CUDART_VERSION >= 12080
-                vals[jj] = (uint8_t)__nv_cvt_float_to_fp6(src[j + jj] * inv_d, __NV_E2M3, cudaRoundNearest);
+            // Vectorized: quantize 4 floats → 4 byte-padded FP6 in one x4 intrinsic.
+            __nv_fp6x4_e2m3 fp6(make_float4(
+                src[j + 0] * inv_d, src[j + 1] * inv_d,
+                src[j + 2] * inv_d, src[j + 3] * inv_d));
+            memcpy(vals, &fp6.__x, 4);
 #else
+            for (int jj = 0; jj < 4; ++jj) {
                 vals[jj] = mxfp_detail::float_to_fp6_e2m3(src[j + jj] * inv_d);
-#endif
             }
+#endif
             mxfp_detail::pack_fp6x4(vals, &qs_dst[j * 3 / 4]);
         }
     }
@@ -418,13 +430,17 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E3M2> {
         uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * qs_per_block);
         for (int j = 0; j < 32; j += 4) {
             uint8_t vals[4];
-            for (int jj = 0; jj < 4; ++jj) {
 #if CUDART_VERSION >= 12080
-                vals[jj] = (uint8_t)__nv_cvt_float_to_fp6(src[j + jj] * inv_d, __NV_E3M2, cudaRoundNearest);
+            // Vectorized: quantize 4 floats → 4 byte-padded FP6 in one x4 intrinsic.
+            __nv_fp6x4_e3m2 fp6(make_float4(
+                src[j + 0] * inv_d, src[j + 1] * inv_d,
+                src[j + 2] * inv_d, src[j + 3] * inv_d));
+            memcpy(vals, &fp6.__x, 4);
 #else
+            for (int jj = 0; jj < 4; ++jj) {
                 vals[jj] = mxfp_detail::float_to_fp6_e3m2(src[j + jj] * inv_d);
-#endif
             }
+#endif
             mxfp_detail::pack_fp6x4(vals, &qs_dst[j * 3 / 4]);
         }
     }
@@ -470,14 +486,21 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E4M3> {
     static __device__ __forceinline__ void write_qs(
             const float * __restrict__ src, char * __restrict__ row_base,
             int block_idx, int /*blocks_per_row_total*/, float inv_d) {
-        uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * qs_per_block);
-        for (int j = 0; j < 32; ++j) {
+        uint32_t * qs_dst = reinterpret_cast<uint32_t *>(row_base + block_idx * qs_per_block);
 #if CUDART_VERSION >= 12050
-            qs_dst[j] = __nv_cvt_float_to_fp8(src[j] * inv_d, __NV_SATFINITE, __NV_E4M3);
-#else
-            qs_dst[j] = mxfp_detail::float_to_fp8_e4m3(src[j] * inv_d);
-#endif
+        // Vectorized: quantize 4 floats → uint32 in one x4 intrinsic.
+        for (int j = 0; j < 32; j += 4) {
+            __nv_fp8x4_e4m3 fp8(make_float4(
+                src[j + 0] * inv_d, src[j + 1] * inv_d,
+                src[j + 2] * inv_d, src[j + 3] * inv_d));
+            qs_dst[j / 4] = fp8.__x;
         }
+#else
+        uint8_t * qs_bytes = reinterpret_cast<uint8_t *>(qs_dst);
+        for (int j = 0; j < 32; ++j) {
+            qs_bytes[j] = mxfp_detail::float_to_fp8_e4m3(src[j] * inv_d);
+        }
+#endif
     }
 };
 
@@ -521,14 +544,21 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E5M2> {
     static __device__ __forceinline__ void write_qs(
             const float * __restrict__ src, char * __restrict__ row_base,
             int block_idx, int /*blocks_per_row_total*/, float inv_d) {
-        uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * qs_per_block);
-        for (int j = 0; j < 32; ++j) {
+        uint32_t * qs_dst = reinterpret_cast<uint32_t *>(row_base + block_idx * qs_per_block);
 #if CUDART_VERSION >= 12050
-            qs_dst[j] = __nv_cvt_float_to_fp8(src[j] * inv_d, __NV_SATFINITE, __NV_E5M2);
-#else
-            qs_dst[j] = mxfp_detail::float_to_fp8_e5m2(src[j] * inv_d);
-#endif
+        // Vectorized: quantize 4 floats → uint32 in one x4 intrinsic.
+        for (int j = 0; j < 32; j += 4) {
+            __nv_fp8x4_e5m2 fp8(make_float4(
+                src[j + 0] * inv_d, src[j + 1] * inv_d,
+                src[j + 2] * inv_d, src[j + 3] * inv_d));
+            qs_dst[j / 4] = fp8.__x;
         }
+#else
+        uint8_t * qs_bytes = reinterpret_cast<uint8_t *>(qs_dst);
+        for (int j = 0; j < 32; ++j) {
+            qs_bytes[j] = mxfp_detail::float_to_fp8_e5m2(src[j] * inv_d);
+        }
+#endif
     }
 };
 

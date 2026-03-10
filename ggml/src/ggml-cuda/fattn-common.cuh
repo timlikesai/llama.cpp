@@ -648,11 +648,31 @@ static __device__ __forceinline__ void dequantize_V_mxfp4_soa(
         *reinterpret_cast<uint16_t *>(qs) = __ldg(reinterpret_cast<const uint16_t *>(V_row + qs_head_off + ib * 16 + iqs));
     }
 
-    const float d = ggml_cuda_e8m0_to_fp32(__ldg(reinterpret_cast<const uint8_t *>(V_row + e_head_off + ib))) * 0.5f;
+    const float d_raw = ggml_cuda_e8m0_to_fp32(__ldg(reinterpret_cast<const uint8_t *>(V_row + e_head_off + ib)));
 
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
-        const half2 dh = __float2half2_rn(d);
+#if CUDART_VERSION >= 12050
+        // Direct FP4→half2 via HW intrinsics: convert full bytes, select nibble half.
+        // Eliminates nibble extraction + repacking — 2 fewer integer ops per pair.
+        // __nv_cvt_fp4x2_to_halfraw2 gives true FP4 E2M1 values → scale without 0.5f.
+        const half2 dh = __float2half2_rn(d_raw);
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            // Convert both nibbles of each byte in one HW instruction.
+            const half2 ab0 = *reinterpret_cast<const half2 *>(
+                &__nv_cvt_fp4x2_to_halfraw2(qs[l0],     __NV_E2M1));
+            const half2 ab1 = *reinterpret_cast<const half2 *>(
+                &__nv_cvt_fp4x2_to_halfraw2(qs[l0 + 1], __NV_E2M1));
+            // ab.x = low nibble (elements 0-15), ab.y = high nibble (elements 16-31).
+            // Select the half we need based on shift.
+            const half2 h2 = shift ? __highs2half2(ab0, ab1) : __lows2half2(ab0, ab1);
+            ((half2 *) dst)[l0/2] = dh * h2;
+        }
+#else
+        // Fallback: LUT-based dequant (kvalues_mxfp4 stores 2× values → scale includes 0.5f).
+        const half2 dh = __float2half2_rn(d_raw * 0.5f);
 
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
@@ -660,9 +680,12 @@ static __device__ __forceinline__ void dequantize_V_mxfp4_soa(
             const int q1 = shift ? (qs[l0 + 1] >> 4) : (qs[l0 + 1] & 0xF);
             ((half2 *) dst)[l0/2] = dh * make_half2(kvalues_mxfp4[q0], kvalues_mxfp4[q1]);
         }
+#endif
     } else
 #endif // FP16_AVAILABLE
     if constexpr (std::is_same_v<T, float>) {
+        // Float path: keep LUT approach (kvalues_mxfp4 stores 2× values → scale includes 0.5f).
+        const float d = d_raw * 0.5f;
 #pragma unroll
         for (int l = 0; l < ne; ++l) {
             const int q = shift ? (qs[l] >> 4) : (qs[l] & 0xF);
@@ -742,19 +765,36 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp_soa_impl(
         const int ib = elem_start / QK;
         const int elem_in_block = elem_start % QK;
 
-        uint8_t vals[4];
-        mxfp_load_elems<mxfp_type, 4>(K_row + qs_head_off, ib, elem_in_block, vals);
-
         const int u = Q_q8[k_KQ_0/nthreads];
         const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
 
         const float e = ggml_cuda_e8m0_to_fp32(__ldg(reinterpret_cast<const uint8_t *>(K_row + e_head_off + ib)));
 
         float dot = 0.0f;
+#if CUDART_VERSION >= 12050
+        if constexpr (mxfp_traits<mxfp_type>::bits_per_elem == 8) {
+            // Vectorized FP8→float4: batch dequant 4 elements via HW intrinsics.
+            constexpr int qpb = mxfp_traits<mxfp_type>::qs_per_block;
+            const uint32_t packed = __ldg(reinterpret_cast<const uint32_t *>(
+                K_row + qs_head_off + ib * qpb + elem_in_block));
+            float4 f4;
+            if constexpr (mxfp_type == GGML_TYPE_MXFP8_E4M3) {
+                __nv_fp8x4_e4m3 fp8; fp8.__x = packed; f4 = float4(fp8);
+            } else {
+                __nv_fp8x4_e5m2 fp8; fp8.__x = packed; f4 = float4(fp8);
+            }
+            const int8_t * q = reinterpret_cast<const int8_t *>(&u);
+            dot = f4.x*float(q[0]) + f4.y*float(q[1]) + f4.z*float(q[2]) + f4.w*float(q[3]);
+        } else
+#endif
+        {
+            uint8_t vals[4];
+            mxfp_load_elems<mxfp_type, 4>(K_row + qs_head_off, ib, elem_in_block, vals);
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const int8_t q_val = reinterpret_cast<const int8_t *>(&u)[i];
-            dot += mxfp_elem_to_float<mxfp_type>(vals[i]) * float(q_val);
+            for (int i = 0; i < 4; ++i) {
+                const int8_t q_val = reinterpret_cast<const int8_t *>(&u)[i];
+                dot += mxfp_elem_to_float<mxfp_type>(vals[i]) * float(q_val);
+            }
         }
 
         sum += e * dot * Q_ds.x;
@@ -788,9 +828,37 @@ static __device__ __forceinline__ void dequantize_V_mxfp_soa_impl(
 
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
-            ((half2 *) dst)[l0/2] = dh * make_half2(
-                __float2half(mxfp_elem_to_float<mxfp_type>(vals[l0 + 0])),
-                __float2half(mxfp_elem_to_float<mxfp_type>(vals[l0 + 1])));
+            half2 h2;
+#if CUDART_VERSION >= 12050
+            if constexpr (mxfp_type == GGML_TYPE_MXFP8_E4M3) {
+                // Direct FP8→half2 via HW intrinsics (skips float intermediate).
+                __nv_fp8x2_e4m3 fp8;
+                fp8.__x = (uint16_t)vals[l0] | ((uint16_t)vals[l0 + 1] << 8);
+                h2 = half2(fp8);
+            } else if constexpr (mxfp_type == GGML_TYPE_MXFP8_E5M2) {
+                __nv_fp8x2_e5m2 fp8;
+                fp8.__x = (uint16_t)vals[l0] | ((uint16_t)vals[l0 + 1] << 8);
+                h2 = half2(fp8);
+            } else
+#endif
+#if CUDART_VERSION >= 12080
+            if constexpr (mxfp_type == GGML_TYPE_MXFP6_E2M3) {
+                // Direct FP6→half2 via HW intrinsics (skips float intermediate).
+                const __nv_fp6x2_storage_t p = (uint16_t)vals[l0] | ((uint16_t)vals[l0 + 1] << 8);
+                const __half2_raw h2r = __nv_cvt_fp6x2_to_halfraw2(p, __NV_E2M3);
+                h2 = *reinterpret_cast<const half2 *>(&h2r);
+            } else if constexpr (mxfp_type == GGML_TYPE_MXFP6_E3M2) {
+                const __nv_fp6x2_storage_t p = (uint16_t)vals[l0] | ((uint16_t)vals[l0 + 1] << 8);
+                const __half2_raw h2r = __nv_cvt_fp6x2_to_halfraw2(p, __NV_E3M2);
+                h2 = *reinterpret_cast<const half2 *>(&h2r);
+            } else
+#endif
+            {
+                h2 = make_half2(
+                    __float2half(mxfp_elem_to_float<mxfp_type>(vals[l0 + 0])),
+                    __float2half(mxfp_elem_to_float<mxfp_type>(vals[l0 + 1])));
+            }
+            ((half2 *) dst)[l0/2] = dh * h2;
         }
     } else
 #endif // FP16_AVAILABLE
