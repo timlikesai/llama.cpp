@@ -22,7 +22,7 @@
 
 ---
 
-## Current State (2026-03-08)
+## Current State (2026-03-09)
 
 ### What the code does now (SoA working):
 
@@ -281,29 +281,100 @@ These map to Metal as: different NE/NL configs, wider loads for MXFP8
 
 ---
 
-## STEP 4: Cross-backend pattern sharing [TODO]
+## STEP 4: CUDA HW Intrinsic Optimization [DONE — 2026-03-09]
 
-### 4a. Document Metal-specific vs portable patterns
-### 4b. Update CUDA mxfp-traits.cuh with Metal wins [TODO]
-### 4c. Benchmark CUDA on Linux 2x 5070 Ti [TODO]
+End-to-end audit of all MXFP CUDA dequant/quant paths against NVIDIA FP4/FP6/FP8 intrinsic APIs.
+Reference docs saved: `docs/cuda-fp{4,6,8}-intrinsics.md`
+
+### 4a. x4 Vectorized Quantization [DONE]
+- [x] FP4 write_qs: `__nv_fp4x2_e2m1(float2)` replaces scalar loop (CUDA 12.8+)
+- [x] FP6 write_qs + MMA Q: `__nv_fp6x4_e2m3/e3m2(float4)` → uint32 (CUDA 12.8+)
+- [x] FP8 write_qs + MMA Q: `__nv_fp8x4_e4m3/e5m2(float4)` → uint32 (CUDA 12.5+)
+- [x] VEC FP8 K dot: `__nv_fp8x4 → float4()` x4 dequant (CUDA 12.5+)
+- [x] VEC FP4/FP6/FP8 V dequant: fp4x2/fp6x2/fp8x2 HW intrinsics
+- [x] All paths have scalar fallbacks gated by `CUDART_VERSION`
+- Result: pp512 +0.4-0.8% for MXFP configs, tg128 unchanged, PPL identical
+
+### 4b. MMA FP8/FP6 V Loader Intrinsics [DONE]
+- [x] FP8 V: `__nv_fp8x2_e4m3/e5m2{pair} → half2()` + `__hmul2(scale)` (CUDA 12.5+)
+- [x] FP6 V: `__nv_cvt_fp6x2_to_halfraw2()` + `__hmul2(scale)` (CUDA 12.8+)
+- [x] Eliminates scalar `dequant_elem` + float intermediate + manual half conversion
+- [x] Matches pattern already used by VEC kernel and FP4 MMA V loader
+- Result: pp512 +0.3% for matched V configs, PPL identical
+
+### 4c. Key Finding: x4 Dequant Asymmetry
+- FP8 is the ONLY type with x4 dequant (`__nv_fp8x4 → operator float4()`)
+- FP4 x4 types (`__nv_fp4x4_e2m1`) are quantization-only — no `operator float4()`
+- FP6 x4 types (`__nv_fp6x4_e2m3`) are quantization-only — no `operator float4()`
+- Max FP4 dequant = x2 (`__nv_cvt_fp4x2_to_halfraw2`), max FP6 dequant = x2
+
+### 4d. CUDA Benchmark (post-intrinsics, Qwen3-Coder-30B-A3B, D=128, 16-chunk, RTX 5070 Ti)
+| Config | PPL | pp512 | tg128 | % f16 tg |
+|--------|-----|-------|-------|----------|
+| f16 | 11.53 | 6,263 | 203.7 | 100% |
+| q8_0 | 11.52 | 6,177 | 199.6 | 98.0% |
+| q8+q4 | 11.45 | 6,196 | 199.5 | 97.9% |
+| mxfp8+mxfp8 | 11.60 | 6,022 | 193.5 | 95.0% |
+| mxfp6+mxfp6 | 11.66 | 5,461 | 192.7 | 94.6% |
+| mxfp8+mxfp4 | 11.61 | 6,034 | 191.3 | 93.9% |
+| mxfp6+mxfp4 | 11.50 | 5,980 | 190.5 | 93.5% |
+| mxfp4 | 12.53 | 6,137 | 189.7 | 93.1% |
 
 ---
 
-## STEP 5: Vulkan SoA [TODO]
+## STEP 4e: CUDA Memory Transfer Parallelism [INVESTIGATED — opportunities identified]
 
-### 5a. Research current Vulkan MXFP implementation
-### 5b. Vulkan set_rows shaders → SoA layout
-### 5c. Vulkan FA shaders → SoA dequant
-### 5d. Test on Linux 2x 5070 Ti
+Analyzed all memory transfer hot points in VEC (tg128) and MMA (pp512) kernels.
+The ~6.5% tg128 gap (190 vs 204 t/s) is dequant ALU on the critical path, not memory bandwidth.
+
+### Investigated and Rejected
+- **VEC FP4 dual-nibble thread reduction** (nthreads_KQ 16→8): Mathematically feasible but
+  shuffle savings cancel out (+1 inner, -1 outer). L1 cache makes redundant __ldg free. Skip.
+- **VEC FP6 aligned loads**: 6-bit packing puts groups at byte offsets {0,3,6,9,12,15,18,21}.
+  Only 2/8 are 4-byte aligned. Cannot use uint32_t loads. 3× byte __ldg on same cache line
+  is near-optimal. MMA's cp.async+expand approach requires smem+syncthreads — too costly for VEC.
+- **MMA V cp.async**: V loading partially overlaps with softmax already (double-buffer).
+  Storing raw V in smem + inline dequant would save 88-98% V smem but requires custom
+  A-matrix loader. Medium effort, 2-5% estimated gain. Deferred.
+
+### Open Opportunities (for future work)
+1. **Software pipelining in VEC**: Prefetch K[i+1] while computing K[i] dot. Issue `__ldg`
+   early to fill memory pipeline. Currently K→softmax→V is fully serial per iteration.
+2. **V pre-dequant to smem in VEC**: Stage dequanted V in shared memory while K dots are
+   computing. VEC kernel has smem for KQ scores — could add V staging buffer.
+3. **Quantized-domain V accumulation**: Accumulate raw quantized V values, apply E8M0 scales
+   once at the end. Would eliminate per-element dequant from inner loop entirely.
+   Architecturally complex — needs careful numerical analysis.
+4. **Interleaved K/V phases**: Process half the rows' K dots, then start V dequant for those
+   while computing remaining K dots. Turns serial pipeline into 2-stage overlap.
+5. **MMA single-buffer V (MLA)**: V loading has zero overlap in single-buffer path. cp.async
+   would help most here. 1-2% gain for MLA models.
 
 ---
 
-## STEP 6: CPU SoA — Canonical Reference Implementation [IN PROGRESS]
+## STEP 5: Cross-backend pattern sharing [TODO]
+
+### 5a. Document Metal-specific vs portable patterns
+### 5b. Update CUDA mxfp-traits.cuh with Metal wins [TODO]
+### 5c. Benchmark CUDA on Linux 2x 5070 Ti [TODO]
+
+---
+
+## STEP 6: Vulkan SoA [TODO]
+
+### 6a. Research current Vulkan MXFP implementation
+### 6b. Vulkan set_rows shaders → SoA layout
+### 6c. Vulkan FA shaders → SoA dequant
+### 6d. Test on Linux 2x 5070 Ti
+
+---
+
+## STEP 7: CPU SoA — Canonical Reference Implementation [IN PROGRESS]
 
 CPU is THE canonical reference. CUDA and Metal implement this reference.
 SoA layout: `[qs contiguous][e8m0 contiguous]` per row. No AoS in FA. Ever.
 
-### 6a. SoA quantize/dequantize functions in ggml-quants.c [DONE]
+### 7a. SoA quantize/dequantize functions in ggml-quants.c [DONE]
 - [x] `quantize_row_mxfp4_soa()` / `dequantize_row_mxfp4_soa()` — MXFP4 E2M1
 - [x] `quantize_row_mxfp8_soa()` / `dequantize_row_mxfp8_soa()` — MXFP8 E4M3
 - [x] `quantize_row_mxfp8_e5m2_soa()` / `dequantize_row_mxfp8_e5m2_soa()` — MXFP8 E5M2
@@ -313,31 +384,31 @@ SoA layout: `[qs contiguous][e8m0 contiguous]` per row. No AoS in FA. Ever.
 - [x] Same E8M0 MSE search, same element quantization, different memory layout
 - [x] Use `void *` / `const void *` pointers (not block_mxfp* structs)
 
-### 6b. CPU set_rows → SoA layout [DONE]
+### 7b. CPU set_rows → SoA layout [DONE]
 - [x] `ggml_compute_forward_set_rows_f32()` in ops.cpp detects MXFP types
 - [x] Routes to SoA quantize functions instead of AoS `from_float`
 - [x] Non-MXFP types unchanged (use standard AoS `from_float`)
 
-### 6c. CPU FA → SoA dequant [DONE]
+### 7c. CPU FA → SoA dequant [DONE]
 - [x] Scalar FA (single-query path): K and V dequant use SoA functions
 - [x] Tiled GEMM FA (multi-query path): K and V dequant use SoA functions
 - [x] Q preprocessing: SoA round-trip (quantize → dequant) captures quantization loss
 - [x] Both FA paths use type-specific SoA function pointer dispatch
 
-### 6d. e_hi clamping bug fix [DONE]
+### 7d. e_hi clamping bug fix [DONE]
 - [x] CPU: `e_hi` clamped to `max(1, ...)` in `mxfp_compute_e8m0_mse()`
 - [x] Metal: `e_hi` clamped to `max(..., 1)` in both MSE search sites
 - [x] Vulkan: `e_hi` clamped to `max(1, ...)` in all 5 set_rows MSE search sites
 - When `e_base` is very negative, `e_hi` could become <1, causing MSE loop to not execute
 
-### 6e. Validate CPU SoA end-to-end [TODO]
+### 7e. Validate CPU SoA end-to-end [TODO]
 - [ ] Run kv-bench-local.sh with CPU backend for all MXFP configs
 - [ ] Compare PPL against f16 baseline
 - [ ] Verify CPU results match Metal results
 
 ---
 
-## STEP 7: SIMD SoA Dequant for CPU Flash Attention [TODO]
+## STEP 8: SIMD SoA Dequant for CPU Flash Attention [TODO]
 
 CPU FA currently uses scalar SoA dequant (plain C loops from ggml-quants.c).
 This step adds ARM NEON and x86 AVX2 optimized SoA dequant for FA performance.
@@ -357,7 +428,7 @@ ops.cpp:           FA calls _cpu() instead of scalar SoA ref directly
 - SoA: contiguous qs region → `vld1q_u8` (NEON) / `_mm256_loadu_si256` (AVX2) on aligned data
 - E8M0 separate → load once per block, broadcast to all 32 elements
 
-### 7a. ARM NEON SoA dequant [TODO]
+### 8a. ARM NEON SoA dequant [TODO]
 Functions to add in `arch/arm/quants.c`:
 - [ ] `dequantize_row_mxfp4_soa_cpu()` — LUT[nibble] × e8m0_scale, 16B qs/block
 - [ ] `dequantize_row_mxfp8_soa_cpu()` — FP8→float via IEEE bit ops, 32B qs/block
@@ -375,7 +446,7 @@ NEON approach per block:
 4. Store float32x4_t results
 ```
 
-### 7b. x86 AVX2 SoA dequant [TODO]
+### 8b. x86 AVX2 SoA dequant [TODO]
 Functions to add in `arch/x86/quants.c`:
 - [ ] `dequantize_row_mxfp4_soa_cpu()` — `_mm_shuffle_epi8` LUT + scale
 - [ ] `dequantize_row_mxfp8_soa_cpu()` — IEEE bit manipulation + scale
@@ -383,13 +454,13 @@ Functions to add in `arch/x86/quants.c`:
 - [ ] `dequantize_row_mxfp6_e2m3_soa_cpu()` — unpack + IEEE + scale
 - [ ] `dequantize_row_mxfp6_e3m2_soa_cpu()` — same, E3M2 params
 
-### 7c. Dispatch wiring [TODO]
+### 8c. Dispatch wiring [TODO]
 - [ ] `quants.h`: declare all 10 SoA dequant functions (_cpu + _generic)
 - [ ] `quants.c`: generic wrappers calling scalar SoA ref
 - [ ] `arch-fallback.h`: add `#define _generic _cpu` for all new functions
 - [ ] `ops.cpp`: FA function pointer dispatch calls `_cpu()` variants
 
-### 7d. SIMD SoA quantize for set_rows [TODO — lower priority]
+### 8d. SIMD SoA quantize for set_rows [TODO — lower priority]
 - [ ] ARM NEON SoA quantize (5 types)
 - [ ] x86 AVX2 SoA quantize (5 types)
 - Lower priority because set_rows runs once per token, FA dequant runs per KV position
@@ -638,9 +709,9 @@ Step   │ Operation              │ CUDA (reference)              │ Metal (c
 ───────┼────────────────────────┼───────────────────────────────┼───────────────────────────────┼────────
 5.1    │ Load V from SoA        │ Dequant V → half2 in smem     │ Dequant V on-the-fly          │ ✓ same math
        │                        │ load_V_f16/mxfp8/mxfp6()     │ dequant_mxfp_soa_4x4/t4()    │
-       │                        │ MXFP4: LUT × e8m0 scale      │ MXFP4: LUT × e8m0 scale      │
-       │                        │ MXFP8: dequant × scale        │ MXFP8: LUT × scale           │
-       │                        │ MXFP6: unpack 6b × scale      │ MXFP6: unpack 6b × scale     │
+       │                        │ MXFP4: fp4x2 HW → half2      │ MXFP4: LUT × e8m0 scale      │
+       │                        │ MXFP8: fp8x2 HW → half2      │ MXFP8: LUT × scale           │
+       │                        │ MXFP6: fp6x2 HW → half2      │ MXFP6: unpack 6b × scale     │
 ───────┼────────────────────────┼───────────────────────────────┼───────────────────────────────┼────────
 5.2    │ VKQ MMA                │ half2 V tile × softmax(QK)    │ float/half V × softmax(QK)    │ ✓
        │                        │ via MMA instruction           │ via simdgroup MMA             │
