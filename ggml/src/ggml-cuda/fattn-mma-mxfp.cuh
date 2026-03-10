@@ -528,15 +528,25 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_load_V_mxfp8_f16(
                 const int qs_blk_off = (i0_start / 32 + blk_idx) * QK_MXFP8;
                 const uint16_t pair = *reinterpret_cast<const uint16_t *>(
                     row_t + V_qs_head_off + qs_blk_off + 2 * pair_in_blk);
+                const uint8_t e_val = *(row_t + V_e_head_off + i0_start / 32 + blk_idx);
+                const half2 scale_h2 = __float2half2_rn(ggml_cuda_e8m0_to_fp32(e_val));
+
+#if CUDART_VERSION >= 12050
+                if constexpr (v_mxfp8_type == GGML_TYPE_MXFP8_E4M3) {
+                    __nv_fp8x2_e4m3 fp8; fp8.__x = pair;
+                    val = __hmul2(half2(fp8), scale_h2);
+                } else {
+                    __nv_fp8x2_e5m2 fp8; fp8.__x = pair;
+                    val = __hmul2(half2(fp8), scale_h2);
+                }
+#else
                 const uint8_t fp8_0 = pair & 0xFF;
                 const uint8_t fp8_1 = pair >> 8;
-
-                const uint8_t e_val = *(row_t + V_e_head_off + i0_start / 32 + blk_idx);
-                const float scale = ggml_cuda_e8m0_to_fp32(e_val);
-
+                const float scale = __half2float(scale_h2.x);
                 const float v0 = mxfp_traits<v_mxfp8_type>::dequant_elem(fp8_0) * scale;
                 const float v1 = mxfp_traits<v_mxfp8_type>::dequant_elem(fp8_1) * scale;
                 val = make_half2(__float2half(v0), __float2half(v1));
+#endif
             }
             tile_V[t * stride_tile_V + d_h2] = val;
         }
@@ -613,11 +623,24 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_load_V_mxfp6_f16(
                 }
 
                 const uint8_t e_val = *(row_t + V_e_head_off + i0_start / 32 + blk_idx);
-                const float scale = ggml_cuda_e8m0_to_fp32(e_val);
+                const half2 scale_h2 = __float2half2_rn(ggml_cuda_e8m0_to_fp32(e_val));
 
-                const float f0 = mxfp_traits<v_mxfp6_type>::dequant_elem(v0_fp6) * scale;
-                const float f1 = mxfp_traits<v_mxfp6_type>::dequant_elem(v1_fp6) * scale;
-                val = make_half2(__float2half(f0), __float2half(f1));
+#if CUDART_VERSION >= 12080
+                {
+                    constexpr __nv_fp6_interpretation_t fp6_interp =
+                        (v_mxfp6_type == GGML_TYPE_MXFP6_E2M3) ? __NV_E2M3 : __NV_E3M2;
+                    const __nv_fp6x2_storage_t p = (uint16_t)v0_fp6 | ((uint16_t)v1_fp6 << 8);
+                    const __half2_raw h2r = __nv_cvt_fp6x2_to_halfraw2(p, fp6_interp);
+                    val = __hmul2(*reinterpret_cast<const half2 *>(&h2r), scale_h2);
+                }
+#else
+                {
+                    const float scale = __half2float(scale_h2.x);
+                    const float f0 = mxfp_traits<v_mxfp6_type>::dequant_elem(v0_fp6) * scale;
+                    const float f1 = mxfp_traits<v_mxfp6_type>::dequant_elem(v1_fp6) * scale;
+                    val = make_half2(__float2half(f0), __float2half(f1));
+                }
+#endif
             }
             tile_V[t * stride_tile_V + d_h2] = val;
         }
