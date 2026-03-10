@@ -322,10 +322,11 @@ Reference docs saved: `docs/cuda-fp{4,6,8}-intrinsics.md`
 
 ---
 
-## STEP 4e: CUDA Memory Transfer Parallelism [INVESTIGATED — opportunities identified]
+## STEP 4e: CUDA Memory Transfer Parallelism [CLOSED — at practical limit]
 
 Analyzed all memory transfer hot points in VEC (tg128) and MMA (pp512) kernels.
-The ~6.5% tg128 gap (190 vs 204 t/s) is dequant ALU on the critical path, not memory bandwidth.
+The ~6% tg128 gap (190 vs 204 t/s) is dequant ALU on the critical path, not memory bandwidth.
+VEC MXFP is at 93-94% of f16 tg128 — this is the practical ceiling for MXFP types.
 
 ### Investigated and Rejected
 - **VEC FP4 dual-nibble thread reduction** (nthreads_KQ 16→8): Mathematically feasible but
@@ -336,19 +337,16 @@ The ~6.5% tg128 gap (190 vs 204 t/s) is dequant ALU on the critical path, not me
 - **MMA V cp.async**: V loading partially overlaps with softmax already (double-buffer).
   Storing raw V in smem + inline dequant would save 88-98% V smem but requires custom
   A-matrix loader. Medium effort, 2-5% estimated gain. Deferred.
+- **Software pipelining in VEC** [TESTED 2026-03-09]: PTX `prefetch.global.L1` for next-iteration
+  K data during softmax+V phase. Zero measurable impact. Despite `__launch_bounds__(128,1)` giving
+  only 4 warps for latency hiding, warp scheduling already hides memory latency adequately.
+  Bottleneck is confirmed as dequant ALU, not memory latency.
 
-### Open Opportunities (for future work)
-1. **Software pipelining in VEC**: Prefetch K[i+1] while computing K[i] dot. Issue `__ldg`
-   early to fill memory pipeline. Currently K→softmax→V is fully serial per iteration.
-2. **V pre-dequant to smem in VEC**: Stage dequanted V in shared memory while K dots are
-   computing. VEC kernel has smem for KQ scores — could add V staging buffer.
-3. **Quantized-domain V accumulation**: Accumulate raw quantized V values, apply E8M0 scales
-   once at the end. Would eliminate per-element dequant from inner loop entirely.
-   Architecturally complex — needs careful numerical analysis.
-4. **Interleaved K/V phases**: Process half the rows' K dots, then start V dequant for those
-   while computing remaining K dots. Turns serial pipeline into 2-stage overlap.
-5. **MMA single-buffer V (MLA)**: V loading has zero overlap in single-buffer path. cp.async
-   would help most here. 1-2% gain for MLA models.
+### Remaining Opportunities (diminishing returns)
+- **V pre-dequant to smem**: Same ALU bottleneck — would not help.
+- **Quantized-domain V accumulation**: NOT FEASIBLE — E8M0 scales vary per row, cannot defer.
+- **Interleaved K/V phases**: Overlaps memory, but bottleneck is ALU.
+- **MMA single-buffer V cp.async (MLA)**: 1-2% for MLA only. Low priority.
 
 ---
 

@@ -62,17 +62,17 @@ DO_BUILD=true
 DO_PERPLEXITY=true
 DO_BENCH=true
 CHUNKS_LIST=(16)
-# All MXFP configs use V=mxfp4 (K dominates quality; avoids cartesian explosion).
+# Match CUDA kv-bench.sh configs for like-for-like comparison.
 CONFIGS=(
     "f16"
     "q8_0"
     "q4_0"
     "q8_0+q4_0"
     "mxfp8"
-    "mxfp8_e5m2"
     "mxfp6"
-    "mxfp6_e3m2"
     "mxfp4"
+    "mxfp8+mxfp8"
+    "mxfp6+mxfp6"
 )
 MODEL_INPUTS=()
 _config_overridden=false
@@ -195,6 +195,8 @@ config_types() {
         mxfp6|mxfp6_e2m3)   TYPE_K="mxfp6_e2m3";  TYPE_V="mxfp4";  CLI_K="mxfp6";      CLI_V="mxfp4"     ;;
         mxfp6_e3m2)         TYPE_K="mxfp6_e3m2";  TYPE_V="mxfp4";  CLI_K="mxfp6_e3m2"; CLI_V="mxfp4"     ;;
         mxfp4)        TYPE_K="mxfp4";        TYPE_V="mxfp4";  CLI_K="mxfp4";     CLI_V="mxfp4"     ;;
+        mxfp8+mxfp8)  TYPE_K="mxfp8_e4m3";  TYPE_V="mxfp8_e4m3"; CLI_K="mxfp8";  CLI_V="mxfp8"     ;;
+        mxfp6+mxfp6)  TYPE_K="mxfp6_e2m3";  TYPE_V="mxfp6_e2m3"; CLI_K="mxfp6";  CLI_V="mxfp6"     ;;
         *)
             echo "Unknown config: $1"
             exit 1
