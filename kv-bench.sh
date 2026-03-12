@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # KV Cache Quantization Benchmark — Unified (Metal local + CUDA Docker)
 #
@@ -40,6 +40,7 @@ MODELS=(
     "gpt-oss-20b|lmstudio-community/gpt-oss-20b-GGUF/gpt-oss-20b-MXFP4.gguf"
     "gpt-oss-120b|lmstudio-community/gpt-oss-120b-GGUF/gpt-oss-120b-MXFP4-00001-of-00002.gguf"
     "nemotron-nano|noctrex/Nemotron-3-Nano-30B-A3B-MXFP4_MOE-GGUF/NVIDIA-Nemotron-3-Nano-30B-A3B-MXFP4_MOE.gguf"
+    "nemotron-super|unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF/NVIDIA-Nemotron-3-Super-120B-A12B-MXFP4_MOE-00001-of-00003.gguf"
     "glm-4.7-flash|noctrex/GLM-4.7-Flash-MXFP4_MOE-GGUF/GLM-4.7-Flash-MXFP4_MOE.gguf"
     "glm-4.7-flash-i1-xl|noctrex/GLM-4.7-Flash-i1-MXFP4_MOE_XL-exp-GGUF/GLM-4.7-Flash-i1-MXFP4_MOE_XL-exp.gguf"
     # ── Standard quant models ──
