@@ -58,8 +58,9 @@ MODELS=(
     "qwen3-4b-math|mradermacher/Qwen3-4B-math-GGUF/Qwen3-4B-math.Q8_0.gguf"
     "lfm2.5-thinking|unsloth/LFM2.5-1.2B-Thinking-GGUF/LFM2.5-1.2B-Thinking-Q8_0.gguf"
     "lfm2.5-instruct|unsloth/LFM2.5-1.2B-Instruct-GGUF/LFM2.5-1.2B-Instruct-Q8_0.gguf"
-    "embeddinggemma|unsloth/embeddinggemma-300m-GGUF/embeddinggemma-300M-Q8_0.gguf"
     "qwen3.5-27b-q4|unsloth/Qwen3.5-27B-GGUF/Qwen3.5-27B-Q4_1.gguf"
+    "gemma-3-12b-qat-q8|unsloth/gemma-3-12b-it-qat-GGUF/gemma-3-12b-it-qat-Q8_0.gguf"
+    "gemma-3-12b-qat-q4|unsloth/gemma-3-12b-it-qat-GGUF/gemma-3-12b-it-qat-Q4_0.gguf"
 )
 DEFAULT_MODEL="qwen3-coder"
 
@@ -69,7 +70,7 @@ DO_PERPLEXITY=true
 DO_BENCH=true
 DO_GPU=true
 DO_CPU=false
-CHUNKS_LIST=(16)
+CHUNKS_LIST=(16 128)
 REPEATS=3
 PP=512
 TG=128
@@ -109,9 +110,13 @@ while [[ $# -gt 0 ]]; do
             fi
             case "$2" in
                 f16)   CONFIGS+=("f16") ;;
-                mxfp)  CONFIGS+=("mxfp8" "mxfp8_e5m2" "mxfp6" "mxfp6_e3m2" "mxfp4") ;;
+                mxfp)  CONFIGS+=("mxfp8" "mxfp8_e5m2" "mxfp6" "mxfp6_e3m2" "mxfp4"
+                                  "mxfp8+mxfp8" "mxfp8_e5m2+mxfp8_e5m2" "mxfp6+mxfp6" "mxfp6_e3m2+mxfp6_e3m2") ;;
                 mxfp8) CONFIGS+=("mxfp8" "mxfp8_e5m2") ;;
                 mxfp6) CONFIGS+=("mxfp6" "mxfp6_e3m2") ;;
+                all)   CONFIGS+=("f16" "q8_0" "q4_0" "q8_0+q4_0"
+                                  "mxfp8" "mxfp8_e5m2" "mxfp6" "mxfp6_e3m2" "mxfp4"
+                                  "mxfp8+mxfp8" "mxfp8_e5m2+mxfp8_e5m2" "mxfp6+mxfp6" "mxfp6_e3m2+mxfp6_e3m2") ;;
                 *)     CONFIGS+=("$2") ;;
             esac
             shift 2
@@ -141,6 +146,13 @@ while [[ $# -gt 0 ]]; do
             esac
             shift 2
             ;;
+        --all)
+            MODEL_INPUTS=()
+            for entry in "${MODELS[@]}"; do
+                MODEL_INPUTS+=("${entry%%|*}")
+            done
+            shift
+            ;;
         --help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -163,10 +175,12 @@ while [[ $# -gt 0 ]]; do
             echo "  --config NAME       Config to test (repeatable). Available:"
             echo "                        f16, q8_0, q4_0, q8_0+q4_0"
             echo "                        mxfp8, mxfp8_e5m2, mxfp6, mxfp6_e3m2, mxfp4"
-            echo "                        mxfp8+mxfp8, mxfp6+mxfp6"
-            echo "                      Groups: mxfp (all 5), mxfp8 (both), mxfp6 (both)"
+            echo "                        mxfp8+mxfp8, mxfp8_e5m2+mxfp8_e5m2"
+            echo "                        mxfp6+mxfp6, mxfp6_e3m2+mxfp6_e3m2"
+            echo "                      Groups: all, mxfp (all 9), mxfp8 (both), mxfp6 (both)"
             echo "  --model NAME|PATH   Model preset, path, or group (repeatable)"
             echo "                      Groups: gemma, glm, qwen, all"
+            echo "  --all               Shortcut for --model all"
             echo ""
             echo "Models:"
             for entry in "${MODELS[@]}"; do

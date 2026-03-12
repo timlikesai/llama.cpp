@@ -1346,6 +1346,17 @@ bool ggml_is_type_mxfp(enum ggml_type type) {
            type == GGML_TYPE_MXFP6_E3M2;
 }
 
+bool ggml_mxfp_use_hadamard(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_MXFP4_E2M1:  return MXFP_USE_HADAMARD_E2M1;
+        case GGML_TYPE_MXFP8_E4M3:  return MXFP_USE_HADAMARD_E4M3;
+        case GGML_TYPE_MXFP8_E5M2:  return MXFP_USE_HADAMARD_E5M2;
+        case GGML_TYPE_MXFP6_E2M3:  return MXFP_USE_HADAMARD_E2M3;
+        case GGML_TYPE_MXFP6_E3M2:  return MXFP_USE_HADAMARD_E3M2;
+        default: return false;
+    }
+}
+
 const char * ggml_op_name(enum ggml_op op) {
     return GGML_OP_NAME[op];
 }

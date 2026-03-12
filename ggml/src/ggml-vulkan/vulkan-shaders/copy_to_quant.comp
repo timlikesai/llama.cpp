@@ -258,7 +258,7 @@ void hadamard_32_inplace(inout float vals[32]) {
             }
         }
     }
-    const float norm = 0.17677669529663689; // 1/sqrt(32)
+    const float norm = MXFP_HADAMARD_32_NORM;
     for (int i = 0; i < 32; ++i) {
         vals[i] *= norm;
     }
@@ -281,6 +281,7 @@ uint compute_e8m0_uint(float vals[32], int emax_offset) {
     return uint(e_base);
 }
 
+// Canonical source: ggml_mxfp_e8m0_to_fp32() in ggml-common.h
 float e8m0_to_fp32(uint e) {
     if (e == 0u) return uintBitsToFloat(0x00400000u); // 2^(-127), matches MX spec
     return uintBitsToFloat(e << 23);

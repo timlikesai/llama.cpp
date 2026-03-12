@@ -103,7 +103,12 @@ void main() {
         const uint mxfp_blocks_per_row = HSK / 32u;
         const uint mxfp_active_rows = min(Br, N - i * Br);
         const uint mxfp_total_blocks = mxfp_active_rows * mxfp_blocks_per_row;
-        const bool mxfp_apply_hadamard = (HSK == HSV);
+        const bool mxfp_apply_hadamard =
+#ifdef MXFP_USE_HADAMARD
+            (HSK == HSV);
+#else
+            false;
+#endif
 
         // Each subgroup handles one block; distribute blocks across subgroups
         const uint lane = gl_SubgroupInvocationID;  // 0..31 within subgroup
@@ -134,7 +139,7 @@ void main() {
                     float other = subgroupShuffleXor(val, stride);
                     val = ((lane & stride) == 0u) ? val + other : other - val;
                 }
-                val *= 0.17677669529663689; // 1/sqrt(32)
+                val *= MXFP_HADAMARD_32_NORM;
             }
 
             // E8M0 scale via subgroup max reduction (manual shuffle tree)

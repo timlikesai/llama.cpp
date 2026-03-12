@@ -188,7 +188,7 @@ static __global__ void flash_attn_ext_vec(
                 constexpr int nthreads_quantize = D/sizeof(int) < WARP_SIZE ? D/sizeof(int) : WARP_SIZE;
 #pragma unroll
                 for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_quantize) {
-                    if constexpr (is_mxfp_soa_v<type_K>) {
+                    if constexpr (is_mxfp_soa_v<type_K> && mxfp_use_hadamard_v<type_K>) {
                         quantize_q8_1_hadamard_to_shared<float2, nthreads_quantize>
                             (Q_f + i0*sizeof(int), scale, tmp_q_i32 + i0, tmp_q_ds + i0/QI8_1);
                     } else {

@@ -254,6 +254,10 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
+    set(LLAMA_TEST_NAME test-mxfp-converters)
+    llama_build_and_test(test-mxfp-converters.cpp)
+    target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    unset(LLAMA_TEST_NAME)
 endif()
 
 # libmtmd

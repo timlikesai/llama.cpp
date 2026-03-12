@@ -1766,6 +1766,8 @@ void init_iq_shmem(uvec3 wgsize)
 #endif
 
 #if defined(DATA_A_MXFP4) || defined(MXFP_ALL_DEQUANT)
+// E2M1 values doubled for integer arithmetic (implementation detail).
+// Canonical float values: {0, 0.5, 1, 1.5, 2, 3, 4, 6} — see kvalues_mxfp4_float in ggml-common.h.
 const int8_t kvalues_mxfp4_const[16] = {
     int8_t(0), int8_t(1), int8_t(2), int8_t(3), int8_t(4), int8_t(6), int8_t(8), int8_t(12),
     int8_t(0), int8_t(-1), int8_t(-2), int8_t(-3), int8_t(-4), int8_t(-6), int8_t(-8), int8_t(-12),
@@ -1785,6 +1787,10 @@ void init_iq_shmem(uvec3 wgsize)
 #endif
 
 // FP8 E4M3 dequantization: 1 sign, 4 exponent (bias 7), 3 mantissa
+// MXFP element converters — GLSL copies of canonical implementations in ggml-common.h.
+// GLSL cannot include C headers, so these are maintained separately.
+// Canonical source: ggml_mxfp_fp8_e4m3_to_float() etc. in ggml-common.h.
+//
 // MX E4M3 has NO NaN — all 256 bit patterns are valid numbers.
 // exp=15 mant=7 = ±448 (not NaN as in NVIDIA's non-MX E4M3).
 #if defined(DATA_A_MXFP8_E4M3) || defined(MXFP_ALL_DEQUANT)
@@ -1891,6 +1897,7 @@ vec4 bf16_to_fp32(uvec4 u)
     return vec4(bf16_to_fp32(u.x), bf16_to_fp32(u.y), bf16_to_fp32(u.z), bf16_to_fp32(u.w));
 }
 
+// Canonical source: ggml_mxfp_e8m0_to_fp32() in ggml-common.h (uses memcpy; GLSL uses uintBitsToFloat).
 float e8m0_to_fp32(uint8_t x) {
     return uintBitsToFloat(x == uint8_t(0) ? 0x00400000u : (uint(x) << 23));
 }

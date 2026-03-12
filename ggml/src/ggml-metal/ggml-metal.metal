@@ -46,6 +46,7 @@ constexpr constant static float kvalues_iq4nl_f[16] = {
     -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f, 1.f, 13.f, 25.f, 38.f, 53.f, 69.f, 89.f, 113.f
 };
 
+// Canonical E2M1 values (matches kvalues_mxfp4_float in ggml-common.h).
 constexpr constant static float kvalues_mxfp4_f[16] = {
     0, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f
 };
@@ -157,6 +158,7 @@ static inline int best_index_int8(int n, constant float * val, float x) {
     return x - val[mu-1] < val[mu] - x ? mu-1 : mu;
 }
 
+// Canonical source: ggml_mxfp_e8m0_to_fp32() in ggml-common.h (uses memcpy; MSL uses as_type).
 static inline float e8m0_to_fp32(uint8_t x) {
     uint32_t bits;
 
@@ -874,7 +876,7 @@ static inline float hadamard_32_simd(float val, ushort tiisg) {
         float partner = simd_shuffle_xor(val, stride);
         val = (tiisg & stride) == 0 ? (val + partner) : (partner - val);
     }
-    return val * 0.17677669529663689f; // 1/sqrt(32)
+    return val * MXFP_HADAMARD_32_NORM;
 }
 
 // MSE-optimal E8M0 exponent for a 32-element block (MXFP4, MXFP4_E2M1_EMAX_OFFSET).
@@ -921,6 +923,9 @@ static inline uint8_t mxfp4_compute_e8m0(float val) {
 // MXFP4 round-trip: quantize then dequantize a single value given block scale.
 // Uses decision boundaries instead of 16-element linear scan.
 // Positive kvalues sorted: {0, 0.5, 1, 1.5, 2, 3, 4, 6}
+// Boundaries {0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0} use actual E2M1 values.
+// CPU's ggml-quants.c uses doubled LUT {0,1,2,3,4,6,8,12} with half-scale,
+// boundaries {0.5, 1.5, 2.5, 3.5, 5, 7, 10}. Mathematically identical (×2 factor).
 // Decision boundaries (midpoints): {0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0}
 static inline float mxfp4_roundtrip(float val, float scale) {
     float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
@@ -951,6 +956,8 @@ static inline float mxfp4_preprocess_q_elem(float val, ushort tiisg, bool apply_
 
 // ===== MXFP8 E4M3 dequantization =====
 // FP8 E4M3: 1 sign, 4 exponent (bias 7), 3 mantissa. Max finite = 448.
+// Canonical source: ggml_mxfp_fp8_e4m3_to_float() in ggml-common.h.
+// Metal keeps its own copy due to MSL language differences.
 static inline float fp8_e4m3_to_float(uint8_t v) {
     uint32_t sign = ((uint32_t)(v & 0x80)) << 24;
     uint32_t exp  = (v >> 3) & 0xF;
@@ -1301,13 +1308,21 @@ static inline float mxfp_preprocess_q_elem(float val, ushort tiisg, bool apply_h
 
 // Dispatch MXFP preprocessing by mxfp_type function constant.
 // The function constant is resolved at PSO creation time, so the switch compiles away.
+// Hadamard flag per type from centralized MXFP_USE_HADAMARD_* defines (canonical source: ggml-common.h).
+// mxfp_type mapping: 1=E2M1, 2=E4M3, 3=E5M2, 4=E2M3, 5=E3M2
 static inline float mxfp_preprocess_q_dispatch(float val, ushort tiisg, bool apply_hadamard, int32_t mxfp_type) {
+    const bool use_hadamard = apply_hadamard &&
+        ((mxfp_type == 1 && MXFP_USE_HADAMARD_E2M1) ||
+         (mxfp_type == 2 && MXFP_USE_HADAMARD_E4M3) ||
+         (mxfp_type == 3 && MXFP_USE_HADAMARD_E5M2) ||
+         (mxfp_type == 4 && MXFP_USE_HADAMARD_E2M3) ||
+         (mxfp_type == 5 && MXFP_USE_HADAMARD_E3M2));
     switch (mxfp_type) {
-        case 1:  return mxfp4_preprocess_q_elem(val, tiisg, apply_hadamard);
-        case 2:  return mxfp_preprocess_q_elem<8,  float_to_fp8_e4m3_rn, fp8_e4m3_to_float>(val, tiisg, apply_hadamard);
-        case 3:  return mxfp_preprocess_q_elem<16, float_to_fp8_e5m2_rn, fp8_e5m2_to_float>(val, tiisg, apply_hadamard);
-        case 4:  return mxfp_preprocess_q_elem<3,  float_to_fp6_e2m3_rn, fp6_e2m3_to_float>(val, tiisg, apply_hadamard);
-        case 5:  return mxfp_preprocess_q_elem<5,  float_to_fp6_e3m2_rn, fp6_e3m2_to_float>(val, tiisg, apply_hadamard);
+        case 1:  return mxfp4_preprocess_q_elem(val, tiisg, use_hadamard);
+        case 2:  return mxfp_preprocess_q_elem<MXFP8_E4M3_EMAX_OFFSET, float_to_fp8_e4m3_rn, fp8_e4m3_to_float>(val, tiisg, use_hadamard);
+        case 3:  return mxfp_preprocess_q_elem<MXFP8_E5M2_EMAX_OFFSET, float_to_fp8_e5m2_rn, fp8_e5m2_to_float>(val, tiisg, use_hadamard);
+        case 4:  return mxfp_preprocess_q_elem<MXFP6_E2M3_EMAX_OFFSET, float_to_fp6_e2m3_rn, fp6_e2m3_to_float>(val, tiisg, use_hadamard);
+        case 5:  return mxfp_preprocess_q_elem<MXFP6_E3M2_EMAX_OFFSET, float_to_fp6_e3m2_rn, fp6_e3m2_to_float>(val, tiisg, use_hadamard);
         default: return val;
     }
 }
@@ -9983,7 +9998,7 @@ kernel void kernel_set_rows_mxfp4_simd(
                 float partner = simd_shuffle_xor(val, stride);
                 val = (tiisg & stride) ? (partner - val) : (partner + val);
             }
-            val *= 0.17677669529663689f; // 1/sqrt(32)
+            val *= MXFP_HADAMARD_32_NORM;
         }
 
         uint8_t e = mxfp4_compute_e8m0(val);
@@ -10041,14 +10056,14 @@ kernel void kernel_set_rows_mxfp8_simd(
                 float partner = simd_shuffle_xor(val, stride);
                 val = (tiisg & stride) ? (partner - val) : (partner + val);
             }
-            val *= 0.17677669529663689f; // 1/sqrt(32)
+            val *= MXFP_HADAMARD_32_NORM;
         }
 
         uint8_t e;
         if (MXFP_SUBTYPE == 2) {
-            e = mxfp_compute_e8m0_mse<8, mxfp_roundtrip<float_to_fp8_e4m3_rn, fp8_e4m3_to_float>>(val);
+            e = mxfp_compute_e8m0_mse<MXFP8_E4M3_EMAX_OFFSET, mxfp_roundtrip<float_to_fp8_e4m3_rn, fp8_e4m3_to_float>>(val);
         } else {
-            e = mxfp_compute_e8m0_mse<16, mxfp_roundtrip<float_to_fp8_e5m2_rn, fp8_e5m2_to_float>>(val);
+            e = mxfp_compute_e8m0_mse<MXFP8_E5M2_EMAX_OFFSET, mxfp_roundtrip<float_to_fp8_e5m2_rn, fp8_e5m2_to_float>>(val);
         }
 
         float scale = e8m0_to_fp32(e);
@@ -10100,14 +10115,14 @@ kernel void kernel_set_rows_mxfp6_simd(
                 float partner = simd_shuffle_xor(val, stride);
                 val = (tiisg & stride) ? (partner - val) : (partner + val);
             }
-            val *= 0.17677669529663689f; // 1/sqrt(32)
+            val *= MXFP_HADAMARD_32_NORM;
         }
 
         uint8_t e;
         if (MXFP_SUBTYPE == 4) {
-            e = mxfp_compute_e8m0_mse<3, mxfp_roundtrip<float_to_fp6_e2m3_rn, fp6_e2m3_to_float>>(val);
+            e = mxfp_compute_e8m0_mse<MXFP6_E2M3_EMAX_OFFSET, mxfp_roundtrip<float_to_fp6_e2m3_rn, fp6_e2m3_to_float>>(val);
         } else {
-            e = mxfp_compute_e8m0_mse<5, mxfp_roundtrip<float_to_fp6_e3m2_rn, fp6_e3m2_to_float>>(val);
+            e = mxfp_compute_e8m0_mse<MXFP6_E3M2_EMAX_OFFSET, mxfp_roundtrip<float_to_fp6_e3m2_rn, fp6_e3m2_to_float>>(val);
         }
 
         float scale = e8m0_to_fp32(e);

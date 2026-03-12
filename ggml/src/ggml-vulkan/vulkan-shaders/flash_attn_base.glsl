@@ -631,6 +631,15 @@ uint get_v_block_byte_size() {
 #if defined(DATA_A_MXFP4) || defined(DATA_A_MXFP8_E4M3) || defined(DATA_A_MXFP8_E5M2) || defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
 #define MXFP_Q_PREPROCESS
 
+// Hadamard flag from centralized MXFP_USE_HADAMARD_* defines (canonical source: ggml-common.h).
+#if (defined(DATA_A_MXFP4)       && MXFP_USE_HADAMARD_E2M1) || \
+    (defined(DATA_A_MXFP8_E4M3)  && MXFP_USE_HADAMARD_E4M3) || \
+    (defined(DATA_A_MXFP8_E5M2)  && MXFP_USE_HADAMARD_E5M2) || \
+    (defined(DATA_A_MXFP6_E2M3)  && MXFP_USE_HADAMARD_E2M3) || \
+    (defined(DATA_A_MXFP6_E3M2)  && MXFP_USE_HADAMARD_E3M2)
+#define MXFP_USE_HADAMARD
+#endif
+
 // In-place Hadamard transform on 32 elements in shared memory.
 // shmem points to the start of the 32-element block (as 8 vec4s).
 // Each thread in the workgroup processes assigned elements.
@@ -646,7 +655,7 @@ void hadamard_32_shmem(inout float vals[32]) {
             }
         }
     }
-    const float norm = 0.17677669529663689; // 1/sqrt(32)
+    const float norm = MXFP_HADAMARD_32_NORM;
     for (uint i = 0u; i < 32u; i++) {
         vals[i] *= norm;
     }

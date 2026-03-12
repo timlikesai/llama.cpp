@@ -4979,7 +4979,7 @@ static void hadamard_32_inplace(float vals[32]) {
       s = vaddq_f32(v3, v7); d = vsubq_f32(v3, v7); v3 = s; v7 = d;
     }
 
-    const float32x4_t norm = vdupq_n_f32(0.17677669529663689f);
+    const float32x4_t norm = vdupq_n_f32(MXFP_HADAMARD_32_NORM);
     vst1q_f32(vals +  0, vmulq_f32(v0, norm));
     vst1q_f32(vals +  4, vmulq_f32(v1, norm));
     vst1q_f32(vals +  8, vmulq_f32(v2, norm));
@@ -8391,9 +8391,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         v_to_float = ggml_get_to_float_fn(v->type);
     }
 
-    // Hadamard rotation must match K rotation. Skip for MLA (DK != DV) since
-    // V is a view of K and rotation would corrupt V.
-    const bool apply_hadamard_q = is_mxfp_k && (DK == DV);
+    // Hadamard rotation must match K rotation.
+    // Skipped for: MLA (DK != DV, V is a view of K), E5M2/E3M2 (no quality benefit).
+    const bool apply_hadamard_q = is_mxfp_k && (DK == DV) && ggml_mxfp_use_hadamard(k->type);
 
     GGML_ASSERT((is_mxfp_k || q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || is_mxfp_v || v_to_float) && "fattn: unsupported V-type");
@@ -8635,9 +8635,9 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
     const bool is_mxfp_k = ggml_is_type_mxfp(k_type);
     const bool is_mxfp_v = ggml_is_type_mxfp(v_type);
-    // Hadamard rotation must match K rotation. Skip for MLA (DK != DV) since
-    // V is a view of K and rotation would corrupt V.
-    const bool apply_hadamard_q = is_mxfp_k && (DK == DV);
+    // Hadamard rotation must match K rotation.
+    // Skipped for: MLA (DK != DV, V is a view of K), E5M2/E3M2 (no quality benefit).
+    const bool apply_hadamard_q = is_mxfp_k && (DK == DV) && ggml_mxfp_use_hadamard(k->type);
 
     // SoA function pointers for MXFP FA path
     typedef void (*soa_quantize_fn)(const float *, void *, int64_t);

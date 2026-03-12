@@ -23,6 +23,16 @@ static constexpr bool is_mxfp_soa_v =
     type == GGML_TYPE_MXFP6_E2M3 || type == GGML_TYPE_MXFP6_E3M2 ||
     type == GGML_TYPE_MXFP8_E5M2;
 
+// Compile-time check: should Hadamard rotation be applied for this MXFP type?
+// References centralized MXFP_USE_HADAMARD_* defines from ggml-common.h.
+template<ggml_type type>
+static constexpr bool mxfp_use_hadamard_v =
+    (type == GGML_TYPE_MXFP4_E2M1 && MXFP_USE_HADAMARD_E2M1) ||
+    (type == GGML_TYPE_MXFP8_E4M3 && MXFP_USE_HADAMARD_E4M3) ||
+    (type == GGML_TYPE_MXFP8_E5M2 && MXFP_USE_HADAMARD_E5M2) ||
+    (type == GGML_TYPE_MXFP6_E2M3 && MXFP_USE_HADAMARD_E2M3) ||
+    (type == GGML_TYPE_MXFP6_E3M2 && MXFP_USE_HADAMARD_E3M2);
+
 // Runtime check: ggml_is_type_mxfp() is now in ggml.h (shared across all backends).
 
 // Runtime check: is this MXFP type compiled (respects GGML_CUDA_MXFP_ALL_VARIANTS gate)?
@@ -46,10 +56,10 @@ template<ggml_type type, int D>
 static __device__ __forceinline__ void mxfp_soa_head_offsets(
         const int nb_row, const int head, const int gqa_ratio,
         int & qs_off, int & e_off) {
-    // block_size and qs_per_block derived from ggml-common.h struct definitions:
-    //   MXFP4: block=17 (1+16), qs=16    MXFP8: block=33 (1+32), qs=32    MXFP6: block=25 (1+24), qs=24
-    constexpr int qs_per_block = (type == GGML_TYPE_MXFP4_E2M1) ? 16 :
-                                 (type == GGML_TYPE_MXFP8_E4M3 || type == GGML_TYPE_MXFP8_E5M2) ? 32 : 24;
+    // qs_per_block from centralized MXFP_QS_PER_BLOCK_* defines in ggml-common.h.
+    constexpr int qs_per_block = (type == GGML_TYPE_MXFP4_E2M1) ? MXFP_QS_PER_BLOCK_E2M1 :
+                                 (type == GGML_TYPE_MXFP8_E4M3 || type == GGML_TYPE_MXFP8_E5M2) ?
+                                     MXFP_QS_PER_BLOCK_E4M3 : MXFP_QS_PER_BLOCK_E2M3;
     constexpr int block_size   = qs_per_block + 1;  // +1 byte for E8M0 scale
     constexpr int blocks_per_head = D / 32;
     const int stride_blocks = nb_row / block_size;
@@ -61,8 +71,8 @@ static __device__ __forceinline__ void mxfp_soa_head_offsets(
 // FP4 E2M1 traits: uses LUT + ggml_cuda_float_to_fp4_e2m1 (has non-CUDART fallback).
 // Defined outside CUDART guard so MXFP4 works on all backends (CUDA, HIP, MUSA).
 template<> struct mxfp_traits<GGML_TYPE_MXFP4_E2M1> {
-    static constexpr int bits_per_elem = 4;
-    static constexpr int qs_per_block  = 16;   // 32 * 4 / 8
+    static constexpr int bits_per_elem = MXFP_BITS_PER_ELEM_E2M1;
+    static constexpr int qs_per_block  = MXFP_QS_PER_BLOCK_E2M1;
     static constexpr int block_size    = sizeof(block_mxfp4);
     static constexpr int e8m0_offset   = MXFP4_E2M1_EMAX_OFFSET;
 
@@ -97,241 +107,27 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP4_E2M1> {
     }
 };
 
-// ------------------------------------------------------------------------------------------------------------------
-// Portable MXFP helpers — IEEE bit manipulation, no CUDA 12.8+ intrinsics needed.
-// Ported from our Metal shader implementation (ggml-metal.metal) to work on all backends.
-// ------------------------------------------------------------------------------------------------------------------
+// Portable MXFP element converters are now in ggml-common.h (canonical source: ggml_mxfp_*).
+// Thin wrappers for backward compatibility with existing call sites using mxfp_detail:: prefix.
 namespace mxfp_detail {
-
-    // --- FP6 dequantization ---
-
-    // FP6 E2M3 layout: [S(1) | E(2) | M(3)] — max normal = 7.5
-    static __device__ __forceinline__ float fp6_e2m3_to_float(uint8_t v) {
-        const float sign = (v & 0x20) ? -1.0f : 1.0f;
-        const int exp  = (v >> 3) & 0x3;
-        const int mant = v & 0x7;
-        if (exp == 0) return sign * (float)mant * 0.125f;
-        return sign * (1.0f + mant * 0.125f) * (float)(1 << (exp - 1));
-    }
-
-    // FP6 E3M2 layout: [S(1) | E(3) | M(2)] — max normal = 28.0, no NaN/Inf
-    static __device__ __forceinline__ float fp6_e3m2_to_float(uint8_t v) {
-        const float sign = (v & 0x20) ? -1.0f : 1.0f;
-        const int exp  = (v >> 2) & 0x7;
-        const int mant = v & 0x3;
-        if (exp == 0) return sign * (float)mant * 0.0625f;  // 2^(-4)
-        // MX E3M2 has no NaN/Inf — exp=7 is a valid normal value (max finite = 28.0).
-        return sign * ldexpf(1.0f + mant * 0.25f, exp - 3);
-    }
-
-    // --- FP6 quantization (round-to-nearest-even) ---
-
-    static __device__ __forceinline__ uint8_t float_to_fp6_e2m3(float x) {
-        uint8_t sign = 0;
-        if (x < 0) { sign = 0x20; x = -x; }
-        if (x == 0) return sign;
-        if (x >= 7.5f) return sign | 0x1F;  // max finite
-
-        uint32_t bits;
-        memcpy(&bits, &x, sizeof(uint32_t));
-        int f32_exp = (int)((bits >> 23) & 0xFF) - 127;
-
-        if (f32_exp < 0) {
-            // Subnormal in E2M3: mant * 2^(-3)
-            float scaled = x * 8.0f;
-            int mant = (int)(scaled + 0.5f);
-            if (mant > 7) return sign | 0x08;  // smallest normal
-            return sign | (uint8_t)mant;
-        }
-        if (f32_exp > 2) f32_exp = 2;
-
-        float mantf = (x / (float)(1 << f32_exp)) - 1.0f;
-        int mant = (int)(mantf * 8.0f + 0.5f);
-        if (mant > 7) { mant = 0; f32_exp++; }
-        if (f32_exp > 2) return sign | 0x1F;
-        return sign | (uint8_t)(((f32_exp + 1) << 3) | mant);
-    }
-
-    static __device__ __forceinline__ uint8_t float_to_fp6_e3m2(float x) {
-        uint8_t sign = 0;
-        if (x < 0) { sign = 0x20; x = -x; }
-        if (x == 0) return sign;
-        if (x >= 28.0f) return sign | 0x1F;  // max finite
-
-        uint32_t bits;
-        memcpy(&bits, &x, sizeof(uint32_t));
-        int f32_exp = (int)((bits >> 23) & 0xFF) - 127;
-        int biased_exp = f32_exp + 3;
-
-        if (biased_exp <= 0) {
-            // Subnormal in E3M2: mant * 2^(-4)
-            float scaled = x * 16.0f;
-            int mant = (int)(scaled + 0.5f);
-            if (mant > 3) return sign | 0x04;  // smallest normal
-            return sign | (uint8_t)mant;
-        }
-        if (biased_exp > 7) return sign | 0x1F;
-
-        float pow2 = (f32_exp >= 0) ? (float)(1 << f32_exp) : 1.0f / (float)(1 << (-f32_exp));
-        float mantf = (x / pow2) - 1.0f;
-        int mant = (int)(mantf * 4.0f + 0.5f);
-        if (mant > 3) { mant = 0; biased_exp++; }
-        if (biased_exp > 7) return sign | 0x1F;
-        return sign | (uint8_t)((biased_exp << 2) | mant);
-    }
-
-    // --- FP8 dequantization (IEEE bit manipulation) ---
-
-    // FP8 E4M3: [S(1) | E(4) | M(3)] — bias=7, max finite=448
-    static __device__ __forceinline__ float fp8_e4m3_to_float(uint8_t v) {
-        uint32_t sign = ((uint32_t)(v & 0x80)) << 24;
-        uint32_t exp  = (v >> 3) & 0xF;
-        uint32_t mant = v & 0x7;
-
-        if (exp == 0) {
-            if (mant == 0) { float r; uint32_t s = sign; memcpy(&r, &s, 4); return r; }
-            // Subnormal: mant * 2^(1-7) * 2^(-3) = mant * 2^(-9)
-            float val = (float)mant * (1.0f / 512.0f);
-            uint32_t vb; memcpy(&vb, &val, 4);
-            vb = (vb & 0x7FFFFFFFu) | sign;
-            memcpy(&val, &vb, 4);
-            return val;
-        }
-        if (exp == 15 && mant == 7) {
-            uint32_t nan_bits = sign | 0x7FC00000u;
-            float r; memcpy(&r, &nan_bits, 4); return r;
-        }
-        // Normal: (-1)^S * 2^(E-7) * (1 + M/8) → F32 exp = E-7+127 = E+120
-        uint32_t f32_bits = sign | ((exp + 120) << 23) | (mant << 20);
-        float r; memcpy(&r, &f32_bits, 4); return r;
-    }
-
-    // FP8 E5M2: [S(1) | E(5) | M(2)] — bias=15, max finite=57344
-    static __device__ __forceinline__ float fp8_e5m2_to_float(uint8_t v) {
-        uint32_t sign = ((uint32_t)(v & 0x80)) << 24;
-        uint32_t exp  = (v >> 2) & 0x1F;
-        uint32_t mant = v & 0x3;
-
-        if (exp == 0) {
-            if (mant == 0) { float r; uint32_t s = sign; memcpy(&r, &s, 4); return r; }
-            // Subnormal: mant * 2^(1-15) * 2^(-2) = mant/4 * 2^(-14)
-            float val = (float)mant * 0.25f * (1.0f / 16384.0f);
-            uint32_t vb; memcpy(&vb, &val, 4);
-            vb = (vb & 0x7FFFFFFFu) | sign;
-            memcpy(&val, &vb, 4);
-            return val;
-        }
-        if (exp == 31) {
-            uint32_t inf_nan = sign | 0x7F800000u | (mant ? 0x400000u : 0);
-            float r; memcpy(&r, &inf_nan, 4); return r;
-        }
-        // Normal: F32 exp = E-15+127 = E+112
-        uint32_t f32_bits = sign | ((exp + 112) << 23) | (mant << 21);
-        float r; memcpy(&r, &f32_bits, 4); return r;
-    }
-
-    // --- FP8 quantization (round-to-nearest-even, saturate-to-finite) ---
-
-    static __device__ __forceinline__ uint8_t float_to_fp8_e4m3(float x) {
-        uint32_t bits;
-        memcpy(&bits, &x, sizeof(uint32_t));
-        uint8_t sign = (bits >> 24) & 0x80;
-        bits &= 0x7FFFFFFFu;
-        if (bits == 0) return sign;
-
-        uint32_t f32_exp  = (bits >> 23) & 0xFF;
-        uint32_t f32_mant = bits & 0x7FFFFF;
-        int e4m3_exp = (int)f32_exp - 120;
-
-        if (e4m3_exp < 0) {
-            // Subnormal in E4M3
-            int shift = 1 - e4m3_exp;
-            uint32_t full_mant = (1u << 23) | f32_mant;
-            int total_shift = 20 + shift;
-            if (total_shift >= 32) return sign;
-            uint32_t mant3 = full_mant >> total_shift;
-            if (total_shift > 0 && total_shift < 32) {
-                uint32_t round_bit = (full_mant >> (total_shift - 1)) & 1;
-                uint32_t sticky = (total_shift > 1) ? (full_mant & ((1u << (total_shift - 1)) - 1)) : 0;
-                if (round_bit && (sticky || (mant3 & 1))) mant3++;
-            }
-            if (mant3 > 7) return sign | 0x08;
-            return sign | (uint8_t)mant3;
-        }
-
-        uint32_t round_bit = (f32_mant >> 19) & 1;
-        uint32_t sticky = f32_mant & ((1u << 19) - 1);
-        uint32_t mant3 = f32_mant >> 20;
-        if (round_bit && (sticky || (mant3 & 1))) {
-            mant3++;
-            if (mant3 > 7) { mant3 = 0; e4m3_exp++; }
-        }
-        if (e4m3_exp > 15 || (e4m3_exp == 15 && mant3 >= 7)) return sign | 0x7E; // max finite
-        return sign | (uint8_t)((e4m3_exp << 3) | mant3);
-    }
-
-    static __device__ __forceinline__ uint8_t float_to_fp8_e5m2(float x) {
-        uint32_t bits;
-        memcpy(&bits, &x, sizeof(uint32_t));
-        uint8_t sign = (bits >> 24) & 0x80;
-        bits &= 0x7FFFFFFFu;
-        if (bits == 0) return sign;
-
-        uint32_t f32_exp  = (bits >> 23) & 0xFF;
-        uint32_t f32_mant = bits & 0x7FFFFF;
-        int e5m2_exp = (int)f32_exp - 112;
-
-        if (e5m2_exp < 0) {
-            int shift = 1 - e5m2_exp;
-            uint32_t full_mant = (1u << 23) | f32_mant;
-            int total_shift = 21 + shift;
-            if (total_shift >= 32) return sign;
-            uint32_t mant2 = full_mant >> total_shift;
-            if (total_shift > 0 && total_shift < 32) {
-                uint32_t round_bit = (full_mant >> (total_shift - 1)) & 1;
-                uint32_t sticky = (total_shift > 1) ? (full_mant & ((1u << (total_shift - 1)) - 1)) : 0;
-                if (round_bit && (sticky || (mant2 & 1))) mant2++;
-            }
-            if (mant2 > 3) return sign | 0x04;
-            return sign | (uint8_t)mant2;
-        }
-
-        uint32_t round_bit = (f32_mant >> 20) & 1;
-        uint32_t sticky = f32_mant & ((1u << 20) - 1);
-        uint32_t mant2 = f32_mant >> 21;
-        if (round_bit && (sticky || (mant2 & 1))) {
-            mant2++;
-            if (mant2 > 3) { mant2 = 0; e5m2_exp++; }
-        }
-        if (e5m2_exp >= 31) return sign | 0x7B; // max finite
-        return sign | (uint8_t)((e5m2_exp << 2) | mant2);
-    }
-
-    // --- FP6 packing/unpacking ---
-
-    // Pack 4 six-bit values into 3 bytes
-    static __device__ __forceinline__ void pack_fp6x4(const uint8_t v[4], uint8_t out[3]) {
-        uint32_t packed = (v[0] & 0x3F) | ((v[1] & 0x3F) << 6) |
-                          ((v[2] & 0x3F) << 12) | ((v[3] & 0x3F) << 18);
-        out[0] = (uint8_t)(packed);
-        out[1] = (uint8_t)(packed >> 8);
-        out[2] = (uint8_t)(packed >> 16);
-    }
-
-    // Unpack 3 bytes into 4 six-bit values
-    static __device__ __forceinline__ void unpack_fp6x4(const uint8_t in[3], uint8_t v[4]) {
-        uint32_t packed = (uint32_t)in[0] | ((uint32_t)in[1] << 8) | ((uint32_t)in[2] << 16);
-        v[0] = packed & 0x3F;
-        v[1] = (packed >> 6) & 0x3F;
-        v[2] = (packed >> 12) & 0x3F;
-        v[3] = (packed >> 18) & 0x3F;
-    }
+    static __device__ __forceinline__ float fp4_e2m1_to_float(uint8_t v) { return ggml_mxfp_fp4_e2m1_to_float(v); }
+    static __device__ __forceinline__ uint8_t float_to_fp4_e2m1(float x) { return ggml_mxfp_float_to_fp4_e2m1(x); }
+    static __device__ __forceinline__ float fp6_e2m3_to_float(uint8_t v) { return ggml_mxfp_fp6_e2m3_to_float(v); }
+    static __device__ __forceinline__ float fp6_e3m2_to_float(uint8_t v) { return ggml_mxfp_fp6_e3m2_to_float(v); }
+    static __device__ __forceinline__ uint8_t float_to_fp6_e2m3(float x) { return ggml_mxfp_float_to_fp6_e2m3(x); }
+    static __device__ __forceinline__ uint8_t float_to_fp6_e3m2(float x) { return ggml_mxfp_float_to_fp6_e3m2(x); }
+    static __device__ __forceinline__ float fp8_e4m3_to_float(uint8_t v) { return ggml_mxfp_fp8_e4m3_to_float(v); }
+    static __device__ __forceinline__ float fp8_e5m2_to_float(uint8_t v) { return ggml_mxfp_fp8_e5m2_to_float(v); }
+    static __device__ __forceinline__ uint8_t float_to_fp8_e4m3(float x) { return ggml_mxfp_float_to_fp8_e4m3(x); }
+    static __device__ __forceinline__ uint8_t float_to_fp8_e5m2(float x) { return ggml_mxfp_float_to_fp8_e5m2(x); }
+    static __device__ __forceinline__ void pack_fp6x4(const uint8_t v[4], uint8_t out[3]) { ggml_mxfp_pack_fp6x4(v, out); }
+    static __device__ __forceinline__ void unpack_fp6x4(const uint8_t in[3], uint8_t v[4]) { ggml_mxfp_unpack_fp6x4(in, v); }
 } // namespace mxfp_detail
 
 // FP6 E2M3:
 template<> struct mxfp_traits<GGML_TYPE_MXFP6_E2M3> {
-    static constexpr int bits_per_elem = 6;
-    static constexpr int qs_per_block  = 24;   // 32 * 6 / 8
+    static constexpr int bits_per_elem = MXFP_BITS_PER_ELEM_E2M3;
+    static constexpr int qs_per_block  = MXFP_QS_PER_BLOCK_E2M3;
     static constexpr int block_size    = sizeof(block_mxfp6);
     static constexpr int e8m0_offset   = MXFP6_E2M3_EMAX_OFFSET;
 
@@ -389,8 +185,8 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E2M3> {
 
 // FP6 E3M2:
 template<> struct mxfp_traits<GGML_TYPE_MXFP6_E3M2> {
-    static constexpr int bits_per_elem = 6;
-    static constexpr int qs_per_block  = 24;
+    static constexpr int bits_per_elem = MXFP_BITS_PER_ELEM_E3M2;
+    static constexpr int qs_per_block  = MXFP_QS_PER_BLOCK_E3M2;
     static constexpr int block_size    = sizeof(block_mxfp6);
     static constexpr int e8m0_offset   = MXFP6_E3M2_EMAX_OFFSET;
 
@@ -448,8 +244,8 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E3M2> {
 
 // FP8 E4M3:
 template<> struct mxfp_traits<GGML_TYPE_MXFP8_E4M3> {
-    static constexpr int bits_per_elem = 8;
-    static constexpr int qs_per_block  = 32;   // 32 * 8 / 8
+    static constexpr int bits_per_elem = MXFP_BITS_PER_ELEM_E4M3;
+    static constexpr int qs_per_block  = MXFP_QS_PER_BLOCK_E4M3;
     static constexpr int block_size    = sizeof(block_mxfp8);
     static constexpr int e8m0_offset   = MXFP8_E4M3_EMAX_OFFSET;
 
@@ -506,8 +302,8 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E4M3> {
 
 // FP8 E5M2:
 template<> struct mxfp_traits<GGML_TYPE_MXFP8_E5M2> {
-    static constexpr int bits_per_elem = 8;
-    static constexpr int qs_per_block  = 32;
+    static constexpr int bits_per_elem = MXFP_BITS_PER_ELEM_E5M2;
+    static constexpr int qs_per_block  = MXFP_QS_PER_BLOCK_E5M2;
     static constexpr int block_size    = sizeof(block_mxfp8);
     static constexpr int e8m0_offset   = MXFP8_E5M2_EMAX_OFFSET;
 

@@ -636,6 +636,12 @@ void process_shaders() {
         {"MXFP6_E3M2_EMAX_OFFSET",   "5"},
         {"MXFP8_E4M3_EMAX_OFFSET",   "8"},
         {"MXFP8_E5M2_EMAX_OFFSET",  "16"},
+        {"MXFP_USE_HADAMARD_E2M1",   "1"},
+        {"MXFP_USE_HADAMARD_E4M3",   "1"},
+        {"MXFP_USE_HADAMARD_E5M2",   "0"},
+        {"MXFP_USE_HADAMARD_E2M3",   "1"},
+        {"MXFP_USE_HADAMARD_E3M2",   "0"},
+        {"MXFP_HADAMARD_32_NORM",    "0.17677669529663689"},
     };
 
     for (const bool& fp16 : {false, true}) {

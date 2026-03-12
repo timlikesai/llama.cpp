@@ -8,7 +8,8 @@
 //   Zhang et al., "Block Rotation is All You Need for MXFP4 Quantization", arXiv:2511.04214
 //   Dao et al., "FlashAttention-3", arXiv:2407.08608 (incoherent processing for FP8 attention)
 
-static constexpr float HADAMARD_32_NORM = 0.17677669529663689f; // 1/sqrt(32)
+// Use centralized constant from ggml-common.h
+static constexpr float HADAMARD_32_NORM = MXFP_HADAMARD_32_NORM;
 
 // Single-thread in-place Hadamard transform over 32 values.
 static __device__ __forceinline__ void hadamard_32_inplace(float vals[32]) {

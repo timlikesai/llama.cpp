@@ -291,84 +291,10 @@ void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_REST
 
 // FP8 E4M3: 1 sign, 4 exponent (bias 7), 3 mantissa
 // Max finite: 448 (exp=15, mant=6), NaN: exp=15, mant=7
-float fp8_e4m3_to_float(uint8_t v) {
-    const uint32_t sign = ((uint32_t)(v & 0x80)) << 24;
-    const uint32_t exp  = (v >> 3) & 0xF;
-    const uint32_t mant = v & 0x7;
-
-    uint32_t bits;
-    if (exp == 0) {
-        if (mant == 0) {
-            bits = sign;
-        } else {
-            // Subnormal: val = mant * 2^(-9)
-            float val = (float)mant * (1.0f / 512.0f);
-            memcpy(&bits, &val, sizeof(bits));
-            bits = (bits & 0x7FFFFFFF) | sign;
-        }
-    } else if (exp == 15 && mant == 7) {
-        bits = sign | 0x7FC00000;  // NaN
-    } else {
-        // Normal: exp_f32 = exp_e4m3 + 120, mant shifted to 23-bit field
-        bits = sign | ((exp + 120) << 23) | (mant << 20);
-    }
-
-    float result;
-    memcpy(&result, &bits, sizeof(result));
-    return result;
-}
-
-uint8_t float_to_fp8_e4m3_rn(float x) {
-    uint32_t bits;
-    memcpy(&bits, &x, sizeof(bits));
-    const uint8_t sign = (bits >> 24) & 0x80;
-    bits &= 0x7FFFFFFF;
-
-    if (bits == 0) return sign;
-
-    const uint32_t f32_exp  = (bits >> 23) & 0xFF;
-    const uint32_t f32_mant = bits & 0x7FFFFF;
-
-    int e4m3_exp = (int)f32_exp - 120;
-
-    if (e4m3_exp < 0) {
-        // Subnormal in E4M3
-        const int shift = 1 - e4m3_exp;
-        const uint32_t full_mant = (1 << 23) | f32_mant;
-        const int total_shift = 20 + shift;
-        if (total_shift >= 32) return sign;
-        uint32_t mant3 = full_mant >> total_shift;
-        if (total_shift > 0 && total_shift < 32) {
-            const uint32_t round_bit = (full_mant >> (total_shift - 1)) & 1;
-            const uint32_t sticky = (total_shift > 1) ? (full_mant & ((1u << (total_shift - 1)) - 1)) : 0;
-            if (round_bit && (sticky || (mant3 & 1))) {
-                mant3++;
-            }
-        }
-        if (mant3 > 7) return sign | 0x08;
-        return sign | (uint8_t)mant3;
-    }
-
-    // Normal: round mantissa from 23 bits to 3 bits
-    const uint32_t round_bit = (f32_mant >> 19) & 1;
-    const uint32_t sticky = f32_mant & ((1 << 19) - 1);
-    uint32_t mant3 = f32_mant >> 20;
-
-    if (round_bit && (sticky || (mant3 & 1))) {
-        mant3++;
-        if (mant3 > 7) {
-            mant3 = 0;
-            e4m3_exp++;
-        }
-    }
-
-    // Saturate to max finite (exp=15, mant=6 = 448)
-    if (e4m3_exp > 15 || (e4m3_exp == 15 && mant3 >= 7)) {
-        return sign | 0x7E;
-    }
-
-    return sign | (uint8_t)((e4m3_exp << 3) | mant3);
-}
+// Thin wrappers around canonical implementations in ggml-common.h.
+// Verified bit-for-bit identical by test-mxfp-converters.
+float fp8_e4m3_to_float(uint8_t v)    { return ggml_mxfp_fp8_e4m3_to_float(v); }
+uint8_t float_to_fp8_e4m3_rn(float x) { return ggml_mxfp_float_to_fp8_e4m3(x); }
 
 // ============================================================================
 // MXFP Quantization Infrastructure
@@ -409,12 +335,13 @@ static inline int best_index_mxfp4(float x, float e);
 
 // MXFP4 E2M1 MSE error: decision boundary quantization with HALF scale factor.
 //
-// MXFP4 uses GGML_E8M0_TO_FP32_HALF(e) = scale/2 because the kvalues_mxfp4 LUT
-// stores doubled values {0,1,2,3,4,6,8,12} for efficient nibble indexing.
+// This CPU implementation uses the doubled int8 kvalues_mxfp4 LUT {0,1,2,3,4,6,8,12}
+// with GGML_E8M0_TO_FP32_HALF(e) = scale/2 for efficient nibble-indexed integer arithmetic.
 // The MSE interface passes GGML_E8M0_TO_FP32(e) as scale, so we halve it.
 //
-// Decision boundaries at midpoints {0.5, 1.5, 2.5, 3.5, 5, 7, 10} are optimal
-// for the non-uniform MXFP4 representable set {0, 1, 2, 3, 4, 6, 8, 12}.
+// Canonical E2M1 values are {0, 0.5, 1, 1.5, 2, 3, 4, 6} (kvalues_mxfp4_float in ggml-common.h).
+// Doubled boundaries {0.5, 1.5, 2.5, 3.5, 5, 7, 10} ÷ 2 = canonical {0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5}.
+// Mathematically identical — the doubling is an implementation detail.
 // This is the Lloyd-Max quantizer for uniform input density.
 static float mse_error_mxfp4(float val, float inv_scale, float scale) {
     // Decision boundary quantization with direct reconstruction.
@@ -773,187 +700,25 @@ void ggml_hadamard_32_inplace(float vals[32]) {
             }
         }
     }
-    const float norm = 0.17677669529663689f; // 1/sqrt(32)
+    const float norm = MXFP_HADAMARD_32_NORM;
     for (int i = 0; i < 32; ++i) {
         vals[i] *= norm;
     }
 }
 
-// FP6 E2M3 conversion helpers
-// E2M3: 1 sign, 2 exponent (bias 1), 3 mantissa. Max finite = 7.5
-float fp6_e2m3_to_float(uint8_t v) {
-    const float sign = (v & 0x20) ? -1.0f : 1.0f;
-    const int exp  = (v >> 3) & 0x3;
-    const int mant = v & 0x7;
-    if (exp == 0) {
-        return sign * (float)mant * (1.0f / 8.0f);  // subnormal: mant * 2^(-3)
-    }
-    // Normal: (1 + mant/8) * 2^(exp-1). Construct via IEEE bit manipulation.
-    const uint32_t ieee_bits = ((uint32_t)(exp + 126) << 23) | ((uint32_t)mant << 20);
-    float result;
-    memcpy(&result, &ieee_bits, sizeof(float));
-    return sign * result;
-}
+float fp6_e2m3_to_float(uint8_t v)     { return ggml_mxfp_fp6_e2m3_to_float(v); }
+uint8_t float_to_fp6_e2m3_rn(float x) { return ggml_mxfp_float_to_fp6_e2m3(x); }
+float fp6_e3m2_to_float(uint8_t v)     { return ggml_mxfp_fp6_e3m2_to_float(v); }
+uint8_t float_to_fp6_e3m2_rn(float x) { return ggml_mxfp_float_to_fp6_e3m2(x); }
+float fp8_e5m2_to_float(uint8_t v)     { return ggml_mxfp_fp8_e5m2_to_float(v); }
+uint8_t float_to_fp8_e5m2_rn(float x) { return ggml_mxfp_float_to_fp8_e5m2(x); }
 
-uint8_t float_to_fp6_e2m3_rn(float x) {
-    uint8_t sign = 0;
-    if (x < 0) { sign = 0x20; x = -x; }
-    if (x == 0) return sign;
-    if (x >= 7.5f) return sign | 0x1F;  // saturate to max
-
-    int exp;
-    frexpf(x, &exp);
-    exp -= 1;
-
-    if (exp < 0) {
-        float scaled = x * 8.0f;
-        int mant = (int)(scaled + 0.5f);
-        if (mant > 7) return sign | 0x08;  // rounds up to first normal (exp=1, mant=0 = 1.0)
-        return sign | (uint8_t)mant;
-    }
-    if (exp > 2) { exp = 2; }
-
-    float mantf = (x / (float)(1 << exp)) - 1.0f;
-    int mant = (int)(mantf * 8.0f + 0.5f);
-    if (mant > 7) { mant = 0; exp++; }
-    if (exp > 2) return sign | 0x1F;
-    return sign | (uint8_t)(((exp + 1) << 3) | mant);
-}
-
-// FP6 E3M2 conversion helpers
-// E3M2: 1 sign, 3 exponent (bias 3), 2 mantissa. Max finite = 28.0
-// MX format: NO NaN/Inf — exp=7 is a valid normal value (unlike IEEE-754).
-float fp6_e3m2_to_float(uint8_t v) {
-    const float sign = (v & 0x20) ? -1.0f : 1.0f;
-    const int exp  = (v >> 2) & 0x7;
-    const int mant = v & 0x3;
-    if (exp == 0) {
-        return sign * (float)mant * (1.0f / 16.0f);  // subnormal: mant * 2^(1-bias-m) = mant * 2^(-4)
-    }
-    // Normal: (1 + mant/4) * 2^(exp-3). Construct via IEEE bit manipulation.
-    const uint32_t ieee_bits = ((uint32_t)(exp + 124) << 23) | ((uint32_t)mant << 21);
-    float result;
-    memcpy(&result, &ieee_bits, sizeof(float));
-    return sign * result;
-}
-
-uint8_t float_to_fp6_e3m2_rn(float x) {
-    uint8_t sign = 0;
-    if (x < 0) { sign = 0x20; x = -x; }
-    if (x == 0) return sign;
-    if (x >= 28.0f) return sign | 0x1F;  // saturate to max finite (exp=7, mant=3)
-
-    int exp;
-    frexpf(x, &exp);
-    exp -= 1;
-    int biased_exp = exp + 3;
-
-    if (biased_exp <= 0) {
-        float scaled = x * 16.0f;
-        int mant = (int)(scaled + 0.5f);
-        if (mant > 3) return sign | 0x04;  // rounds up to first normal (exp=1, mant=0 = 0.25)
-        return sign | (uint8_t)mant;
-    }
-
-    // MX format: exp=7 is valid (no NaN/Inf), so only overflow at biased_exp > 7.
-    if (biased_exp > 7) return sign | 0x1F;
-
-    // 2^exp via IEEE bit construction (safe for negative exp)
-    uint32_t pow2_bits = (uint32_t)(exp + 127) << 23;
-    float pow2; memcpy(&pow2, &pow2_bits, sizeof(float));
-    float mantf = (x / pow2) - 1.0f;
-    int mant = (int)(mantf * 4.0f + 0.5f);
-    if (mant > 3) { mant = 0; biased_exp++; }
-    if (biased_exp > 7) return sign | 0x1F;
-    return sign | (uint8_t)((biased_exp << 2) | mant);
-}
-
-// FP8 E5M2 conversion helpers
-// E5M2: 1 sign, 5 exponent (bias 15), 2 mantissa. Max finite = 57344
-float fp8_e5m2_to_float(uint8_t v) {
-    const uint32_t sign = ((uint32_t)(v & 0x80)) << 24;
-    const uint32_t exp  = (v >> 2) & 0x1F;
-    const uint32_t mant = v & 0x3;
-
-    uint32_t bits;
-    if (exp == 0) {
-        if (mant == 0) {
-            bits = sign;
-        } else {
-            float val = (float)mant * (1.0f / 4.0f) * (1.0f / 16384.0f);
-            memcpy(&bits, &val, sizeof(bits));
-            bits = (bits & 0x7FFFFFFF) | sign;
-        }
-    } else if (exp == 31) {
-        bits = sign | 0x7F800000 | (mant ? 0x400000 : 0);
-    } else {
-        bits = sign | ((exp + 112) << 23) | (mant << 21);
-    }
-
-    float result;
-    memcpy(&result, &bits, sizeof(result));
-    return result;
-}
-
-uint8_t float_to_fp8_e5m2_rn(float x) {
-    uint32_t bits;
-    memcpy(&bits, &x, sizeof(bits));
-    const uint8_t sign = (bits >> 24) & 0x80;
-    bits &= 0x7FFFFFFF;
-
-    if (bits == 0) return sign;
-
-    const uint32_t f32_exp  = (bits >> 23) & 0xFF;
-    const uint32_t f32_mant = bits & 0x7FFFFF;
-
-    int e5m2_exp = (int)f32_exp - 112;
-
-    if (e5m2_exp < 0) {
-        const int shift = 1 - e5m2_exp;
-        const uint32_t full_mant = (1 << 23) | f32_mant;
-        const int total_shift = 21 + shift;
-        if (total_shift >= 32) return sign;
-        uint32_t mant2 = full_mant >> total_shift;
-        if (total_shift > 0 && total_shift < 32) {
-            const uint32_t round_bit = (full_mant >> (total_shift - 1)) & 1;
-            const uint32_t sticky = (total_shift > 1) ? (full_mant & ((1u << (total_shift - 1)) - 1)) : 0;
-            if (round_bit && (sticky || (mant2 & 1))) mant2++;
-        }
-        if (mant2 > 3) return sign | 0x04;
-        return sign | (uint8_t)mant2;
-    }
-
-    const uint32_t round_bit = (f32_mant >> 20) & 1;
-    const uint32_t sticky = f32_mant & ((1 << 20) - 1);
-    uint32_t mant2 = f32_mant >> 21;
-
-    if (round_bit && (sticky || (mant2 & 1))) {
-        mant2++;
-        if (mant2 > 3) { mant2 = 0; e5m2_exp++; }
-    }
-
-    if (e5m2_exp >= 31) return sign | 0x7B;
-    return sign | (uint8_t)((e5m2_exp << 2) | mant2);
-}
-
-// FP6 tight packing: 4 six-bit values <-> 3 bytes
-void pack_fp6x4(const uint8_t v[4], uint8_t out[3]) {
-    uint32_t packed = (v[0] & 0x3F) | ((v[1] & 0x3F) << 6) | ((v[2] & 0x3F) << 12) | ((v[3] & 0x3F) << 18);
-    out[0] = (uint8_t)(packed);
-    out[1] = (uint8_t)(packed >> 8);
-    out[2] = (uint8_t)(packed >> 16);
-}
-
-void unpack_fp6x4(const uint8_t in[3], uint8_t v[4]) {
-    uint32_t packed = (uint32_t)in[0] | ((uint32_t)in[1] << 8) | ((uint32_t)in[2] << 16);
-    v[0] = packed & 0x3F;
-    v[1] = (packed >> 6) & 0x3F;
-    v[2] = (packed >> 12) & 0x3F;
-    v[3] = (packed >> 18) & 0x3F;
-}
+void pack_fp6x4(const uint8_t v[4], uint8_t out[3])   { ggml_mxfp_pack_fp6x4(v, out); }
+void unpack_fp6x4(const uint8_t in[3], uint8_t v[4])   { ggml_mxfp_unpack_fp6x4(in, v); }
 
 // MSE error functions for FP8/FP6: quantize at given scale → dequantize → squared error.
 // Used by mxfp_compute_e8m0_mse() to evaluate candidate E8M0 exponents.
+// These call the public API wrappers which delegate to canonical ggml_mxfp_* in ggml-common.h.
 static float mse_error_fp8_e4m3(float val, float inv_scale, float scale) {
     const float recon = fp8_e4m3_to_float(float_to_fp8_e4m3_rn(val * inv_scale)) * scale;
     const float err = val - recon;

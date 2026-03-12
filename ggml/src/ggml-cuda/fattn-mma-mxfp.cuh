@@ -1338,9 +1338,9 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_process_tile(
     KQ_max[0] = -FLT_MAX / 2.0f;
     KQ_max[1] = -FLT_MAX / 2.0f;
 
-    // MLA: V is a view of K, so K is not Hadamard-rotated (would corrupt V). Skip Q rotation too.
-    // Future: full Hadamard with output un-rotation (SnapMLA, arXiv:2602.10718) could recover quality.
-    constexpr bool apply_hadamard = (DKQ == DV);
+    // Hadamard Q rotation must match K-side rotation applied during KV cache write.
+    // Skipped for: MLA (DKQ != DV, V is a view of K), E5M2/E3M2 (no quality benefit).
+    constexpr bool apply_hadamard = (DKQ == DV) && mxfp_use_hadamard_v<mxfp_type>;
     flash_attn_ext_mxfp_quantize_Q<mxfp_type, DKQ, ncols, nwarps, stride_q_qs, stride_q_sc, apply_hadamard>
         (Q_f2, tile_Q_qs, tile_Q_sc, scale, stride_Q1, stride_Q2, ncols1, ncols2, jt, zt_gqa, gqa_ratio, ne01);
 
