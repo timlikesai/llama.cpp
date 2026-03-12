@@ -9974,35 +9974,35 @@ kernel void kernel_set_rows_mxfp4_simd(
     device char  * dst_row = ((device char *) dst + i1*args.nb1 + i02*args.nb2 + i03*args.nb3);
     const device float * src_row = (const device float *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
 
-    const int ind = sgitg;
-    if (ind >= args.nk0) return;
+    const ushort nsg = (ushort)min(args.nk0, 1024/32);
+    for (int ind = sgitg; ind < args.nk0; ind += nsg) {
+        float val = src_row[32*ind + tiisg];
 
-    float val = src_row[32*ind + tiisg];
-
-    if (args.apply_hadamard) {
-        for (ushort stride = 1; stride < 32; stride <<= 1) {
-            float partner = simd_shuffle_xor(val, stride);
-            val = (tiisg & stride) ? (partner - val) : (partner + val);
+        if (args.apply_hadamard) {
+            for (ushort stride = 1; stride < 32; stride <<= 1) {
+                float partner = simd_shuffle_xor(val, stride);
+                val = (tiisg & stride) ? (partner - val) : (partner + val);
+            }
+            val *= 0.17677669529663689f; // 1/sqrt(32)
         }
-        val *= 0.17677669529663689f; // 1/sqrt(32)
-    }
 
-    uint8_t e = mxfp4_compute_e8m0(val);
+        uint8_t e = mxfp4_compute_e8m0(val);
 
-    float scale = e8m0_to_fp32(e);
-    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
-    uint8_t nibble = best_index_mxfp4_metal(val, inv_scale);
+        float scale = e8m0_to_fp32(e);
+        float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+        uint8_t nibble = best_index_mxfp4_metal(val, inv_scale);
 
-    // Pack nibbles: byte[j] = element[j] (low) | element[j+16] (high)
-    uint8_t partner_nibble = (uint8_t)simd_shuffle(nibble, (tiisg + 16) & 31);
+        // Pack nibbles: byte[j] = element[j] (low) | element[j+16] (high)
+        uint8_t partner_nibble = (uint8_t)simd_shuffle(nibble, (tiisg + 16) & 31);
 
-    // Write SoA: [qs_block0[16]|qs_block1[16]|...][e8m0_0|e8m0_1|...]
-    if (tiisg < 16) {
-        device uint8_t * qs_dst = (device uint8_t *)(dst_row + ind * MXFP4_SOA_QS_PER_BLOCK);
-        qs_dst[tiisg] = nibble | (partner_nibble << 4);
-    }
-    if (tiisg == 0) {
-        *(dst_row + args.nk0 * MXFP4_SOA_QS_PER_BLOCK + ind) = (char)e;
+        // Write SoA: [qs_block0[16]|qs_block1[16]|...][e8m0_0|e8m0_1|...]
+        if (tiisg < 16) {
+            device uint8_t * qs_dst = (device uint8_t *)(dst_row + ind * MXFP4_SOA_QS_PER_BLOCK);
+            qs_dst[tiisg] = nibble | (partner_nibble << 4);
+        }
+        if (tiisg == 0) {
+            *(dst_row + (int)(args.nb1 / (MXFP4_SOA_QS_PER_BLOCK + 1)) * MXFP4_SOA_QS_PER_BLOCK + ind) = (char)e;
+        }
     }
 }
 
@@ -10032,35 +10032,35 @@ kernel void kernel_set_rows_mxfp8_simd(
     device char  * dst_row = ((device char *) dst + i1*args.nb1 + i02*args.nb2 + i03*args.nb3);
     const device float * src_row = (const device float *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
 
-    const int ind = sgitg;
-    if (ind >= args.nk0) return;
+    const ushort nsg = (ushort)min(args.nk0, 1024/32);
+    for (int ind = sgitg; ind < args.nk0; ind += nsg) {
+        float val = src_row[32*ind + tiisg];
 
-    float val = src_row[32*ind + tiisg];
-
-    if (args.apply_hadamard) {
-        for (ushort stride = 1; stride < 32; stride <<= 1) {
-            float partner = simd_shuffle_xor(val, stride);
-            val = (tiisg & stride) ? (partner - val) : (partner + val);
+        if (args.apply_hadamard) {
+            for (ushort stride = 1; stride < 32; stride <<= 1) {
+                float partner = simd_shuffle_xor(val, stride);
+                val = (tiisg & stride) ? (partner - val) : (partner + val);
+            }
+            val *= 0.17677669529663689f; // 1/sqrt(32)
         }
-        val *= 0.17677669529663689f; // 1/sqrt(32)
-    }
 
-    uint8_t e;
-    if (MXFP_SUBTYPE == 2) {
-        e = mxfp_compute_e8m0_mse<8, mxfp_roundtrip<float_to_fp8_e4m3_rn, fp8_e4m3_to_float>>(val);
-    } else {
-        e = mxfp_compute_e8m0_mse<16, mxfp_roundtrip<float_to_fp8_e5m2_rn, fp8_e5m2_to_float>>(val);
-    }
+        uint8_t e;
+        if (MXFP_SUBTYPE == 2) {
+            e = mxfp_compute_e8m0_mse<8, mxfp_roundtrip<float_to_fp8_e4m3_rn, fp8_e4m3_to_float>>(val);
+        } else {
+            e = mxfp_compute_e8m0_mse<16, mxfp_roundtrip<float_to_fp8_e5m2_rn, fp8_e5m2_to_float>>(val);
+        }
 
-    float scale = e8m0_to_fp32(e);
-    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
-    uint8_t fp8 = (MXFP_SUBTYPE == 2) ? float_to_fp8_e4m3_rn(val * inv_scale)
-                                       : float_to_fp8_e5m2_rn(val * inv_scale);
+        float scale = e8m0_to_fp32(e);
+        float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+        uint8_t fp8 = (MXFP_SUBTYPE == 2) ? float_to_fp8_e4m3_rn(val * inv_scale)
+                                           : float_to_fp8_e5m2_rn(val * inv_scale);
 
-    // Write SoA: [qs_block0[32]|qs_block1[32]|...][e8m0_0|e8m0_1|...]
-    *(device uint8_t *)(dst_row + ind * MXFP8_SOA_QS_PER_BLOCK + tiisg) = fp8;
-    if (tiisg == 0) {
-        *(dst_row + args.nk0 * MXFP8_SOA_QS_PER_BLOCK + ind) = (char)e;
+        // Write SoA: [qs_block0[32]|qs_block1[32]|...][e8m0_0|e8m0_1|...]
+        *(device uint8_t *)(dst_row + ind * MXFP8_SOA_QS_PER_BLOCK + tiisg) = fp8;
+        if (tiisg == 0) {
+            *(dst_row + (int)(args.nb1 / (MXFP8_SOA_QS_PER_BLOCK + 1)) * MXFP8_SOA_QS_PER_BLOCK + ind) = (char)e;
+        }
     }
 }
 
@@ -10091,50 +10091,50 @@ kernel void kernel_set_rows_mxfp6_simd(
     device char  * dst_row = ((device char *) dst + i1*args.nb1 + i02*args.nb2 + i03*args.nb3);
     const device float * src_row = (const device float *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
 
-    const int ind = sgitg;
-    if (ind >= args.nk0) return;
+    const ushort nsg = (ushort)min(args.nk0, 1024/32);
+    for (int ind = sgitg; ind < args.nk0; ind += nsg) {
+        float val = src_row[32*ind + tiisg];
 
-    float val = src_row[32*ind + tiisg];
-
-    if (args.apply_hadamard) {
-        for (ushort stride = 1; stride < 32; stride <<= 1) {
-            float partner = simd_shuffle_xor(val, stride);
-            val = (tiisg & stride) ? (partner - val) : (partner + val);
+        if (args.apply_hadamard) {
+            for (ushort stride = 1; stride < 32; stride <<= 1) {
+                float partner = simd_shuffle_xor(val, stride);
+                val = (tiisg & stride) ? (partner - val) : (partner + val);
+            }
+            val *= 0.17677669529663689f; // 1/sqrt(32)
         }
-        val *= 0.17677669529663689f; // 1/sqrt(32)
-    }
 
-    uint8_t e;
-    if (MXFP_SUBTYPE == 4) {
-        e = mxfp_compute_e8m0_mse<3, mxfp_roundtrip<float_to_fp6_e2m3_rn, fp6_e2m3_to_float>>(val);
-    } else {
-        e = mxfp_compute_e8m0_mse<5, mxfp_roundtrip<float_to_fp6_e3m2_rn, fp6_e3m2_to_float>>(val);
-    }
+        uint8_t e;
+        if (MXFP_SUBTYPE == 4) {
+            e = mxfp_compute_e8m0_mse<3, mxfp_roundtrip<float_to_fp6_e2m3_rn, fp6_e2m3_to_float>>(val);
+        } else {
+            e = mxfp_compute_e8m0_mse<5, mxfp_roundtrip<float_to_fp6_e3m2_rn, fp6_e3m2_to_float>>(val);
+        }
 
-    float scale = e8m0_to_fp32(e);
-    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
-    uint8_t fp6 = (MXFP_SUBTYPE == 4) ? float_to_fp6_e2m3_rn(val * inv_scale)
-                                       : float_to_fp6_e3m2_rn(val * inv_scale);
+        float scale = e8m0_to_fp32(e);
+        float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+        uint8_t fp6 = (MXFP_SUBTYPE == 4) ? float_to_fp6_e2m3_rn(val * inv_scale)
+                                           : float_to_fp6_e3m2_rn(val * inv_scale);
 
-    // Pack 4×6-bit values into 3 bytes: groups of 4 threads cooperate
-    const ushort group = tiisg / 4;
-    const ushort lane = tiisg % 4;
+        // Pack 4×6-bit values into 3 bytes: groups of 4 threads cooperate
+        const ushort group = tiisg / 4;
+        const ushort lane = tiisg % 4;
 
-    uint8_t v0 = (uint8_t)simd_shuffle((uint)fp6, group * 4 + 0);
-    uint8_t v1 = (uint8_t)simd_shuffle((uint)fp6, group * 4 + 1);
-    uint8_t v2 = (uint8_t)simd_shuffle((uint)fp6, group * 4 + 2);
-    uint8_t v3 = (uint8_t)simd_shuffle((uint)fp6, group * 4 + 3);
+        uint8_t v0 = (uint8_t)simd_shuffle((uint)fp6, group * 4 + 0);
+        uint8_t v1 = (uint8_t)simd_shuffle((uint)fp6, group * 4 + 1);
+        uint8_t v2 = (uint8_t)simd_shuffle((uint)fp6, group * 4 + 2);
+        uint8_t v3 = (uint8_t)simd_shuffle((uint)fp6, group * 4 + 3);
 
-    // Write SoA: [qs_block0[24]|qs_block1[24]|...][e8m0_0|e8m0_1|...]
-    if (lane == 0) {
-        uint32_t packed = (v0 & 0x3F) | ((v1 & 0x3F) << 6) | ((v2 & 0x3F) << 12) | ((v3 & 0x3F) << 18);
-        device uint8_t * qs_dst = (device uint8_t *)(dst_row + ind * MXFP6_SOA_QS_PER_BLOCK + group * 3);
-        qs_dst[0] = (uint8_t)(packed);
-        qs_dst[1] = (uint8_t)(packed >> 8);
-        qs_dst[2] = (uint8_t)(packed >> 16);
-    }
-    if (tiisg == 0) {
-        *(dst_row + args.nk0 * MXFP6_SOA_QS_PER_BLOCK + ind) = (char)e;
+        // Write SoA: [qs_block0[24]|qs_block1[24]|...][e8m0_0|e8m0_1|...]
+        if (lane == 0) {
+            uint32_t packed = (v0 & 0x3F) | ((v1 & 0x3F) << 6) | ((v2 & 0x3F) << 12) | ((v3 & 0x3F) << 18);
+            device uint8_t * qs_dst = (device uint8_t *)(dst_row + ind * MXFP6_SOA_QS_PER_BLOCK + group * 3);
+            qs_dst[0] = (uint8_t)(packed);
+            qs_dst[1] = (uint8_t)(packed >> 8);
+            qs_dst[2] = (uint8_t)(packed >> 16);
+        }
+        if (tiisg == 0) {
+            *(dst_row + (int)(args.nb1 / (MXFP6_SOA_QS_PER_BLOCK + 1)) * MXFP6_SOA_QS_PER_BLOCK + ind) = (char)e;
+        }
     }
 }
 

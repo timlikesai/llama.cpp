@@ -1225,8 +1225,9 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
     if (is_mxfp_simd) {
-        // SIMD dispatch: nk0 simdgroups × 32 threads, one row per threadgroup
-        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, 32*nk0, 1, 1);
+        // SIMD dispatch: up to 1024 threads (32 simdgroups max), kernels loop when nk0 > 32
+        const int mxfp_nth = 32*MIN(nk0, 1024/32);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, mxfp_nth, 1, 1);
     } else {
         ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nrptg - 1)/nrptg, ne02, ne03, nth, nrptg, 1);
     }
