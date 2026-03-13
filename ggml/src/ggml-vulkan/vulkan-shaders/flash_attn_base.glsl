@@ -180,6 +180,10 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 // Non-MXFP dequant paths also use these in flash_attn.comp / flash_attn_cm1.comp.
 uint32_t k_stride, v_stride;
 
+// mxfp_active_stride: set to k_stride or v_stride before each cm2 coopMatLoadTensorNV call.
+// Used by MXFP SoA decode functions in dequant_funcs_cm2.glsl to locate the E8M0 region.
+uint32_t mxfp_active_stride;
+
 #if defined(DATA_A_MXFP4)
 #define BLOCK_BYTE_SIZE 17
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
