@@ -64,8 +64,8 @@ static __device__ __forceinline__ void mxfp_soa_head_offsets(
     constexpr int blocks_per_head = D / 32;
     const int stride_blocks = nb_row / block_size;
     const int z = head / gqa_ratio;
-    qs_off = z * blocks_per_head * qs_per_block;
-    e_off  = stride_blocks * qs_per_block + z * blocks_per_head;
+    qs_off = MXFP_SOA_QS_OFFSET(z * blocks_per_head, qs_per_block);
+    e_off  = MXFP_SOA_E8M0_OFFSET(stride_blocks, qs_per_block) + z * blocks_per_head;
 }
 
 // FP4 E2M1 traits: uses LUT + ggml_cuda_float_to_fp4_e2m1 (has non-CUDART fallback).
@@ -90,7 +90,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP4_E2M1> {
     static __device__ __forceinline__ void write_qs(
             const float * __restrict__ src, char * __restrict__ row_base,
             int block_idx, int /*blocks_per_row_total*/, float inv_d) {
-        uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * qs_per_block);
+        uint8_t * qs_dst = (uint8_t *)(row_base + MXFP_SOA_QS_OFFSET(block_idx, qs_per_block));
 #if CUDART_VERSION >= 12080
         // Vectorized: quantize lo+hi pair → byte via x2 intrinsic (lo→low nibble, hi→high nibble).
         for (int j = 0; j < QK_MXFP4/2; ++j) {
@@ -164,7 +164,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E2M3> {
     static __device__ __forceinline__ void write_qs(
             const float * __restrict__ src, char * __restrict__ row_base,
             int block_idx, int /*blocks_per_row_total*/, float inv_d) {
-        uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * qs_per_block);
+        uint8_t * qs_dst = (uint8_t *)(row_base + MXFP_SOA_QS_OFFSET(block_idx, qs_per_block));
         for (int j = 0; j < 32; j += 4) {
             uint8_t vals[4];
 #if CUDART_VERSION >= 12080
@@ -223,7 +223,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP6_E3M2> {
     static __device__ __forceinline__ void write_qs(
             const float * __restrict__ src, char * __restrict__ row_base,
             int block_idx, int /*blocks_per_row_total*/, float inv_d) {
-        uint8_t * qs_dst = (uint8_t *)(row_base + block_idx * qs_per_block);
+        uint8_t * qs_dst = (uint8_t *)(row_base + MXFP_SOA_QS_OFFSET(block_idx, qs_per_block));
         for (int j = 0; j < 32; j += 4) {
             uint8_t vals[4];
 #if CUDART_VERSION >= 12080
@@ -282,7 +282,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E4M3> {
     static __device__ __forceinline__ void write_qs(
             const float * __restrict__ src, char * __restrict__ row_base,
             int block_idx, int /*blocks_per_row_total*/, float inv_d) {
-        uint32_t * qs_dst = reinterpret_cast<uint32_t *>(row_base + block_idx * qs_per_block);
+        uint32_t * qs_dst = reinterpret_cast<uint32_t *>(row_base + MXFP_SOA_QS_OFFSET(block_idx, qs_per_block));
 #if CUDART_VERSION >= 12050
         // Vectorized: quantize 4 floats → uint32 in one x4 intrinsic.
         for (int j = 0; j < 32; j += 4) {
@@ -340,7 +340,7 @@ template<> struct mxfp_traits<GGML_TYPE_MXFP8_E5M2> {
     static __device__ __forceinline__ void write_qs(
             const float * __restrict__ src, char * __restrict__ row_base,
             int block_idx, int /*blocks_per_row_total*/, float inv_d) {
-        uint32_t * qs_dst = reinterpret_cast<uint32_t *>(row_base + block_idx * qs_per_block);
+        uint32_t * qs_dst = reinterpret_cast<uint32_t *>(row_base + MXFP_SOA_QS_OFFSET(block_idx, qs_per_block));
 #if CUDART_VERSION >= 12050
         // Vectorized: quantize 4 floats → uint32 in one x4 intrinsic.
         for (int j = 0; j < 32; j += 4) {
@@ -418,6 +418,6 @@ static __device__ void quantize_f32_mxfp_block_soa(
     traits::write_qs(src, row_base, block_idx, blocks_per_row_total, inv_d);
 
     // Write E8M0 scale byte to SoA E8M0 region.
-    *(row_base + blocks_per_row_total * traits::qs_per_block + block_idx) = e_val;
+    *(row_base + MXFP_SOA_E8M0_OFFSET(blocks_per_row_total, traits::qs_per_block) + block_idx) = e_val;
 }
 

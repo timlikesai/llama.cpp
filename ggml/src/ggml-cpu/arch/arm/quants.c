@@ -4524,7 +4524,7 @@ static inline void dequantize_row_mxfp4_soa_neon(
     const int nb = k / QK_MXFP4;
     const char * row = (const char *)src;
     const char * qs_base   = row;
-    const char * e8m0_base = row + nb * MXFP4_SOA_QS_PER_BLOCK;
+    const char * e8m0_base = row + MXFP_SOA_E8M0_OFFSET(nb, MXFP4_SOA_QS_PER_BLOCK);
 
     const int8x16_t values = vld1q_s8(kvalues_mxfp4);
     const uint8x16_t m4b = vdupq_n_u8(0x0f);
@@ -4532,7 +4532,7 @@ static inline void dequantize_row_mxfp4_soa_neon(
     for (int i = 0; i < nb; i++) {
         const float d = GGML_E8M0_TO_FP32_HALF((uint8_t)e8m0_base[i]);
         const float32x4_t v_scale = vdupq_n_f32(d);
-        const uint8_t * qs = (const uint8_t *)(qs_base + i * MXFP4_SOA_QS_PER_BLOCK);
+        const uint8_t * qs = (const uint8_t *)(qs_base + MXFP_SOA_QS_OFFSET(i, MXFP4_SOA_QS_PER_BLOCK));
 
         const uint8x16_t q4bits = vld1q_u8(qs);
 
@@ -4570,7 +4570,7 @@ static inline void dequantize_row_mxfp8_soa_neon(
     const int nb = k / QK_MXFP8;
     const char * row = (const char *)src;
     const char * qs_base   = row;
-    const char * e8m0_base = row + nb * MXFP8_SOA_QS_PER_BLOCK;
+    const char * e8m0_base = row + MXFP_SOA_E8M0_OFFSET(nb, MXFP8_SOA_QS_PER_BLOCK);
 
     const uint32x4_t v_exp_mask  = vdupq_n_u32(exp_mask);
     const uint32x4_t v_mant_mask = vdupq_n_u32(mant_mask);
@@ -4581,7 +4581,7 @@ static inline void dequantize_row_mxfp8_soa_neon(
 
     for (int ib = 0; ib < nb; ++ib) {
         const float32x4_t v_scale = vdupq_n_f32(GGML_E8M0_TO_FP32((uint8_t)e8m0_base[ib]));
-        const uint8_t * qs = (const uint8_t *)(qs_base + ib * MXFP8_SOA_QS_PER_BLOCK);
+        const uint8_t * qs = (const uint8_t *)(qs_base + MXFP_SOA_QS_OFFSET(ib, MXFP8_SOA_QS_PER_BLOCK));
 
         for (int j = 0; j < 32; j += 8) {
             const uint8x8_t raw8 = vld1_u8(qs + j);
@@ -4625,7 +4625,7 @@ static inline void dequantize_row_mxfp6_soa_neon(
     const int nb = k / QK_MXFP6;
     const char * row = (const char *)src;
     const char * qs_base   = row;
-    const char * e8m0_base = row + nb * MXFP6_SOA_QS_PER_BLOCK;
+    const char * e8m0_base = row + MXFP_SOA_E8M0_OFFSET(nb, MXFP6_SOA_QS_PER_BLOCK);
 
     const uint32x4_t v_exp_mask  = vdupq_n_u32(exp_mask);
     const uint32x4_t v_mant_mask = vdupq_n_u32(mant_mask);
@@ -4636,7 +4636,7 @@ static inline void dequantize_row_mxfp6_soa_neon(
 
     for (int ib = 0; ib < nb; ++ib) {
         const float32x4_t v_scale = vdupq_n_f32(GGML_E8M0_TO_FP32((uint8_t)e8m0_base[ib]));
-        const uint8_t * qs = (const uint8_t *)(qs_base + ib * MXFP6_SOA_QS_PER_BLOCK);
+        const uint8_t * qs = (const uint8_t *)(qs_base + MXFP_SOA_QS_OFFSET(ib, MXFP6_SOA_QS_PER_BLOCK));
 
         for (int j = 0; j < 32; j += 4) {
             const uint8_t * p = qs + (j * 3 / 4);

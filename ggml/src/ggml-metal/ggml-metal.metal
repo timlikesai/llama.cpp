@@ -158,19 +158,8 @@ static inline int best_index_int8(int n, constant float * val, float x) {
     return x - val[mu-1] < val[mu] - x ? mu-1 : mu;
 }
 
-// Canonical source: ggml_mxfp_e8m0_to_fp32() in ggml-common.h (uses memcpy; MSL uses as_type).
-static inline float e8m0_to_fp32(uint8_t x) {
-    uint32_t bits;
-
-    if (x == 0) {
-        bits = 0x00400000;
-    } else {
-        // no clamping — scale overflow handled by clamping dequant output to half range
-        bits = (uint32_t) x << 23;
-    }
-
-    return as_type<float>(bits);
-}
+// Shared via ggml-common.h GGML_MXFP_FUNC (portable bit cast macros eliminate MSL/C differences).
+#define e8m0_to_fp32 ggml_mxfp_e8m0_to_fp32
 
 static inline float dot(float x, float y) {
     return x*y;
@@ -672,7 +661,7 @@ void dequantize_mxfp4_soa(device const char * row, short bidx, short nblocks, sh
     // Aligned uint32_t loads (4 loads vs 16 byte loads)
     device const uint32_t * qs32 = (device const uint32_t *)(row + bidx * MXFP4_SOA_QS_PER_BLOCK);
     // Clamp scale to prevent half overflow: max_lut=6, half_max=65504, max_safe_scale=10917
-    const float d = min(e8m0_to_fp32(*(device const uint8_t *)(row + nblocks * MXFP4_SOA_QS_PER_BLOCK + bidx)), 10917.0f);
+    const float d = min(e8m0_to_fp32(*(device const uint8_t *)(row + MXFP_SOA_E8M0_OFFSET(nblocks, MXFP4_SOA_QS_PER_BLOCK) + bidx)), 10917.0f);
     const uint shr = il >= 1 ? 4 : 0;
 
     float4x4 reg_f;
@@ -692,7 +681,7 @@ template <typename type4>
 void dequantize_mxfp4_t4_soa(device const char * row, short bidx, short nblocks, short il, thread type4 & reg) {
     const short il4 = il % 4;
     const uint32_t p = *(device const uint32_t *)(row + bidx * MXFP4_SOA_QS_PER_BLOCK + il4 * 4);
-    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + nblocks * MXFP4_SOA_QS_PER_BLOCK + bidx));
+    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + MXFP_SOA_E8M0_OFFSET(nblocks, MXFP4_SOA_QS_PER_BLOCK) + bidx));
     const uint shr = il >= 4 ? 4 : 0;
 
     float4 reg_f;
@@ -712,7 +701,7 @@ void dequantize_mxfp4_t4_soa(device const char * row, short bidx, short nblocks,
 template <typename type4x4>
 void dequantize_mxfp8_soa(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg, constant float * lut) {
     device const uint32_t * qs32 = (device const uint32_t *)(row + bidx * MXFP8_SOA_QS_PER_BLOCK + il * 16);
-    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + nblocks * MXFP8_SOA_QS_PER_BLOCK + bidx));
+    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + MXFP_SOA_E8M0_OFFSET(nblocks, MXFP8_SOA_QS_PER_BLOCK) + bidx));
 
     float4x4 reg_f;
     for (int i = 0; i < 4; ++i) {
@@ -729,7 +718,7 @@ void dequantize_mxfp8_soa(device const char * row, short bidx, short nblocks, sh
 template <typename type4>
 void dequantize_mxfp8_t4_soa(device const char * row, short bidx, short nblocks, short il, thread type4 & reg, constant float * lut) {
     const uint32_t p = *(device const uint32_t *)(row + bidx * MXFP8_SOA_QS_PER_BLOCK + il * 4);
-    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + nblocks * MXFP8_SOA_QS_PER_BLOCK + bidx));
+    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + MXFP_SOA_E8M0_OFFSET(nblocks, MXFP8_SOA_QS_PER_BLOCK) + bidx));
 
     float4 reg_f;
     reg_f[0] = d * lut[(p >>  0) & 0xFF];
@@ -765,7 +754,7 @@ void dequantize_mxfp8_e5m2_t4_soa(device const char * row, short bidx, short nbl
 template <typename type4x4>
 void dequantize_mxfp6_soa(device const char * row, short bidx, short nblocks, short il, thread type4x4 & reg, constant float * lut) {
     device const uint32_t * qs32 = (device const uint32_t *)(row + bidx * MXFP6_SOA_QS_PER_BLOCK + il * 12);
-    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + nblocks * MXFP6_SOA_QS_PER_BLOCK + bidx));
+    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + MXFP_SOA_E8M0_OFFSET(nblocks, MXFP6_SOA_QS_PER_BLOCK) + bidx));
 
     const uint32_t w0 = qs32[0];
     const uint32_t w1 = qs32[1];
@@ -794,7 +783,7 @@ template <typename type4>
 void dequantize_mxfp6_t4_soa(device const char * row, short bidx, short nblocks, short il, thread type4 & reg, constant float * lut) {
     device const uint8_t * p = (device const uint8_t *)(row + bidx * MXFP6_SOA_QS_PER_BLOCK + il * 3);
     const uint32_t packed = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
-    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + nblocks * MXFP6_SOA_QS_PER_BLOCK + bidx));
+    const float d = e8m0_to_fp32(*(device const uint8_t *)(row + MXFP_SOA_E8M0_OFFSET(nblocks, MXFP6_SOA_QS_PER_BLOCK) + bidx));
 
     float4 reg_f;
     reg_f[0] = d * lut[ packed        & 0x3F];
@@ -885,10 +874,7 @@ static inline uint8_t mxfp4_compute_e8m0(float val) {
     float amax = simd_max(abs(val));
     if (amax == 0.0f) return 0;
 
-    uint32_t amax_bits = as_type<uint32_t>(amax);
-    int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
-    int round_up = ((amax_bits & 0x7FFFFF) >= 0x3504F3) ? 1 : 0;
-    int e_base = floor_log2 + round_up - MXFP4_E2M1_EMAX_OFFSET + 127;
+    int e_base = ggml_mxfp_e8m0_base_estimate(amax, MXFP4_E2M1_EMAX_OFFSET);
 
     int e_lo = max(e_base - MXFP_E8M0_MSE_RANGE, 1);
     int e_hi = max(min(e_base + MXFP_E8M0_MSE_RANGE, 254), 1);
@@ -955,60 +941,9 @@ static inline float mxfp4_preprocess_q_elem(float val, ushort tiisg, bool apply_
 }
 
 // ===== MXFP8 E4M3 dequantization =====
-// FP8 E4M3: 1 sign, 4 exponent (bias 7), 3 mantissa. Max finite = 448.
-// Canonical source: ggml_mxfp_fp8_e4m3_to_float() in ggml-common.h.
-// Metal keeps its own copy due to MSL language differences.
-static inline float fp8_e4m3_to_float(uint8_t v) {
-    uint32_t sign = ((uint32_t)(v & 0x80)) << 24;
-    uint32_t exp  = (v >> 3) & 0xF;
-    uint32_t mant = v & 0x7;
-
-    if (exp == 0) {
-        if (mant == 0) return as_type<float>(sign);
-        // Subnormal: mant * 2^(-9)
-        float val = (float)mant * (1.0f / 512.0f);
-        return as_type<float>((as_type<uint32_t>(val) & 0x7FFFFFFF) | sign);
-    }
-    if (exp == 15 && mant == 7) return as_type<float>(sign | 0x7FC00000); // NaN
-    return as_type<float>(sign | ((exp + 120) << 23) | (mant << 20));
-}
-
-// FP8 E4M3 quantize (round-to-nearest-even) for preprocessing round-trip
-static inline uint8_t float_to_fp8_e4m3_rn(float x) {
-    uint32_t bits = as_type<uint32_t>(x);
-    uint8_t sign = (bits >> 24) & 0x80;
-    bits &= 0x7FFFFFFF;
-    if (bits == 0) return sign;
-
-    uint32_t f32_exp  = (bits >> 23) & 0xFF;
-    uint32_t f32_mant = bits & 0x7FFFFF;
-    int e4m3_exp = (int)f32_exp - 120;
-
-    if (e4m3_exp < 0) {
-        int shift = 1 - e4m3_exp;
-        uint32_t full_mant = (1 << 23) | f32_mant;
-        int total_shift = 20 + shift;
-        if (total_shift >= 32) return sign;
-        uint32_t mant3 = full_mant >> total_shift;
-        if (total_shift > 0 && total_shift < 32) {
-            uint32_t round_bit = (full_mant >> (total_shift - 1)) & 1;
-            uint32_t sticky = (total_shift > 1) ? (full_mant & ((1u << (total_shift - 1)) - 1)) : 0;
-            if (round_bit && (sticky || (mant3 & 1))) mant3++;
-        }
-        if (mant3 > 7) return sign | 0x08;
-        return sign | (uint8_t)mant3;
-    }
-
-    uint32_t round_bit = (f32_mant >> 19) & 1;
-    uint32_t sticky = f32_mant & ((1 << 19) - 1);
-    uint32_t mant3 = f32_mant >> 20;
-    if (round_bit && (sticky || (mant3 & 1))) {
-        mant3++;
-        if (mant3 > 7) { mant3 = 0; e4m3_exp++; }
-    }
-    if (e4m3_exp > 15 || (e4m3_exp == 15 && mant3 >= 7)) return sign | 0x7E; // max finite (exp=15, mant=6 = 448)
-    return sign | (uint8_t)((e4m3_exp << 3) | mant3);
-}
+// Shared via ggml-common.h GGML_MXFP_FUNC (portable bit cast macros eliminate MSL/C differences).
+#define fp8_e4m3_to_float    ggml_mxfp_fp8_e4m3_to_float
+#define float_to_fp8_e4m3_rn ggml_mxfp_float_to_fp8_e4m3
 
 // ===== AoS dequant for MXFP8 (used by mul_mm, get_rows — NOT flash attention) =====
 template <typename type4x4>
@@ -1051,57 +986,9 @@ void dequantize_mxfp8_e4m3_t4(device const block_mxfp8 * xb, short il, thread ty
 }
 
 // ===== MXFP8 E5M2 dequantization =====
-// FP8 E5M2: 1 sign, 5 exponent (bias 15), 2 mantissa. Max finite = 57344.
-static inline float fp8_e5m2_to_float(uint8_t v) {
-    uint32_t sign = ((uint32_t)(v & 0x80)) << 24;
-    uint32_t exp  = (v >> 2) & 0x1F;
-    uint32_t mant = v & 0x3;
-
-    if (exp == 0) {
-        if (mant == 0) return as_type<float>(sign);
-        float val = (float)mant * (1.0f / 4.0f) * (1.0f / 16384.0f);
-        return as_type<float>((as_type<uint32_t>(val) & 0x7FFFFFFF) | sign);
-    }
-    if (exp == 31) return as_type<float>(sign | 0x7F800000 | (mant ? 0x400000 : 0));
-    return as_type<float>(sign | ((exp + 112) << 23) | (mant << 21));
-}
-
-// FP8 E5M2 quantize (round-to-nearest-even) for preprocessing round-trip
-static inline uint8_t float_to_fp8_e5m2_rn(float x) {
-    uint32_t bits = as_type<uint32_t>(x);
-    uint8_t sign = (bits >> 24) & 0x80;
-    bits &= 0x7FFFFFFF;
-    if (bits == 0) return sign;
-
-    uint32_t f32_exp  = (bits >> 23) & 0xFF;
-    uint32_t f32_mant = bits & 0x7FFFFF;
-    int e5m2_exp = (int)f32_exp - 112;
-
-    if (e5m2_exp < 0) {
-        int shift = 1 - e5m2_exp;
-        uint32_t full_mant = (1 << 23) | f32_mant;
-        int total_shift = 21 + shift;
-        if (total_shift >= 32) return sign;
-        uint32_t mant2 = full_mant >> total_shift;
-        if (total_shift > 0 && total_shift < 32) {
-            uint32_t round_bit = (full_mant >> (total_shift - 1)) & 1;
-            uint32_t sticky = (total_shift > 1) ? (full_mant & ((1u << (total_shift - 1)) - 1)) : 0;
-            if (round_bit && (sticky || (mant2 & 1))) mant2++;
-        }
-        if (mant2 > 3) return sign | 0x04;
-        return sign | (uint8_t)mant2;
-    }
-
-    uint32_t round_bit = (f32_mant >> 20) & 1;
-    uint32_t sticky = f32_mant & ((1 << 20) - 1);
-    uint32_t mant2 = f32_mant >> 21;
-    if (round_bit && (sticky || (mant2 & 1))) {
-        mant2++;
-        if (mant2 > 3) { mant2 = 0; e5m2_exp++; }
-    }
-    if (e5m2_exp >= 31) return sign | 0x7B; // max finite
-    return sign | (uint8_t)((e5m2_exp << 2) | mant2);
-}
+// Shared via ggml-common.h GGML_MXFP_FUNC (portable bit cast macros eliminate MSL/C differences).
+#define fp8_e5m2_to_float    ggml_mxfp_fp8_e5m2_to_float
+#define float_to_fp8_e5m2_rn ggml_mxfp_float_to_fp8_e5m2
 
 template <typename type4x4>
 void dequantize_mxfp8_e5m2(device const block_mxfp8 * xb, short il, thread type4x4 & reg) {
@@ -1114,79 +1001,11 @@ void dequantize_mxfp8_e5m2_t4(device const block_mxfp8 * xb, short il, thread ty
 }
 
 // ===== MXFP6 conversion helpers =====
-
-// FP6 E2M3: 1 sign, 2 exponent (bias 1), 3 mantissa. Max finite = 7.5
-static inline float fp6_e2m3_to_float(uint8_t v) {
-    float sign = (v & 0x20) ? -1.0f : 1.0f;
-    int exp  = (v >> 3) & 0x3;
-    int mant = v & 0x7;
-    if (exp == 0) return sign * (float)mant * (1.0f / 8.0f);
-    return sign * (1.0f + mant / 8.0f) * (float)(1 << (exp - 1));
-}
-
-// FP6 E2M3 quantize (round-to-nearest) for preprocessing round-trip
-static inline uint8_t float_to_fp6_e2m3_rn(float x) {
-    uint8_t sign = 0;
-    if (x < 0) { sign = 0x20; x = -x; }
-    if (x == 0) return sign;
-    if (x >= 7.5f) return sign | 0x1F;
-
-    // Use integer log2 approximation
-    uint32_t bits = as_type<uint32_t>(x);
-    int f32_exp = (int)((bits >> 23) & 0xFF) - 127;
-
-    if (f32_exp < 0) {
-        float scaled = x * 8.0f;
-        int mant = (int)(scaled + 0.5f);
-        if (mant > 7) return sign | 0x08;
-        return sign | (uint8_t)mant;
-    }
-    if (f32_exp > 2) f32_exp = 2;
-
-    float mantf = (x / (float)(1 << f32_exp)) - 1.0f;
-    int mant = (int)(mantf * 8.0f + 0.5f);
-    if (mant > 7) { mant = 0; f32_exp++; }
-    if (f32_exp > 2) return sign | 0x1F;
-    return sign | (uint8_t)(((f32_exp + 1) << 3) | mant);
-}
-
-// FP6 E3M2: 1 sign, 3 exponent (bias 3), 2 mantissa. Max finite = 28.0
-static inline float fp6_e3m2_to_float(uint8_t v) {
-    float sign = (v & 0x20) ? -1.0f : 1.0f;
-    int exp  = (v >> 2) & 0x7;
-    int mant = v & 0x3;
-    if (exp == 0) return sign * (float)mant * (1.0f / 16.0f);
-    // 2^(exp-3) = ldexp(1.0, exp-3), use integer shift or division
-    float pow2 = (exp >= 3) ? (float)(1 << (exp - 3)) : 1.0f / (float)(1 << (3 - exp));
-    return sign * (1.0f + mant / 4.0f) * pow2;
-}
-
-// FP6 E3M2 quantize (round-to-nearest) for preprocessing round-trip
-static inline uint8_t float_to_fp6_e3m2_rn(float x) {
-    uint8_t sign = 0;
-    if (x < 0) { sign = 0x20; x = -x; }
-    if (x == 0) return sign;
-    if (x >= 28.0f) return sign | 0x1F;
-
-    uint32_t bits = as_type<uint32_t>(x);
-    int f32_exp = (int)((bits >> 23) & 0xFF) - 127;
-    int biased_exp = f32_exp + 3;
-
-    if (biased_exp <= 0) {
-        float scaled = x * 16.0f;
-        int mant = (int)(scaled + 0.5f);
-        if (mant > 3) return sign | 0x04;
-        return sign | (uint8_t)mant;
-    }
-    if (biased_exp > 7) return sign | 0x1F;
-
-    float pow2 = (f32_exp >= 0) ? (float)(1 << f32_exp) : 1.0f / (float)(1 << (-f32_exp));
-    float mantf = (x / pow2) - 1.0f;
-    int mant = (int)(mantf * 4.0f + 0.5f);
-    if (mant > 3) { mant = 0; biased_exp++; }
-    if (biased_exp > 7) return sign | 0x1F;
-    return sign | (uint8_t)((biased_exp << 2) | mant);
-}
+// Shared via ggml-common.h GGML_MXFP_FUNC (portable bit cast macros eliminate MSL/C differences).
+#define fp6_e2m3_to_float    ggml_mxfp_fp6_e2m3_to_float
+#define float_to_fp6_e2m3_rn ggml_mxfp_float_to_fp6_e2m3
+#define fp6_e3m2_to_float    ggml_mxfp_fp6_e3m2_to_float
+#define float_to_fp6_e3m2_rn ggml_mxfp_float_to_fp6_e3m2
 
 // ===== AoS dequant for MXFP6 (used by mul_mm, get_rows — NOT flash attention) =====
 template <typename type4x4>
@@ -1274,10 +1093,7 @@ static inline uint8_t mxfp_compute_e8m0_mse(float val) {
     float amax = simd_max(abs(val));
     if (amax == 0.0f) return 0;
 
-    uint32_t amax_bits = as_type<uint32_t>(amax);
-    int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
-    int round_up = ((amax_bits & 0x7FFFFF) >= 0x3504F3) ? 1 : 0;
-    int e_base = floor_log2 + round_up - EMAX_OFFSET + 127;
+    int e_base = ggml_mxfp_e8m0_base_estimate(amax, EMAX_OFFSET);
 
     int e_lo = max(e_base - MXFP_E8M0_MSE_RANGE, 1);
     int e_hi = max(min(e_base + MXFP_E8M0_MSE_RANGE, 254), 1);
@@ -10012,11 +9828,11 @@ kernel void kernel_set_rows_mxfp4_simd(
 
         // Write SoA: [qs_block0[16]|qs_block1[16]|...][e8m0_0|e8m0_1|...]
         if (tiisg < 16) {
-            device uint8_t * qs_dst = (device uint8_t *)(dst_row + ind * MXFP4_SOA_QS_PER_BLOCK);
+            device uint8_t * qs_dst = (device uint8_t *)(dst_row + MXFP_SOA_QS_OFFSET(ind, MXFP4_SOA_QS_PER_BLOCK));
             qs_dst[tiisg] = nibble | (partner_nibble << 4);
         }
         if (tiisg == 0) {
-            *(dst_row + (int)(args.nb1 / (MXFP4_SOA_QS_PER_BLOCK + 1)) * MXFP4_SOA_QS_PER_BLOCK + ind) = (char)e;
+            *(dst_row + MXFP_SOA_E8M0_OFFSET((int)(args.nb1 / (MXFP4_SOA_QS_PER_BLOCK + 1)), MXFP4_SOA_QS_PER_BLOCK) + ind) = (char)e;
         }
     }
 }
@@ -10072,9 +9888,9 @@ kernel void kernel_set_rows_mxfp8_simd(
                                            : float_to_fp8_e5m2_rn(val * inv_scale);
 
         // Write SoA: [qs_block0[32]|qs_block1[32]|...][e8m0_0|e8m0_1|...]
-        *(device uint8_t *)(dst_row + ind * MXFP8_SOA_QS_PER_BLOCK + tiisg) = fp8;
+        *(device uint8_t *)(dst_row + MXFP_SOA_QS_OFFSET(ind, MXFP8_SOA_QS_PER_BLOCK) + tiisg) = fp8;
         if (tiisg == 0) {
-            *(dst_row + (int)(args.nb1 / (MXFP8_SOA_QS_PER_BLOCK + 1)) * MXFP8_SOA_QS_PER_BLOCK + ind) = (char)e;
+            *(dst_row + MXFP_SOA_E8M0_OFFSET((int)(args.nb1 / (MXFP8_SOA_QS_PER_BLOCK + 1)), MXFP8_SOA_QS_PER_BLOCK) + ind) = (char)e;
         }
     }
 }
@@ -10142,13 +9958,13 @@ kernel void kernel_set_rows_mxfp6_simd(
         // Write SoA: [qs_block0[24]|qs_block1[24]|...][e8m0_0|e8m0_1|...]
         if (lane == 0) {
             uint32_t packed = (v0 & 0x3F) | ((v1 & 0x3F) << 6) | ((v2 & 0x3F) << 12) | ((v3 & 0x3F) << 18);
-            device uint8_t * qs_dst = (device uint8_t *)(dst_row + ind * MXFP6_SOA_QS_PER_BLOCK + group * 3);
+            device uint8_t * qs_dst = (device uint8_t *)(dst_row + MXFP_SOA_QS_OFFSET(ind, MXFP6_SOA_QS_PER_BLOCK) + group * 3);
             qs_dst[0] = (uint8_t)(packed);
             qs_dst[1] = (uint8_t)(packed >> 8);
             qs_dst[2] = (uint8_t)(packed >> 16);
         }
         if (tiisg == 0) {
-            *(dst_row + (int)(args.nb1 / (MXFP6_SOA_QS_PER_BLOCK + 1)) * MXFP6_SOA_QS_PER_BLOCK + ind) = (char)e;
+            *(dst_row + MXFP_SOA_E8M0_OFFSET((int)(args.nb1 / (MXFP6_SOA_QS_PER_BLOCK + 1)), MXFP6_SOA_QS_PER_BLOCK) + ind) = (char)e;
         }
     }
 }

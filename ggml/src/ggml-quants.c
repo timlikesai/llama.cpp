@@ -849,7 +849,7 @@ void quantize_row_mxfp4_soa(const float * GGML_RESTRICT x, void * GGML_RESTRICT 
     const int nb = k / QK_MXFP4;
     char * row = (char *)dst;
     char * qs_base  = row;
-    char * e8m0_base = row + nb * MXFP4_SOA_QS_PER_BLOCK;
+    char * e8m0_base = row + MXFP_SOA_E8M0_OFFSET(nb, MXFP4_SOA_QS_PER_BLOCK);
 
     for (int i = 0; i < nb; i++) {
         const uint8_t e = mxfp_compute_e8m0_mse(&x[i*QK_MXFP4], QK_MXFP4, &mxfp4_traits);
@@ -857,7 +857,7 @@ void quantize_row_mxfp4_soa(const float * GGML_RESTRICT x, void * GGML_RESTRICT 
 
         e8m0_base[i] = (char)e;
 
-        uint8_t * qs = (uint8_t *)(qs_base + i * MXFP4_SOA_QS_PER_BLOCK);
+        uint8_t * qs = (uint8_t *)(qs_base + MXFP_SOA_QS_OFFSET(i, MXFP4_SOA_QS_PER_BLOCK));
         for (int j = 0; j < QK_MXFP4/2; ++j) {
             const uint8_t x0 = best_index_mxfp4(x[i*QK_MXFP4 + 0        + j], d);
             const uint8_t x1 = best_index_mxfp4(x[i*QK_MXFP4 + QK_MXFP4/2 + j], d);
@@ -871,11 +871,11 @@ void dequantize_row_mxfp4_soa(const void * GGML_RESTRICT src, float * GGML_RESTR
     const int nb = k / QK_MXFP4;
     const char * row = (const char *)src;
     const char * qs_base   = row;
-    const char * e8m0_base = row + nb * MXFP4_SOA_QS_PER_BLOCK;
+    const char * e8m0_base = row + MXFP_SOA_E8M0_OFFSET(nb, MXFP4_SOA_QS_PER_BLOCK);
 
     for (int i = 0; i < nb; i++) {
         const float d = GGML_E8M0_TO_FP32_HALF((uint8_t)e8m0_base[i]);
-        const uint8_t * qs = (const uint8_t *)(qs_base + i * MXFP4_SOA_QS_PER_BLOCK);
+        const uint8_t * qs = (const uint8_t *)(qs_base + MXFP_SOA_QS_OFFSET(i, MXFP4_SOA_QS_PER_BLOCK));
 
         for (int j = 0; j < QK_MXFP4/2; ++j) {
             const int8_t x0 = kvalues_mxfp4[qs[j] & 0x0F];
@@ -892,7 +892,7 @@ static void quantize_row_mxfp8_soa_impl(const float * GGML_RESTRICT x, void * GG
     const int nb = k / QK_MXFP8;
     char * row = (char *)dst;
     char * qs_base   = row;
-    char * e8m0_base = row + nb * MXFP8_SOA_QS_PER_BLOCK;
+    char * e8m0_base = row + MXFP_SOA_E8M0_OFFSET(nb, MXFP8_SOA_QS_PER_BLOCK);
 
     for (int i = 0; i < nb; i++) {
         const uint8_t e = mxfp_compute_e8m0_mse(&x[i*QK_MXFP8], QK_MXFP8, traits);
@@ -900,7 +900,7 @@ static void quantize_row_mxfp8_soa_impl(const float * GGML_RESTRICT x, void * GG
         const float inv_d = d > 0.0f ? 1.0f / d : 0.0f;
         e8m0_base[i] = (char)e;
 
-        uint8_t * qs = (uint8_t *)(qs_base + i * MXFP8_SOA_QS_PER_BLOCK);
+        uint8_t * qs = (uint8_t *)(qs_base + MXFP_SOA_QS_OFFSET(i, MXFP8_SOA_QS_PER_BLOCK));
         for (int j = 0; j < QK_MXFP8; ++j) {
             qs[j] = traits->to_elem(x[i*QK_MXFP8 + j] * inv_d);
         }
@@ -913,11 +913,11 @@ static void dequantize_row_mxfp8_soa_impl(const void * GGML_RESTRICT src, float 
     const int nb = k / QK_MXFP8;
     const char * row = (const char *)src;
     const char * qs_base   = row;
-    const char * e8m0_base = row + nb * MXFP8_SOA_QS_PER_BLOCK;
+    const char * e8m0_base = row + MXFP_SOA_E8M0_OFFSET(nb, MXFP8_SOA_QS_PER_BLOCK);
 
     for (int i = 0; i < nb; i++) {
         const float d = GGML_E8M0_TO_FP32((uint8_t)e8m0_base[i]);
-        const uint8_t * qs = (const uint8_t *)(qs_base + i * MXFP8_SOA_QS_PER_BLOCK);
+        const uint8_t * qs = (const uint8_t *)(qs_base + MXFP_SOA_QS_OFFSET(i, MXFP8_SOA_QS_PER_BLOCK));
         for (int j = 0; j < QK_MXFP8; ++j) {
             y[i*QK_MXFP8 + j] = traits->to_float(qs[j]) * d;
         }
@@ -930,7 +930,7 @@ static void quantize_row_mxfp6_soa_impl(const float * GGML_RESTRICT x, void * GG
     const int nb = k / QK_MXFP6;
     char * row = (char *)dst;
     char * qs_base   = row;
-    char * e8m0_base = row + nb * MXFP6_SOA_QS_PER_BLOCK;
+    char * e8m0_base = row + MXFP_SOA_E8M0_OFFSET(nb, MXFP6_SOA_QS_PER_BLOCK);
 
     for (int i = 0; i < nb; i++) {
         const uint8_t e = mxfp_compute_e8m0_mse(&x[i*QK_MXFP6], QK_MXFP6, traits);
@@ -938,7 +938,7 @@ static void quantize_row_mxfp6_soa_impl(const float * GGML_RESTRICT x, void * GG
         const float inv_d = d > 0.0f ? 1.0f / d : 0.0f;
         e8m0_base[i] = (char)e;
 
-        uint8_t * qs = (uint8_t *)(qs_base + i * MXFP6_SOA_QS_PER_BLOCK);
+        uint8_t * qs = (uint8_t *)(qs_base + MXFP_SOA_QS_OFFSET(i, MXFP6_SOA_QS_PER_BLOCK));
         for (int j = 0; j < QK_MXFP6; j += 4) {
             uint8_t vals[4];
             for (int jj = 0; jj < 4; jj++) {
@@ -955,11 +955,11 @@ static void dequantize_row_mxfp6_soa_impl(const void * GGML_RESTRICT src, float 
     const int nb = k / QK_MXFP6;
     const char * row = (const char *)src;
     const char * qs_base   = row;
-    const char * e8m0_base = row + nb * MXFP6_SOA_QS_PER_BLOCK;
+    const char * e8m0_base = row + MXFP_SOA_E8M0_OFFSET(nb, MXFP6_SOA_QS_PER_BLOCK);
 
     for (int i = 0; i < nb; i++) {
         const float d = GGML_E8M0_TO_FP32((uint8_t)e8m0_base[i]);
-        const uint8_t * qs = (const uint8_t *)(qs_base + i * MXFP6_SOA_QS_PER_BLOCK);
+        const uint8_t * qs = (const uint8_t *)(qs_base + MXFP_SOA_QS_OFFSET(i, MXFP6_SOA_QS_PER_BLOCK));
         for (int j = 0; j < QK_MXFP6; j += 4) {
             uint8_t vals[4];
             unpack_fp6x4(&qs[j * 3 / 4], vals);

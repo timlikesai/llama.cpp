@@ -271,6 +271,12 @@ static_assert(sizeof(block_mxfp6) == sizeof(uint8_t) + QK_MXFP6 * 6 / 8, "wrong 
 #define MXFP8_SOA_QS_PER_BLOCK  MXFP_QS_PER_BLOCK_E4M3   // 32 bytes
 #define MXFP6_SOA_QS_PER_BLOCK  MXFP_QS_PER_BLOCK_E2M3   // 24 bytes
 
+// SoA offset helpers — single source of truth for the SoA memory layout contract.
+// qs region: blocks 0..nblocks-1 at contiguous qs_per_block-byte strides.
+// e8m0 region: starts immediately after all qs blocks.
+#define MXFP_SOA_QS_OFFSET(block_idx, qs_per_block)     ((block_idx) * (qs_per_block))
+#define MXFP_SOA_E8M0_OFFSET(nblocks, qs_per_block)     ((nblocks) * (qs_per_block))
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta
@@ -519,6 +525,12 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 #define GGML_TABLE_BEGIN(type, name, size) static const type name[size] = {
 #define GGML_TABLE_END() };
 #define GGML_MXFP_FUNC static inline
+static inline uint32_t ggml_mxfp_f32_as_u32_(float f) { uint32_t u; memcpy(&u, &f, sizeof(u)); return u; }
+static inline float    ggml_mxfp_u32_as_f32_(uint32_t u) { float f; memcpy(&f, &u, sizeof(f)); return f; }
+#define GGML_MXFP_F32_AS_U32(f) ggml_mxfp_f32_as_u32_(f)
+#define GGML_MXFP_U32_AS_F32(u) ggml_mxfp_u32_as_f32_(u)
+#define GGML_MXFP_LDEXPF(x, n)  ldexpf(x, n)
+#define GGML_MXFP_THREAD
 
 #define GGML_COMMON_IMPL
 #elif defined(GGML_COMMON_IMPL_CPP)
@@ -529,6 +541,12 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 #define GGML_TABLE_BEGIN(type, name, size) static const type name[size] = {
 #define GGML_TABLE_END() };
 #define GGML_MXFP_FUNC static inline
+static inline uint32_t ggml_mxfp_f32_as_u32_(float f) { uint32_t u; memcpy(&u, &f, sizeof(u)); return u; }
+static inline float    ggml_mxfp_u32_as_f32_(uint32_t u) { float f; memcpy(&f, &u, sizeof(f)); return f; }
+#define GGML_MXFP_F32_AS_U32(f) ggml_mxfp_f32_as_u32_(f)
+#define GGML_MXFP_U32_AS_F32(u) ggml_mxfp_u32_as_f32_(u)
+#define GGML_MXFP_LDEXPF(x, n)  ldexpf(x, n)
+#define GGML_MXFP_THREAD
 
 #define GGML_COMMON_IMPL
 #elif defined(GGML_COMMON_IMPL_METAL)
@@ -536,7 +554,11 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 
 #define GGML_TABLE_BEGIN(type, name, size) static const constant type name[size] = {
 #define GGML_TABLE_END() };
-// Metal keeps its own MSL element converters — no GGML_MXFP_FUNC defined.
+#define GGML_MXFP_FUNC static inline
+#define GGML_MXFP_F32_AS_U32(f) as_type<uint32_t>(f)
+#define GGML_MXFP_U32_AS_F32(u) as_type<float>(u)
+#define GGML_MXFP_LDEXPF(x, n)  metal::ldexp(x, n)
+#define GGML_MXFP_THREAD thread
 
 #define GGML_COMMON_IMPL
 #elif defined(GGML_COMMON_IMPL_CUDA) || defined(GGML_COMMON_IMPL_HIP) || defined(GGML_COMMON_IMPL_MUSA)
@@ -546,6 +568,10 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 #define GGML_TABLE_BEGIN(type, name, size) static const __device__ type name[size] = {
 #define GGML_TABLE_END() };
 #define GGML_MXFP_FUNC static __device__ __forceinline__
+#define GGML_MXFP_F32_AS_U32(f) __float_as_uint(f)
+#define GGML_MXFP_U32_AS_F32(u) __uint_as_float(u)
+#define GGML_MXFP_LDEXPF(x, n)  ldexpf(x, n)
+#define GGML_MXFP_THREAD
 
 #define GGML_COMMON_IMPL
 #elif defined(GGML_COMMON_IMPL_SYCL)
@@ -557,6 +583,12 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 #define GGML_TABLE_BEGIN(type, name, size) static const type name[size] = {
 #define GGML_TABLE_END() };
 #define GGML_MXFP_FUNC static inline
+static inline uint32_t ggml_mxfp_f32_as_u32_(float f) { uint32_t u; memcpy(&u, &f, sizeof(u)); return u; }
+static inline float    ggml_mxfp_u32_as_f32_(uint32_t u) { float f; memcpy(&f, &u, sizeof(f)); return f; }
+#define GGML_MXFP_F32_AS_U32(f) ggml_mxfp_f32_as_u32_(f)
+#define GGML_MXFP_U32_AS_F32(u) ggml_mxfp_u32_as_f32_(u)
+#define GGML_MXFP_LDEXPF(x, n)  ldexpf(x, n)
+#define GGML_MXFP_THREAD
 
 #define GGML_COMMON_IMPL
 #endif
@@ -1244,8 +1276,7 @@ GGML_MXFP_FUNC uint8_t ggml_mxfp_float_to_fp6_e2m3(float x) {
     if (x == 0) return sign;
     if (x >= 7.5f) return sign | 0x1F;  // max finite
 
-    uint32_t bits;
-    memcpy(&bits, &x, sizeof(uint32_t));
+    uint32_t bits = GGML_MXFP_F32_AS_U32(x);
     int f32_exp = (int)((bits >> 23) & 0xFF) - 127;
 
     if (f32_exp < 0) {
@@ -1272,7 +1303,7 @@ GGML_MXFP_FUNC float ggml_mxfp_fp6_e3m2_to_float(uint8_t v) {
     const int mant = v & 0x3;
     if (exp == 0) return sign * (float)mant * 0.0625f;  // 2^(-4)
     // MX E3M2 has no NaN/Inf — exp=7 is a valid normal value (max finite = 28.0).
-    return sign * ldexpf(1.0f + mant * 0.25f, exp - 3);
+    return sign * GGML_MXFP_LDEXPF(1.0f + mant * 0.25f, exp - 3);
 }
 
 GGML_MXFP_FUNC uint8_t ggml_mxfp_float_to_fp6_e3m2(float x) {
@@ -1281,8 +1312,7 @@ GGML_MXFP_FUNC uint8_t ggml_mxfp_float_to_fp6_e3m2(float x) {
     if (x == 0) return sign;
     if (x >= 28.0f) return sign | 0x1F;  // max finite
 
-    uint32_t bits;
-    memcpy(&bits, &x, sizeof(uint32_t));
+    uint32_t bits = GGML_MXFP_F32_AS_U32(x);
     int f32_exp = (int)((bits >> 23) & 0xFF) - 127;
     int biased_exp = f32_exp + 3;
 
@@ -1311,26 +1341,22 @@ GGML_MXFP_FUNC float ggml_mxfp_fp8_e4m3_to_float(uint8_t v) {
     uint32_t mant = v & 0x7;
 
     if (exp == 0) {
-        if (mant == 0) { float r; uint32_t s = sign; memcpy(&r, &s, 4); return r; }
+        if (mant == 0) return GGML_MXFP_U32_AS_F32(sign);
         // Subnormal: mant * 2^(1-7) * 2^(-3) = mant * 2^(-9)
         float val = (float)mant * (1.0f / 512.0f);
-        uint32_t vb; memcpy(&vb, &val, 4);
+        uint32_t vb = GGML_MXFP_F32_AS_U32(val);
         vb = (vb & 0x7FFFFFFFu) | sign;
-        memcpy(&val, &vb, 4);
-        return val;
+        return GGML_MXFP_U32_AS_F32(vb);
     }
     if (exp == 15 && mant == 7) {
-        uint32_t nan_bits = sign | 0x7FC00000u;
-        float r; memcpy(&r, &nan_bits, 4); return r;
+        return GGML_MXFP_U32_AS_F32(sign | 0x7FC00000u);
     }
     // Normal: (-1)^S * 2^(E-7) * (1 + M/8) → F32 exp = E-7+127 = E+120
-    uint32_t f32_bits = sign | ((exp + 120) << 23) | (mant << 20);
-    float r; memcpy(&r, &f32_bits, 4); return r;
+    return GGML_MXFP_U32_AS_F32(sign | ((exp + 120) << 23) | (mant << 20));
 }
 
 GGML_MXFP_FUNC uint8_t ggml_mxfp_float_to_fp8_e4m3(float x) {
-    uint32_t bits;
-    memcpy(&bits, &x, sizeof(uint32_t));
+    uint32_t bits = GGML_MXFP_F32_AS_U32(x);
     uint8_t sign = (bits >> 24) & 0x80;
     bits &= 0x7FFFFFFFu;
     if (bits == 0) return sign;
@@ -1374,26 +1400,22 @@ GGML_MXFP_FUNC float ggml_mxfp_fp8_e5m2_to_float(uint8_t v) {
     uint32_t mant = v & 0x3;
 
     if (exp == 0) {
-        if (mant == 0) { float r; uint32_t s = sign; memcpy(&r, &s, 4); return r; }
+        if (mant == 0) return GGML_MXFP_U32_AS_F32(sign);
         // Subnormal: mant * 2^(1-15) * 2^(-2) = mant/4 * 2^(-14)
         float val = (float)mant * 0.25f * (1.0f / 16384.0f);
-        uint32_t vb; memcpy(&vb, &val, 4);
+        uint32_t vb = GGML_MXFP_F32_AS_U32(val);
         vb = (vb & 0x7FFFFFFFu) | sign;
-        memcpy(&val, &vb, 4);
-        return val;
+        return GGML_MXFP_U32_AS_F32(vb);
     }
     if (exp == 31) {
-        uint32_t inf_nan = sign | 0x7F800000u | (mant ? 0x400000u : 0);
-        float r; memcpy(&r, &inf_nan, 4); return r;
+        return GGML_MXFP_U32_AS_F32(sign | 0x7F800000u | (mant ? 0x400000u : 0));
     }
     // Normal: F32 exp = E-15+127 = E+112
-    uint32_t f32_bits = sign | ((exp + 112) << 23) | (mant << 21);
-    float r; memcpy(&r, &f32_bits, 4); return r;
+    return GGML_MXFP_U32_AS_F32(sign | ((exp + 112) << 23) | (mant << 21));
 }
 
 GGML_MXFP_FUNC uint8_t ggml_mxfp_float_to_fp8_e5m2(float x) {
-    uint32_t bits;
-    memcpy(&bits, &x, sizeof(uint32_t));
+    uint32_t bits = GGML_MXFP_F32_AS_U32(x);
     uint8_t sign = (bits >> 24) & 0x80;
     bits &= 0x7FFFFFFFu;
     if (bits == 0) return sign;
@@ -1451,36 +1473,21 @@ GGML_MXFP_FUNC void ggml_mxfp_unpack_fp6x4(const uint8_t in[3], uint8_t v[4]) {
 // E8M0 shared exponent → float conversion.
 // E8M0 encoding: value = 2^(x - 127) for x > 0, 2^(-127) for x == 0.
 GGML_MXFP_FUNC float ggml_mxfp_e8m0_to_fp32(uint8_t x) {
-    uint32_t bits;
-    if (x == 0) {
-        bits = 0x00400000;  // 2^(-127)
-    } else {
-        bits = (uint32_t) x << 23;
-    }
-    float result;
-    memcpy(&result, &bits, sizeof(float));
-    return result;
+    uint32_t bits = (x == 0) ? 0x00400000u : ((uint32_t)x << 23);
+    return GGML_MXFP_U32_AS_F32(bits);
 }
 
 // E8M0 → float/2. Used with MXFP4 since E2M1 values are doubled in kvalues_mxfp4.
 GGML_MXFP_FUNC float ggml_mxfp_e8m0_to_fp32_half(uint8_t x) {
-    uint32_t bits;
-    if (x < 2) {
-        bits = 0x00200000 << x;
-    } else {
-        bits = (uint32_t)(x - 1) << 23;
-    }
-    float result;
-    memcpy(&result, &bits, sizeof(float));
-    return result;
+    uint32_t bits = (x < 2) ? (0x00200000u << x) : ((uint32_t)(x - 1) << 23);
+    return GGML_MXFP_U32_AS_F32(bits);
 }
 
 // E8M0 base exponent estimate: round(log2(amax)) - emax_offset + 127.
 // Uses integer bit extraction — no log2f() SFU dependency.
 // Caller must ensure amax > 0 and finite. Returns unclamped e_base.
 GGML_MXFP_FUNC int ggml_mxfp_e8m0_base_estimate(float amax, int emax_offset) {
-    uint32_t amax_bits;
-    memcpy(&amax_bits, &amax, sizeof(uint32_t));
+    uint32_t amax_bits = GGML_MXFP_F32_AS_U32(amax);
     const int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
     // Round: add 1 if mantissa >= sqrt(2)-1 (0x3504F3 in 23-bit IEEE mantissa).
     const int round_log2 = floor_log2 + ((amax_bits & 0x7FFFFF) >= 0x3504F3 ? 1 : 0);
@@ -1490,7 +1497,7 @@ GGML_MXFP_FUNC int ggml_mxfp_e8m0_base_estimate(float amax, int emax_offset) {
 // Block-32 Walsh-Hadamard Transform, normalized by 1/sqrt(32).
 // Spreads outlier energy across all elements sharing an E8M0 exponent,
 // improving quantization quality (see QuaRot arXiv:2404.00456).
-GGML_MXFP_FUNC void ggml_mxfp_hadamard_32_inplace(float * vals) {
+GGML_MXFP_FUNC void ggml_mxfp_hadamard_32_inplace(GGML_MXFP_THREAD float * vals) {
 #pragma unroll
     for (int stride = 1; stride < 32; stride *= 2) {
 #pragma unroll

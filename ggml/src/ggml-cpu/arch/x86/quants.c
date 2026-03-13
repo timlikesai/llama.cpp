@@ -4183,7 +4183,7 @@ static inline void dequantize_row_mxfp4_soa_avx2(
     const int nb = k / QK_MXFP4;
     const char * row = (const char *)src;
     const char * qs_base   = row;
-    const char * e8m0_base = row + nb * MXFP4_SOA_QS_PER_BLOCK;
+    const char * e8m0_base = row + MXFP_SOA_E8M0_OFFSET(nb, MXFP4_SOA_QS_PER_BLOCK);
 
     const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_mxfp4);
     const __m128i m4b = _mm_set1_epi8(0x0f);
@@ -4191,7 +4191,7 @@ static inline void dequantize_row_mxfp4_soa_avx2(
     for (int i = 0; i < nb; i++) {
         const float d = GGML_E8M0_TO_FP32_HALF((uint8_t)e8m0_base[i]);
         const __m256 v_scale = _mm256_set1_ps(d);
-        const uint8_t * qs = (const uint8_t *)(qs_base + i * MXFP4_SOA_QS_PER_BLOCK);
+        const uint8_t * qs = (const uint8_t *)(qs_base + MXFP_SOA_QS_OFFSET(i, MXFP4_SOA_QS_PER_BLOCK));
 
         const __m128i q4bits = _mm_loadu_si128((const __m128i *)qs);
 
@@ -4220,7 +4220,7 @@ static inline void dequantize_row_mxfp8_soa_avx2(
     const int nb = k / QK_MXFP8;
     const char * row = (const char *)src;
     const char * qs_base   = row;
-    const char * e8m0_base = row + nb * MXFP8_SOA_QS_PER_BLOCK;
+    const char * e8m0_base = row + MXFP_SOA_E8M0_OFFSET(nb, MXFP8_SOA_QS_PER_BLOCK);
 
     const __m256i v_exp_mask  = _mm256_set1_epi32(exp_mask);
     const __m256i v_mant_mask = _mm256_set1_epi32(mant_mask);
@@ -4230,7 +4230,7 @@ static inline void dequantize_row_mxfp8_soa_avx2(
 
     for (int ib = 0; ib < nb; ++ib) {
         const __m256 v_scale = _mm256_set1_ps(GGML_E8M0_TO_FP32((uint8_t)e8m0_base[ib]));
-        const uint8_t * qs = (const uint8_t *)(qs_base + ib * MXFP8_SOA_QS_PER_BLOCK);
+        const uint8_t * qs = (const uint8_t *)(qs_base + MXFP_SOA_QS_OFFSET(ib, MXFP8_SOA_QS_PER_BLOCK));
 
         for (int j = 0; j < 32; j += 8) {
             const __m128i raw8 = _mm_loadl_epi64((const __m128i *)(qs + j));
@@ -4266,7 +4266,7 @@ static inline void dequantize_row_mxfp6_soa_avx2(
     const int nb = k / QK_MXFP6;
     const char * row = (const char *)src;
     const char * qs_base   = row;
-    const char * e8m0_base = row + nb * MXFP6_SOA_QS_PER_BLOCK;
+    const char * e8m0_base = row + MXFP_SOA_E8M0_OFFSET(nb, MXFP6_SOA_QS_PER_BLOCK);
 
     const __m256i v_exp_mask  = _mm256_set1_epi32(exp_mask);
     const __m256i v_mant_mask = _mm256_set1_epi32(mant_mask);
@@ -4276,7 +4276,7 @@ static inline void dequantize_row_mxfp6_soa_avx2(
 
     for (int ib = 0; ib < nb; ++ib) {
         const __m256 v_scale = _mm256_set1_ps(GGML_E8M0_TO_FP32((uint8_t)e8m0_base[ib]));
-        const uint8_t * qs = (const uint8_t *)(qs_base + ib * MXFP6_SOA_QS_PER_BLOCK);
+        const uint8_t * qs = (const uint8_t *)(qs_base + MXFP_SOA_QS_OFFSET(ib, MXFP6_SOA_QS_PER_BLOCK));
 
         for (int j = 0; j < 32; j += 8) {
             uint8_t unpacked[8];
