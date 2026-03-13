@@ -1803,12 +1803,12 @@ float fp8_e4m3_to_float(uint v) {
 #else
 float fp8_e4m3_to_float(uint v) {
     uint sign = (v & 0x80u) << 24;
-    uint exp  = (v >> 3) & 0xFu;
-    uint mant = v & 0x7u;
+    uint exp  = (v >> MXFP8_E4M3_EXP_SHIFT) & MXFP8_E4M3_EXP_MASK;
+    uint mant = v & MXFP8_E4M3_MANT_MASK;
     // Normal: reconstruct absolute value via IEEE-754 bit manipulation
-    float normal_val = uintBitsToFloat(((exp + 120u) << 23) | (mant << 20));
+    float normal_val = uintBitsToFloat(((exp + MXFP8_E4M3_IEEE_EXP_OFF) << 23) | (mant << MXFP8_E4M3_MANT_SHIFT));
     // Subnormal (exp=0): value = mant * 2^(-9). Select avoids branch divergence.
-    float abs_result = (exp == 0u) ? (float(mant) * (1.0 / 512.0)) : normal_val;
+    float abs_result = (exp == 0u) ? (float(mant) * MXFP8_E4M3_SUB_SCALE) : normal_val;
     return uintBitsToFloat(floatBitsToUint(abs_result) | sign);
 }
 #endif
@@ -1826,12 +1826,12 @@ float fp8_e5m2_to_float(uint v) {
 #else
 float fp8_e5m2_to_float(uint v) {
     uint sign = (v & 0x80u) << 24;
-    uint exp  = (v >> 2) & 0x1Fu;
-    uint mant = v & 0x3u;
+    uint exp  = (v >> MXFP8_E5M2_EXP_SHIFT) & MXFP8_E5M2_EXP_MASK;
+    uint mant = v & MXFP8_E5M2_MANT_MASK;
     // Normal: reconstruct absolute value via IEEE-754 bit manipulation
-    float normal_val = uintBitsToFloat(((exp + 112u) << 23) | (mant << 21));
+    float normal_val = uintBitsToFloat(((exp + MXFP8_E5M2_IEEE_EXP_OFF) << 23) | (mant << MXFP8_E5M2_MANT_SHIFT));
     // Subnormal (exp=0): value = mant * 2^(-16). Select avoids branch divergence.
-    float abs_result = (exp == 0u) ? (float(mant) * (1.0 / 65536.0)) : normal_val;
+    float abs_result = (exp == 0u) ? (float(mant) * MXFP8_E5M2_SUB_SCALE) : normal_val;
     return uintBitsToFloat(floatBitsToUint(abs_result) | sign);
 }
 #endif
@@ -1842,12 +1842,12 @@ float fp8_e5m2_to_float(uint v) {
 #if defined(DATA_A_MXFP6_E2M3) || defined(MXFP_ALL_DEQUANT)
 float fp6_e2m3_to_float(uint v) {
     uint sign = (v & 0x20u) << 26;  // sign bit → IEEE position 31
-    uint exp  = (v >> 3) & 0x3u;
-    uint mant = v & 0x7u;
+    uint exp  = (v >> MXFP6_E2M3_EXP_SHIFT) & MXFP6_E2M3_EXP_MASK;
+    uint mant = v & MXFP6_E2M3_MANT_MASK;
     // Normal: reconstruct absolute value via IEEE-754 bit manipulation
-    float normal_val = uintBitsToFloat(((exp + 126u) << 23) | (mant << 20));
+    float normal_val = uintBitsToFloat(((exp + MXFP6_E2M3_IEEE_EXP_OFF) << 23) | (mant << MXFP6_E2M3_MANT_SHIFT));
     // Subnormal (exp=0): value = mant/8. Select avoids branch divergence.
-    float abs_result = (exp == 0u) ? (float(mant) * (1.0 / 8.0)) : normal_val;
+    float abs_result = (exp == 0u) ? (float(mant) * MXFP6_E2M3_SUB_SCALE) : normal_val;
     return uintBitsToFloat(floatBitsToUint(abs_result) | sign);
 }
 #endif
@@ -1857,12 +1857,12 @@ float fp6_e2m3_to_float(uint v) {
 #if defined(DATA_A_MXFP6_E3M2) || defined(MXFP_ALL_DEQUANT)
 float fp6_e3m2_to_float(uint v) {
     uint sign = (v & 0x20u) << 26;  // sign bit → IEEE position 31
-    uint exp  = (v >> 2) & 0x7u;
-    uint mant = v & 0x3u;
+    uint exp  = (v >> MXFP6_E3M2_EXP_SHIFT) & MXFP6_E3M2_EXP_MASK;
+    uint mant = v & MXFP6_E3M2_MANT_MASK;
     // Normal: reconstruct absolute value via IEEE-754 bit manipulation
-    float normal_val = uintBitsToFloat(((exp + 124u) << 23) | (mant << 21));
+    float normal_val = uintBitsToFloat(((exp + MXFP6_E3M2_IEEE_EXP_OFF) << 23) | (mant << MXFP6_E3M2_MANT_SHIFT));
     // Subnormal (exp=0): value = mant/16. Select avoids branch divergence.
-    float abs_result = (exp == 0u) ? (float(mant) * (1.0 / 16.0)) : normal_val;
+    float abs_result = (exp == 0u) ? (float(mant) * MXFP6_E3M2_SUB_SCALE) : normal_val;
     return uintBitsToFloat(floatBitsToUint(abs_result) | sign);
 }
 #endif

@@ -52,12 +52,9 @@ __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
         return 0;
     }
 
-    // FP4 E2M1: max exponent (unbiased) is 2.
-    constexpr int FP4_E2M1_EMAX = 2;
-
     // ggml_cuda_float_to_e8m0 returns round(log2(amax)) + 127.
     // Subtract emax to get the shared exponent for this element type.
-    int biased = (int)ggml_cuda_float_to_e8m0(amax) - FP4_E2M1_EMAX;
+    int biased = (int)ggml_cuda_float_to_e8m0(amax) - MXFP4_E2M1_EMAX_OFFSET;
 
     biased = max(biased, 0);
     biased = min(biased, 254);
