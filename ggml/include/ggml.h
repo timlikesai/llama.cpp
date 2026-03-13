@@ -750,6 +750,7 @@ extern "C" {
     GGML_API bool    ggml_is_quantized(enum ggml_type type);
     GGML_API bool    ggml_is_type_mxfp(enum ggml_type type);
     GGML_API bool    ggml_mxfp_use_hadamard(enum ggml_type type);
+    GGML_API int     ggml_mxfp_qs_per_block(enum ggml_type type);  // quantized bytes per 32-element block (SoA qs region)
 
     // TODO: temporary until model loading of ggml examples is refactored
     GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);

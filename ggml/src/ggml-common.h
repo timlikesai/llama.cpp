@@ -71,6 +71,9 @@ typedef sycl::half2 ggml_half2;
 #define GGML_COMMON_DECL
 #endif
 
+// Pure numeric constants needed by both DECL and IMPL sections.
+#define MXFP_HADAMARD_32_NORM  0.17677669529663689f  // 1/sqrt(32)
+
 #if defined(GGML_COMMON_DECL)
 
 #ifndef __cplusplus
@@ -207,9 +210,6 @@ static_assert(sizeof(block_q4_1) == 2 * sizeof(ggml_half) + QK4_1 / 2, "wrong q4
 #define MXFP6_E3M2_EMAX_OFFSET   5   // ceil(log2(28.0))
 #define MXFP8_E4M3_EMAX_OFFSET   8   // ceil(log2(448))
 #define MXFP8_E5M2_EMAX_OFFSET  16   // ceil(log2(57344))
-
-// Hadamard normalization: 1/sqrt(32) for block-32 Walsh-Hadamard transform.
-#define MXFP_HADAMARD_32_NORM  0.17677669529663689f
 
 // MXFP type properties — single source of truth for all backends.
 // Bits per element, quantized bytes per block, and Hadamard rotation flag.
@@ -1473,6 +1473,41 @@ GGML_MXFP_FUNC float ggml_mxfp_e8m0_to_fp32_half(uint8_t x) {
     float result;
     memcpy(&result, &bits, sizeof(float));
     return result;
+}
+
+// E8M0 base exponent estimate: round(log2(amax)) - emax_offset + 127.
+// Uses integer bit extraction — no log2f() SFU dependency.
+// Caller must ensure amax > 0 and finite. Returns unclamped e_base.
+GGML_MXFP_FUNC int ggml_mxfp_e8m0_base_estimate(float amax, int emax_offset) {
+    uint32_t amax_bits;
+    memcpy(&amax_bits, &amax, sizeof(uint32_t));
+    const int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
+    // Round: add 1 if mantissa >= sqrt(2)-1 (0x3504F3 in 23-bit IEEE mantissa).
+    const int round_log2 = floor_log2 + ((amax_bits & 0x7FFFFF) >= 0x3504F3 ? 1 : 0);
+    return round_log2 - emax_offset + 127;
+}
+
+// Block-32 Walsh-Hadamard Transform, normalized by 1/sqrt(32).
+// Spreads outlier energy across all elements sharing an E8M0 exponent,
+// improving quantization quality (see QuaRot arXiv:2404.00456).
+GGML_MXFP_FUNC void ggml_mxfp_hadamard_32_inplace(float * vals) {
+#pragma unroll
+    for (int stride = 1; stride < 32; stride *= 2) {
+#pragma unroll
+        for (int i = 0; i < 32; i += 2 * stride) {
+#pragma unroll
+            for (int j = 0; j < stride; ++j) {
+                const float a = vals[i + j];
+                const float b = vals[i + j + stride];
+                vals[i + j]          = a + b;
+                vals[i + j + stride] = a - b;
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        vals[i] *= MXFP_HADAMARD_32_NORM;
+    }
 }
 
 #endif // GGML_MXFP_FUNC

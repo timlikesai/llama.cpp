@@ -801,7 +801,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
         // Block-32 matches MX block size for optimal quantization (BRQ, arXiv:2511.04214).
         // FlashAttention-3 independently validates this approach for FP8 (arXiv:2407.08608).
         if constexpr (apply_hadamard) {
-            hadamard_32_inplace(vals);
+            ggml_mxfp_hadamard_32_inplace(vals);
         }
 
         float amax = 0.0f;

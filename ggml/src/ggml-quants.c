@@ -390,13 +390,7 @@ static inline uint8_t mxfp_compute_e8m0_mse(const float * x, int qk, const mxfp_
     }
     if (amax == 0.0f) return 0;
 
-    // Integer bit extraction for floor(log2(amax)) — no SFU, matches CUDA.
-    uint32_t amax_bits;
-    memcpy(&amax_bits, &amax, sizeof(uint32_t));
-    const int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
-    // Round: add 1 if mantissa >= sqrt(2)-1 threshold (0x3504F3 in 23-bit IEEE mantissa).
-    const int round_log2 = floor_log2 + ((amax_bits & 0x7FFFFF) >= 0x3504F3 ? 1 : 0);
-    const int e_base = round_log2 - traits->emax_offset + 127;
+    const int e_base = ggml_mxfp_e8m0_base_estimate(amax, traits->emax_offset);
 
     // ±R MSE search: test 2R+1 candidates around e_base, pick lowest total MSE.
     int e_lo = e_base - MXFP_E8M0_MSE_RANGE;
@@ -690,20 +684,7 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
 //   MXFP8 E4M3: +0.22, MXFP8 E5M2: +1.38, MXFP6 E2M3: +3.34, MXFP6 E3M2: +4.60
 //
 void ggml_hadamard_32_inplace(float vals[32]) {
-    for (int stride = 1; stride < 32; stride *= 2) {
-        for (int i = 0; i < 32; i += 2 * stride) {
-            for (int j = 0; j < stride; ++j) {
-                const float a = vals[i + j];
-                const float b = vals[i + j + stride];
-                vals[i + j]          = a + b;
-                vals[i + j + stride] = a - b;
-            }
-        }
-    }
-    const float norm = MXFP_HADAMARD_32_NORM;
-    for (int i = 0; i < 32; ++i) {
-        vals[i] *= norm;
-    }
+    ggml_mxfp_hadamard_32_inplace(vals);
 }
 
 float fp6_e2m3_to_float(uint8_t v)     { return ggml_mxfp_fp6_e2m3_to_float(v); }

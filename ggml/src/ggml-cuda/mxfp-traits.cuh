@@ -376,7 +376,7 @@ static __device__ void quantize_f32_mxfp_block_soa(
         for (int j = 0; j < QK; ++j) {
             vals[j] = x[j];
         }
-        hadamard_32_inplace(vals);
+        ggml_mxfp_hadamard_32_inplace(vals);
         src = vals;
     }
 
@@ -388,13 +388,7 @@ static __device__ void quantize_f32_mxfp_block_soa(
     uint8_t e_val = 0;
     float inv_d = 0.0f;
     if (amax != 0.0f && isfinite(amax)) {
-        // Base estimate via integer bit extraction (no SFU).
-        uint32_t amax_bits;
-        memcpy(&amax_bits, &amax, sizeof(uint32_t));
-        const int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
-        // Round log2: add 1 if mantissa >= sqrt(2)-1 (0x3504F3 in IEEE-754 23-bit mantissa).
-        const int round_log2 = floor_log2 + ((amax_bits & 0x7FFFFF) >= 0x3504F3 ? 1 : 0);
-        const int e_base = round_log2 - traits::e8m0_offset + 127;
+        const int e_base = ggml_mxfp_e8m0_base_estimate(amax, traits::e8m0_offset);
 
         // MSE-optimal search: test ±R around estimate, pick lowest MSE.
         const int e_lo = max(1, min(254, e_base - MXFP_E8M0_MSE_RANGE));

@@ -1,36 +1,9 @@
 #pragma once
 
 // Block-32 Walsh-Hadamard Transform for MXFP KV cache quantization.
-// Spreads outlier energy across all block elements, improving E8M0 scale fit.
-//
-// References:
-//   Ashkboos et al., "QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs", arXiv:2404.00456
-//   Zhang et al., "Block Rotation is All You Need for MXFP4 Quantization", arXiv:2511.04214
-//   Dao et al., "FlashAttention-3", arXiv:2407.08608 (incoherent processing for FP8 attention)
-
-// Use centralized constant from ggml-common.h
-static constexpr float HADAMARD_32_NORM = MXFP_HADAMARD_32_NORM;
-
-// Single-thread in-place Hadamard transform over 32 values.
-static __device__ __forceinline__ void hadamard_32_inplace(float vals[32]) {
-#pragma unroll
-    for (int stride = 1; stride < 32; stride *= 2) {
-#pragma unroll
-        for (int i = 0; i < 32; i += 2 * stride) {
-#pragma unroll
-            for (int j = 0; j < stride; ++j) {
-                const float a = vals[i + j];
-                const float b = vals[i + j + stride];
-                vals[i + j]          = a + b;
-                vals[i + j + stride] = a - b;
-            }
-        }
-    }
-#pragma unroll
-    for (int i = 0; i < 32; ++i) {
-        vals[i] *= HADAMARD_32_NORM;
-    }
-}
+// ggml_mxfp_hadamard_32_inplace (single-thread) lives in ggml-common.h as a
+// GGML_MXFP_FUNC — shared between CPU and CUDA device code.
+// Only the distributed warp-shuffle variant is GPU-specific and lives here.
 
 // Distributed Hadamard transform: 8 threads each hold 4 of 32 elements.
 // Stages 1-2 are intra-thread butterflies, stages 3-5 use __shfl_xor_sync.
@@ -69,6 +42,6 @@ static __device__ __forceinline__ void hadamard_32_q8_1(float vals[4], const int
 
 #pragma unroll
     for (int l = 0; l < 4; ++l) {
-        vals[l] *= HADAMARD_32_NORM;
+        vals[l] *= MXFP_HADAMARD_32_NORM;
     }
 }

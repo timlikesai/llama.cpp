@@ -20,15 +20,6 @@
 #define ggml_vec_dot_mxfp8_e5m2_q8_0_generic  ggml_vec_dot_mxfp8_e5m2_q8_0
 #define ggml_vec_dot_mxfp6_e2m3_q8_0_generic  ggml_vec_dot_mxfp6_e2m3_q8_0
 #define ggml_vec_dot_mxfp6_e3m2_q8_0_generic  ggml_vec_dot_mxfp6_e3m2_q8_0
-#define dequantize_row_mxfp8_cpu_generic       dequantize_row_mxfp8_cpu
-#define dequantize_row_mxfp8_e5m2_cpu_generic  dequantize_row_mxfp8_e5m2_cpu
-#define dequantize_row_mxfp6_e2m3_cpu_generic  dequantize_row_mxfp6_e2m3_cpu
-#define dequantize_row_mxfp6_e3m2_cpu_generic  dequantize_row_mxfp6_e3m2_cpu
-#define dequantize_row_mxfp4_soa_cpu_generic      dequantize_row_mxfp4_soa_cpu
-#define dequantize_row_mxfp8_soa_cpu_generic      dequantize_row_mxfp8_soa_cpu
-#define dequantize_row_mxfp8_e5m2_soa_cpu_generic dequantize_row_mxfp8_e5m2_soa_cpu
-#define dequantize_row_mxfp6_e2m3_soa_cpu_generic dequantize_row_mxfp6_e2m3_soa_cpu
-#define dequantize_row_mxfp6_e3m2_soa_cpu_generic dequantize_row_mxfp6_e3m2_soa_cpu
 #define ggml_vec_dot_tq1_0_q8_K_generic ggml_vec_dot_tq1_0_q8_K
 #define ggml_vec_dot_tq2_0_q8_K_generic ggml_vec_dot_tq2_0_q8_K
 #define ggml_vec_dot_q2_K_q8_K_generic ggml_vec_dot_q2_K_q8_K
@@ -128,15 +119,6 @@
 #define ggml_vec_dot_tq1_0_q8_K_generic ggml_vec_dot_tq1_0_q8_K
 #define ggml_vec_dot_tq2_0_q8_K_generic ggml_vec_dot_tq2_0_q8_K
 #define ggml_vec_dot_iq1_m_q8_K_generic ggml_vec_dot_iq1_m_q8_K
-#define dequantize_row_mxfp8_cpu_generic       dequantize_row_mxfp8_cpu
-#define dequantize_row_mxfp8_e5m2_cpu_generic  dequantize_row_mxfp8_e5m2_cpu
-#define dequantize_row_mxfp6_e2m3_cpu_generic  dequantize_row_mxfp6_e2m3_cpu
-#define dequantize_row_mxfp6_e3m2_cpu_generic  dequantize_row_mxfp6_e3m2_cpu
-#define dequantize_row_mxfp4_soa_cpu_generic      dequantize_row_mxfp4_soa_cpu
-#define dequantize_row_mxfp8_soa_cpu_generic      dequantize_row_mxfp8_soa_cpu
-#define dequantize_row_mxfp8_e5m2_soa_cpu_generic dequantize_row_mxfp8_e5m2_soa_cpu
-#define dequantize_row_mxfp6_e2m3_soa_cpu_generic dequantize_row_mxfp6_e2m3_soa_cpu
-#define dequantize_row_mxfp6_e3m2_soa_cpu_generic dequantize_row_mxfp6_e3m2_soa_cpu
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_0_4x8_generic ggml_quantize_mat_q8_0_4x8
@@ -182,15 +164,6 @@
 #define ggml_vec_dot_iq1_m_q8_K_generic ggml_vec_dot_iq1_m_q8_K
 #define ggml_vec_dot_mxfp4_q8_0_generic ggml_vec_dot_mxfp4_q8_0
 #define ggml_vec_dot_nvfp4_q8_0_generic ggml_vec_dot_nvfp4_q8_0
-#define dequantize_row_mxfp8_cpu_generic       dequantize_row_mxfp8_cpu
-#define dequantize_row_mxfp8_e5m2_cpu_generic  dequantize_row_mxfp8_e5m2_cpu
-#define dequantize_row_mxfp6_e2m3_cpu_generic  dequantize_row_mxfp6_e2m3_cpu
-#define dequantize_row_mxfp6_e3m2_cpu_generic  dequantize_row_mxfp6_e3m2_cpu
-#define dequantize_row_mxfp4_soa_cpu_generic      dequantize_row_mxfp4_soa_cpu
-#define dequantize_row_mxfp8_soa_cpu_generic      dequantize_row_mxfp8_soa_cpu
-#define dequantize_row_mxfp8_e5m2_soa_cpu_generic dequantize_row_mxfp8_e5m2_soa_cpu
-#define dequantize_row_mxfp6_e2m3_soa_cpu_generic dequantize_row_mxfp6_e2m3_soa_cpu
-#define dequantize_row_mxfp6_e3m2_soa_cpu_generic dequantize_row_mxfp6_e3m2_soa_cpu
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_0_4x8_generic ggml_quantize_mat_q8_0_4x8
@@ -238,15 +211,6 @@
 #define ggml_vec_dot_iq4_xs_q8_K_generic ggml_vec_dot_iq4_xs_q8_K
 #define ggml_vec_dot_mxfp4_q8_0_generic ggml_vec_dot_mxfp4_q8_0
 #define ggml_vec_dot_nvfp4_q8_0_generic ggml_vec_dot_nvfp4_q8_0
-#define dequantize_row_mxfp8_cpu_generic       dequantize_row_mxfp8_cpu
-#define dequantize_row_mxfp8_e5m2_cpu_generic  dequantize_row_mxfp8_e5m2_cpu
-#define dequantize_row_mxfp6_e2m3_cpu_generic  dequantize_row_mxfp6_e2m3_cpu
-#define dequantize_row_mxfp6_e3m2_cpu_generic  dequantize_row_mxfp6_e3m2_cpu
-#define dequantize_row_mxfp4_soa_cpu_generic      dequantize_row_mxfp4_soa_cpu
-#define dequantize_row_mxfp8_soa_cpu_generic      dequantize_row_mxfp8_soa_cpu
-#define dequantize_row_mxfp8_e5m2_soa_cpu_generic dequantize_row_mxfp8_e5m2_soa_cpu
-#define dequantize_row_mxfp6_e2m3_soa_cpu_generic dequantize_row_mxfp6_e2m3_soa_cpu
-#define dequantize_row_mxfp6_e3m2_soa_cpu_generic dequantize_row_mxfp6_e3m2_soa_cpu
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x1_generic ggml_quantize_mat_q8_0_4x1
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
@@ -290,15 +254,6 @@
 #define ggml_vec_dot_tq1_0_q8_K_generic ggml_vec_dot_tq1_0_q8_K
 #define ggml_vec_dot_tq2_0_q8_K_generic ggml_vec_dot_tq2_0_q8_K
 #define ggml_vec_dot_q2_K_q8_K_generic ggml_vec_dot_q2_K_q8_K
-#define dequantize_row_mxfp8_cpu_generic       dequantize_row_mxfp8_cpu
-#define dequantize_row_mxfp8_e5m2_cpu_generic  dequantize_row_mxfp8_e5m2_cpu
-#define dequantize_row_mxfp6_e2m3_cpu_generic  dequantize_row_mxfp6_e2m3_cpu
-#define dequantize_row_mxfp6_e3m2_cpu_generic  dequantize_row_mxfp6_e3m2_cpu
-#define dequantize_row_mxfp4_soa_cpu_generic      dequantize_row_mxfp4_soa_cpu
-#define dequantize_row_mxfp8_soa_cpu_generic      dequantize_row_mxfp8_soa_cpu
-#define dequantize_row_mxfp8_e5m2_soa_cpu_generic dequantize_row_mxfp8_e5m2_soa_cpu
-#define dequantize_row_mxfp6_e2m3_soa_cpu_generic dequantize_row_mxfp6_e2m3_soa_cpu
-#define dequantize_row_mxfp6_e3m2_soa_cpu_generic dequantize_row_mxfp6_e3m2_soa_cpu
 #define ggml_vec_dot_iq2_xxs_q8_K_generic ggml_vec_dot_iq2_xxs_q8_K
 #define ggml_vec_dot_iq2_xs_q8_K_generic ggml_vec_dot_iq2_xs_q8_K
 #define ggml_vec_dot_iq2_s_q8_K_generic ggml_vec_dot_iq2_s_q8_K
@@ -359,15 +314,6 @@
 #define ggml_vec_dot_iq4_xs_q8_K_generic ggml_vec_dot_iq4_xs_q8_K
 #define ggml_vec_dot_mxfp4_q8_0_generic ggml_vec_dot_mxfp4_q8_0
 #define ggml_vec_dot_nvfp4_q8_0_generic ggml_vec_dot_nvfp4_q8_0
-#define dequantize_row_mxfp8_cpu_generic       dequantize_row_mxfp8_cpu
-#define dequantize_row_mxfp8_e5m2_cpu_generic  dequantize_row_mxfp8_e5m2_cpu
-#define dequantize_row_mxfp6_e2m3_cpu_generic  dequantize_row_mxfp6_e2m3_cpu
-#define dequantize_row_mxfp6_e3m2_cpu_generic  dequantize_row_mxfp6_e3m2_cpu
-#define dequantize_row_mxfp4_soa_cpu_generic      dequantize_row_mxfp4_soa_cpu
-#define dequantize_row_mxfp8_soa_cpu_generic      dequantize_row_mxfp8_soa_cpu
-#define dequantize_row_mxfp8_e5m2_soa_cpu_generic dequantize_row_mxfp8_e5m2_soa_cpu
-#define dequantize_row_mxfp6_e2m3_soa_cpu_generic dequantize_row_mxfp6_e2m3_soa_cpu
-#define dequantize_row_mxfp6_e3m2_soa_cpu_generic dequantize_row_mxfp6_e3m2_soa_cpu
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_0_4x8_generic ggml_quantize_mat_q8_0_4x8
@@ -405,4 +351,19 @@
 #define ggml_gemm_mxfp4_8x8_q8_0_generic ggml_gemm_mxfp4_8x8_q8_0
 #define ggml_gemm_q8_0_4x4_q8_0_generic ggml_gemm_q8_0_4x4_q8_0
 #define ggml_gemm_q8_0_4x8_q8_0_generic ggml_gemm_q8_0_4x8_q8_0
+#endif
+
+// MXFP dequantize has no arch-specific (SIMD) implementations except on arm and x86.
+// All other targets use the scalar generic as the public cpu function.
+#if !defined(__aarch64__) && !defined(__arm__) && !defined(_M_ARM) && !defined(_M_ARM64) && \
+    !defined(__x86_64__) && !defined(__i386__) && !defined(_M_IX86) && !defined(_M_X64)
+#define dequantize_row_mxfp8_cpu_generic       dequantize_row_mxfp8_cpu
+#define dequantize_row_mxfp8_e5m2_cpu_generic  dequantize_row_mxfp8_e5m2_cpu
+#define dequantize_row_mxfp6_e2m3_cpu_generic  dequantize_row_mxfp6_e2m3_cpu
+#define dequantize_row_mxfp6_e3m2_cpu_generic  dequantize_row_mxfp6_e3m2_cpu
+#define dequantize_row_mxfp4_soa_cpu_generic      dequantize_row_mxfp4_soa_cpu
+#define dequantize_row_mxfp8_soa_cpu_generic      dequantize_row_mxfp8_soa_cpu
+#define dequantize_row_mxfp8_e5m2_soa_cpu_generic dequantize_row_mxfp8_e5m2_soa_cpu
+#define dequantize_row_mxfp6_e2m3_soa_cpu_generic dequantize_row_mxfp6_e2m3_soa_cpu
+#define dequantize_row_mxfp6_e3m2_soa_cpu_generic dequantize_row_mxfp6_e3m2_soa_cpu
 #endif
