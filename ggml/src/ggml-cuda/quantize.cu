@@ -55,14 +55,9 @@ __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
     // FP4 E2M1: max exponent (unbiased) is 2.
     constexpr int FP4_E2M1_EMAX = 2;
 
-    const float e = log2f(amax);
-
-    // "even" -> round-to-nearest integer, ties-to-even
-    const int e_int = __float2int_rn(e);
-
-    const int shared_exp = e_int - FP4_E2M1_EMAX;
-
-    int biased = shared_exp + 127;
+    // ggml_cuda_float_to_e8m0 returns round(log2(amax)) + 127.
+    // Subtract emax to get the shared exponent for this element type.
+    int biased = (int)ggml_cuda_float_to_e8m0(amax) - FP4_E2M1_EMAX;
 
     biased = max(biased, 0);
     biased = min(biased, 254);

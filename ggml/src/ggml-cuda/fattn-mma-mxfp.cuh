@@ -465,7 +465,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_load_V_f16(
                 const uint8_t b1 = pair >> 8;
 
                 const uint8_t e_val = *(row_t + V_e_head_off + i0_start / 32 + blk_idx);
-                const half2 scale_h2 = __float2half2_rn(ggml_cuda_e8m0_to_fp32(e_val));
+                const half2 scale_h2 = ggml_cuda_e8m0_to_half2(e_val);
 
 #if CUDART_VERSION >= 12080
                 __nv_fp4x2_e2m1 fp4_lo;
@@ -529,7 +529,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_load_V_mxfp8_f16(
                 const uint16_t pair = *reinterpret_cast<const uint16_t *>(
                     row_t + V_qs_head_off + qs_blk_off + 2 * pair_in_blk);
                 const uint8_t e_val = *(row_t + V_e_head_off + i0_start / 32 + blk_idx);
-                const half2 scale_h2 = __float2half2_rn(ggml_cuda_e8m0_to_fp32(e_val));
+                const half2 scale_h2 = ggml_cuda_e8m0_to_half2(e_val);
 
 #if CUDART_VERSION >= 12050
                 if constexpr (v_mxfp8_type == GGML_TYPE_MXFP8_E4M3) {
@@ -623,7 +623,7 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_load_V_mxfp6_f16(
                 }
 
                 const uint8_t e_val = *(row_t + V_e_head_off + i0_start / 32 + blk_idx);
-                const half2 scale_h2 = __float2half2_rn(ggml_cuda_e8m0_to_fp32(e_val));
+                const half2 scale_h2 = ggml_cuda_e8m0_to_half2(e_val);
 
 #if CUDART_VERSION >= 12080
                 {
@@ -818,13 +818,9 @@ static __device__ __forceinline__ void flash_attn_ext_mxfp_quantize_Q(
         } else {
             using soa_traits = mxfp_traits<mxfp_type>;
             constexpr int EMAX = traits::emax;
-            // E8M0 scale: round(log2(amax)) via IEEE-754 bit extraction (Schraudolph 1999).
-            // floor(log2(x)) from exponent field, +1 if mantissa >= sqrt(2)-1 (0x3504F3).
-            uint32_t amax_bits;
-            memcpy(&amax_bits, &amax, sizeof(uint32_t));
-            const int e_floor = (int)((amax_bits >> 23) & 0xFF) - 127;
-            const int e_int = e_floor + ((amax_bits & 0x7FFFFF) >= 0x3504F3 ? 1 : 0);
-            const int e_base = e_int - EMAX + 127;
+            // E8M0 base estimate: HW intrinsic returns round(log2(amax)) + 127,
+            // subtract emax to get the shared exponent for this element type.
+            const int e_base = (int)ggml_cuda_float_to_e8m0(amax) - EMAX;
 
             // MSE-optimal search: test ±R around estimate, pick lowest MSE.
             // Matches set-rows and CPU paths for consistent quantization quality.

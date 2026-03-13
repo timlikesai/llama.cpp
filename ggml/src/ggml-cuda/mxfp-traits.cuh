@@ -388,7 +388,8 @@ static __device__ void quantize_f32_mxfp_block_soa(
     uint8_t e_val = 0;
     float inv_d = 0.0f;
     if (amax != 0.0f && isfinite(amax)) {
-        const int e_base = ggml_mxfp_e8m0_base_estimate(amax, traits::e8m0_offset);
+        // HW intrinsic returns round(log2(amax)) + 127; subtract emax offset for this type.
+        const int e_base = (int)ggml_cuda_float_to_e8m0(amax) - traits::e8m0_offset;
 
         // MSE-optimal search: test ±R around estimate, pick lowest MSE.
         const int e_lo = max(1, min(254, e_base - MXFP_E8M0_MSE_RANGE));

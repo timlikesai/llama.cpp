@@ -790,6 +790,38 @@ static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
 #endif // CUDART_VERSION >= 12080
 }
 
+// E8M0 → replicated half2 scale for MMA V tile loading.
+// Shorter path than e8m0→bf16→float→half2: uses struct operator for e8m0→half directly.
+static __device__ __forceinline__ half2 ggml_cuda_e8m0_to_half2(uint8_t x) {
+#if CUDART_VERSION >= 12080
+    __nv_fp8_e8m0 e; e.__x = x;
+    const half h = (__half)e;
+    return __half2half2(h);
+#else
+    return __float2half2_rn(ggml_mxfp_e8m0_to_fp32(x));
+#endif // CUDART_VERSION >= 12080
+}
+
+// Float → E8M0 base exponent: round(log2(|x|)) + 127, clamped to [0, 254].
+// Uses integer bit extraction for exact log-space rounding (Schraudolph 1999).
+// NOTE: __nv_cvt_float_to_e8m0 rounds in LINEAR space (nearest power of 2 by
+// absolute distance), which differs for ~8.6% of values (those between the
+// geometric mean sqrt(2)×2^n and arithmetic mean 1.5×2^n of consecutive powers).
+// This caused PPL 11.5→62M in compute_e8m0_scale. Portable code is intentional.
+static __device__ __forceinline__ uint8_t ggml_cuda_float_to_e8m0(float x) {
+    if (!(x > 0.0f)) {
+        return 0;
+    }
+    uint32_t bits;
+    memcpy(&bits, &x, sizeof(uint32_t));
+    const int floor_log2 = (int)((bits >> 23) & 0xFF) - 127;
+    const int round_log2 = floor_log2 + ((bits & 0x7FFFFF) >= 0x3504F3 ? 1 : 0);
+    int biased = round_log2 + 127;
+    biased = max(biased, 0);
+    biased = min(biased, 254);
+    return static_cast<uint8_t>(biased);
+}
+
 __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e) {
 #if CUDART_VERSION >= 12080
     return __nv_cvt_float_to_fp4(x * e, __NV_E2M1, cudaRoundNearest);
