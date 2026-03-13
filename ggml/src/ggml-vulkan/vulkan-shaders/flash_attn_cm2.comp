@@ -332,8 +332,77 @@ void main() {
 
         uint32_t k_offset = ik2*p.nb12 + ik3*p.nb13;
 #ifdef MXFP_Q_PREPROCESS
-        // MXFP SoA: dequant K tile into shared memory via dequantize4, then coopmat load.
-        // dequantize4 handles SoA addressing for all MXFP types correctly.
+        // MXFP SoA: optimized inline dequant K tile → shmem → coopmat.
+        // Direct SoA addressing: no modulo, no binding_idx branch, no coord round-trip.
+        // K buffer: k_raw_u32 (binding 1), stride: k_stride, block bytes: K_BLOCK_BYTE_SIZE.
+#define MXFP_SOA_DEQUANT_TILE(BUF, STRIDE, BBS, HS, HS_PAD, BASE_OFFSET, TILE_ROW) \
+        { \
+            const uint32_t _tid = gl_LocalInvocationIndex; \
+            const uint32_t _base_blk = (BASE_OFFSET) / (BBS); \
+            const uint32_t _qs_per_blk = (BBS) - 1u; \
+            const uint32_t _total = Bc * ((HS) / 4u); \
+            for (uint32_t _idx = _tid; _idx < _total; _idx += gl_WorkGroupSize.x) { \
+                const uint32_t _row = _idx / ((HS) / 4u); \
+                const uint32_t _d   = _idx % ((HS) / 4u); \
+                const uint32_t _eo  = 4u * _d; \
+                const uint32_t _blk = _eo >> 5; \
+                const uint32_t _eib = _eo & 31u; \
+                const uint32_t _kv_row = (TILE_ROW) + _row; \
+                FLOAT_TYPEV4 _v4 = FLOAT_TYPEV4(0.0); \
+                if (_kv_row < KV) { \
+                    const uint32_t _row_byte = (_base_blk + _kv_row * (STRIDE)) * (BBS); \
+                    const uint32_t _e8m0_byte = _row_byte + (STRIDE) * _qs_per_blk + _blk; \
+                    const uint32_t _ew = _e8m0_byte >> 2u; \
+                    const uint32_t _es = (_e8m0_byte & 3u) << 3u; \
+                    const float _scale = e8m0_to_fp32(uint8_t(((BUF)[_ew] >> _es) & 0xFFu)); \
+                    const uint32_t _qs_byte = _row_byte + _blk * _qs_per_blk + MXFP_QS_BYTE_IN_BLK(_eib); \
+                    const uint32_t _w = _qs_byte >> 2u; \
+                    const uint32_t _s = (_qs_byte & 3u) << 3u; \
+                    uint _packed = (BUF)[_w] >> _s; \
+                    if (_s != 0u) _packed |= (BUF)[_w + 1u] << (32u - _s); \
+                    _v4 = MXFP_DEQUANT4(_packed, _eib, _scale); \
+                } \
+                kv_shmem[_row * (HS_PAD) + _eo + 0u] = float16_t(_v4.x); \
+                kv_shmem[_row * (HS_PAD) + _eo + 1u] = float16_t(_v4.y); \
+                kv_shmem[_row * (HS_PAD) + _eo + 2u] = float16_t(_v4.z); \
+                kv_shmem[_row * (HS_PAD) + _eo + 3u] = float16_t(_v4.w); \
+            } \
+            if ((HS_PAD) > (HS)) { \
+                for (uint32_t _idx = _tid; _idx < Bc * ((HS_PAD) - (HS)); _idx += gl_WorkGroupSize.x) { \
+                    kv_shmem[(_idx / ((HS_PAD) - (HS))) * (HS_PAD) + (HS) + _idx % ((HS_PAD) - (HS))] = float16_t(0.0); \
+                } \
+            } \
+        }
+
+        // Type-specific: QS byte offset within block, and element dequant from packed uint32.
+#if defined(DATA_A_MXFP4)
+#define MXFP_QS_BYTE_IN_BLK(eib) ((eib) & 0xFu)  // nibble-packed: byte = elem % 16
+#define MXFP_DEQUANT4(packed, eib, scale) FLOAT_TYPEV4( \
+            fp4_e2m1_to_float(((packed) >>  0) >> (((eib) & 0x10u) >> 2) & 0xFu) * (scale), \
+            fp4_e2m1_to_float(((packed) >>  8) >> (((eib) & 0x10u) >> 2) & 0xFu) * (scale), \
+            fp4_e2m1_to_float(((packed) >> 16) >> (((eib) & 0x10u) >> 2) & 0xFu) * (scale), \
+            fp4_e2m1_to_float(((packed) >> 24) >> (((eib) & 0x10u) >> 2) & 0xFu) * (scale))
+#elif defined(DATA_A_MXFP8_E4M3)
+#define MXFP_QS_BYTE_IN_BLK(eib) (eib)  // byte-per-element: byte = elem
+#define MXFP_DEQUANT4(packed, eib, scale) FLOAT_TYPEV4( \
+            fp8_e4m3_to_float((packed) & 0xFFu) * (scale), \
+            fp8_e4m3_to_float(((packed) >> 8) & 0xFFu) * (scale), \
+            fp8_e4m3_to_float(((packed) >> 16) & 0xFFu) * (scale), \
+            fp8_e4m3_to_float(((packed) >> 24) & 0xFFu) * (scale))
+#elif defined(DATA_A_MXFP8_E5M2)
+#define MXFP_QS_BYTE_IN_BLK(eib) (eib)
+#define MXFP_DEQUANT4(packed, eib, scale) FLOAT_TYPEV4( \
+            fp8_e5m2_to_float((packed) & 0xFFu) * (scale), \
+            fp8_e5m2_to_float(((packed) >> 8) & 0xFFu) * (scale), \
+            fp8_e5m2_to_float(((packed) >> 16) & 0xFFu) * (scale), \
+            fp8_e5m2_to_float(((packed) >> 24) & 0xFFu) * (scale))
+// FP6 types can't use the simple packed uint32 pattern — fall back to dequantize4
+#else
+#define MXFP_DEQUANT4(packed, eib, scale) FLOAT_TYPEV4(0.0)
+#endif
+
+#if defined(DATA_A_MXFP4) || defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
+        // FP4 and FP6: use proven dequantize4 SoA path.
         {
             const uint32_t tid = gl_LocalInvocationIndex;
             const uint32_t total = Bc * (HSK / 4u);
@@ -358,6 +427,10 @@ void main() {
                 }
             }
         }
+#else
+        // FP8: use optimized inline SoA macro (no modulo, no function call overhead).
+        MXFP_SOA_DEQUANT_TILE(k_raw_u32.k_u32, k_stride, K_BLOCK_BYTE_SIZE, HSK, HSK_pad, k_offset, j * Bc)
+#endif
         barrier();
         {
             tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> shmemLayoutK = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
@@ -430,7 +503,9 @@ void main() {
         coopmat<float16_t, gl_ScopeWorkgroup, Bc, HSV_pad, gl_MatrixUseB> V;
         uint32_t v_offset = iv2*p.nb22 + iv3*p.nb23;
 #ifdef MXFP_Q_PREPROCESS
-        // MXFP SoA: dequant V tile into shared memory via dequantize4, then coopmat load.
+        // MXFP SoA: dequant V tile → shmem → coopmat.
+#if defined(DATA_A_MXFP4) || defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
+        // FP4 and FP6: use proven dequantize4 SoA path.
         {
             const uint32_t tid = gl_LocalInvocationIndex;
             const uint32_t total = Bc * (HSV / 4u);
@@ -455,6 +530,9 @@ void main() {
                 }
             }
         }
+#else
+        MXFP_SOA_DEQUANT_TILE(v_raw_u32.v_u32, v_stride, V_BLOCK_BYTE_SIZE, HSV, HSV_pad, v_offset, j * Bc)
+#endif
         barrier();
         {
             tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> shmemLayoutV = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
