@@ -234,6 +234,39 @@ static_assert(sizeof(block_q4_1) == 2 * sizeof(ggml_half) + QK4_1 / 2, "wrong q4
 #define MXFP_USE_HADAMARD_E2M3   1
 #define MXFP_USE_HADAMARD_E3M2   0
 
+// SIMD dequant constants for IEEE-754 bit reconstruction of FP8/FP6 elements.
+// For a format with sign(1), exp(E), mant(M), bias(B):
+//   EXP_MASK   = (1<<E)-1      MANT_MASK  = (1<<M)-1      EXP_SHIFT  = M
+//   IEEE_EXP_OFF = 127-B       MANT_SHIFT = 23-M           SUB_SCALE  = 2^(1-B-M)
+// Used by x86 AVX2 and ARM NEON vectorized dequant in dot product, AoS dequant, SoA dequant.
+#define MXFP8_E4M3_EXP_MASK       0xF       // (1<<4)-1
+#define MXFP8_E4M3_MANT_MASK      0x7       // (1<<3)-1
+#define MXFP8_E4M3_EXP_SHIFT      3
+#define MXFP8_E4M3_IEEE_EXP_OFF   120       // 127-7
+#define MXFP8_E4M3_MANT_SHIFT     20        // 23-3
+#define MXFP8_E4M3_SUB_SCALE      (1.0f/512.0f)   // 2^(-9) = 2^(1-7-3)
+
+#define MXFP8_E5M2_EXP_MASK       0x1F      // (1<<5)-1
+#define MXFP8_E5M2_MANT_MASK      0x3       // (1<<2)-1
+#define MXFP8_E5M2_EXP_SHIFT      2
+#define MXFP8_E5M2_IEEE_EXP_OFF   112       // 127-15
+#define MXFP8_E5M2_MANT_SHIFT     21        // 23-2
+#define MXFP8_E5M2_SUB_SCALE      (1.0f/65536.0f) // 2^(-16) = 2^(1-15-2)
+
+#define MXFP6_E2M3_EXP_MASK       0x3       // (1<<2)-1
+#define MXFP6_E2M3_MANT_MASK      0x7       // (1<<3)-1
+#define MXFP6_E2M3_EXP_SHIFT      3
+#define MXFP6_E2M3_IEEE_EXP_OFF   126       // 127-1
+#define MXFP6_E2M3_MANT_SHIFT     20        // 23-3
+#define MXFP6_E2M3_SUB_SCALE      (1.0f/8.0f)     // 2^(-3) = 2^(1-1-3)
+
+#define MXFP6_E3M2_EXP_MASK       0x7       // (1<<3)-1
+#define MXFP6_E3M2_MANT_MASK      0x3       // (1<<2)-1
+#define MXFP6_E3M2_EXP_SHIFT      2
+#define MXFP6_E3M2_IEEE_EXP_OFF   124       // 127-3
+#define MXFP6_E3M2_MANT_SHIFT     21        // 23-2
+#define MXFP6_E3M2_SUB_SCALE      (1.0f/16.0f)    // 2^(-4) = 2^(1-3-2)
+
 #define QK_MXFP4 32
 typedef struct {
     uint8_t e; // E8M0

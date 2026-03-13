@@ -3845,8 +3845,7 @@ static inline void ggml_vec_dot_mxfp8_q8_0_avx2(
     const __m256  v_sub_sc    = _mm256_set1_ps(sub_scale);
     const __m256i v_zero      = _mm256_setzero_si256();
 
-    __m256 acc0 = _mm256_setzero_ps();
-    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc = _mm256_setzero_ps();
 
     for (int ib = 0; ib < nb; ++ib) {
         const __m256 v_scale = _mm256_set1_ps(
@@ -3885,11 +3884,11 @@ static inline void ggml_vec_dot_mxfp8_q8_0_avx2(
             const __m256 val = _mm256_blendv_ps(normal, sub_val, is_sub);
 
             // Accumulate: val * scale * q8_float
-            acc0 = _mm256_fmadd_ps(_mm256_mul_ps(val, v_scale), qf, acc0);
+            acc = _mm256_fmadd_ps(_mm256_mul_ps(val, v_scale), qf, acc);
         }
     }
 
-    *s = hsum_float_8(_mm256_add_ps(acc0, acc1));
+    *s = hsum_float_8(acc);
 }
 #endif
 
@@ -3899,7 +3898,8 @@ void ggml_vec_dot_mxfp8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #if defined(__AVX2__)
     // E4M3: sign(1) exp(4) mant(3), bias=7
     ggml_vec_dot_mxfp8_q8_0_avx2(n, s, vx, vy,
-        0xF, 0x7, 3, 120, 20, 1.0f/512.0f);
+        MXFP8_E4M3_EXP_MASK, MXFP8_E4M3_MANT_MASK, MXFP8_E4M3_EXP_SHIFT,
+        MXFP8_E4M3_IEEE_EXP_OFF, MXFP8_E4M3_MANT_SHIFT, MXFP8_E4M3_SUB_SCALE);
 #else
     ggml_vec_dot_mxfp8_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
@@ -3911,7 +3911,8 @@ void ggml_vec_dot_mxfp8_e5m2_q8_0(int n, float * GGML_RESTRICT s, size_t bs, con
 #if defined(__AVX2__)
     // E5M2: sign(1) exp(5) mant(2), bias=15
     ggml_vec_dot_mxfp8_q8_0_avx2(n, s, vx, vy,
-        0x1F, 0x3, 2, 112, 21, 1.0f/65536.0f);
+        MXFP8_E5M2_EXP_MASK, MXFP8_E5M2_MANT_MASK, MXFP8_E5M2_EXP_SHIFT,
+        MXFP8_E5M2_IEEE_EXP_OFF, MXFP8_E5M2_MANT_SHIFT, MXFP8_E5M2_SUB_SCALE);
 #else
     ggml_vec_dot_mxfp8_e5m2_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
@@ -4013,7 +4014,8 @@ void ggml_vec_dot_mxfp6_e2m3_q8_0(int n, float * GGML_RESTRICT s, size_t bs, con
 #if defined(__AVX2__)
     // E2M3: sign(1) exp(2) mant(3), bias=1
     ggml_vec_dot_mxfp6_q8_0_avx2(n, s, vx, vy, sizeof(block_mxfp6),
-        0x3, 0x7, 3, 126, 20, 1.0f/8.0f);
+        MXFP6_E2M3_EXP_MASK, MXFP6_E2M3_MANT_MASK, MXFP6_E2M3_EXP_SHIFT,
+        MXFP6_E2M3_IEEE_EXP_OFF, MXFP6_E2M3_MANT_SHIFT, MXFP6_E2M3_SUB_SCALE);
 #else
     ggml_vec_dot_mxfp6_e2m3_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
@@ -4025,7 +4027,8 @@ void ggml_vec_dot_mxfp6_e3m2_q8_0(int n, float * GGML_RESTRICT s, size_t bs, con
 #if defined(__AVX2__)
     // E3M2: sign(1) exp(3) mant(2), bias=3
     ggml_vec_dot_mxfp6_q8_0_avx2(n, s, vx, vy, sizeof(block_mxfp6),
-        0x7, 0x3, 2, 124, 21, 1.0f/16.0f);
+        MXFP6_E3M2_EXP_MASK, MXFP6_E3M2_MANT_MASK, MXFP6_E3M2_EXP_SHIFT,
+        MXFP6_E3M2_IEEE_EXP_OFF, MXFP6_E3M2_MANT_SHIFT, MXFP6_E3M2_SUB_SCALE);
 #else
     ggml_vec_dot_mxfp6_e3m2_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
@@ -4145,7 +4148,9 @@ static inline void dequantize_row_mxfp6_avx2(
 
 void dequantize_row_mxfp8_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
 #if defined(__AVX2__)
-    dequantize_row_mxfp8_avx2(x, y, k, 0xF, 0x7, 3, 120, 20, 1.0f/512.0f);
+    dequantize_row_mxfp8_avx2(x, y, k,
+        MXFP8_E4M3_EXP_MASK, MXFP8_E4M3_MANT_MASK, MXFP8_E4M3_EXP_SHIFT,
+        MXFP8_E4M3_IEEE_EXP_OFF, MXFP8_E4M3_MANT_SHIFT, MXFP8_E4M3_SUB_SCALE);
 #else
     dequantize_row_mxfp8_cpu_generic(x, y, k);
 #endif
@@ -4153,7 +4158,9 @@ void dequantize_row_mxfp8_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRIC
 
 void dequantize_row_mxfp8_e5m2_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
 #if defined(__AVX2__)
-    dequantize_row_mxfp8_avx2(x, y, k, 0x1F, 0x3, 2, 112, 21, 1.0f/65536.0f);
+    dequantize_row_mxfp8_avx2(x, y, k,
+        MXFP8_E5M2_EXP_MASK, MXFP8_E5M2_MANT_MASK, MXFP8_E5M2_EXP_SHIFT,
+        MXFP8_E5M2_IEEE_EXP_OFF, MXFP8_E5M2_MANT_SHIFT, MXFP8_E5M2_SUB_SCALE);
 #else
     dequantize_row_mxfp8_e5m2_cpu_generic(x, y, k);
 #endif
@@ -4161,7 +4168,9 @@ void dequantize_row_mxfp8_e5m2_cpu(const void * GGML_RESTRICT x, float * GGML_RE
 
 void dequantize_row_mxfp6_e2m3_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
 #if defined(__AVX2__)
-    dequantize_row_mxfp6_avx2(x, y, k, sizeof(block_mxfp6), 0x3, 0x7, 3, 126, 20, 1.0f/8.0f);
+    dequantize_row_mxfp6_avx2(x, y, k, sizeof(block_mxfp6),
+        MXFP6_E2M3_EXP_MASK, MXFP6_E2M3_MANT_MASK, MXFP6_E2M3_EXP_SHIFT,
+        MXFP6_E2M3_IEEE_EXP_OFF, MXFP6_E2M3_MANT_SHIFT, MXFP6_E2M3_SUB_SCALE);
 #else
     dequantize_row_mxfp6_e2m3_cpu_generic(x, y, k);
 #endif
@@ -4169,7 +4178,9 @@ void dequantize_row_mxfp6_e2m3_cpu(const void * GGML_RESTRICT x, float * GGML_RE
 
 void dequantize_row_mxfp6_e3m2_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
 #if defined(__AVX2__)
-    dequantize_row_mxfp6_avx2(x, y, k, sizeof(block_mxfp6), 0x7, 0x3, 2, 124, 21, 1.0f/16.0f);
+    dequantize_row_mxfp6_avx2(x, y, k, sizeof(block_mxfp6),
+        MXFP6_E3M2_EXP_MASK, MXFP6_E3M2_MANT_MASK, MXFP6_E3M2_EXP_SHIFT,
+        MXFP6_E3M2_IEEE_EXP_OFF, MXFP6_E3M2_MANT_SHIFT, MXFP6_E3M2_SUB_SCALE);
 #else
     dequantize_row_mxfp6_e3m2_cpu_generic(x, y, k);
 #endif
@@ -4333,7 +4344,9 @@ void dequantize_row_mxfp4_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RES
 
 void dequantize_row_mxfp8_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
 #if defined(__AVX2__)
-    dequantize_row_mxfp8_soa_avx2(x, y, k, 0xF, 0x7, 3, 120, 20, 1.0f/512.0f);
+    dequantize_row_mxfp8_soa_avx2(x, y, k,
+        MXFP8_E4M3_EXP_MASK, MXFP8_E4M3_MANT_MASK, MXFP8_E4M3_EXP_SHIFT,
+        MXFP8_E4M3_IEEE_EXP_OFF, MXFP8_E4M3_MANT_SHIFT, MXFP8_E4M3_SUB_SCALE);
 #else
     dequantize_row_mxfp8_soa_cpu_generic(x, y, k);
 #endif
@@ -4341,7 +4354,9 @@ void dequantize_row_mxfp8_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RES
 
 void dequantize_row_mxfp8_e5m2_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
 #if defined(__AVX2__)
-    dequantize_row_mxfp8_soa_avx2(x, y, k, 0x1F, 0x3, 2, 112, 21, 1.0f/65536.0f);
+    dequantize_row_mxfp8_soa_avx2(x, y, k,
+        MXFP8_E5M2_EXP_MASK, MXFP8_E5M2_MANT_MASK, MXFP8_E5M2_EXP_SHIFT,
+        MXFP8_E5M2_IEEE_EXP_OFF, MXFP8_E5M2_MANT_SHIFT, MXFP8_E5M2_SUB_SCALE);
 #else
     dequantize_row_mxfp8_e5m2_soa_cpu_generic(x, y, k);
 #endif
@@ -4349,7 +4364,9 @@ void dequantize_row_mxfp8_e5m2_soa_cpu(const void * GGML_RESTRICT x, float * GGM
 
 void dequantize_row_mxfp6_e2m3_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
 #if defined(__AVX2__)
-    dequantize_row_mxfp6_soa_avx2(x, y, k, 0x3, 0x7, 3, 126, 20, 1.0f/8.0f);
+    dequantize_row_mxfp6_soa_avx2(x, y, k,
+        MXFP6_E2M3_EXP_MASK, MXFP6_E2M3_MANT_MASK, MXFP6_E2M3_EXP_SHIFT,
+        MXFP6_E2M3_IEEE_EXP_OFF, MXFP6_E2M3_MANT_SHIFT, MXFP6_E2M3_SUB_SCALE);
 #else
     dequantize_row_mxfp6_e2m3_soa_cpu_generic(x, y, k);
 #endif
@@ -4357,7 +4374,9 @@ void dequantize_row_mxfp6_e2m3_soa_cpu(const void * GGML_RESTRICT x, float * GGM
 
 void dequantize_row_mxfp6_e3m2_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
 #if defined(__AVX2__)
-    dequantize_row_mxfp6_soa_avx2(x, y, k, 0x7, 0x3, 2, 124, 21, 1.0f/16.0f);
+    dequantize_row_mxfp6_soa_avx2(x, y, k,
+        MXFP6_E3M2_EXP_MASK, MXFP6_E3M2_MANT_MASK, MXFP6_E3M2_EXP_SHIFT,
+        MXFP6_E3M2_IEEE_EXP_OFF, MXFP6_E3M2_MANT_SHIFT, MXFP6_E3M2_SUB_SCALE);
 #else
     dequantize_row_mxfp6_e3m2_soa_cpu_generic(x, y, k);
 #endif
