@@ -1786,13 +1786,11 @@ void init_iq_shmem(uvec3 wgsize)
 }
 #endif
 
-// FP8 E4M3 dequantization: 1 sign, 4 exponent (bias 7), 3 mantissa
-// MXFP element converters — GLSL copies of canonical implementations in ggml-common.h.
-// GLSL cannot include C headers, so these are maintained separately.
-// Canonical source: ggml_mxfp_fp8_e4m3_to_float() etc. in ggml-common.h.
-//
-// MX E4M3 has NO NaN — all 256 bit patterns are valid numbers.
-// exp=15 mant=7 = ±448 (not NaN as in NVIDIA's non-MX E4M3).
+// MXFP element dequantization — LUT-based for performance, HW intrinsic where available.
+// Canonical source: kvalues_mxfp8_e4m3[256] etc. in ggml-common.h.
+// LUT lookup (1 op) replaces IEEE-754 bit reconstruction (7-9 ALU ops per element).
+
+// FP8 E4M3: 1 sign, 4 exponent (bias 7), 3 mantissa. MX E4M3 has NO NaN.
 #if defined(DATA_A_MXFP8_E4M3) || defined(MXFP_ALL_DEQUANT)
 #if defined(HAS_FLOAT8_E4M3_HW) && !defined(MXFP_ALL_DEQUANT)
 #extension GL_EXT_float_e4m3 : require
@@ -1801,21 +1799,46 @@ float fp8_e4m3_to_float(uint v) {
     return float(f8);
 }
 #else
-float fp8_e4m3_to_float(uint v) {
-    uint sign = (v & 0x80u) << 24;
-    uint exp  = (v >> MXFP8_E4M3_EXP_SHIFT) & MXFP8_E4M3_EXP_MASK;
-    uint mant = v & MXFP8_E4M3_MANT_MASK;
-    // Normal: reconstruct absolute value via IEEE-754 bit manipulation
-    float normal_val = uintBitsToFloat(((exp + MXFP8_E4M3_IEEE_EXP_OFF) << 23) | (mant << MXFP8_E4M3_MANT_SHIFT));
-    // Subnormal (exp=0): value = mant * 2^(-9). Select avoids branch divergence.
-    float abs_result = (exp == 0u) ? (float(mant) * MXFP8_E4M3_SUB_SCALE) : normal_val;
-    return uintBitsToFloat(floatBitsToUint(abs_result) | sign);
-}
+const float mxfp8_e4m3_lut[256] = float[256](
+           0.0, 0.001953125,  0.00390625, 0.005859375,   0.0078125, 0.009765625,  0.01171875, 0.013671875,
+      0.015625, 0.017578125,  0.01953125, 0.021484375,   0.0234375, 0.025390625,  0.02734375, 0.029296875,
+       0.03125,  0.03515625,   0.0390625,  0.04296875,    0.046875,  0.05078125,   0.0546875,  0.05859375,
+        0.0625,   0.0703125,    0.078125,   0.0859375,     0.09375,   0.1015625,    0.109375,   0.1171875,
+         0.125,    0.140625,     0.15625,    0.171875,      0.1875,    0.203125,     0.21875,    0.234375,
+          0.25,     0.28125,      0.3125,     0.34375,       0.375,     0.40625,      0.4375,     0.46875,
+           0.5,      0.5625,       0.625,      0.6875,        0.75,      0.8125,       0.875,      0.9375,
+           1.0,       1.125,        1.25,       1.375,         1.5,       1.625,        1.75,       1.875,
+           2.0,        2.25,         2.5,        2.75,         3.0,        3.25,         3.5,        3.75,
+           4.0,         4.5,         5.0,         5.5,         6.0,         6.5,         7.0,         7.5,
+           8.0,         9.0,        10.0,        11.0,        12.0,        13.0,        14.0,        15.0,
+          16.0,        18.0,        20.0,        22.0,        24.0,        26.0,        28.0,        30.0,
+          32.0,        36.0,        40.0,        44.0,        48.0,        52.0,        56.0,        60.0,
+          64.0,        72.0,        80.0,        88.0,        96.0,       104.0,       112.0,       120.0,
+         128.0,       144.0,       160.0,       176.0,       192.0,       208.0,       224.0,       240.0,
+         256.0,       288.0,       320.0,       352.0,       384.0,       416.0,       448.0,       448.0,
+          -0.0,-0.001953125, -0.00390625,-0.005859375,  -0.0078125,-0.009765625, -0.01171875,-0.013671875,
+     -0.015625,-0.017578125, -0.01953125,-0.021484375,  -0.0234375,-0.025390625, -0.02734375,-0.029296875,
+      -0.03125, -0.03515625,  -0.0390625, -0.04296875,   -0.046875, -0.05078125,  -0.0546875, -0.05859375,
+       -0.0625,  -0.0703125,   -0.078125,  -0.0859375,    -0.09375,  -0.1015625,   -0.109375,  -0.1171875,
+        -0.125,   -0.140625,    -0.15625,   -0.171875,     -0.1875,   -0.203125,    -0.21875,   -0.234375,
+         -0.25,    -0.28125,     -0.3125,    -0.34375,      -0.375,    -0.40625,     -0.4375,    -0.46875,
+          -0.5,     -0.5625,      -0.625,     -0.6875,       -0.75,     -0.8125,      -0.875,     -0.9375,
+          -1.0,      -1.125,       -1.25,      -1.375,        -1.5,      -1.625,       -1.75,      -1.875,
+          -2.0,       -2.25,        -2.5,       -2.75,        -3.0,       -3.25,        -3.5,       -3.75,
+          -4.0,        -4.5,        -5.0,        -5.5,        -6.0,        -6.5,        -7.0,        -7.5,
+          -8.0,        -9.0,       -10.0,       -11.0,       -12.0,       -13.0,       -14.0,       -15.0,
+         -16.0,       -18.0,       -20.0,       -22.0,       -24.0,       -26.0,       -28.0,       -30.0,
+         -32.0,       -36.0,       -40.0,       -44.0,       -48.0,       -52.0,       -56.0,       -60.0,
+         -64.0,       -72.0,       -80.0,       -88.0,       -96.0,      -104.0,      -112.0,      -120.0,
+        -128.0,      -144.0,      -160.0,      -176.0,      -192.0,      -208.0,      -224.0,      -240.0,
+        -256.0,      -288.0,      -320.0,      -352.0,      -384.0,      -416.0,      -448.0,      -448.0
+);
+float fp8_e4m3_to_float(uint v) { return mxfp8_e4m3_lut[v & 0xFFu]; }
 #endif
 #endif
 
-// FP8 E5M2 dequantization: 1 sign, 5 exponent (bias 15), 2 mantissa
-// In MX context, NaN/Inf never appear in KV cache data (quantized from valid floats).
+// FP8 E5M2: 1 sign, 5 exponent (bias 15), 2 mantissa.
+// In MX context, Inf/NaN never appear in KV cache data — saturated to max finite in LUT.
 #if defined(DATA_A_MXFP8_E5M2) || defined(MXFP_ALL_DEQUANT)
 #if defined(HAS_FLOAT8_E5M2_HW) && !defined(MXFP_ALL_DEQUANT)
 #extension GL_EXT_float_e5m2 : require
@@ -1824,47 +1847,72 @@ float fp8_e5m2_to_float(uint v) {
     return float(f8);
 }
 #else
-float fp8_e5m2_to_float(uint v) {
-    uint sign = (v & 0x80u) << 24;
-    uint exp  = (v >> MXFP8_E5M2_EXP_SHIFT) & MXFP8_E5M2_EXP_MASK;
-    uint mant = v & MXFP8_E5M2_MANT_MASK;
-    // Normal: reconstruct absolute value via IEEE-754 bit manipulation
-    float normal_val = uintBitsToFloat(((exp + MXFP8_E5M2_IEEE_EXP_OFF) << 23) | (mant << MXFP8_E5M2_MANT_SHIFT));
-    // Subnormal (exp=0): value = mant * 2^(-16). Select avoids branch divergence.
-    float abs_result = (exp == 0u) ? (float(mant) * MXFP8_E5M2_SUB_SCALE) : normal_val;
-    return uintBitsToFloat(floatBitsToUint(abs_result) | sign);
-}
+const float mxfp8_e5m2_lut[256] = float[256](
+       0.0, 1.525879e-05, 3.051758e-05, 4.577637e-05, 6.103516e-05, 7.629395e-05, 9.155273e-05, 1.068115e-04,
+    1.220703e-04, 1.525879e-04, 1.831055e-04, 2.136230e-04, 2.441406e-04, 3.051758e-04, 3.662109e-04, 4.272461e-04,
+    4.882812e-04, 6.103516e-04, 7.324219e-04, 8.544922e-04, 9.765625e-04, 1.220703e-03, 1.464844e-03, 1.708984e-03,
+    1.953125e-03, 2.441406e-03, 2.929688e-03, 3.417969e-03, 3.906250e-03, 4.882812e-03, 5.859375e-03, 6.835938e-03,
+    7.812500e-03, 9.765625e-03, 1.171875e-02, 1.367188e-02, 1.562500e-02, 1.953125e-02, 2.343750e-02, 2.734375e-02,
+    3.125000e-02, 3.906250e-02, 4.687500e-02, 5.468750e-02, 6.250000e-02, 7.812500e-02, 9.375000e-02, 1.093750e-01,
+         0.125,      0.15625,       0.1875,      0.21875,        0.25,       0.3125,        0.375,       0.4375,
+           0.5,        0.625,         0.75,        0.875,         1.0,         1.25,          1.5,         1.75,
+           2.0,          2.5,          3.0,          3.5,         4.0,          5.0,          6.0,          7.0,
+           8.0,         10.0,         12.0,         14.0,        16.0,         20.0,         24.0,         28.0,
+          32.0,         40.0,         48.0,         56.0,        64.0,         80.0,         96.0,        112.0,
+         128.0,        160.0,        192.0,        224.0,       256.0,        320.0,        384.0,        448.0,
+         512.0,        640.0,        768.0,        896.0,      1024.0,       1280.0,       1536.0,       1792.0,
+        2048.0,       2560.0,       3072.0,       3584.0,      4096.0,       5120.0,       6144.0,       7168.0,
+        8192.0,      10240.0,      12288.0,      14336.0,     16384.0,      20480.0,      24576.0,      28672.0,
+       32768.0,      40960.0,      49152.0,      57344.0,     57344.0,      57344.0,      57344.0,      57344.0,
+         -0.0,-1.525879e-05,-3.051758e-05,-4.577637e-05,-6.103516e-05,-7.629395e-05,-9.155273e-05,-1.068115e-04,
+   -1.220703e-04,-1.525879e-04,-1.831055e-04,-2.136230e-04,-2.441406e-04,-3.051758e-04,-3.662109e-04,-4.272461e-04,
+   -4.882812e-04,-6.103516e-04,-7.324219e-04,-8.544922e-04,-9.765625e-04,-1.220703e-03,-1.464844e-03,-1.708984e-03,
+   -1.953125e-03,-2.441406e-03,-2.929688e-03,-3.417969e-03,-3.906250e-03,-4.882812e-03,-5.859375e-03,-6.835938e-03,
+   -7.812500e-03,-9.765625e-03,-1.171875e-02,-1.367188e-02,-1.562500e-02,-1.953125e-02,-2.343750e-02,-2.734375e-02,
+   -3.125000e-02,-3.906250e-02,-4.687500e-02,-5.468750e-02,-6.250000e-02,-7.812500e-02,-9.375000e-02,-1.093750e-01,
+        -0.125,     -0.15625,      -0.1875,     -0.21875,       -0.25,      -0.3125,       -0.375,      -0.4375,
+          -0.5,       -0.625,        -0.75,       -0.875,        -1.0,        -1.25,         -1.5,        -1.75,
+          -2.0,         -2.5,         -3.0,         -3.5,        -4.0,         -5.0,         -6.0,         -7.0,
+          -8.0,        -10.0,        -12.0,        -14.0,       -16.0,        -20.0,        -24.0,        -28.0,
+         -32.0,        -40.0,        -48.0,        -56.0,       -64.0,        -80.0,        -96.0,       -112.0,
+        -128.0,       -160.0,       -192.0,       -224.0,      -256.0,       -320.0,       -384.0,       -448.0,
+        -512.0,       -640.0,       -768.0,       -896.0,     -1024.0,      -1280.0,      -1536.0,      -1792.0,
+       -2048.0,      -2560.0,      -3072.0,      -3584.0,     -4096.0,      -5120.0,      -6144.0,      -7168.0,
+       -8192.0,     -10240.0,     -12288.0,     -14336.0,    -16384.0,     -20480.0,     -24576.0,     -28672.0,
+      -32768.0,     -40960.0,     -49152.0,     -57344.0,    -57344.0,     -57344.0,     -57344.0,     -57344.0
+);
+float fp8_e5m2_to_float(uint v) { return mxfp8_e5m2_lut[v & 0xFFu]; }
 #endif
 #endif
 
-// FP6 E2M3 dequantization: 1 sign, 2 exponent (bias 1), 3 mantissa
-// MX FP6 has no NaN/Inf — all bit patterns are valid normals/subnormals.
+// FP6 E2M3: 1 sign, 2 exponent (bias 1), 3 mantissa. No NaN/Inf.
 #if defined(DATA_A_MXFP6_E2M3) || defined(MXFP_ALL_DEQUANT)
-float fp6_e2m3_to_float(uint v) {
-    uint sign = (v & 0x20u) << 26;  // sign bit → IEEE position 31
-    uint exp  = (v >> MXFP6_E2M3_EXP_SHIFT) & MXFP6_E2M3_EXP_MASK;
-    uint mant = v & MXFP6_E2M3_MANT_MASK;
-    // Normal: reconstruct absolute value via IEEE-754 bit manipulation
-    float normal_val = uintBitsToFloat(((exp + MXFP6_E2M3_IEEE_EXP_OFF) << 23) | (mant << MXFP6_E2M3_MANT_SHIFT));
-    // Subnormal (exp=0): value = mant/8. Select avoids branch divergence.
-    float abs_result = (exp == 0u) ? (float(mant) * MXFP6_E2M3_SUB_SCALE) : normal_val;
-    return uintBitsToFloat(floatBitsToUint(abs_result) | sign);
-}
+const float mxfp6_e2m3_lut[64] = float[64](
+     0.0,  0.125,   0.25,  0.375,    0.5,  0.625,   0.75,  0.875,
+     1.0,  1.125,   1.25,  1.375,    1.5,  1.625,   1.75,  1.875,
+     2.0,   2.25,    2.5,   2.75,    3.0,   3.25,    3.5,   3.75,
+     4.0,    4.5,    5.0,    5.5,    6.0,    6.5,    7.0,    7.5,
+    -0.0, -0.125,  -0.25, -0.375,   -0.5, -0.625,  -0.75, -0.875,
+    -1.0, -1.125,  -1.25, -1.375,   -1.5, -1.625,  -1.75, -1.875,
+    -2.0,  -2.25,   -2.5,  -2.75,   -3.0,  -3.25,   -3.5,  -3.75,
+    -4.0,   -4.5,   -5.0,   -5.5,   -6.0,   -6.5,   -7.0,   -7.5
+);
+float fp6_e2m3_to_float(uint v) { return mxfp6_e2m3_lut[v & 0x3Fu]; }
 #endif
 
-// FP6 E3M2 dequantization: 1 sign, 3 exponent (bias 3), 2 mantissa
-// MX FP6 has no NaN/Inf — all bit patterns are valid normals/subnormals.
+// FP6 E3M2: 1 sign, 3 exponent (bias 3), 2 mantissa. No NaN/Inf.
 #if defined(DATA_A_MXFP6_E3M2) || defined(MXFP_ALL_DEQUANT)
-float fp6_e3m2_to_float(uint v) {
-    uint sign = (v & 0x20u) << 26;  // sign bit → IEEE position 31
-    uint exp  = (v >> MXFP6_E3M2_EXP_SHIFT) & MXFP6_E3M2_EXP_MASK;
-    uint mant = v & MXFP6_E3M2_MANT_MASK;
-    // Normal: reconstruct absolute value via IEEE-754 bit manipulation
-    float normal_val = uintBitsToFloat(((exp + MXFP6_E3M2_IEEE_EXP_OFF) << 23) | (mant << MXFP6_E3M2_MANT_SHIFT));
-    // Subnormal (exp=0): value = mant/16. Select avoids branch divergence.
-    float abs_result = (exp == 0u) ? (float(mant) * MXFP6_E3M2_SUB_SCALE) : normal_val;
-    return uintBitsToFloat(floatBitsToUint(abs_result) | sign);
-}
+const float mxfp6_e3m2_lut[64] = float[64](
+      0.0,  0.0625,  0.125, 0.1875,   0.25, 0.3125,  0.375, 0.4375,
+      0.5,  0.625,    0.75,  0.875,    1.0,   1.25,    1.5,   1.75,
+      2.0,    2.5,     3.0,    3.5,    4.0,    5.0,    6.0,    7.0,
+      8.0,   10.0,    12.0,   14.0,   16.0,   20.0,   24.0,   28.0,
+     -0.0, -0.0625, -0.125,-0.1875,  -0.25,-0.3125, -0.375,-0.4375,
+     -0.5,  -0.625,  -0.75, -0.875,   -1.0,  -1.25,   -1.5,  -1.75,
+     -2.0,   -2.5,    -3.0,   -3.5,   -4.0,   -5.0,   -6.0,   -7.0,
+     -8.0,  -10.0,   -12.0,  -14.0,  -16.0,  -20.0,  -24.0,  -28.0
+);
+float fp6_e3m2_to_float(uint v) { return mxfp6_e3m2_lut[v & 0x3Fu]; }
 #endif
 
 // Unpack 4 six-bit values from 3 packed bytes
