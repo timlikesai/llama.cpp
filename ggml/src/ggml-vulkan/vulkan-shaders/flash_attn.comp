@@ -640,6 +640,7 @@ void main() {
                 } else {
 #if defined(MXFP_Q_PREPROCESS) && !defined(MXFP_ALL_DEQUANT) && !defined(MIXED_Q_DEQUANT)
                     // Optimized V dequant: pre-computed row base, direct buffer access (no binding branch)
+                    // Scale kept per-element (compiler fuses dequant*scale with P*V into FMA chain)
                     {
                         const uint elem = 4u * (d * D_split + d_tid);
                         const uint blk = elem >> 5u;
