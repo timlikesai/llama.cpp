@@ -338,12 +338,12 @@ void quantize(uint dst_idx, uint src_idx) {
 #if defined(SET_ROWS)
     const uint NPR = p.nb21;
     const uint bwr = dst_idx % NPR;
-    const uint row_byte = (dst_idx - bwr) * 17u;
-    q_soa_bytes[row_byte + NPR * 16u + bwr] = uint8_t(e);
+    const uint row_byte = (dst_idx - bwr) * (MXFP_QS_PER_BLOCK_E2M1 + 1u);
+    q_soa_bytes[row_byte + NPR * MXFP_QS_PER_BLOCK_E2M1 + bwr] = uint8_t(e);
     for (int j = 0; j < 16; ++j) {
         uint x0 = best_index_mxfp4(vals[j],      d);
         uint x1 = best_index_mxfp4(vals[j + 16],  d);
-        q_soa_bytes[row_byte + bwr * 16u + uint(j)] = uint8_t(x0 | (x1 << 4));
+        q_soa_bytes[row_byte + bwr * MXFP_QS_PER_BLOCK_E2M1 + uint(j)] = uint8_t(x0 | (x1 << 4));
     }
 #else
     data_q[dst_idx].e = uint8_t(e);
@@ -425,10 +425,10 @@ void quantize(uint dst_idx, uint src_idx) {
 #if defined(SET_ROWS)
     const uint NPR = p.nb21;
     const uint bwr = dst_idx % NPR;
-    const uint row_byte = (dst_idx - bwr) * 33u;
-    q_soa_bytes[row_byte + NPR * 32u + bwr] = uint8_t(e);
+    const uint row_byte = (dst_idx - bwr) * (MXFP_QS_PER_BLOCK_E4M3 + 1u);
+    q_soa_bytes[row_byte + NPR * MXFP_QS_PER_BLOCK_E4M3 + bwr] = uint8_t(e);
     for (int j = 0; j < 32; ++j) {
-        q_soa_bytes[row_byte + bwr * 32u + uint(j)] = uint8_t(float_to_fp8_e4m3(vals[j] * inv_d));
+        q_soa_bytes[row_byte + bwr * MXFP_QS_PER_BLOCK_E4M3 + uint(j)] = uint8_t(float_to_fp8_e4m3(vals[j] * inv_d));
     }
 #else
     data_q[dst_idx].e = uint8_t(e);
@@ -508,10 +508,10 @@ void quantize(uint dst_idx, uint src_idx) {
 #if defined(SET_ROWS)
     const uint NPR = p.nb21;
     const uint bwr = dst_idx % NPR;
-    const uint row_byte = (dst_idx - bwr) * 33u;
-    q_soa_bytes[row_byte + NPR * 32u + bwr] = uint8_t(e);
+    const uint row_byte = (dst_idx - bwr) * (MXFP_QS_PER_BLOCK_E5M2 + 1u);
+    q_soa_bytes[row_byte + NPR * MXFP_QS_PER_BLOCK_E5M2 + bwr] = uint8_t(e);
     for (int j = 0; j < 32; ++j) {
-        q_soa_bytes[row_byte + bwr * 32u + uint(j)] = uint8_t(float_to_fp8_e5m2(vals[j] * inv_d));
+        q_soa_bytes[row_byte + bwr * MXFP_QS_PER_BLOCK_E5M2 + uint(j)] = uint8_t(float_to_fp8_e5m2(vals[j] * inv_d));
     }
 #else
     data_q[dst_idx].e = uint8_t(e);
@@ -588,8 +588,8 @@ void quantize(uint dst_idx, uint src_idx) {
 #if defined(SET_ROWS)
     const uint NPR = p.nb21;
     const uint bwr = dst_idx % NPR;
-    const uint row_byte = (dst_idx - bwr) * 25u;
-    q_soa_bytes[row_byte + NPR * 24u + bwr] = uint8_t(e);
+    const uint row_byte = (dst_idx - bwr) * (MXFP_QS_PER_BLOCK_E2M3 + 1u);
+    q_soa_bytes[row_byte + NPR * MXFP_QS_PER_BLOCK_E2M3 + bwr] = uint8_t(e);
     for (int j = 0; j < 32; j += 4) {
         uint v0 = float_to_fp6_e2m3(vals[j + 0] * inv_d);
         uint v1 = float_to_fp6_e2m3(vals[j + 1] * inv_d);
@@ -598,9 +598,9 @@ void quantize(uint dst_idx, uint src_idx) {
         uint base = j * 3u / 4u;
         uint8_t b0, b1, b2;
         pack_fp6x4(v0, v1, v2, v3, b0, b1, b2);
-        q_soa_bytes[row_byte + bwr * 24u + base]      = b0;
-        q_soa_bytes[row_byte + bwr * 24u + base + 1u]  = b1;
-        q_soa_bytes[row_byte + bwr * 24u + base + 2u]  = b2;
+        q_soa_bytes[row_byte + bwr * MXFP_QS_PER_BLOCK_E2M3 + base]      = b0;
+        q_soa_bytes[row_byte + bwr * MXFP_QS_PER_BLOCK_E2M3 + base + 1u]  = b1;
+        q_soa_bytes[row_byte + bwr * MXFP_QS_PER_BLOCK_E2M3 + base + 2u]  = b2;
     }
 #else
     data_q[dst_idx].e = uint8_t(e);
@@ -687,8 +687,8 @@ void quantize(uint dst_idx, uint src_idx) {
 #if defined(SET_ROWS)
     const uint NPR = p.nb21;
     const uint bwr = dst_idx % NPR;
-    const uint row_byte = (dst_idx - bwr) * 25u;
-    q_soa_bytes[row_byte + NPR * 24u + bwr] = uint8_t(e);
+    const uint row_byte = (dst_idx - bwr) * (MXFP_QS_PER_BLOCK_E3M2 + 1u);
+    q_soa_bytes[row_byte + NPR * MXFP_QS_PER_BLOCK_E3M2 + bwr] = uint8_t(e);
     for (int j = 0; j < 32; j += 4) {
         uint v0 = float_to_fp6_e3m2(vals[j + 0] * inv_d);
         uint v1 = float_to_fp6_e3m2(vals[j + 1] * inv_d);
@@ -697,9 +697,9 @@ void quantize(uint dst_idx, uint src_idx) {
         uint base = j * 3u / 4u;
         uint8_t b0, b1, b2;
         pack_fp6x4(v0, v1, v2, v3, b0, b1, b2);
-        q_soa_bytes[row_byte + bwr * 24u + base]      = b0;
-        q_soa_bytes[row_byte + bwr * 24u + base + 1u]  = b1;
-        q_soa_bytes[row_byte + bwr * 24u + base + 2u]  = b2;
+        q_soa_bytes[row_byte + bwr * MXFP_QS_PER_BLOCK_E3M2 + base]      = b0;
+        q_soa_bytes[row_byte + bwr * MXFP_QS_PER_BLOCK_E3M2 + base + 1u]  = b1;
+        q_soa_bytes[row_byte + bwr * MXFP_QS_PER_BLOCK_E3M2 + base + 2u]  = b2;
     }
 #else
     data_q[dst_idx].e = uint8_t(e);

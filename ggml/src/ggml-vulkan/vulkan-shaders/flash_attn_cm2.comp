@@ -332,14 +332,13 @@ void main() {
 
         uint32_t k_offset = ik2*p.nb12 + ik3*p.nb13;
 #ifdef MXFP_Q_PREPROCESS
-        // MXFP SoA: optimized inline dequant K tile → shmem → coopmat.
-        // Direct SoA addressing: no modulo, no binding_idx branch, no coord round-trip.
-        // K buffer: k_raw_u32 (binding 1), stride: k_stride, block bytes: K_BLOCK_BYTE_SIZE.
-#define MXFP_SOA_DEQUANT_TILE(BUF, STRIDE, BBS, HS, HS_PAD, BASE_OFFSET, TILE_ROW) \
+        // MXFP SoA dequant: tile from global → kv_shmem → coopmat.
+        // Uses MXFP_QS_PER_BLOCK and MXFP_SOA_BLOCK_BYTES from flash_attn_base.glsl
+        // (canonical source: ggml-common.h via vulkan-shaders-gen.cpp).
+#define MXFP_SOA_DEQUANT_TILE(BUF, STRIDE, HS, HS_PAD, BASE_OFFSET, TILE_ROW) \
         { \
             const uint32_t _tid = gl_LocalInvocationIndex; \
-            const uint32_t _base_blk = (BASE_OFFSET) / (BBS); \
-            const uint32_t _qs_per_blk = (BBS) - 1u; \
+            const uint32_t _base_blk = (BASE_OFFSET) / MXFP_SOA_BLOCK_BYTES; \
             const uint32_t _total = Bc * ((HS) / 4u); \
             for (uint32_t _idx = _tid; _idx < _total; _idx += gl_WorkGroupSize.x) { \
                 const uint32_t _row = _idx / ((HS) / 4u); \
@@ -350,12 +349,12 @@ void main() {
                 const uint32_t _kv_row = (TILE_ROW) + _row; \
                 FLOAT_TYPEV4 _v4 = FLOAT_TYPEV4(0.0); \
                 if (_kv_row < KV) { \
-                    const uint32_t _row_byte = (_base_blk + _kv_row * (STRIDE)) * (BBS); \
-                    const uint32_t _e8m0_byte = _row_byte + (STRIDE) * _qs_per_blk + _blk; \
+                    const uint32_t _row_byte = (_base_blk + _kv_row * (STRIDE)) * MXFP_SOA_BLOCK_BYTES; \
+                    const uint32_t _e8m0_byte = _row_byte + (STRIDE) * MXFP_QS_PER_BLOCK + _blk; \
                     const uint32_t _ew = _e8m0_byte >> 2u; \
                     const uint32_t _es = (_e8m0_byte & 3u) << 3u; \
                     const float _scale = e8m0_to_fp32(uint8_t(((BUF)[_ew] >> _es) & 0xFFu)); \
-                    const uint32_t _qs_byte = _row_byte + _blk * _qs_per_blk + MXFP_QS_BYTE_IN_BLK(_eib); \
+                    const uint32_t _qs_byte = _row_byte + _blk * MXFP_QS_PER_BLOCK + MXFP_QS_BYTE_IN_BLK(_eib); \
                     const uint32_t _w = _qs_byte >> 2u; \
                     const uint32_t _s = (_qs_byte & 3u) << 3u; \
                     uint _packed = (BUF)[_w] >> _s; \
@@ -429,7 +428,7 @@ void main() {
         }
 #else
         // FP8: use optimized inline SoA macro (no modulo, no function call overhead).
-        MXFP_SOA_DEQUANT_TILE(k_raw_u32.k_u32, k_stride, K_BLOCK_BYTE_SIZE, HSK, HSK_pad, k_offset, j * Bc)
+        MXFP_SOA_DEQUANT_TILE(k_raw_u32.k_u32, k_stride, HSK, HSK_pad, k_offset, j * Bc)
 #endif
         barrier();
         {
@@ -531,7 +530,7 @@ void main() {
             }
         }
 #else
-        MXFP_SOA_DEQUANT_TILE(v_raw_u32.v_u32, v_stride, V_BLOCK_BYTE_SIZE, HSV, HSV_pad, v_offset, j * Bc)
+        MXFP_SOA_DEQUANT_TILE(v_raw_u32.v_u32, v_stride, HSV, HSV_pad, v_offset, j * Bc)
 #endif
         barrier();
         {

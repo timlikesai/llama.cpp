@@ -667,6 +667,13 @@ void process_shaders() {
         {"MXFP6_E3M2_IEEE_EXP_OFF", "124u"},
         {"MXFP6_E3M2_MANT_SHIFT",   "21"},
         {"MXFP6_E3M2_SUB_SCALE",    "(1.0 / 16.0)"},
+        // SoA layout constants (canonical source: ggml-common.h)
+        // QS bytes per 32-element block for each MXFP type
+        {"MXFP_QS_PER_BLOCK_E2M1",  "16"},   // 32 * 4 / 8
+        {"MXFP_QS_PER_BLOCK_E4M3",  "32"},   // 32 * 8 / 8
+        {"MXFP_QS_PER_BLOCK_E5M2",  "32"},
+        {"MXFP_QS_PER_BLOCK_E2M3",  "24"},   // 32 * 6 / 8
+        {"MXFP_QS_PER_BLOCK_E3M2",  "24"},
     };
 
     for (const bool& fp16 : {false, true}) {
