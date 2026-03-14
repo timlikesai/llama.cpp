@@ -1816,6 +1816,23 @@ float fp8_e4m3_to_float(uint v) {
     return uintBitsToFloat(sign | floatBitsToUint(float(v & 0x7u) * (1.0 / 512.0)));
 }
 #endif
+
+// Fused E8M0 dequant: fold scale multiply into exponent addition. ZERO float multiplies.
+// val * e8m0_scale = 2^(exp4-7) * (1+m/8) * 2^(e8m0-127) = 2^(exp4+e8m0-134) * (1+m/8)
+// IEEE exponent = exp4 + e8m0 - 134 + 127 = exp4 + e8m0 - 7
+float fp8_e4m3_dequant_fused(uint v, uint e8m0) {
+    uint sign = (v & 0x80u) << 24u;
+    uint exp4 = (v >> 3u) & 0xFu;
+    uint mant = (v & 0x7u) << 20u;
+    if (exp4 != 0u && e8m0 != 0u) {
+        uint fused_exp = exp4 + e8m0 - 7u;
+        // Clamp to valid IEEE range [1, 254]
+        if (fused_exp >= 255u) return uintBitsToFloat(sign | 0x7F7FFFFFu); // max finite
+        return uintBitsToFloat(sign | (fused_exp << 23u) | mant);
+    }
+    // Fallback for subnormals or zero scale: use standard path
+    return fp8_e4m3_to_float(v) * ((e8m0 == 0u) ? uintBitsToFloat(0x00400000u) : uintBitsToFloat(e8m0 << 23u));
+}
 #endif
 
 // FP8 E5M2: 1 sign, 5 exponent (bias 15), 2 mantissa.
@@ -1844,6 +1861,20 @@ float fp8_e5m2_to_float(uint v) {
     return uintBitsToFloat(sign | floatBitsToUint(float(v & 0x3u) * (1.0 / 65536.0)));
 }
 #endif
+
+// Fused E8M0 dequant for E5M2: val * 2^(e8m0-127) via exponent addition.
+// IEEE exponent = exp5 + e8m0 - 15 (E5M2 bias=15)
+float fp8_e5m2_dequant_fused(uint v, uint e8m0) {
+    uint sign = (v & 0x80u) << 24u;
+    uint exp5 = (v >> 2u) & 0x1Fu;
+    uint mant = (v & 0x3u) << 21u;
+    if (exp5 != 0u && exp5 < 31u && e8m0 != 0u) {
+        uint fused_exp = exp5 + e8m0 - 15u;
+        if (fused_exp >= 255u) return uintBitsToFloat(sign | 0x7F7FFFFFu);
+        return uintBitsToFloat(sign | (fused_exp << 23u) | mant);
+    }
+    return fp8_e5m2_to_float(v) * ((e8m0 == 0u) ? uintBitsToFloat(0x00400000u) : uintBitsToFloat(e8m0 << 23u));
+}
 #endif
 
 // FP6 E2M3: 1 sign, 2 exponent (bias 1), 3 mantissa. No NaN/Inf.
@@ -1861,6 +1892,19 @@ float fp6_e2m3_to_float(uint v) {
     }
     return uintBitsToFloat(sign | floatBitsToUint(float(v & 0x7u) * (1.0 / 8.0)));
 }
+
+// Fused E8M0 dequant for E2M3: IEEE exponent = exp2 + e8m0 - 1
+float fp6_e2m3_dequant_fused(uint v, uint e8m0) {
+    uint sign = (v & 0x20u) << 26u;
+    uint exp2 = (v >> 3u) & 0x3u;
+    uint mant = (v & 0x7u) << 20u;
+    if (exp2 != 0u && e8m0 != 0u) {
+        uint fused_exp = exp2 + e8m0 - 1u;
+        if (fused_exp >= 255u) return uintBitsToFloat(sign | 0x7F7FFFFFu);
+        return uintBitsToFloat(sign | (fused_exp << 23u) | mant);
+    }
+    return fp6_e2m3_to_float(v) * ((e8m0 == 0u) ? uintBitsToFloat(0x00400000u) : uintBitsToFloat(e8m0 << 23u));
+}
 #endif
 
 // FP6 E3M2: 1 sign, 3 exponent (bias 3), 2 mantissa. No NaN/Inf.
@@ -1877,6 +1921,19 @@ float fp6_e3m2_to_float(uint v) {
         return uintBitsToFloat(sign | ((exp3 + 124u) << 23u) | mant);
     }
     return uintBitsToFloat(sign | floatBitsToUint(float(v & 0x3u) * (1.0 / 16.0)));
+}
+
+// Fused E8M0 dequant for E3M2: IEEE exponent = exp3 + e8m0 - 3
+float fp6_e3m2_dequant_fused(uint v, uint e8m0) {
+    uint sign = (v & 0x20u) << 26u;
+    uint exp3 = (v >> 2u) & 0x7u;
+    uint mant = (v & 0x3u) << 21u;
+    if (exp3 != 0u && e8m0 != 0u) {
+        uint fused_exp = exp3 + e8m0 - 3u;
+        if (fused_exp >= 255u) return uintBitsToFloat(sign | 0x7F7FFFFFu);
+        return uintBitsToFloat(sign | (fused_exp << 23u) | mant);
+    }
+    return fp6_e3m2_to_float(v) * ((e8m0 == 0u) ? uintBitsToFloat(0x00400000u) : uintBitsToFloat(e8m0 << 23u));
 }
 #endif
 

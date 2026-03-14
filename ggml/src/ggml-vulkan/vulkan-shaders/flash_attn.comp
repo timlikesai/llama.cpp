@@ -335,8 +335,11 @@ void main() {
                             const uint e8m0_byte = row_byte + k_stride * MXFP_QS_PER_BLOCK + bwr + blk;
                             const uint ew = e8m0_byte >> 2u;
                             const uint es = (e8m0_byte & 3u) << 3u;
-                            mxfp_k_scale = e8m0_to_fp32(uint8_t((k_raw_u32.k_u32[ew] >> es) & 0xFFu));
-                            mxfp_k_scale = subgroupShuffle(mxfp_k_scale, gl_SubgroupInvocationID & ~7u);
+                            const uint e8m0_raw = (k_raw_u32.k_u32[ew] >> es) & 0xFFu;
+                            // Broadcast raw E8M0 byte for fused dequant
+                            const uint e8m0_bc = subgroupShuffle(e8m0_raw, gl_SubgroupInvocationID & ~7u);
+                            // FP4: still needs float scale for LUT values
+                            mxfp_k_scale = e8m0_to_fp32(uint8_t(e8m0_bc));
 #if defined(DATA_A_MXFP4)
                             const uint qs_byte = row_byte + (bwr + blk) * MXFP_QS_PER_BLOCK + (eib & 0xFu);
                             const uint w = qs_byte >> 2u;
@@ -356,17 +359,20 @@ void main() {
                             uint packed = k_raw_u32.k_u32[w] >> s;
                             if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
 #if defined(DATA_A_MXFP8_E4M3)
+                            // Fused E8M0: zero float multiplies, pure integer ALU
                             K_Tf = FLOAT_TYPEV4(
-                                fp8_e4m3_to_float(packed & 0xFFu),
-                                fp8_e4m3_to_float((packed >> 8u) & 0xFFu),
-                                fp8_e4m3_to_float((packed >> 16u) & 0xFFu),
-                                fp8_e4m3_to_float((packed >> 24u) & 0xFFu));
+                                fp8_e4m3_dequant_fused(packed & 0xFFu, e8m0_bc),
+                                fp8_e4m3_dequant_fused((packed >> 8u) & 0xFFu, e8m0_bc),
+                                fp8_e4m3_dequant_fused((packed >> 16u) & 0xFFu, e8m0_bc),
+                                fp8_e4m3_dequant_fused((packed >> 24u) & 0xFFu, e8m0_bc));
+                            mxfp_k_scale = 1.0;  // already fused into the values
 #else
                             K_Tf = FLOAT_TYPEV4(
-                                fp8_e5m2_to_float(packed & 0xFFu),
-                                fp8_e5m2_to_float((packed >> 8u) & 0xFFu),
-                                fp8_e5m2_to_float((packed >> 16u) & 0xFFu),
-                                fp8_e5m2_to_float((packed >> 24u) & 0xFFu));
+                                fp8_e5m2_dequant_fused(packed & 0xFFu, e8m0_bc),
+                                fp8_e5m2_dequant_fused((packed >> 8u) & 0xFFu, e8m0_bc),
+                                fp8_e5m2_dequant_fused((packed >> 16u) & 0xFFu, e8m0_bc),
+                                fp8_e5m2_dequant_fused((packed >> 24u) & 0xFFu, e8m0_bc));
+                            mxfp_k_scale = 1.0;
 #endif
 #elif defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
                             const uint group = eib / 4u;
@@ -377,16 +383,18 @@ void main() {
                             const uint pk = b0 | (b1 << 8u) | (b2 << 16u);
 #if defined(DATA_A_MXFP6_E2M3)
                             K_Tf = FLOAT_TYPEV4(
-                                fp6_e2m3_to_float(pk & 0x3Fu),
-                                fp6_e2m3_to_float((pk >> 6u) & 0x3Fu),
-                                fp6_e2m3_to_float((pk >> 12u) & 0x3Fu),
-                                fp6_e2m3_to_float((pk >> 18u) & 0x3Fu));
+                                fp6_e2m3_dequant_fused(pk & 0x3Fu, e8m0_bc),
+                                fp6_e2m3_dequant_fused((pk >> 6u) & 0x3Fu, e8m0_bc),
+                                fp6_e2m3_dequant_fused((pk >> 12u) & 0x3Fu, e8m0_bc),
+                                fp6_e2m3_dequant_fused((pk >> 18u) & 0x3Fu, e8m0_bc));
+                            mxfp_k_scale = 1.0;
 #else
                             K_Tf = FLOAT_TYPEV4(
-                                fp6_e3m2_to_float(pk & 0x3Fu),
-                                fp6_e3m2_to_float((pk >> 6u) & 0x3Fu),
-                                fp6_e3m2_to_float((pk >> 12u) & 0x3Fu),
-                                fp6_e3m2_to_float((pk >> 18u) & 0x3Fu));
+                                fp6_e3m2_dequant_fused(pk & 0x3Fu, e8m0_bc),
+                                fp6_e3m2_dequant_fused((pk >> 6u) & 0x3Fu, e8m0_bc),
+                                fp6_e3m2_dequant_fused((pk >> 12u) & 0x3Fu, e8m0_bc),
+                                fp6_e3m2_dequant_fused((pk >> 18u) & 0x3Fu, e8m0_bc));
+                            mxfp_k_scale = 1.0;
 #endif
 #endif
                         }
@@ -443,12 +451,11 @@ void main() {
                             const uint e8m0_byte = row_byte + k_stride * MXFP_QS_PER_BLOCK + bwr + blk;
                             const uint ew = e8m0_byte >> 2u;
                             const uint es = (e8m0_byte & 3u) << 3u;
-                            mxfp_k_scale = e8m0_to_fp32(uint8_t((k_raw_u32.k_u32[ew] >> es) & 0xFFu));
-                            // Broadcast: all lanes in same 8-lane group (same block) use same scale
-                            mxfp_k_scale = subgroupShuffle(mxfp_k_scale, gl_SubgroupInvocationID & ~7u);
+                            const uint e8m0_raw = (k_raw_u32.k_u32[ew] >> es) & 0xFFu;
+                            const uint e8m0_bc = subgroupShuffle(e8m0_raw, gl_SubgroupInvocationID & ~7u);
+                            mxfp_k_scale = e8m0_to_fp32(uint8_t(e8m0_bc));
 
                             // QS data: direct SoA addressing, no modulo needed
-                            // Unscaled — E8M0 scale factored to dot product result
 #if defined(DATA_A_MXFP4)
                             const uint qs_byte = row_byte + (bwr + blk) * MXFP_QS_PER_BLOCK + (eib & 0xFu);
                             const uint w = qs_byte >> 2u;
@@ -468,17 +475,20 @@ void main() {
                             uint packed = k_raw_u32.k_u32[w] >> s;
                             if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
 #if defined(DATA_A_MXFP8_E4M3)
+                            // Fused E8M0: zero float multiplies, pure integer ALU
                             K_Tf = FLOAT_TYPEV4(
-                                fp8_e4m3_to_float(packed & 0xFFu),
-                                fp8_e4m3_to_float((packed >> 8u) & 0xFFu),
-                                fp8_e4m3_to_float((packed >> 16u) & 0xFFu),
-                                fp8_e4m3_to_float((packed >> 24u) & 0xFFu));
+                                fp8_e4m3_dequant_fused(packed & 0xFFu, e8m0_bc),
+                                fp8_e4m3_dequant_fused((packed >> 8u) & 0xFFu, e8m0_bc),
+                                fp8_e4m3_dequant_fused((packed >> 16u) & 0xFFu, e8m0_bc),
+                                fp8_e4m3_dequant_fused((packed >> 24u) & 0xFFu, e8m0_bc));
+                            mxfp_k_scale = 1.0;  // already fused into the values
 #else
                             K_Tf = FLOAT_TYPEV4(
-                                fp8_e5m2_to_float(packed & 0xFFu),
-                                fp8_e5m2_to_float((packed >> 8u) & 0xFFu),
-                                fp8_e5m2_to_float((packed >> 16u) & 0xFFu),
-                                fp8_e5m2_to_float((packed >> 24u) & 0xFFu));
+                                fp8_e5m2_dequant_fused(packed & 0xFFu, e8m0_bc),
+                                fp8_e5m2_dequant_fused((packed >> 8u) & 0xFFu, e8m0_bc),
+                                fp8_e5m2_dequant_fused((packed >> 16u) & 0xFFu, e8m0_bc),
+                                fp8_e5m2_dequant_fused((packed >> 24u) & 0xFFu, e8m0_bc));
+                            mxfp_k_scale = 1.0;
 #endif
 #elif defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
                             const uint group = eib / 4u;
@@ -489,16 +499,18 @@ void main() {
                             const uint pk = b0 | (b1 << 8u) | (b2 << 16u);
 #if defined(DATA_A_MXFP6_E2M3)
                             K_Tf = FLOAT_TYPEV4(
-                                fp6_e2m3_to_float(pk & 0x3Fu),
-                                fp6_e2m3_to_float((pk >> 6u) & 0x3Fu),
-                                fp6_e2m3_to_float((pk >> 12u) & 0x3Fu),
-                                fp6_e2m3_to_float((pk >> 18u) & 0x3Fu));
+                                fp6_e2m3_dequant_fused(pk & 0x3Fu, e8m0_bc),
+                                fp6_e2m3_dequant_fused((pk >> 6u) & 0x3Fu, e8m0_bc),
+                                fp6_e2m3_dequant_fused((pk >> 12u) & 0x3Fu, e8m0_bc),
+                                fp6_e2m3_dequant_fused((pk >> 18u) & 0x3Fu, e8m0_bc));
+                            mxfp_k_scale = 1.0;
 #else
                             K_Tf = FLOAT_TYPEV4(
-                                fp6_e3m2_to_float(pk & 0x3Fu),
-                                fp6_e3m2_to_float((pk >> 6u) & 0x3Fu),
-                                fp6_e3m2_to_float((pk >> 12u) & 0x3Fu),
-                                fp6_e3m2_to_float((pk >> 18u) & 0x3Fu));
+                                fp6_e3m2_dequant_fused(pk & 0x3Fu, e8m0_bc),
+                                fp6_e3m2_dequant_fused((pk >> 6u) & 0x3Fu, e8m0_bc),
+                                fp6_e3m2_dequant_fused((pk >> 12u) & 0x3Fu, e8m0_bc),
+                                fp6_e3m2_dequant_fused((pk >> 18u) & 0x3Fu, e8m0_bc));
+                            mxfp_k_scale = 1.0;
 #endif
 #endif
                         }
