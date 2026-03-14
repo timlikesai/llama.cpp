@@ -318,6 +318,7 @@ void main() {
                     }
 
                     FLOAT_TYPEV4 K_Tf;
+                    float mxfp_k_scale = 1.0;
                     if (SHMEM_STAGING != 0) {
                         K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
                     } else {
@@ -334,8 +335,8 @@ void main() {
                             const uint e8m0_byte = row_byte + k_stride * MXFP_QS_PER_BLOCK + bwr + blk;
                             const uint ew = e8m0_byte >> 2u;
                             const uint es = (e8m0_byte & 3u) << 3u;
-                            float k_scale = e8m0_to_fp32(uint8_t((k_raw_u32.k_u32[ew] >> es) & 0xFFu));
-                            k_scale = subgroupShuffle(k_scale, gl_SubgroupInvocationID & ~7u);
+                            mxfp_k_scale = e8m0_to_fp32(uint8_t((k_raw_u32.k_u32[ew] >> es) & 0xFFu));
+                            mxfp_k_scale = subgroupShuffle(mxfp_k_scale, gl_SubgroupInvocationID & ~7u);
 #if defined(DATA_A_MXFP4)
                             const uint qs_byte = row_byte + (bwr + blk) * MXFP_QS_PER_BLOCK + (eib & 0xFu);
                             const uint w = qs_byte >> 2u;
@@ -344,10 +345,10 @@ void main() {
                             if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
                             const uint shift = (eib & 0x10u) >> 2u;
                             K_Tf = FLOAT_TYPEV4(
-                                fp4_e2m1_to_float((packed >>  0u) >> shift & 0xFu) * k_scale,
-                                fp4_e2m1_to_float((packed >>  8u) >> shift & 0xFu) * k_scale,
-                                fp4_e2m1_to_float((packed >> 16u) >> shift & 0xFu) * k_scale,
-                                fp4_e2m1_to_float((packed >> 24u) >> shift & 0xFu) * k_scale);
+                                fp4_e2m1_to_float((packed >>  0u) >> shift & 0xFu),
+                                fp4_e2m1_to_float((packed >>  8u) >> shift & 0xFu),
+                                fp4_e2m1_to_float((packed >> 16u) >> shift & 0xFu),
+                                fp4_e2m1_to_float((packed >> 24u) >> shift & 0xFu));
 #elif defined(DATA_A_MXFP8_E4M3) || defined(DATA_A_MXFP8_E5M2)
                             const uint qs_byte = row_byte + (bwr + blk) * MXFP_QS_PER_BLOCK + eib;
                             const uint w = qs_byte >> 2u;
@@ -356,16 +357,16 @@ void main() {
                             if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
 #if defined(DATA_A_MXFP8_E4M3)
                             K_Tf = FLOAT_TYPEV4(
-                                fp8_e4m3_to_float(packed & 0xFFu) * k_scale,
-                                fp8_e4m3_to_float((packed >> 8u) & 0xFFu) * k_scale,
-                                fp8_e4m3_to_float((packed >> 16u) & 0xFFu) * k_scale,
-                                fp8_e4m3_to_float((packed >> 24u) & 0xFFu) * k_scale);
+                                fp8_e4m3_to_float(packed & 0xFFu),
+                                fp8_e4m3_to_float((packed >> 8u) & 0xFFu),
+                                fp8_e4m3_to_float((packed >> 16u) & 0xFFu),
+                                fp8_e4m3_to_float((packed >> 24u) & 0xFFu));
 #else
                             K_Tf = FLOAT_TYPEV4(
-                                fp8_e5m2_to_float(packed & 0xFFu) * k_scale,
-                                fp8_e5m2_to_float((packed >> 8u) & 0xFFu) * k_scale,
-                                fp8_e5m2_to_float((packed >> 16u) & 0xFFu) * k_scale,
-                                fp8_e5m2_to_float((packed >> 24u) & 0xFFu) * k_scale);
+                                fp8_e5m2_to_float(packed & 0xFFu),
+                                fp8_e5m2_to_float((packed >> 8u) & 0xFFu),
+                                fp8_e5m2_to_float((packed >> 16u) & 0xFFu),
+                                fp8_e5m2_to_float((packed >> 24u) & 0xFFu));
 #endif
 #elif defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
                             const uint group = eib / 4u;
@@ -376,16 +377,16 @@ void main() {
                             const uint pk = b0 | (b1 << 8u) | (b2 << 16u);
 #if defined(DATA_A_MXFP6_E2M3)
                             K_Tf = FLOAT_TYPEV4(
-                                fp6_e2m3_to_float(pk & 0x3Fu) * k_scale,
-                                fp6_e2m3_to_float((pk >> 6u) & 0x3Fu) * k_scale,
-                                fp6_e2m3_to_float((pk >> 12u) & 0x3Fu) * k_scale,
-                                fp6_e2m3_to_float((pk >> 18u) & 0x3Fu) * k_scale);
+                                fp6_e2m3_to_float(pk & 0x3Fu),
+                                fp6_e2m3_to_float((pk >> 6u) & 0x3Fu),
+                                fp6_e2m3_to_float((pk >> 12u) & 0x3Fu),
+                                fp6_e2m3_to_float((pk >> 18u) & 0x3Fu));
 #else
                             K_Tf = FLOAT_TYPEV4(
-                                fp6_e3m2_to_float(pk & 0x3Fu) * k_scale,
-                                fp6_e3m2_to_float((pk >> 6u) & 0x3Fu) * k_scale,
-                                fp6_e3m2_to_float((pk >> 12u) & 0x3Fu) * k_scale,
-                                fp6_e3m2_to_float((pk >> 18u) & 0x3Fu) * k_scale);
+                                fp6_e3m2_to_float(pk & 0x3Fu),
+                                fp6_e3m2_to_float((pk >> 6u) & 0x3Fu),
+                                fp6_e3m2_to_float((pk >> 12u) & 0x3Fu),
+                                fp6_e3m2_to_float((pk >> 18u) & 0x3Fu));
 #endif
 #endif
                         }
@@ -399,7 +400,13 @@ void main() {
 #endif
                     }
                     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+#if defined(MXFP_Q_PREPROCESS)
+                        // E8M0 scale factored out: 1 multiply on dot result instead of 4 per element.
+                        // Exact because E8M0 scale is a power-of-two (pure exponent).
+                        Sf[r][c] += ACC_TYPE(dot(Q_cache[r], K_Tf)) * ACC_TYPE(mxfp_k_scale);
+#else
                         Sf[r][c] += ACC_TYPE(dot(Q_cache[r], K_Tf));
+#endif
                     }
                 }
             }
@@ -411,6 +418,7 @@ void main() {
 
                 [[unroll]] for (uint32_t d = 0; d < HSK_per_thread / 4; ++d) {
                     FLOAT_TYPEV4 K_Tf;
+                    float mxfp_k_scale = 1.0;
                     if (SHMEM_STAGING != 0) {
                         K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
                     } else {
@@ -435,11 +443,12 @@ void main() {
                             const uint e8m0_byte = row_byte + k_stride * MXFP_QS_PER_BLOCK + bwr + blk;
                             const uint ew = e8m0_byte >> 2u;
                             const uint es = (e8m0_byte & 3u) << 3u;
-                            float k_scale = e8m0_to_fp32(uint8_t((k_raw_u32.k_u32[ew] >> es) & 0xFFu));
+                            mxfp_k_scale = e8m0_to_fp32(uint8_t((k_raw_u32.k_u32[ew] >> es) & 0xFFu));
                             // Broadcast: all lanes in same 8-lane group (same block) use same scale
-                            k_scale = subgroupShuffle(k_scale, gl_SubgroupInvocationID & ~7u);
+                            mxfp_k_scale = subgroupShuffle(mxfp_k_scale, gl_SubgroupInvocationID & ~7u);
 
                             // QS data: direct SoA addressing, no modulo needed
+                            // Unscaled — E8M0 scale factored to dot product result
 #if defined(DATA_A_MXFP4)
                             const uint qs_byte = row_byte + (bwr + blk) * MXFP_QS_PER_BLOCK + (eib & 0xFu);
                             const uint w = qs_byte >> 2u;
@@ -448,10 +457,10 @@ void main() {
                             if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
                             const uint shift = (eib & 0x10u) >> 2u;
                             K_Tf = FLOAT_TYPEV4(
-                                fp4_e2m1_to_float((packed >>  0u) >> shift & 0xFu) * k_scale,
-                                fp4_e2m1_to_float((packed >>  8u) >> shift & 0xFu) * k_scale,
-                                fp4_e2m1_to_float((packed >> 16u) >> shift & 0xFu) * k_scale,
-                                fp4_e2m1_to_float((packed >> 24u) >> shift & 0xFu) * k_scale);
+                                fp4_e2m1_to_float((packed >>  0u) >> shift & 0xFu),
+                                fp4_e2m1_to_float((packed >>  8u) >> shift & 0xFu),
+                                fp4_e2m1_to_float((packed >> 16u) >> shift & 0xFu),
+                                fp4_e2m1_to_float((packed >> 24u) >> shift & 0xFu));
 #elif defined(DATA_A_MXFP8_E4M3) || defined(DATA_A_MXFP8_E5M2)
                             const uint qs_byte = row_byte + (bwr + blk) * MXFP_QS_PER_BLOCK + eib;
                             const uint w = qs_byte >> 2u;
@@ -460,16 +469,16 @@ void main() {
                             if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
 #if defined(DATA_A_MXFP8_E4M3)
                             K_Tf = FLOAT_TYPEV4(
-                                fp8_e4m3_to_float(packed & 0xFFu) * k_scale,
-                                fp8_e4m3_to_float((packed >> 8u) & 0xFFu) * k_scale,
-                                fp8_e4m3_to_float((packed >> 16u) & 0xFFu) * k_scale,
-                                fp8_e4m3_to_float((packed >> 24u) & 0xFFu) * k_scale);
+                                fp8_e4m3_to_float(packed & 0xFFu),
+                                fp8_e4m3_to_float((packed >> 8u) & 0xFFu),
+                                fp8_e4m3_to_float((packed >> 16u) & 0xFFu),
+                                fp8_e4m3_to_float((packed >> 24u) & 0xFFu));
 #else
                             K_Tf = FLOAT_TYPEV4(
-                                fp8_e5m2_to_float(packed & 0xFFu) * k_scale,
-                                fp8_e5m2_to_float((packed >> 8u) & 0xFFu) * k_scale,
-                                fp8_e5m2_to_float((packed >> 16u) & 0xFFu) * k_scale,
-                                fp8_e5m2_to_float((packed >> 24u) & 0xFFu) * k_scale);
+                                fp8_e5m2_to_float(packed & 0xFFu),
+                                fp8_e5m2_to_float((packed >> 8u) & 0xFFu),
+                                fp8_e5m2_to_float((packed >> 16u) & 0xFFu),
+                                fp8_e5m2_to_float((packed >> 24u) & 0xFFu));
 #endif
 #elif defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
                             const uint group = eib / 4u;
@@ -480,16 +489,16 @@ void main() {
                             const uint pk = b0 | (b1 << 8u) | (b2 << 16u);
 #if defined(DATA_A_MXFP6_E2M3)
                             K_Tf = FLOAT_TYPEV4(
-                                fp6_e2m3_to_float(pk & 0x3Fu) * k_scale,
-                                fp6_e2m3_to_float((pk >> 6u) & 0x3Fu) * k_scale,
-                                fp6_e2m3_to_float((pk >> 12u) & 0x3Fu) * k_scale,
-                                fp6_e2m3_to_float((pk >> 18u) & 0x3Fu) * k_scale);
+                                fp6_e2m3_to_float(pk & 0x3Fu),
+                                fp6_e2m3_to_float((pk >> 6u) & 0x3Fu),
+                                fp6_e2m3_to_float((pk >> 12u) & 0x3Fu),
+                                fp6_e2m3_to_float((pk >> 18u) & 0x3Fu));
 #else
                             K_Tf = FLOAT_TYPEV4(
-                                fp6_e3m2_to_float(pk & 0x3Fu) * k_scale,
-                                fp6_e3m2_to_float((pk >> 6u) & 0x3Fu) * k_scale,
-                                fp6_e3m2_to_float((pk >> 12u) & 0x3Fu) * k_scale,
-                                fp6_e3m2_to_float((pk >> 18u) & 0x3Fu) * k_scale);
+                                fp6_e3m2_to_float(pk & 0x3Fu),
+                                fp6_e3m2_to_float((pk >> 6u) & 0x3Fu),
+                                fp6_e3m2_to_float((pk >> 12u) & 0x3Fu),
+                                fp6_e3m2_to_float((pk >> 18u) & 0x3Fu));
 #endif
 #endif
                         }
@@ -503,7 +512,11 @@ void main() {
 #endif
                     }
                     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+#if defined(MXFP_Q_PREPROCESS)
+                        Sf[r][c] += ACC_TYPE(dot(Qf[tile_row(r) * qf_stride + d * D_split + d_tid], K_Tf)) * ACC_TYPE(mxfp_k_scale);
+#else
                         Sf[r][c] += ACC_TYPE(dot(Qf[tile_row(r) * qf_stride + d * D_split + d_tid], K_Tf));
+#endif
                     }
                 }
             }
