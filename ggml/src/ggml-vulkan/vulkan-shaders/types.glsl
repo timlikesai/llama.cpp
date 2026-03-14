@@ -1792,7 +1792,7 @@ void init_iq_shmem(uvec3 wgsize)
 
 // FP8 E4M3: 1 sign, 4 exponent (bias 7), 3 mantissa. MX E4M3 has NO NaN.
 #if defined(DATA_A_MXFP8_E4M3) || defined(MXFP_ALL_DEQUANT)
-#if defined(HAS_FLOAT8_E4M3_HW) && !defined(MXFP_ALL_DEQUANT)
+#if defined(HAS_FLOAT8_E4M3_HW)
 #extension GL_EXT_float_e4m3 : require
 float fp8_e4m3_to_float(uint v) {
     floate4m3_t f8 = uintBitsToFloate4m3EXT(uint8_t(v));
@@ -1840,7 +1840,7 @@ float fp8_e4m3_to_float(uint v) { return mxfp8_e4m3_lut[v & 0xFFu]; }
 // FP8 E5M2: 1 sign, 5 exponent (bias 15), 2 mantissa.
 // In MX context, Inf/NaN never appear in KV cache data — saturated to max finite in LUT.
 #if defined(DATA_A_MXFP8_E5M2) || defined(MXFP_ALL_DEQUANT)
-#if defined(HAS_FLOAT8_E5M2_HW) && !defined(MXFP_ALL_DEQUANT)
+#if defined(HAS_FLOAT8_E5M2_HW)
 #extension GL_EXT_float_e5m2 : require
 float fp8_e5m2_to_float(uint v) {
     floate5m2_t f8 = uintBitsToFloate5m2EXT(uint8_t(v));
