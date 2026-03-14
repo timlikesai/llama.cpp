@@ -625,12 +625,81 @@ void main() {
                 Lf[r] += Pf[r];
             }
 
+            // Pre-compute V row addressing for this KV column (constant across d loop)
+#if defined(MXFP_Q_PREPROCESS) && !defined(MXFP_ALL_DEQUANT) && !defined(MIXED_Q_DEQUANT)
+            const uint v_kv_row = j * Bc + c * cols_per_iter + col_tid;
+            const uint v_idx_base = (v_offset / MXFP_SOA_BLOCK_BYTES) + v_kv_row * v_stride;
+            const uint v_row_byte = (v_idx_base / v_stride) * v_stride * MXFP_SOA_BLOCK_BYTES;
+            const uint v_bwr = v_idx_base % v_stride;
+#endif
+
             [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
                 FLOAT_TYPEV4 Vf;
                 if (SHMEM_STAGING != 0) {
                     Vf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
                 } else {
-#if BLOCK_SIZE > 1
+#if defined(MXFP_Q_PREPROCESS) && !defined(MXFP_ALL_DEQUANT) && !defined(MIXED_Q_DEQUANT)
+                    // Optimized V dequant: pre-computed row base, direct buffer access (no binding branch)
+                    {
+                        const uint elem = 4u * (d * D_split + d_tid);
+                        const uint blk = elem >> 5u;
+                        const uint eib = elem & 31u;
+                        const uint e_byte = v_row_byte + v_stride * MXFP_QS_PER_BLOCK + v_bwr + blk;
+                        const float v_scale = e8m0_to_fp32(uint8_t((v_raw_u32.v_u32[e_byte >> 2u] >> ((e_byte & 3u) << 3u)) & 0xFFu));
+#if defined(DATA_A_MXFP4)
+                        const uint qs_byte = v_row_byte + (v_bwr + blk) * MXFP_QS_PER_BLOCK + (eib & 0xFu);
+                        const uint w = qs_byte >> 2u;
+                        const uint s = (qs_byte & 3u) << 3u;
+                        uint packed = v_raw_u32.v_u32[w] >> s;
+                        if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
+                        const uint shift = (eib & 0x10u) >> 2u;
+                        Vf = FLOAT_TYPEV4(
+                            fp4_e2m1_to_float((packed >>  0u) >> shift & 0xFu) * v_scale,
+                            fp4_e2m1_to_float((packed >>  8u) >> shift & 0xFu) * v_scale,
+                            fp4_e2m1_to_float((packed >> 16u) >> shift & 0xFu) * v_scale,
+                            fp4_e2m1_to_float((packed >> 24u) >> shift & 0xFu) * v_scale);
+#elif defined(DATA_A_MXFP8_E4M3) || defined(DATA_A_MXFP8_E5M2)
+                        const uint qs_byte = v_row_byte + (v_bwr + blk) * MXFP_QS_PER_BLOCK + eib;
+                        const uint w = qs_byte >> 2u;
+                        const uint s = (qs_byte & 3u) << 3u;
+                        uint packed = v_raw_u32.v_u32[w] >> s;
+                        if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
+#if defined(DATA_A_MXFP8_E4M3)
+                        Vf = FLOAT_TYPEV4(
+                            fp8_e4m3_to_float(packed & 0xFFu) * v_scale,
+                            fp8_e4m3_to_float((packed >> 8u) & 0xFFu) * v_scale,
+                            fp8_e4m3_to_float((packed >> 16u) & 0xFFu) * v_scale,
+                            fp8_e4m3_to_float((packed >> 24u) & 0xFFu) * v_scale);
+#else
+                        Vf = FLOAT_TYPEV4(
+                            fp8_e5m2_to_float(packed & 0xFFu) * v_scale,
+                            fp8_e5m2_to_float((packed >> 8u) & 0xFFu) * v_scale,
+                            fp8_e5m2_to_float((packed >> 16u) & 0xFFu) * v_scale,
+                            fp8_e5m2_to_float((packed >> 24u) & 0xFFu) * v_scale);
+#endif
+#elif defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
+                        const uint group = eib / 4u;
+                        const uint base_b = v_row_byte + (v_bwr + blk) * MXFP_QS_PER_BLOCK + group * 3u;
+                        const uint b0 = (v_raw_u32.v_u32[base_b >> 2u] >> ((base_b & 3u) << 3u)) & 0xFFu;
+                        const uint b1 = (v_raw_u32.v_u32[(base_b+1u) >> 2u] >> (((base_b+1u) & 3u) << 3u)) & 0xFFu;
+                        const uint b2 = (v_raw_u32.v_u32[(base_b+2u) >> 2u] >> (((base_b+2u) & 3u) << 3u)) & 0xFFu;
+                        const uint pk = b0 | (b1 << 8u) | (b2 << 16u);
+#if defined(DATA_A_MXFP6_E2M3)
+                        Vf = FLOAT_TYPEV4(
+                            fp6_e2m3_to_float(pk & 0x3Fu) * v_scale,
+                            fp6_e2m3_to_float((pk >> 6u) & 0x3Fu) * v_scale,
+                            fp6_e2m3_to_float((pk >> 12u) & 0x3Fu) * v_scale,
+                            fp6_e2m3_to_float((pk >> 18u) & 0x3Fu) * v_scale);
+#else
+                        Vf = FLOAT_TYPEV4(
+                            fp6_e3m2_to_float(pk & 0x3Fu) * v_scale,
+                            fp6_e3m2_to_float((pk >> 6u) & 0x3Fu) * v_scale,
+                            fp6_e3m2_to_float((pk >> 12u) & 0x3Fu) * v_scale,
+                            fp6_e3m2_to_float((pk >> 18u) & 0x3Fu) * v_scale);
+#endif
+#endif
+                    }
+#elif BLOCK_SIZE > 1
                     uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
                     uint ib = coord / BLOCK_SIZE;
                     uint iqs = (coord % BLOCK_SIZE);
