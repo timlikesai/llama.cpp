@@ -8,7 +8,6 @@
 
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
-#extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_KHR_shader_subgroup_vote : enable
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_cooperative_matrix : enable
@@ -89,75 +88,9 @@ void main() {
         uint32_t r = (idx + tid) / (HSK / 4);
         if (r < Br && d < HSK / 4 &&
             i * Br + r < N) {
-#ifdef MXFP_Q_PREPROCESS
-            Qf[r * qstride + d] = f16vec4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d]);
-#else
             Qf[r * qstride + d] = f16vec4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale);
-#endif
         }
     }
-
-#ifdef MXFP_Q_PREPROCESS
-    barrier();
-    // Apply Hadamard + MXFP roundtrip to unscaled Q, then apply scale.
-    // Parallelized: each subgroup (32 threads) processes one MX block.
-    {
-        const uint mxfp_blocks_per_row = HSK / 32u;
-        const uint mxfp_active_rows = min(Br, N - i * Br);
-        const uint mxfp_total_blocks = mxfp_active_rows * mxfp_blocks_per_row;
-        const bool mxfp_apply_hadamard =
-#ifdef MXFP_USE_HADAMARD
-            (HSK == HSV);
-#else
-            false;
-#endif
-
-        const uint lane = gl_SubgroupInvocationID;
-        const uint sg_id = gl_SubgroupID;
-
-        for (uint block_idx = sg_id; block_idx < mxfp_total_blocks; block_idx += gl_NumSubgroups) {
-            uint row = block_idx / mxfp_blocks_per_row;
-            uint blk = block_idx % mxfp_blocks_per_row;
-            uint base = row * qstride + blk * 8u;
-
-            // Each thread loads 1 element
-            f16vec4 v4 = Qf[base + lane / 4u];
-            float val;
-            switch (lane & 3u) {
-                case 0u: val = float(v4.x); break;
-                case 1u: val = float(v4.y); break;
-                case 2u: val = float(v4.z); break;
-                case 3u: val = float(v4.w); break;
-            }
-
-            // Hadamard via subgroup shuffles
-            if (mxfp_apply_hadamard) {
-                for (uint stride = 1u; stride < 32u; stride <<= 1u) {
-                    float other = subgroupShuffleXor(val, stride);
-                    val = ((lane & stride) == 0u) ? val + other : other - val;
-                }
-                val *= MXFP_HADAMARD_32_NORM;
-            }
-
-            // E8M0 scale via subgroup max
-            float amax = subgroupMax(abs(val));
-            // MSE-optimal E8M0 via subgroup-parallel search, then roundtrip
-            float scale = compute_e8m0_scale_subgroup(val, amax);
-            val = mxfp_roundtrip_val(val, scale);
-            val *= float(p.scale);
-
-            // Write back: groups of 4 threads assemble vec4
-            float v0 = subgroupShuffle(val, (lane & ~3u) + 0u);
-            float v1 = subgroupShuffle(val, (lane & ~3u) + 1u);
-            float v2 = subgroupShuffle(val, (lane & ~3u) + 2u);
-            float v3 = subgroupShuffle(val, (lane & ~3u) + 3u);
-            if ((lane & 3u) == 0u) {
-                Qf[base + lane / 4u] = f16vec4(v0, v1, v2, v3);
-            }
-        }
-    }
-#endif
-
     barrier();
 
     f16vec4 Of[rows_per_thread][d_per_thread];
@@ -195,12 +128,8 @@ void main() {
     uint32_t mo_offset = mo_stride * i;
 
 #if BLOCK_SIZE > 1
-    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / K_BLOCK_BYTE_SIZE;
-#if defined(MXFP_ALL_DEQUANT) || defined(MIXED_Q_DEQUANT)
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / get_v_block_byte_size();
-#else
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / V_BLOCK_BYTE_SIZE;
-#endif
+    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / BLOCK_BYTE_SIZE;
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / BLOCK_BYTE_SIZE;
 #else
     uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / 2;
     uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / 2;
@@ -302,7 +231,7 @@ void main() {
                         uint coord = (j * Bc + c) * k_stride * BLOCK_SIZE + 4 * d;
                         uint ib = coord / BLOCK_SIZE;
                         uint iqs = (coord % BLOCK_SIZE);
-                        K_Tf = f16vec4(dequantize4(ib, iqs, k_offset, BINDING_IDX_K));
+                        K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
 #else
                         K_Tf = f16vec4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
 #endif
@@ -341,7 +270,7 @@ void main() {
                         uint coord = (j * Bc + row) * k_stride * BLOCK_SIZE + d * 16 + col_vec * 4;
                         uint ib = coord / BLOCK_SIZE;
                         uint iqs = (coord % BLOCK_SIZE);
-                        K_Tf = f16vec4(dequantize4(ib, iqs, k_offset, BINDING_IDX_K));
+                        K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
 #else
                         K_Tf = f16vec4(data_kv4[k_offset / 4 + (j * Bc + row) * k_stride / 4 + d * 16 / 4 + col_vec]);
 #endif
@@ -472,11 +401,7 @@ void main() {
                         uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE + 4 * d;
                         uint ib = coord / BLOCK_SIZE;
                         uint iqs = (coord % BLOCK_SIZE);
-#if defined(MXFP_ALL_DEQUANT) || defined(MIXED_Q_DEQUANT)
-                        V_Tf = f16vec4((V_TYPE_ID != 0u) ? dequantize4_v(ib, iqs, v_offset) : dequantize4(ib, iqs, v_offset, BINDING_IDX_V));
-#else
-                        V_Tf = f16vec4(dequantize4(ib, iqs, v_offset, BINDING_IDX_V));
-#endif
+                        V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
 #else
                         V_Tf = f16vec4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
 #endif
@@ -524,11 +449,7 @@ void main() {
 
                 if (!KV_bounds_check || (v_row < KV && v_col < HSV)) {
 #if BLOCK_SIZE > 1
-#if defined(MXFP_ALL_DEQUANT) || defined(MIXED_Q_DEQUANT)
-                    kvsh[row * vsh_stride + col] = f16vec4((V_TYPE_ID != 0u) ? dequantize4_v(ib, iqs, v_offset) : dequantize4(ib, iqs, v_offset, BINDING_IDX_V));
-#else
-                    kvsh[row * vsh_stride + col] = f16vec4(dequantize4(ib, iqs, v_offset, BINDING_IDX_V));
-#endif
+                    kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
 #else
                     kvsh[row * vsh_stride + col] = data_vv4[(v_offset + v_row * v_stride + v_col) / 4];
 #endif

@@ -1696,56 +1696,6 @@ struct block_mxfp4
 #define A_TYPE block_mxfp4
 #endif
 
-#define QUANT_K_MXFP8 32
-#define QUANT_R_MXFP8 1
-#define QUANT_K_MXFP8_E4M3 QUANT_K_MXFP8
-#define QUANT_K_MXFP8_E5M2 QUANT_K_MXFP8
-
-struct block_mxfp8
-{
-    uint8_t e;
-    uint8_t qs[QUANT_K_MXFP8];
-};
-
-#if defined(DATA_A_MXFP8_E4M3)
-#define QUANT_K QUANT_K_MXFP8
-#define QUANT_R QUANT_R_MXFP8
-#define QUANT_AUXF 1
-#define A_TYPE block_mxfp8
-#endif
-
-#if defined(DATA_A_MXFP8_E5M2)
-#define QUANT_K QUANT_K_MXFP8
-#define QUANT_R QUANT_R_MXFP8
-#define QUANT_AUXF 1
-#define A_TYPE block_mxfp8
-#endif
-
-#define QUANT_K_MXFP6 32
-#define QUANT_R_MXFP6 1
-#define QUANT_K_MXFP6_E2M3 QUANT_K_MXFP6
-#define QUANT_K_MXFP6_E3M2 QUANT_K_MXFP6
-
-struct block_mxfp6
-{
-    uint8_t e;
-    uint8_t qs[24]; // 32 six-bit values tightly packed (4 per 3 bytes)
-};
-
-#if defined(DATA_A_MXFP6_E2M3)
-#define QUANT_K QUANT_K_MXFP6
-#define QUANT_R QUANT_R_MXFP6
-#define QUANT_AUXF 1
-#define A_TYPE block_mxfp6
-#endif
-
-#if defined(DATA_A_MXFP6_E3M2)
-#define QUANT_K QUANT_K_MXFP6
-#define QUANT_R QUANT_R_MXFP6
-#define QUANT_AUXF 1
-#define A_TYPE block_mxfp6
-#endif
-
 #if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
 const int8_t kvalues_iq4nl_const[16] = {
     int8_t(-127), int8_t(-104), int8_t(-83), int8_t(-65), int8_t(-49), int8_t(-35), int8_t(-22), int8_t(-10),
@@ -1765,9 +1715,7 @@ void init_iq_shmem(uvec3 wgsize)
 }
 #endif
 
-#if defined(DATA_A_MXFP4) || defined(MXFP_ALL_DEQUANT)
-// E2M1 values doubled for integer arithmetic (implementation detail).
-// Canonical float values: {0, 0.5, 1, 1.5, 2, 3, 4, 6} — see kvalues_mxfp4_float in ggml-common.h.
+#if defined(DATA_A_MXFP4)
 const int8_t kvalues_mxfp4_const[16] = {
     int8_t(0), int8_t(1), int8_t(2), int8_t(3), int8_t(4), int8_t(6), int8_t(8), int8_t(12),
     int8_t(0), int8_t(-1), int8_t(-2), int8_t(-3), int8_t(-4), int8_t(-6), int8_t(-8), int8_t(-12),
@@ -1783,168 +1731,6 @@ void init_iq_shmem(uvec3 wgsize)
         kvalues_mxfp4[i] = kvalues_mxfp4_const[i];
     }
     barrier();
-}
-#endif
-
-// MXFP element dequantization — LUT-based for performance, HW intrinsic where available.
-// Canonical source: kvalues_mxfp8_e4m3[256] etc. in ggml-common.h.
-// LUT lookup (1 op) replaces IEEE-754 bit reconstruction (7-9 ALU ops per element).
-
-// FP8 E4M3: 1 sign, 4 exponent (bias 7), 3 mantissa. MX E4M3 has NO NaN.
-#if defined(DATA_A_MXFP8_E4M3) || defined(MXFP_ALL_DEQUANT)
-#if defined(HAS_FLOAT8_E4M3_HW)
-#extension GL_EXT_float_e4m3 : require
-float fp8_e4m3_to_float(uint v) {
-    floate4m3_t f8 = uintBitsToFloate4m3EXT(uint8_t(v));
-    return float(f8);
-}
-#else
-// ALU-only IEEE-754 bit reconstruction — avoids 256-entry LUT constant memory pressure.
-// 32 threads reading different LUT indices = serialized constant cache accesses.
-// Pure ALU runs on INT32 pipe in parallel with FP32/memory pipes.
-// E4M3: sign(1) exp(4, bias 7) mant(3). MX E4M3 has NO NaN (0x7F = max normal 448).
-float fp8_e4m3_to_float(uint v) {
-    uint sign = (v & 0x80u) << 24u;        // sign bit → IEEE position
-    uint exp4 = (v >> 3u) & 0xFu;          // 4-bit exponent
-    uint mant = (v & 0x7u) << 20u;         // 3-bit mantissa → IEEE position (23-3=20)
-    // Normal: rebias exponent from E4M3 bias 7 to IEEE bias 127 → +120
-    // Subnormal (exp4==0): value = ±mant * 2^(1-7-3) = ±mant * 2^(-9)
-    if (exp4 != 0u) {
-        return uintBitsToFloat(sign | ((exp4 + 120u) << 23u) | mant);
-    }
-    // Subnormal: construct float from mantissa, apply sign via OR
-    return uintBitsToFloat(sign | floatBitsToUint(float(v & 0x7u) * (1.0 / 512.0)));
-}
-#endif
-
-// Fused E8M0 dequant: fold scale multiply into exponent addition. ZERO float multiplies.
-// val * e8m0_scale = 2^(exp4-7) * (1+m/8) * 2^(e8m0-127) = 2^(exp4+e8m0-134) * (1+m/8)
-// IEEE exponent = exp4 + e8m0 - 134 + 127 = exp4 + e8m0 - 7
-float fp8_e4m3_dequant_fused(uint v, uint e8m0) {
-    uint sign = (v & 0x80u) << 24u;
-    uint exp4 = (v >> 3u) & 0xFu;
-    uint mant = (v & 0x7u) << 20u;
-    if (exp4 != 0u && e8m0 != 0u) {
-        uint fused_exp = exp4 + e8m0 - 7u;
-        // Clamp to valid IEEE range [1, 254]
-        if (fused_exp >= 255u) return uintBitsToFloat(sign | 0x7F7FFFFFu); // max finite
-        return uintBitsToFloat(sign | (fused_exp << 23u) | mant);
-    }
-    // Fallback for subnormals or zero scale: use standard path
-    return fp8_e4m3_to_float(v) * ((e8m0 == 0u) ? uintBitsToFloat(0x00400000u) : uintBitsToFloat(e8m0 << 23u));
-}
-#endif
-
-// FP8 E5M2: 1 sign, 5 exponent (bias 15), 2 mantissa.
-// In MX context, Inf/NaN never appear in KV cache data — saturated to max finite in LUT.
-#if defined(DATA_A_MXFP8_E5M2) || defined(MXFP_ALL_DEQUANT)
-#if defined(HAS_FLOAT8_E5M2_HW)
-#extension GL_EXT_float_e5m2 : require
-float fp8_e5m2_to_float(uint v) {
-    floate5m2_t f8 = uintBitsToFloate5m2EXT(uint8_t(v));
-    return float(f8);
-}
-#else
-// ALU-only IEEE-754 bit reconstruction for E5M2.
-// E5M2: sign(1) exp(5, bias 15) mant(2). In MX context, max exponent = normal (no Inf/NaN).
-float fp8_e5m2_to_float(uint v) {
-    uint sign = (v & 0x80u) << 24u;
-    uint exp5 = (v >> 2u) & 0x1Fu;
-    uint mant = (v & 0x3u) << 21u;         // 2-bit mantissa → IEEE position (23-2=21)
-    // Normal: rebias from E5M2 bias 15 to IEEE bias 127 → +112
-    // Subnormal (exp5==0): value = mant * 2^(1-15-2) = mant * 2^(-16)
-    if (exp5 != 0u) {
-        // Clamp to max finite (exp5=30, mant=3 → 57344). exp5=31 also maps to 57344 in MX.
-        if (exp5 >= 31u) return uintBitsToFloat(sign | (0x8Fu << 23u) | (0x3u << 21u)); // 57344
-        return uintBitsToFloat(sign | ((exp5 + 112u) << 23u) | mant);
-    }
-    return uintBitsToFloat(sign | floatBitsToUint(float(v & 0x3u) * (1.0 / 65536.0)));
-}
-#endif
-
-// Fused E8M0 dequant for E5M2: val * 2^(e8m0-127) via exponent addition.
-// IEEE exponent = exp5 + e8m0 - 15 (E5M2 bias=15)
-float fp8_e5m2_dequant_fused(uint v, uint e8m0) {
-    uint sign = (v & 0x80u) << 24u;
-    uint exp5 = (v >> 2u) & 0x1Fu;
-    uint mant = (v & 0x3u) << 21u;
-    if (exp5 != 0u && exp5 < 31u && e8m0 != 0u) {
-        uint fused_exp = exp5 + e8m0 - 15u;
-        if (fused_exp >= 255u) return uintBitsToFloat(sign | 0x7F7FFFFFu);
-        return uintBitsToFloat(sign | (fused_exp << 23u) | mant);
-    }
-    return fp8_e5m2_to_float(v) * ((e8m0 == 0u) ? uintBitsToFloat(0x00400000u) : uintBitsToFloat(e8m0 << 23u));
-}
-#endif
-
-// FP6 E2M3: 1 sign, 2 exponent (bias 1), 3 mantissa. No NaN/Inf.
-#if defined(DATA_A_MXFP6_E2M3) || defined(MXFP_ALL_DEQUANT)
-// ALU-only IEEE-754 bit reconstruction.
-// E2M3: sign(1) exp(2, bias 1) mant(3). Max value = 7.5.
-float fp6_e2m3_to_float(uint v) {
-    uint sign = (v & 0x20u) << 26u;        // bit 5 → IEEE bit 31
-    uint exp2 = (v >> 3u) & 0x3u;          // 2-bit exponent
-    uint mant = (v & 0x7u) << 20u;         // 3-bit mantissa → IEEE position (23-3=20)
-    // Normal: rebias from bias 1 to IEEE bias 127 → +126
-    // Subnormal (exp2==0): value = mant * 2^(1-1-3) = mant / 8
-    if (exp2 != 0u) {
-        return uintBitsToFloat(sign | ((exp2 + 126u) << 23u) | mant);
-    }
-    return uintBitsToFloat(sign | floatBitsToUint(float(v & 0x7u) * (1.0 / 8.0)));
-}
-
-// Fused E8M0 dequant for E2M3: IEEE exponent = exp2 + e8m0 - 1
-float fp6_e2m3_dequant_fused(uint v, uint e8m0) {
-    uint sign = (v & 0x20u) << 26u;
-    uint exp2 = (v >> 3u) & 0x3u;
-    uint mant = (v & 0x7u) << 20u;
-    if (exp2 != 0u && e8m0 != 0u) {
-        uint fused_exp = exp2 + e8m0 - 1u;
-        if (fused_exp >= 255u) return uintBitsToFloat(sign | 0x7F7FFFFFu);
-        return uintBitsToFloat(sign | (fused_exp << 23u) | mant);
-    }
-    return fp6_e2m3_to_float(v) * ((e8m0 == 0u) ? uintBitsToFloat(0x00400000u) : uintBitsToFloat(e8m0 << 23u));
-}
-#endif
-
-// FP6 E3M2: 1 sign, 3 exponent (bias 3), 2 mantissa. No NaN/Inf.
-#if defined(DATA_A_MXFP6_E3M2) || defined(MXFP_ALL_DEQUANT)
-// ALU-only IEEE-754 bit reconstruction.
-// E3M2: sign(1) exp(3, bias 3) mant(2). Max value = 28.
-float fp6_e3m2_to_float(uint v) {
-    uint sign = (v & 0x20u) << 26u;        // bit 5 → IEEE bit 31
-    uint exp3 = (v >> 2u) & 0x7u;          // 3-bit exponent
-    uint mant = (v & 0x3u) << 21u;         // 2-bit mantissa → IEEE position (23-2=21)
-    // Normal: rebias from bias 3 to IEEE bias 127 → +124
-    // Subnormal (exp3==0): value = mant * 2^(1-3-2) = mant / 16
-    if (exp3 != 0u) {
-        return uintBitsToFloat(sign | ((exp3 + 124u) << 23u) | mant);
-    }
-    return uintBitsToFloat(sign | floatBitsToUint(float(v & 0x3u) * (1.0 / 16.0)));
-}
-
-// Fused E8M0 dequant for E3M2: IEEE exponent = exp3 + e8m0 - 3
-float fp6_e3m2_dequant_fused(uint v, uint e8m0) {
-    uint sign = (v & 0x20u) << 26u;
-    uint exp3 = (v >> 2u) & 0x7u;
-    uint mant = (v & 0x3u) << 21u;
-    if (exp3 != 0u && e8m0 != 0u) {
-        uint fused_exp = exp3 + e8m0 - 3u;
-        if (fused_exp >= 255u) return uintBitsToFloat(sign | 0x7F7FFFFFu);
-        return uintBitsToFloat(sign | (fused_exp << 23u) | mant);
-    }
-    return fp6_e3m2_to_float(v) * ((e8m0 == 0u) ? uintBitsToFloat(0x00400000u) : uintBitsToFloat(e8m0 << 23u));
-}
-#endif
-
-// Unpack 4 six-bit values from 3 packed bytes
-#if defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2) || defined(MXFP_ALL_DEQUANT)
-void unpack_fp6x4(uint b0, uint b1, uint b2, out uint v0, out uint v1, out uint v2, out uint v3) {
-    uint packed = b0 | (b1 << 8) | (b2 << 16);
-    v0 = packed & 0x3Fu;
-    v1 = (packed >> 6) & 0x3Fu;
-    v2 = (packed >> 12) & 0x3Fu;
-    v3 = (packed >> 18) & 0x3Fu;
 }
 #endif
 
@@ -1967,9 +1753,17 @@ vec4 bf16_to_fp32(uvec4 u)
     return vec4(bf16_to_fp32(u.x), bf16_to_fp32(u.y), bf16_to_fp32(u.z), bf16_to_fp32(u.w));
 }
 
-// Canonical source: ggml_mxfp_e8m0_to_fp32() in ggml-common.h (uses memcpy; GLSL uses uintBitsToFloat).
 float e8m0_to_fp32(uint8_t x) {
-    return uintBitsToFloat(x == uint8_t(0) ? 0x00400000u : (uint(x) << 23));
+    uint32_t bits;
+
+    if (x == 0) {
+        bits = 0x00400000;
+    } else {
+        bits = x;
+        bits = bits << 23;
+    }
+
+    return uintBitsToFloat(bits);
 }
 
 #if BDA

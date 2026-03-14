@@ -13,7 +13,6 @@
 #extension GL_NV_cooperative_matrix2 : enable
 #extension GL_EXT_buffer_reference : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
-#extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_KHR_shader_subgroup_vote : enable
 #extension GL_EXT_null_initializer : enable
 
@@ -22,19 +21,9 @@
 #include "flash_attn_base.glsl"
 
 layout (binding = 0) readonly buffer Q {uint8_t data_q[];};
-layout (binding = 0) readonly buffer QF32 {float data_q_f32[];};
 layout (binding = 1) readonly buffer K {uint8_t data_k[];};
 layout (binding = 2) readonly buffer V {uint8_t data_v[];};
 layout (binding = 3) readonly buffer M {uint8_t data_m[];};
-
-#ifdef MXFP_Q_PREPROCESS
-// Shared memory for Q preprocessing — Hadamard + roundtrip before loading into coopmat.
-shared float16_t q_shmem[Br * HSK_pad];
-// Separate K and V shmem: enables parallel dequant of both K and V BEFORE a single barrier,
-// reducing from 4 barriers/iter to 2. Matches CUDA double-buffer pattern.
-shared float16_t k_shmem[Bc * HSK_pad];
-shared float16_t v_shmem[Bc * HSV_pad];
-#endif
 
 ACC_TYPE maxReduce(const in ACC_TYPE x, const in ACC_TYPE y) {
     return max(x, y);
@@ -67,15 +56,9 @@ ACC_TYPE Max(const in uint32_t row, const in uint32_t col, const in ACC_TYPE ele
 }
 
 #if BLOCK_SIZE > 1
-#define K_DECODEFUNC , DEQUANTFUNC
-#if defined(DATA_V_MXFP4) && !defined(DATA_A_MXFP4)
-#define V_DECODEFUNC , dequantFuncMXFP4
+#define DECODEFUNC , DEQUANTFUNC
 #else
-#define V_DECODEFUNC , DEQUANTFUNC
-#endif
-#else
-#define K_DECODEFUNC
-#define V_DECODEFUNC
+#define DECODEFUNC
 #endif
 
 // Store the output when doing grouped query attention.
@@ -147,99 +130,14 @@ void main() {
     tensorLayoutK = setTensorLayoutStrideNV(tensorLayoutK, k_stride, 1);
     tensorLayoutV = setTensorLayoutStrideNV(tensorLayoutV, v_stride, 1);
 
-    coopmat<float16_t, gl_ScopeWorkgroup, Br, HSK_pad, gl_MatrixUseA> Qf16;
-
-#ifdef MXFP_Q_PREPROCESS
-    // MXFP Q preprocessing: load Q into shared memory, apply Hadamard + roundtrip, scale, then load into coopmat.
-    {
-        const uint32_t tid = gl_LocalInvocationIndex;
-        // q_offset in bytes (Q is float32)
-        uint32_t q_byte_offset = gqa_iq1*p.nb01*4 + iq2*p.nb02+iq3*p.nb03;
-
-        // Load Q rows into shared memory as float, then process
-        [[unroll]] for (uint32_t idx = tid; idx < Br * HSK; idx += gl_WorkGroupSize.x) {
-            uint32_t r = idx / HSK;
-            uint32_t d = idx % HSK;
-            float val = 0.0;
-            if (i * Br + r < N && d < HSK) {
-                // Read float32 from Q buffer
-                val = data_q_f32[q_byte_offset / 4 + (i * Br + r) * q_stride + d];
-            }
-            q_shmem[r * HSK_pad + d] = float16_t(val);
-        }
-        // Zero-pad HSK..HSK_pad
-        if (HSK_pad > HSK) {
-            [[unroll]] for (uint32_t idx = tid; idx < Br * (HSK_pad - HSK); idx += gl_WorkGroupSize.x) {
-                uint32_t r = idx / (HSK_pad - HSK);
-                uint32_t d = HSK + idx % (HSK_pad - HSK);
-                q_shmem[r * HSK_pad + d] = float16_t(0.0);
-            }
-        }
-        barrier();
-
-        // Apply Hadamard + roundtrip per 32-element block
-        // Parallelized: each subgroup (32 threads) processes one MX block.
-        const uint mxfp_blocks_per_row = HSK / 32u;
-        const uint mxfp_active_rows = min(Br, N - i * Br);
-        const uint mxfp_total_blocks = mxfp_active_rows * mxfp_blocks_per_row;
-        const bool mxfp_apply_hadamard =
-#ifdef MXFP_USE_HADAMARD
-            (HSK == HSV);
-#else
-            false;
-#endif
-
-        const uint lane = gl_SubgroupInvocationID;
-        const uint sg_id = gl_SubgroupID;
-        const uint num_sg = gl_NumSubgroups;
-
-        for (uint block_idx = sg_id; block_idx < mxfp_total_blocks; block_idx += num_sg) {
-            uint row = block_idx / mxfp_blocks_per_row;
-            uint blk = block_idx % mxfp_blocks_per_row;
-            uint base = row * HSK_pad + blk * 32u;
-
-            // Each thread loads 1 element
-            float val = float(q_shmem[base + lane]);
-
-            // Hadamard via subgroup shuffles
-            if (mxfp_apply_hadamard) {
-                for (uint stride = 1u; stride < 32u; stride <<= 1u) {
-                    float other = subgroupShuffleXor(val, stride);
-                    val = ((lane & stride) == 0u) ? val + other : other - val;
-                }
-                val *= MXFP_HADAMARD_32_NORM;
-            }
-
-            // E8M0 scale via subgroup max reduction (manual shuffle tree)
-            float amax = abs(val);
-            amax = max(amax, subgroupShuffleXor(amax, 1u));
-            amax = max(amax, subgroupShuffleXor(amax, 2u));
-            amax = max(amax, subgroupShuffleXor(amax, 4u));
-            amax = max(amax, subgroupShuffleXor(amax, 8u));
-            amax = max(amax, subgroupShuffleXor(amax, 16u));
-
-            // MSE-optimal E8M0 via subgroup-parallel search, then roundtrip
-            float scale = compute_e8m0_scale_subgroup(val, amax);
-            val = mxfp_roundtrip_val(val, scale);
-            val *= float(p.scale);
-
-            // Write back
-            q_shmem[base + lane] = float16_t(val);
-        }
-        barrier();
-
-        // Load from shared memory into coopmat
-        coopMatLoad(Qf16, q_shmem, 0, HSK_pad, gl_CooperativeMatrixLayoutRowMajor);
-    }
-#else
     coopmat<Q_TYPE, gl_ScopeWorkgroup, Br, HSK_pad, gl_MatrixUseAccumulator> Q;
+    coopmat<float16_t, gl_ScopeWorkgroup, Br, HSK_pad, gl_MatrixUseA> Qf16;
 
     uint32_t q_offset = gqa_iq1*p.nb01*4/*sizeof(float)*/ + iq2*p.nb02+iq3*p.nb03;
     coopMatLoadTensorNV(Q, data_q, q_offset, sliceTensorLayoutNV(tensorLayoutQ, i * Br, Br, 0, HSK_pad));
 
     Qf16 = coopmat<float16_t, gl_ScopeWorkgroup, Br, HSK_pad, gl_MatrixUseA>(Q);
     Qf16 *= float16_t(p.scale);
-#endif
 
     coopmat<float16_t, gl_ScopeWorkgroup, Br, HSV_pad, gl_MatrixUseAccumulator> O = coopmat<float16_t, gl_ScopeWorkgroup, Br, HSV_pad, gl_MatrixUseAccumulator>(0);
 
@@ -332,89 +230,7 @@ void main() {
         coopmat<float16_t, gl_ScopeWorkgroup, HSK_pad, Bc, gl_MatrixUseB> K_T;
 
         uint32_t k_offset = ik2*p.nb12 + ik3*p.nb13;
-#ifdef MXFP_Q_PREPROCESS
-        // MXFP SoA: dequant K and V tiles in parallel to separate shmem regions,
-        // then load both into coopmats. 2 barriers per iteration (vs 4 with shared kv_shmem).
-        // Matches CUDA double-buffer pattern: K and V writes don't conflict.
-        uint32_t v_offset = iv2*p.nb22 + iv3*p.nb23;
-
-        // --- Phase 1: K dequant → k_shmem, V dequant → v_shmem (parallel, no barrier needed) ---
-        {
-            const uint32_t tid = gl_LocalInvocationIndex;
-
-            // K dequant
-            {
-                const uint32_t total_k = Bc * (HSK / 4u);
-                for (uint32_t idx = tid; idx < total_k; idx += gl_WorkGroupSize.x) {
-                    const uint32_t row = idx / (HSK / 4u);
-                    const uint32_t d   = idx % (HSK / 4u);
-                    const uint32_t elem_off = 4u * d;
-                    FLOAT_TYPEV4 v4 = FLOAT_TYPEV4(0.0);
-                    if (j * Bc + row < KV) {
-                        uint32_t coord = (j * Bc + row) * k_stride * BLOCK_SIZE + elem_off;
-                        v4 = dequantize4(coord / BLOCK_SIZE, coord % BLOCK_SIZE,
-                                         k_offset / K_BLOCK_BYTE_SIZE, BINDING_IDX_K);
-                    }
-                    k_shmem[row * HSK_pad + elem_off + 0u] = float16_t(v4.x);
-                    k_shmem[row * HSK_pad + elem_off + 1u] = float16_t(v4.y);
-                    k_shmem[row * HSK_pad + elem_off + 2u] = float16_t(v4.z);
-                    k_shmem[row * HSK_pad + elem_off + 3u] = float16_t(v4.w);
-                }
-                if (HSK_pad > HSK) {
-                    for (uint32_t idx = tid; idx < Bc * (HSK_pad - HSK); idx += gl_WorkGroupSize.x) {
-                        k_shmem[(idx / (HSK_pad - HSK)) * HSK_pad + HSK + idx % (HSK_pad - HSK)] = float16_t(0.0);
-                    }
-                }
-            }
-
-            // V dequant (writes to v_shmem — different memory, no conflict with K above)
-            {
-                const uint32_t total_v = Bc * (HSV / 4u);
-                for (uint32_t idx = tid; idx < total_v; idx += gl_WorkGroupSize.x) {
-                    const uint32_t row = idx / (HSV / 4u);
-                    const uint32_t d   = idx % (HSV / 4u);
-                    const uint32_t elem_off = 4u * d;
-                    FLOAT_TYPEV4 v4 = FLOAT_TYPEV4(0.0);
-                    if (j * Bc + row < KV) {
-                        uint32_t coord = (j * Bc + row) * v_stride * BLOCK_SIZE + elem_off;
-                        v4 = dequantize4(coord / BLOCK_SIZE, coord % BLOCK_SIZE,
-                                         v_offset / V_BLOCK_BYTE_SIZE, BINDING_IDX_V);
-                    }
-                    v_shmem[row * HSV_pad + elem_off + 0u] = float16_t(v4.x);
-                    v_shmem[row * HSV_pad + elem_off + 1u] = float16_t(v4.y);
-                    v_shmem[row * HSV_pad + elem_off + 2u] = float16_t(v4.z);
-                    v_shmem[row * HSV_pad + elem_off + 3u] = float16_t(v4.w);
-                }
-                if (HSV_pad > HSV) {
-                    for (uint32_t idx = tid; idx < Bc * (HSV_pad - HSV); idx += gl_WorkGroupSize.x) {
-                        v_shmem[(idx / (HSV_pad - HSV)) * HSV_pad + HSV + idx % (HSV_pad - HSV)] = float16_t(0.0);
-                    }
-                }
-            }
-        }
-
-        // --- Phase 2: barrier, then load both K and V coopmats from shmem ---
-        barrier();
-        {
-            tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> shmemLayoutK = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
-            shmemLayoutK = setTensorLayoutDimensionNV(shmemLayoutK, Bc, HSK_pad);
-            shmemLayoutK = setTensorLayoutStrideNV(shmemLayoutK, HSK_pad, 1);
-            coopMatLoadTensorNV(K_T, k_shmem, 0, shmemLayoutK, tensorViewTranspose);
-        }
-
-        coopmat<float16_t, gl_ScopeWorkgroup, Bc, HSV_pad, gl_MatrixUseB> V;
-        {
-            tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> shmemLayoutV = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
-            shmemLayoutV = setTensorLayoutDimensionNV(shmemLayoutV, Bc, HSV_pad);
-            shmemLayoutV = setTensorLayoutStrideNV(shmemLayoutV, HSV_pad, 1);
-            coopMatLoadTensorNV(V, v_shmem, 0, shmemLayoutV);
-        }
-        barrier();
-
-        // --- Phase 3: all compute (KQ MMA, softmax, VKQ MMA) — shmem not touched ---
-#else
-        coopMatLoadTensorNV(K_T, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, 0, HSK_pad), tensorViewTranspose K_DECODEFUNC);
-#endif
+        coopMatLoadTensorNV(K_T, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, 0, HSK_pad), tensorViewTranspose DECODEFUNC);
         S = coopMatMulAdd(Qf16, K_T, S);
 
         if (LOGIT_SOFTCAP) {
@@ -473,11 +289,9 @@ void main() {
         rowsum = coopmat<ACC_TYPE, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator>(0.0);
         rowsum = coopMatMulAdd(P_A, One, rowsum);
 
-#ifndef MXFP_Q_PREPROCESS
         coopmat<float16_t, gl_ScopeWorkgroup, Bc, HSV_pad, gl_MatrixUseB> V;
         uint32_t v_offset = iv2*p.nb22 + iv3*p.nb23;
-        coopMatLoadTensorNV(V,  data_v, v_offset, sliceTensorLayoutNV(tensorLayoutV, j * Bc, Bc, 0, HSV_pad) V_DECODEFUNC);
-#endif
+        coopMatLoadTensorNV(V,  data_v, v_offset, sliceTensorLayoutNV(tensorLayoutV, j * Bc, Bc, 0, HSV_pad) DECODEFUNC);
 
         L = eM*L + rowsum;
 

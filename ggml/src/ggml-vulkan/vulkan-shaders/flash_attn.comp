@@ -10,7 +10,6 @@
 #extension GL_EXT_shader_subgroup_extended_types_float16 : require
 #endif
 
-#extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_KHR_shader_subgroup_vote : enable
 
@@ -85,90 +84,9 @@ void main() {
         uint32_t r = (idx + tid) / (HSK / 4);
         if (r < Br && d < HSK / 4 &&
             i * Br + r < N) {
-#ifdef MXFP_Q_PREPROCESS
-            // Load Q without scale — roundtrip must operate on unscaled values (scale applied after)
-            Qf[r * qf_stride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d]);
-#else
             Qf[r * qf_stride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale);
-#endif
         }
     }
-
-#ifdef MXFP_Q_PREPROCESS
-    barrier();
-    // Apply Hadamard + MXFP quantize/dequantize round-trip to Q, then apply scale.
-    // Parallelized across subgroups: each subgroup (32 threads) processes one MX block.
-    // Each thread handles 1 element, using subgroup shuffles for Hadamard + reduction.
-    {
-        const uint mxfp_blocks_per_row = HSK / 32u;
-        const uint mxfp_active_rows = min(Br, N - i * Br);
-        const uint mxfp_total_blocks = mxfp_active_rows * mxfp_blocks_per_row;
-        const bool mxfp_apply_hadamard =
-#ifdef MXFP_USE_HADAMARD
-            (HSK == HSV);
-#else
-            false;
-#endif
-
-        // Each subgroup handles one block; distribute blocks across subgroups
-        const uint lane = gl_SubgroupInvocationID;  // 0..31 within subgroup
-        const uint sg_id = gl_SubgroupID;           // subgroup index within workgroup
-
-        for (uint block_idx = sg_id; block_idx < mxfp_total_blocks; block_idx += num_subgroups) {
-            uint row = block_idx / mxfp_blocks_per_row;
-            uint blk = block_idx % mxfp_blocks_per_row;
-            uint base = row * qf_stride + blk * 8u;
-
-            // Each thread loads 1 element (lane maps to element index within 32-element block)
-            FLOAT_TYPEV4 v4 = Qf[base + lane / 4u];
-            float val;
-            switch (lane & 3u) {
-                case 0u: val = float(v4.x); break;
-                case 1u: val = float(v4.y); break;
-                case 2u: val = float(v4.z); break;
-                case 3u: val = float(v4.w); break;
-            }
-
-            // Hadamard via subgroup shuffles: 5 butterfly stages
-            // Lane i XOR stride = partner. If (i & stride)==0, this lane is "a" (lower):
-            //   a' = a + b (val + other)
-            // If (i & stride)!=0, this lane is "b" (upper):
-            //   b' = a - b = other - val  (partner is "a")
-            if (mxfp_apply_hadamard) {
-                for (uint stride = 1u; stride < 32u; stride <<= 1u) {
-                    float other = subgroupShuffleXor(val, stride);
-                    val = ((lane & stride) == 0u) ? val + other : other - val;
-                }
-                val *= MXFP_HADAMARD_32_NORM;
-            }
-
-            // E8M0 scale via subgroup max reduction (manual shuffle tree)
-            float amax = abs(val);
-            amax = max(amax, subgroupShuffleXor(amax, 1u));
-            amax = max(amax, subgroupShuffleXor(amax, 2u));
-            amax = max(amax, subgroupShuffleXor(amax, 4u));
-            amax = max(amax, subgroupShuffleXor(amax, 8u));
-            amax = max(amax, subgroupShuffleXor(amax, 16u));
-            // MSE-optimal E8M0 via subgroup-parallel search, then roundtrip
-            float scale = compute_e8m0_scale_subgroup(val, amax);
-            val = mxfp_roundtrip_val(val, scale);
-
-            // Apply p.scale and write back to shared memory
-            val *= float(p.scale);
-
-            // Write back via vec4: threads in groups of 4 collaborate
-            // Each group of 4 threads assembles a vec4
-            float v0 = subgroupShuffle(val, (lane & ~3u) + 0u);
-            float v1 = subgroupShuffle(val, (lane & ~3u) + 1u);
-            float v2 = subgroupShuffle(val, (lane & ~3u) + 2u);
-            float v3 = subgroupShuffle(val, (lane & ~3u) + 3u);
-            if ((lane & 3u) == 0u) {
-                Qf[base + lane / 4u] = FLOAT_TYPEV4(v0, v1, v2, v3);
-            }
-        }
-    }
-#endif
-
     barrier();
 
     FLOAT_TYPEV4 Of[rows_per_thread][HSV_per_thread / 4];
@@ -205,12 +123,8 @@ void main() {
     uint32_t mo_offset = mo_stride * i;
 
 #if BLOCK_SIZE > 1
-    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / K_BLOCK_BYTE_SIZE;
-#if defined(MXFP_ALL_DEQUANT) || defined(MIXED_Q_DEQUANT)
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / get_v_block_byte_size();
-#else
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / V_BLOCK_BYTE_SIZE;
-#endif
+    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / BLOCK_BYTE_SIZE;
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / BLOCK_BYTE_SIZE;
 #else
     uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / 2;
     uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / 2;
@@ -281,81 +195,6 @@ void main() {
 
         if (SHMEM_STAGING != 0) {
             barrier();
-#if defined(MXFP_Q_PREPROCESS) && !defined(MXFP_ALL_DEQUANT) && !defined(MIXED_Q_DEQUANT)
-            // MXFP optimized staging: iterate by row (c), hoist row addressing.
-            // Eliminates per-element modulo in dequantize4() — row_byte/bwr computed once per KV position.
-            [[unroll]] for (uint32_t idx = 0; idx < Bc * HSK / 4; idx += gl_WorkGroupSize.x) {
-                uint32_t d = (idx + tid) % (HSK / 4);
-                uint32_t c = (idx + tid) / (HSK / 4);
-                if (idx + gl_WorkGroupSize.x <= Bc * HSK / 4 || c < Bc) {
-                    FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(0);
-                    if (!KV_bounds_check || j * Bc + c < KV) {
-                        const uint kv_row = j * Bc + c;
-                        const uint elem = 4u * d;
-                        const uint blk = elem >> 5u;
-                        const uint eib = elem & 31u;
-                        const uint k_idx_base = (k_offset / MXFP_SOA_BLOCK_BYTES) + kv_row * k_stride;
-                        const uint k_row_byte = (k_idx_base / k_stride) * k_stride * MXFP_SOA_BLOCK_BYTES;
-                        const uint k_bwr = k_idx_base % k_stride;
-                        const uint e_byte = k_row_byte + k_stride * MXFP_QS_PER_BLOCK + k_bwr + blk;
-                        const float k_scale = e8m0_to_fp32(uint8_t((k_raw_u32.k_u32[e_byte >> 2u] >> ((e_byte & 3u) << 3u)) & 0xFFu));
-#if defined(DATA_A_MXFP4)
-                        const uint qs_byte = k_row_byte + (k_bwr + blk) * MXFP_QS_PER_BLOCK + (eib & 0xFu);
-                        const uint w = qs_byte >> 2u;
-                        const uint s = (qs_byte & 3u) << 3u;
-                        uint packed = k_raw_u32.k_u32[w] >> s;
-                        if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
-                        const uint shift = (eib & 0x10u) >> 2u;
-                        K_Tf = FLOAT_TYPEV4(
-                            fp4_e2m1_to_float((packed >>  0u) >> shift & 0xFu) * k_scale,
-                            fp4_e2m1_to_float((packed >>  8u) >> shift & 0xFu) * k_scale,
-                            fp4_e2m1_to_float((packed >> 16u) >> shift & 0xFu) * k_scale,
-                            fp4_e2m1_to_float((packed >> 24u) >> shift & 0xFu) * k_scale);
-#elif defined(DATA_A_MXFP8_E4M3) || defined(DATA_A_MXFP8_E5M2)
-                        const uint qs_byte = k_row_byte + (k_bwr + blk) * MXFP_QS_PER_BLOCK + eib;
-                        const uint w = qs_byte >> 2u;
-                        const uint s = (qs_byte & 3u) << 3u;
-                        uint packed = k_raw_u32.k_u32[w] >> s;
-                        if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
-#if defined(DATA_A_MXFP8_E4M3)
-                        K_Tf = FLOAT_TYPEV4(
-                            fp8_e4m3_to_float(packed & 0xFFu) * k_scale,
-                            fp8_e4m3_to_float((packed >> 8u) & 0xFFu) * k_scale,
-                            fp8_e4m3_to_float((packed >> 16u) & 0xFFu) * k_scale,
-                            fp8_e4m3_to_float((packed >> 24u) & 0xFFu) * k_scale);
-#else
-                        K_Tf = FLOAT_TYPEV4(
-                            fp8_e5m2_to_float(packed & 0xFFu) * k_scale,
-                            fp8_e5m2_to_float((packed >> 8u) & 0xFFu) * k_scale,
-                            fp8_e5m2_to_float((packed >> 16u) & 0xFFu) * k_scale,
-                            fp8_e5m2_to_float((packed >> 24u) & 0xFFu) * k_scale);
-#endif
-#elif defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
-                        const uint group = eib / 4u;
-                        const uint base_b = k_row_byte + (k_bwr + blk) * MXFP_QS_PER_BLOCK + group * 3u;
-                        const uint b0 = (k_raw_u32.k_u32[base_b >> 2u] >> ((base_b & 3u) << 3u)) & 0xFFu;
-                        const uint b1 = (k_raw_u32.k_u32[(base_b+1u) >> 2u] >> (((base_b+1u) & 3u) << 3u)) & 0xFFu;
-                        const uint b2 = (k_raw_u32.k_u32[(base_b+2u) >> 2u] >> (((base_b+2u) & 3u) << 3u)) & 0xFFu;
-                        const uint pk = b0 | (b1 << 8u) | (b2 << 16u);
-#if defined(DATA_A_MXFP6_E2M3)
-                        K_Tf = FLOAT_TYPEV4(
-                            fp6_e2m3_to_float(pk & 0x3Fu) * k_scale,
-                            fp6_e2m3_to_float((pk >> 6u) & 0x3Fu) * k_scale,
-                            fp6_e2m3_to_float((pk >> 12u) & 0x3Fu) * k_scale,
-                            fp6_e2m3_to_float((pk >> 18u) & 0x3Fu) * k_scale);
-#else
-                        K_Tf = FLOAT_TYPEV4(
-                            fp6_e3m2_to_float(pk & 0x3Fu) * k_scale,
-                            fp6_e3m2_to_float((pk >> 6u) & 0x3Fu) * k_scale,
-                            fp6_e3m2_to_float((pk >> 12u) & 0x3Fu) * k_scale,
-                            fp6_e3m2_to_float((pk >> 18u) & 0x3Fu) * k_scale);
-#endif
-#endif
-                    }
-                    kvsh[c * kvsh_stride + d] = K_Tf;
-                }
-            }
-#else
             [[unroll]] for (uint32_t idx = 0; idx < Bc * HSK / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t d = (idx + tid) % (HSK / 4);
                 uint32_t c = (idx + tid) / (HSK / 4);
@@ -375,7 +214,6 @@ void main() {
                     kvsh[c * kvsh_stride + d] = K_Tf;
                 }
             }
-#endif
             barrier();
         }
 
@@ -394,87 +232,10 @@ void main() {
                     }
 
                     FLOAT_TYPEV4 K_Tf;
-                    float mxfp_k_scale = 1.0;
                     if (SHMEM_STAGING != 0) {
                         K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
                     } else {
-#if defined(MXFP_Q_PREPROCESS)
-                        // Same optimized MXFP SoA K dequant as the non-cached path below.
-                        {
-                            const uint kv_row = j * Bc + c * cols_per_iter + col_tid;
-                            const uint elem_global = 4u * (d * D_split + d_tid);
-                            const uint blk = elem_global >> 5u;
-                            const uint eib = elem_global & 31u;
-                            const uint row_base = (k_offset / MXFP_SOA_BLOCK_BYTES) + kv_row * k_stride;
-                            const uint row_byte = (row_base / k_stride) * k_stride * MXFP_SOA_BLOCK_BYTES;
-                            const uint bwr = row_base % k_stride;
-                            const uint e8m0_byte = row_byte + k_stride * MXFP_QS_PER_BLOCK + bwr + blk;
-                            const uint ew = e8m0_byte >> 2u;
-                            const uint es = (e8m0_byte & 3u) << 3u;
-                            const uint e8m0_raw = (k_raw_u32.k_u32[ew] >> es) & 0xFFu;
-                            // Broadcast raw E8M0 byte for fused dequant
-                            const uint e8m0_bc = subgroupShuffle(e8m0_raw, gl_SubgroupInvocationID & ~7u);
-                            // FP4: still needs float scale for LUT values
-                            mxfp_k_scale = e8m0_to_fp32(uint8_t(e8m0_bc));
-#if defined(DATA_A_MXFP4)
-                            const uint qs_byte = row_byte + (bwr + blk) * MXFP_QS_PER_BLOCK + (eib & 0xFu);
-                            const uint w = qs_byte >> 2u;
-                            const uint s = (qs_byte & 3u) << 3u;
-                            uint packed = k_raw_u32.k_u32[w] >> s;
-                            if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
-                            const uint shift = (eib & 0x10u) >> 2u;
-                            K_Tf = FLOAT_TYPEV4(
-                                fp4_e2m1_to_float((packed >>  0u) >> shift & 0xFu),
-                                fp4_e2m1_to_float((packed >>  8u) >> shift & 0xFu),
-                                fp4_e2m1_to_float((packed >> 16u) >> shift & 0xFu),
-                                fp4_e2m1_to_float((packed >> 24u) >> shift & 0xFu));
-#elif defined(DATA_A_MXFP8_E4M3) || defined(DATA_A_MXFP8_E5M2)
-                            const uint qs_byte = row_byte + (bwr + blk) * MXFP_QS_PER_BLOCK + eib;
-                            const uint w = qs_byte >> 2u;
-                            const uint s = (qs_byte & 3u) << 3u;
-                            uint packed = k_raw_u32.k_u32[w] >> s;
-                            if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
-#if defined(DATA_A_MXFP8_E4M3)
-                            // Fused E8M0: zero float multiplies, pure integer ALU
-                            K_Tf = FLOAT_TYPEV4(
-                                fp8_e4m3_dequant_fused(packed & 0xFFu, e8m0_bc),
-                                fp8_e4m3_dequant_fused((packed >> 8u) & 0xFFu, e8m0_bc),
-                                fp8_e4m3_dequant_fused((packed >> 16u) & 0xFFu, e8m0_bc),
-                                fp8_e4m3_dequant_fused((packed >> 24u) & 0xFFu, e8m0_bc));
-                            mxfp_k_scale = 1.0;  // already fused into the values
-#else
-                            K_Tf = FLOAT_TYPEV4(
-                                fp8_e5m2_dequant_fused(packed & 0xFFu, e8m0_bc),
-                                fp8_e5m2_dequant_fused((packed >> 8u) & 0xFFu, e8m0_bc),
-                                fp8_e5m2_dequant_fused((packed >> 16u) & 0xFFu, e8m0_bc),
-                                fp8_e5m2_dequant_fused((packed >> 24u) & 0xFFu, e8m0_bc));
-                            mxfp_k_scale = 1.0;
-#endif
-#elif defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
-                            const uint group = eib / 4u;
-                            const uint base_b = row_byte + (bwr + blk) * MXFP_QS_PER_BLOCK + group * 3u;
-                            const uint b0 = (k_raw_u32.k_u32[base_b >> 2u] >> ((base_b & 3u) << 3u)) & 0xFFu;
-                            const uint b1 = (k_raw_u32.k_u32[(base_b+1u) >> 2u] >> (((base_b+1u) & 3u) << 3u)) & 0xFFu;
-                            const uint b2 = (k_raw_u32.k_u32[(base_b+2u) >> 2u] >> (((base_b+2u) & 3u) << 3u)) & 0xFFu;
-                            const uint pk = b0 | (b1 << 8u) | (b2 << 16u);
-#if defined(DATA_A_MXFP6_E2M3)
-                            K_Tf = FLOAT_TYPEV4(
-                                fp6_e2m3_dequant_fused(pk & 0x3Fu, e8m0_bc),
-                                fp6_e2m3_dequant_fused((pk >> 6u) & 0x3Fu, e8m0_bc),
-                                fp6_e2m3_dequant_fused((pk >> 12u) & 0x3Fu, e8m0_bc),
-                                fp6_e2m3_dequant_fused((pk >> 18u) & 0x3Fu, e8m0_bc));
-                            mxfp_k_scale = 1.0;
-#else
-                            K_Tf = FLOAT_TYPEV4(
-                                fp6_e3m2_dequant_fused(pk & 0x3Fu, e8m0_bc),
-                                fp6_e3m2_dequant_fused((pk >> 6u) & 0x3Fu, e8m0_bc),
-                                fp6_e3m2_dequant_fused((pk >> 12u) & 0x3Fu, e8m0_bc),
-                                fp6_e3m2_dequant_fused((pk >> 18u) & 0x3Fu, e8m0_bc));
-                            mxfp_k_scale = 1.0;
-#endif
-#endif
-                        }
-#elif BLOCK_SIZE > 1
+#if BLOCK_SIZE > 1
                         uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
                         uint ib = coord / BLOCK_SIZE;
                         uint iqs = (coord % BLOCK_SIZE);
@@ -484,13 +245,7 @@ void main() {
 #endif
                     }
                     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-#if defined(MXFP_Q_PREPROCESS)
-                        // E8M0 scale factored out: 1 multiply on dot result instead of 4 per element.
-                        // Exact because E8M0 scale is a power-of-two (pure exponent).
-                        Sf[r][c] += ACC_TYPE(dot(Q_cache[r], K_Tf)) * ACC_TYPE(mxfp_k_scale);
-#else
                         Sf[r][c] += ACC_TYPE(dot(Q_cache[r], K_Tf));
-#endif
                     }
                 }
             }
@@ -502,95 +257,10 @@ void main() {
 
                 [[unroll]] for (uint32_t d = 0; d < HSK_per_thread / 4; ++d) {
                     FLOAT_TYPEV4 K_Tf;
-                    float mxfp_k_scale = 1.0;
                     if (SHMEM_STAGING != 0) {
                         K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
                     } else {
-#if defined(MXFP_Q_PREPROCESS)
-                        // Optimized MXFP SoA K dequant: pre-computed row base, E8M0 broadcast.
-                        // Eliminates per-call modulo, binding branch, and redundant scale loads.
-                        // Matches CUDA VEC pattern (fattn-vec.cuh vec_dot_fattn_vec_KQ_mxfp_soa).
-                        {
-                            const uint kv_row = j * Bc + c * cols_per_iter + col_tid;
-                            const uint elem_global = 4u * (d * D_split + d_tid);
-                            const uint blk = elem_global >> 5u;   // block within head (elem / 32)
-                            const uint eib = elem_global & 31u;   // element within block
-
-                            // Row base: constant for this KV row. k_offset is head-aligned,
-                            // so (k_offset + kv_row * k_stride) / k_stride = k_offset/k_stride + kv_row.
-                            const uint row_base = (k_offset / MXFP_SOA_BLOCK_BYTES) + kv_row * k_stride;
-                            const uint row_byte = (row_base / k_stride) * k_stride * MXFP_SOA_BLOCK_BYTES;
-                            const uint bwr = row_base % k_stride;  // = blk (when k_offset is head-aligned)
-
-                            // E8M0 scale: broadcast from first lane in each 8-lane group.
-                            // Within D_split=16 threads, lanes 0-7 share block N, lanes 8-15 share block N+1.
-                            const uint e8m0_byte = row_byte + k_stride * MXFP_QS_PER_BLOCK + bwr + blk;
-                            const uint ew = e8m0_byte >> 2u;
-                            const uint es = (e8m0_byte & 3u) << 3u;
-                            const uint e8m0_raw = (k_raw_u32.k_u32[ew] >> es) & 0xFFu;
-                            const uint e8m0_bc = subgroupShuffle(e8m0_raw, gl_SubgroupInvocationID & ~7u);
-                            mxfp_k_scale = e8m0_to_fp32(uint8_t(e8m0_bc));
-
-                            // QS data: direct SoA addressing, no modulo needed
-#if defined(DATA_A_MXFP4)
-                            const uint qs_byte = row_byte + (bwr + blk) * MXFP_QS_PER_BLOCK + (eib & 0xFu);
-                            const uint w = qs_byte >> 2u;
-                            const uint s = (qs_byte & 3u) << 3u;
-                            uint packed = k_raw_u32.k_u32[w] >> s;
-                            if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
-                            const uint shift = (eib & 0x10u) >> 2u;
-                            K_Tf = FLOAT_TYPEV4(
-                                fp4_e2m1_to_float((packed >>  0u) >> shift & 0xFu),
-                                fp4_e2m1_to_float((packed >>  8u) >> shift & 0xFu),
-                                fp4_e2m1_to_float((packed >> 16u) >> shift & 0xFu),
-                                fp4_e2m1_to_float((packed >> 24u) >> shift & 0xFu));
-#elif defined(DATA_A_MXFP8_E4M3) || defined(DATA_A_MXFP8_E5M2)
-                            const uint qs_byte = row_byte + (bwr + blk) * MXFP_QS_PER_BLOCK + eib;
-                            const uint w = qs_byte >> 2u;
-                            const uint s = (qs_byte & 3u) << 3u;
-                            uint packed = k_raw_u32.k_u32[w] >> s;
-                            if (s != 0u) packed |= k_raw_u32.k_u32[w + 1u] << (32u - s);
-#if defined(DATA_A_MXFP8_E4M3)
-                            // Fused E8M0: zero float multiplies, pure integer ALU
-                            K_Tf = FLOAT_TYPEV4(
-                                fp8_e4m3_dequant_fused(packed & 0xFFu, e8m0_bc),
-                                fp8_e4m3_dequant_fused((packed >> 8u) & 0xFFu, e8m0_bc),
-                                fp8_e4m3_dequant_fused((packed >> 16u) & 0xFFu, e8m0_bc),
-                                fp8_e4m3_dequant_fused((packed >> 24u) & 0xFFu, e8m0_bc));
-                            mxfp_k_scale = 1.0;  // already fused into the values
-#else
-                            K_Tf = FLOAT_TYPEV4(
-                                fp8_e5m2_dequant_fused(packed & 0xFFu, e8m0_bc),
-                                fp8_e5m2_dequant_fused((packed >> 8u) & 0xFFu, e8m0_bc),
-                                fp8_e5m2_dequant_fused((packed >> 16u) & 0xFFu, e8m0_bc),
-                                fp8_e5m2_dequant_fused((packed >> 24u) & 0xFFu, e8m0_bc));
-                            mxfp_k_scale = 1.0;
-#endif
-#elif defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
-                            const uint group = eib / 4u;
-                            const uint base_b = row_byte + (bwr + blk) * MXFP_QS_PER_BLOCK + group * 3u;
-                            const uint b0 = (k_raw_u32.k_u32[base_b >> 2u] >> ((base_b & 3u) << 3u)) & 0xFFu;
-                            const uint b1 = (k_raw_u32.k_u32[(base_b+1u) >> 2u] >> (((base_b+1u) & 3u) << 3u)) & 0xFFu;
-                            const uint b2 = (k_raw_u32.k_u32[(base_b+2u) >> 2u] >> (((base_b+2u) & 3u) << 3u)) & 0xFFu;
-                            const uint pk = b0 | (b1 << 8u) | (b2 << 16u);
-#if defined(DATA_A_MXFP6_E2M3)
-                            K_Tf = FLOAT_TYPEV4(
-                                fp6_e2m3_dequant_fused(pk & 0x3Fu, e8m0_bc),
-                                fp6_e2m3_dequant_fused((pk >> 6u) & 0x3Fu, e8m0_bc),
-                                fp6_e2m3_dequant_fused((pk >> 12u) & 0x3Fu, e8m0_bc),
-                                fp6_e2m3_dequant_fused((pk >> 18u) & 0x3Fu, e8m0_bc));
-                            mxfp_k_scale = 1.0;
-#else
-                            K_Tf = FLOAT_TYPEV4(
-                                fp6_e3m2_dequant_fused(pk & 0x3Fu, e8m0_bc),
-                                fp6_e3m2_dequant_fused((pk >> 6u) & 0x3Fu, e8m0_bc),
-                                fp6_e3m2_dequant_fused((pk >> 12u) & 0x3Fu, e8m0_bc),
-                                fp6_e3m2_dequant_fused((pk >> 18u) & 0x3Fu, e8m0_bc));
-                            mxfp_k_scale = 1.0;
-#endif
-#endif
-                        }
-#elif BLOCK_SIZE > 1
+#if BLOCK_SIZE > 1
                         uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
                         uint ib = coord / BLOCK_SIZE;
                         uint iqs = (coord % BLOCK_SIZE);
@@ -600,11 +270,7 @@ void main() {
 #endif
                     }
                     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-#if defined(MXFP_Q_PREPROCESS)
-                        Sf[r][c] += ACC_TYPE(dot(Qf[tile_row(r) * qf_stride + d * D_split + d_tid], K_Tf)) * ACC_TYPE(mxfp_k_scale);
-#else
                         Sf[r][c] += ACC_TYPE(dot(Qf[tile_row(r) * qf_stride + d * D_split + d_tid], K_Tf));
-#endif
                     }
                 }
             }
@@ -664,80 +330,6 @@ void main() {
 
         if (SHMEM_STAGING != 0) {
             barrier();
-#if defined(MXFP_Q_PREPROCESS) && !defined(MXFP_ALL_DEQUANT) && !defined(MIXED_Q_DEQUANT)
-            // MXFP optimized V staging: inline SoA dequant, no dequantize4() overhead
-            [[unroll]] for (uint32_t idx = 0; idx < Bc * HSV / 4; idx += gl_WorkGroupSize.x) {
-                uint32_t d = (idx + tid) % (HSV / 4);
-                uint32_t c = (idx + tid) / (HSV / 4);
-                if (idx + gl_WorkGroupSize.x <= Bc * HSV / 4 || c < Bc) {
-                    FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
-                    if (!KV_bounds_check || j * Bc + c < KV) {
-                        const uint kv_row = j * Bc + c;
-                        const uint elem = 4u * d;
-                        const uint blk = elem >> 5u;
-                        const uint eib = elem & 31u;
-                        const uint v_idx_base = (v_offset / MXFP_SOA_BLOCK_BYTES) + kv_row * v_stride;
-                        const uint v_row_byte = (v_idx_base / v_stride) * v_stride * MXFP_SOA_BLOCK_BYTES;
-                        const uint v_bwr = v_idx_base % v_stride;
-                        const uint e_byte = v_row_byte + v_stride * MXFP_QS_PER_BLOCK + v_bwr + blk;
-                        const float v_scale = e8m0_to_fp32(uint8_t((v_raw_u32.v_u32[e_byte >> 2u] >> ((e_byte & 3u) << 3u)) & 0xFFu));
-#if defined(DATA_A_MXFP4)
-                        const uint qs_byte = v_row_byte + (v_bwr + blk) * MXFP_QS_PER_BLOCK + (eib & 0xFu);
-                        const uint w = qs_byte >> 2u;
-                        const uint s = (qs_byte & 3u) << 3u;
-                        uint packed = v_raw_u32.v_u32[w] >> s;
-                        if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
-                        const uint shift = (eib & 0x10u) >> 2u;
-                        V_Tf = FLOAT_TYPEV4(
-                            fp4_e2m1_to_float((packed >>  0u) >> shift & 0xFu) * v_scale,
-                            fp4_e2m1_to_float((packed >>  8u) >> shift & 0xFu) * v_scale,
-                            fp4_e2m1_to_float((packed >> 16u) >> shift & 0xFu) * v_scale,
-                            fp4_e2m1_to_float((packed >> 24u) >> shift & 0xFu) * v_scale);
-#elif defined(DATA_A_MXFP8_E4M3) || defined(DATA_A_MXFP8_E5M2)
-                        const uint qs_byte = v_row_byte + (v_bwr + blk) * MXFP_QS_PER_BLOCK + eib;
-                        const uint w = qs_byte >> 2u;
-                        const uint s = (qs_byte & 3u) << 3u;
-                        uint packed = v_raw_u32.v_u32[w] >> s;
-                        if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
-#if defined(DATA_A_MXFP8_E4M3)
-                        V_Tf = FLOAT_TYPEV4(
-                            fp8_e4m3_to_float(packed & 0xFFu) * v_scale,
-                            fp8_e4m3_to_float((packed >> 8u) & 0xFFu) * v_scale,
-                            fp8_e4m3_to_float((packed >> 16u) & 0xFFu) * v_scale,
-                            fp8_e4m3_to_float((packed >> 24u) & 0xFFu) * v_scale);
-#else
-                        V_Tf = FLOAT_TYPEV4(
-                            fp8_e5m2_to_float(packed & 0xFFu) * v_scale,
-                            fp8_e5m2_to_float((packed >> 8u) & 0xFFu) * v_scale,
-                            fp8_e5m2_to_float((packed >> 16u) & 0xFFu) * v_scale,
-                            fp8_e5m2_to_float((packed >> 24u) & 0xFFu) * v_scale);
-#endif
-#elif defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
-                        const uint group = eib / 4u;
-                        const uint base_b = v_row_byte + (v_bwr + blk) * MXFP_QS_PER_BLOCK + group * 3u;
-                        const uint b0 = (v_raw_u32.v_u32[base_b >> 2u] >> ((base_b & 3u) << 3u)) & 0xFFu;
-                        const uint b1 = (v_raw_u32.v_u32[(base_b+1u) >> 2u] >> (((base_b+1u) & 3u) << 3u)) & 0xFFu;
-                        const uint b2 = (v_raw_u32.v_u32[(base_b+2u) >> 2u] >> (((base_b+2u) & 3u) << 3u)) & 0xFFu;
-                        const uint pk = b0 | (b1 << 8u) | (b2 << 16u);
-#if defined(DATA_A_MXFP6_E2M3)
-                        V_Tf = FLOAT_TYPEV4(
-                            fp6_e2m3_to_float(pk & 0x3Fu) * v_scale,
-                            fp6_e2m3_to_float((pk >> 6u) & 0x3Fu) * v_scale,
-                            fp6_e2m3_to_float((pk >> 12u) & 0x3Fu) * v_scale,
-                            fp6_e2m3_to_float((pk >> 18u) & 0x3Fu) * v_scale);
-#else
-                        V_Tf = FLOAT_TYPEV4(
-                            fp6_e3m2_to_float(pk & 0x3Fu) * v_scale,
-                            fp6_e3m2_to_float((pk >> 6u) & 0x3Fu) * v_scale,
-                            fp6_e3m2_to_float((pk >> 12u) & 0x3Fu) * v_scale,
-                            fp6_e3m2_to_float((pk >> 18u) & 0x3Fu) * v_scale);
-#endif
-#endif
-                    }
-                    kvsh[c * kvsh_stride + d] = V_Tf;
-                }
-            }
-#else
             [[unroll]] for (uint32_t idx = 0; idx < Bc * HSV / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t d = (idx + tid) % (HSV / 4);
                 uint32_t c = (idx + tid) / (HSV / 4);
@@ -748,11 +340,7 @@ void main() {
                         uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE + 4 * d;
                         uint ib = coord / BLOCK_SIZE;
                         uint iqs = (coord % BLOCK_SIZE);
-#if defined(MXFP_ALL_DEQUANT) || defined(MIXED_Q_DEQUANT)
-                        V_Tf = (V_TYPE_ID != 0u) ? dequantize4_v(ib, iqs, v_offset) : dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
-#else
                         V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
-#endif
 #else
                         V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
 #endif
@@ -761,7 +349,6 @@ void main() {
                     kvsh[c * kvsh_stride + d] = V_Tf;
                 }
             }
-#endif
             barrier();
         }
 
@@ -776,90 +363,16 @@ void main() {
                 Lf[r] += Pf[r];
             }
 
-            // Pre-compute V row addressing for this KV column (constant across d loop)
-#if defined(MXFP_Q_PREPROCESS) && !defined(MXFP_ALL_DEQUANT) && !defined(MIXED_Q_DEQUANT)
-            const uint v_kv_row = j * Bc + c * cols_per_iter + col_tid;
-            const uint v_idx_base = (v_offset / MXFP_SOA_BLOCK_BYTES) + v_kv_row * v_stride;
-            const uint v_row_byte = (v_idx_base / v_stride) * v_stride * MXFP_SOA_BLOCK_BYTES;
-            const uint v_bwr = v_idx_base % v_stride;
-#endif
-
             [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
                 FLOAT_TYPEV4 Vf;
                 if (SHMEM_STAGING != 0) {
                     Vf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
                 } else {
-#if defined(MXFP_Q_PREPROCESS) && !defined(MXFP_ALL_DEQUANT) && !defined(MIXED_Q_DEQUANT)
-                    // Optimized V dequant: pre-computed row base, direct buffer access (no binding branch)
-                    // Scale kept per-element (compiler fuses dequant*scale with P*V into FMA chain)
-                    {
-                        const uint elem = 4u * (d * D_split + d_tid);
-                        const uint blk = elem >> 5u;
-                        const uint eib = elem & 31u;
-                        const uint e_byte = v_row_byte + v_stride * MXFP_QS_PER_BLOCK + v_bwr + blk;
-                        const float v_scale = e8m0_to_fp32(uint8_t((v_raw_u32.v_u32[e_byte >> 2u] >> ((e_byte & 3u) << 3u)) & 0xFFu));
-#if defined(DATA_A_MXFP4)
-                        const uint qs_byte = v_row_byte + (v_bwr + blk) * MXFP_QS_PER_BLOCK + (eib & 0xFu);
-                        const uint w = qs_byte >> 2u;
-                        const uint s = (qs_byte & 3u) << 3u;
-                        uint packed = v_raw_u32.v_u32[w] >> s;
-                        if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
-                        const uint shift = (eib & 0x10u) >> 2u;
-                        Vf = FLOAT_TYPEV4(
-                            fp4_e2m1_to_float((packed >>  0u) >> shift & 0xFu) * v_scale,
-                            fp4_e2m1_to_float((packed >>  8u) >> shift & 0xFu) * v_scale,
-                            fp4_e2m1_to_float((packed >> 16u) >> shift & 0xFu) * v_scale,
-                            fp4_e2m1_to_float((packed >> 24u) >> shift & 0xFu) * v_scale);
-#elif defined(DATA_A_MXFP8_E4M3) || defined(DATA_A_MXFP8_E5M2)
-                        const uint qs_byte = v_row_byte + (v_bwr + blk) * MXFP_QS_PER_BLOCK + eib;
-                        const uint w = qs_byte >> 2u;
-                        const uint s = (qs_byte & 3u) << 3u;
-                        uint packed = v_raw_u32.v_u32[w] >> s;
-                        if (s != 0u) packed |= v_raw_u32.v_u32[w + 1u] << (32u - s);
-#if defined(DATA_A_MXFP8_E4M3)
-                        Vf = FLOAT_TYPEV4(
-                            fp8_e4m3_to_float(packed & 0xFFu) * v_scale,
-                            fp8_e4m3_to_float((packed >> 8u) & 0xFFu) * v_scale,
-                            fp8_e4m3_to_float((packed >> 16u) & 0xFFu) * v_scale,
-                            fp8_e4m3_to_float((packed >> 24u) & 0xFFu) * v_scale);
-#else
-                        Vf = FLOAT_TYPEV4(
-                            fp8_e5m2_to_float(packed & 0xFFu) * v_scale,
-                            fp8_e5m2_to_float((packed >> 8u) & 0xFFu) * v_scale,
-                            fp8_e5m2_to_float((packed >> 16u) & 0xFFu) * v_scale,
-                            fp8_e5m2_to_float((packed >> 24u) & 0xFFu) * v_scale);
-#endif
-#elif defined(DATA_A_MXFP6_E2M3) || defined(DATA_A_MXFP6_E3M2)
-                        const uint group = eib / 4u;
-                        const uint base_b = v_row_byte + (v_bwr + blk) * MXFP_QS_PER_BLOCK + group * 3u;
-                        const uint b0 = (v_raw_u32.v_u32[base_b >> 2u] >> ((base_b & 3u) << 3u)) & 0xFFu;
-                        const uint b1 = (v_raw_u32.v_u32[(base_b+1u) >> 2u] >> (((base_b+1u) & 3u) << 3u)) & 0xFFu;
-                        const uint b2 = (v_raw_u32.v_u32[(base_b+2u) >> 2u] >> (((base_b+2u) & 3u) << 3u)) & 0xFFu;
-                        const uint pk = b0 | (b1 << 8u) | (b2 << 16u);
-#if defined(DATA_A_MXFP6_E2M3)
-                        Vf = FLOAT_TYPEV4(
-                            fp6_e2m3_to_float(pk & 0x3Fu) * v_scale,
-                            fp6_e2m3_to_float((pk >> 6u) & 0x3Fu) * v_scale,
-                            fp6_e2m3_to_float((pk >> 12u) & 0x3Fu) * v_scale,
-                            fp6_e2m3_to_float((pk >> 18u) & 0x3Fu) * v_scale);
-#else
-                        Vf = FLOAT_TYPEV4(
-                            fp6_e3m2_to_float(pk & 0x3Fu) * v_scale,
-                            fp6_e3m2_to_float((pk >> 6u) & 0x3Fu) * v_scale,
-                            fp6_e3m2_to_float((pk >> 12u) & 0x3Fu) * v_scale,
-                            fp6_e3m2_to_float((pk >> 18u) & 0x3Fu) * v_scale);
-#endif
-#endif
-                    }
-#elif BLOCK_SIZE > 1
+#if BLOCK_SIZE > 1
                     uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
                     uint ib = coord / BLOCK_SIZE;
                     uint iqs = (coord % BLOCK_SIZE);
-#if defined(MXFP_ALL_DEQUANT) || defined(MIXED_Q_DEQUANT)
-                    Vf = (V_TYPE_ID != 0u) ? dequantize4_v(ib, iqs, v_offset) : dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
-#else
                     Vf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
-#endif
 #else
                     Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * v_stride / 4 + d * D_split + d_tid]);
 #endif
