@@ -3825,27 +3825,9 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 
 #if defined(__AVX2__)
 
-// Format traits for FP8 (8-bit, sign at bit 7) and FP6 (6-bit, sign at bit 5).
-typedef struct {
-    int exp_mask;       // (1<<E)-1
-    int mant_mask;      // (1<<M)-1
-    int exp_shift;      // M (mantissa width)
-    int ieee_exp_off;   // 127 - bias
-    int mant_shift;     // 23 - M
-    float sub_scale;    // 2^(1-bias-M)
-    int sign_mask;      // 0x80 for FP8, 0x20 for FP6
-    int sign_shift;     // 24 for FP8, 26 for FP6
-} mxfp_avx2_traits_t;
-
-static const mxfp_avx2_traits_t mxfp8_e4m3_avx2 = {
-    MXFP8_E4M3_EXP_MASK, MXFP8_E4M3_MANT_MASK, MXFP8_E4M3_EXP_SHIFT,
-    MXFP8_E4M3_IEEE_EXP_OFF, MXFP8_E4M3_MANT_SHIFT, MXFP8_E4M3_SUB_SCALE, 0x80, 24
-};
-
-static const mxfp_avx2_traits_t mxfp6_e2m3_avx2 = {
-    MXFP6_E2M3_EXP_MASK, MXFP6_E2M3_MANT_MASK, MXFP6_E2M3_EXP_SHIFT,
-    MXFP6_E2M3_IEEE_EXP_OFF, MXFP6_E2M3_MANT_SHIFT, MXFP6_E2M3_SUB_SCALE, 0x20, 26
-};
+// Use shared mxfp_dequant_traits_t from ggml-common.h.
+// Aliases for readability within this file.
+#define mxfp_avx2_traits_t mxfp_dequant_traits_t
 
 // Dequantize 8 raw MXFP values (widened to int32) → 8 IEEE-754 floats.
 // Handles both normal and subnormal paths. Works for any FP6/FP8 format.
@@ -4140,7 +4122,7 @@ void ggml_vec_dot_mxfp8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     assert(nrc == 1);
     UNUSED(nrc); UNUSED(bs); UNUSED(bx); UNUSED(by);
 #if defined(__AVX2__)
-    ggml_vec_dot_mxfp8_q8_0_avx2(n, s, vx, vy, &mxfp8_e4m3_avx2);
+    ggml_vec_dot_mxfp8_q8_0_avx2(n, s, vx, vy, &MXFP_TRAITS_E4M3);
 #else
     ggml_vec_dot_mxfp8_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
@@ -4150,7 +4132,7 @@ void ggml_vec_dot_mxfp6_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     assert(nrc == 1);
     UNUSED(nrc); UNUSED(bs); UNUSED(bx); UNUSED(by);
 #if defined(__AVX2__)
-    ggml_vec_dot_mxfp6_q8_0_avx2(n, s, vx, vy, &mxfp6_e2m3_avx2);
+    ggml_vec_dot_mxfp6_q8_0_avx2(n, s, vx, vy, &MXFP_TRAITS_E2M3);
 #else
     ggml_vec_dot_mxfp6_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
@@ -4158,7 +4140,7 @@ void ggml_vec_dot_mxfp6_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
 void dequantize_row_mxfp8_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
 #if defined(__AVX2__)
-    dequantize_row_mxfp8_avx2(x, y, k, &mxfp8_e4m3_avx2);
+    dequantize_row_mxfp8_avx2(x, y, k, &MXFP_TRAITS_E4M3);
 #else
     dequantize_row_mxfp8_cpu_generic(x, y, k);
 #endif
@@ -4166,7 +4148,7 @@ void dequantize_row_mxfp8_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRIC
 
 void dequantize_row_mxfp6_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
 #if defined(__AVX2__)
-    dequantize_row_mxfp6_avx2(x, y, k, &mxfp6_e2m3_avx2);
+    dequantize_row_mxfp6_avx2(x, y, k, &MXFP_TRAITS_E2M3);
 #else
     dequantize_row_mxfp6_cpu_generic(x, y, k);
 #endif
@@ -4182,7 +4164,7 @@ void dequantize_row_mxfp4_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RES
 
 void dequantize_row_mxfp8_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
 #if defined(__AVX2__)
-    dequantize_row_mxfp8_soa_avx2(x, y, k, &mxfp8_e4m3_avx2);
+    dequantize_row_mxfp8_soa_avx2(x, y, k, &MXFP_TRAITS_E4M3);
 #else
     dequantize_row_mxfp8_soa_cpu_generic(x, y, k);
 #endif
@@ -4190,7 +4172,7 @@ void dequantize_row_mxfp8_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RES
 
 void dequantize_row_mxfp6_soa_cpu(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
 #if defined(__AVX2__)
-    dequantize_row_mxfp6_soa_avx2(x, y, k, &mxfp6_e2m3_avx2);
+    dequantize_row_mxfp6_soa_avx2(x, y, k, &MXFP_TRAITS_E2M3);
 #else
     dequantize_row_mxfp6_soa_cpu_generic(x, y, k);
 #endif
