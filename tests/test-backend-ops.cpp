@@ -18,7 +18,6 @@
 #include <ggml.h>
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
-#include <ggml-cpu.h>
 #include <ggml-cpp.h>
 
 #include <algorithm>
@@ -151,15 +150,43 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     }
 }
 
+// MXFP SoA functions (GGML_API, exported from ggml-base — available in both static and DL builds)
+extern "C" {
+    void quantize_row_mxfp4_soa(const float * GGML_RESTRICT x, void * GGML_RESTRICT dst, int64_t k);
+    void quantize_row_mxfp8_soa(const float * GGML_RESTRICT x, void * GGML_RESTRICT dst, int64_t k);
+    void quantize_row_mxfp6_soa(const float * GGML_RESTRICT x, void * GGML_RESTRICT dst, int64_t k);
+    void dequantize_row_mxfp4_soa(const void * GGML_RESTRICT src, float * GGML_RESTRICT y, int64_t k);
+    void dequantize_row_mxfp8_soa(const void * GGML_RESTRICT src, float * GGML_RESTRICT y, int64_t k);
+    void dequantize_row_mxfp6_soa(const void * GGML_RESTRICT src, float * GGML_RESTRICT y, int64_t k);
+}
+
+typedef void (*mxfp_soa_quantize_fn)(const float *, void *, int64_t);
 typedef void (*mxfp_soa_dequantize_fn)(const void *, float *, int64_t);
+
+static mxfp_soa_quantize_fn get_mxfp_soa_quantize(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_MXFP4_E2M1: return quantize_row_mxfp4_soa;
+        case GGML_TYPE_MXFP8_E4M3: return quantize_row_mxfp8_soa;
+        case GGML_TYPE_MXFP6_E2M3: return quantize_row_mxfp6_soa;
+        default: return nullptr;
+    }
+}
+
+static mxfp_soa_dequantize_fn get_mxfp_soa_dequantize(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_MXFP4_E2M1: return dequantize_row_mxfp4_soa;
+        case GGML_TYPE_MXFP8_E4M3: return dequantize_row_mxfp8_soa;
+        case GGML_TYPE_MXFP6_E2M3: return dequantize_row_mxfp6_soa;
+        default: return nullptr;
+    }
+}
 
 // Initialize an MXFP tensor with SoA layout (soa_bytes = region width, 0 = one row).
 static void init_tensor_mxfp_soa(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f, size_t soa_bytes = 0) {
     GGML_ASSERT(ggml_is_type_mxfp(tensor->type));
 
-    const auto * traits = ggml_get_type_traits_cpu(tensor->type);
-    GGML_ASSERT(traits->from_float_soa && "MXFP type missing SoA quantize in traits");
-    auto quantize_soa = traits->from_float_soa;
+    auto quantize_soa = get_mxfp_soa_quantize(tensor->type);
+    GGML_ASSERT(quantize_soa && "unsupported MXFP type for SoA init");
 
     const int     qk         = (int)ggml_blck_size(tensor->type);
     const size_t  block_size = ggml_type_size(tensor->type);
@@ -186,6 +213,7 @@ static void init_tensor_mxfp_soa(ggml_tensor * tensor, float min = -1.0f, float 
 
     if (heads_per_region > 1) {
         // Multi-head SoA:
+        GGML_ASSERT(ne2 % heads_per_region == 0 && "ne2 must be divisible by heads_per_region");
         for (int64_t i3 = 0; i3 < ne3; i3++) {
             const int64_t n_groups = ne2 / heads_per_region;
             for (int64_t ig = 0; ig < n_groups; ig++) {
@@ -304,9 +332,11 @@ static std::vector<float> tensor_to_float(const ggml_tensor * t) {
     const bool is_mxfp = ggml_is_type_mxfp(t->type);
 
     mxfp_soa_dequantize_fn mxfp_dequant_soa = nullptr;
+    std::vector<float> mxfp_row_f32;
     if (is_mxfp) {
-        mxfp_dequant_soa = (mxfp_soa_dequantize_fn) ggml_get_type_traits_cpu(t->type)->to_float_soa;
-        GGML_ASSERT(mxfp_dequant_soa && "MXFP type missing SoA dequant in traits");
+        mxfp_dequant_soa = get_mxfp_soa_dequantize(t->type);
+        GGML_ASSERT(mxfp_dequant_soa && "unsupported MXFP type in tensor_to_float");
+        mxfp_row_f32.resize(t->ne[0]);
     }
 
     // access elements by index to avoid gaps in views
@@ -315,9 +345,8 @@ static std::vector<float> tensor_to_float(const ggml_tensor * t) {
             for (int64_t i1 = 0; i1 < t->ne[1]; i1++) {
                 if (is_mxfp) {
                     size_t row_off = i3*t->nb[3] + i2*t->nb[2] + i1*t->nb[1];
-                    std::vector<float> row_f32(t->ne[0]);
-                    mxfp_dequant_soa(&buf[row_off], row_f32.data(), t->ne[0]);
-                    tv.insert(tv.end(), row_f32.begin(), row_f32.end());
+                    mxfp_dequant_soa(&buf[row_off], mxfp_row_f32.data(), t->ne[0]);
+                    tv.insert(tv.end(), mxfp_row_f32.begin(), mxfp_row_f32.end());
                     continue;
                 }
                 for (int64_t i0 = 0; i0 < t->ne[0]; i0 += bs) {
