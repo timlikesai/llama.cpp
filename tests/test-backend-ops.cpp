@@ -211,9 +211,8 @@ static void init_tensor_mxfp_soa(ggml_tensor * tensor, float min = -1.0f, float 
 
     std::vector<uint8_t> buf(ggml_nbytes(tensor), 0);
 
-    if (heads_per_region > 1) {
+    if (heads_per_region > 1 && ne2 % heads_per_region == 0) {
         // Multi-head SoA:
-        GGML_ASSERT(ne2 % heads_per_region == 0 && "ne2 must be divisible by heads_per_region");
         for (int64_t i3 = 0; i3 < ne3; i3++) {
             const int64_t n_groups = ne2 / heads_per_region;
             for (int64_t ig = 0; ig < n_groups; ig++) {

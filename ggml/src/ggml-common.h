@@ -624,7 +624,6 @@ static inline float    ggml_mxfp_u32_as_f32_(uint32_t u) { float f; memcpy(&f, &
 #elif defined(GGML_COMMON_IMPL_CUDA) || defined(GGML_COMMON_IMPL_HIP) || defined(GGML_COMMON_IMPL_MUSA)
 #include <cstdint>
 #include <cstring>
-#include <cmath>
 
 #define GGML_TABLE_BEGIN(type, name, size) static const __device__ type name[size] = {
 #define GGML_TABLE_END() };
