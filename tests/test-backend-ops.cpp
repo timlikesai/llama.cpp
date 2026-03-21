@@ -182,55 +182,46 @@ static mxfp_soa_dequantize_fn get_mxfp_soa_dequantize(ggml_type type) {
 }
 
 // Initialize an MXFP tensor with SoA layout (soa_bytes = region width, 0 = one row).
-static void init_tensor_mxfp_soa(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f, size_t soa_bytes = 0) {
+static void init_tensor_mxfp_soa(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(ggml_is_type_mxfp(tensor->type));
 
     auto quantize_soa = get_mxfp_soa_quantize(tensor->type);
     GGML_ASSERT(quantize_soa && "unsupported MXFP type for SoA init");
 
-    const int     qk         = (int)ggml_blck_size(tensor->type);
-    const size_t  block_size = ggml_type_size(tensor->type);
-    const size_t  head_row_sz = ggml_row_size(tensor->type, tensor->ne[0]);
-    if (soa_bytes == 0) { soa_bytes = head_row_sz; }
-    GGML_ASSERT(soa_bytes % block_size == 0 && "soa_bytes must be a multiple of block_size");
-    const int64_t soa_elems  = (int64_t)(soa_bytes / block_size) * qk;
+    const int64_t DK         = tensor->ne[0];
+    const size_t  row_sz     = ggml_row_size(tensor->type, DK);
+
+    // multihead SoA: heads packed contiguously (matches KV cache after permute)
+    const bool multihead = (tensor->nb[2] == row_sz) && (tensor->ne[2] > 1);
 
     std::default_random_engine gen(42);
     std::uniform_real_distribution<float> dist(min, max);
-    std::vector<float> region_f32(soa_elems);
-
-    const size_t nb1 = tensor->nb[1];
-    const size_t nb2 = tensor->nb[2];
-    const size_t nb3 = tensor->nb[3];
-    const int64_t ne1 = tensor->ne[1];
-    const int64_t ne2 = tensor->ne[2];
-    const int64_t ne3 = tensor->ne[3];
-
-    const int64_t heads_per_region = (int64_t)(soa_bytes / head_row_sz);
-    GGML_ASSERT(soa_bytes % head_row_sz == 0 && "soa_bytes must be a multiple of head_row_sz");
 
     std::vector<uint8_t> buf(ggml_nbytes(tensor), 0);
 
-    if (heads_per_region > 1 && ne2 % heads_per_region == 0) {
-        // Multi-head SoA:
-        for (int64_t i3 = 0; i3 < ne3; i3++) {
-            const int64_t n_groups = ne2 / heads_per_region;
-            for (int64_t ig = 0; ig < n_groups; ig++) {
-                for (int64_t i1 = 0; i1 < ne1; i1++) {
-                    size_t offset = i3*nb3 + ig*heads_per_region*nb2 + i1*nb1;
-                    for (int64_t j = 0; j < soa_elems; j++) { region_f32[j] = dist(gen); }
-                    quantize_soa(region_f32.data(), buf.data() + offset, soa_elems);
-                }
+    if (multihead) {
+        // all heads at one position share one SoA region
+        const int64_t n_heads   = tensor->ne[2];
+        const int64_t soa_elems = n_heads * DK;
+        std::vector<float> region(soa_elems);
+
+        for (int64_t i3 = 0; i3 < tensor->ne[3]; i3++) {
+            for (int64_t i1 = 0; i1 < tensor->ne[1]; i1++) {
+                size_t offset = i3*tensor->nb[3] + i1*tensor->nb[1];
+                for (int64_t j = 0; j < soa_elems; j++) { region[j] = dist(gen); }
+                quantize_soa(region.data(), buf.data() + offset, soa_elems);
             }
         }
     } else {
-        // Per-head SoA:
-        for (int64_t i3 = 0; i3 < ne3; i3++) {
-            for (int64_t i2 = 0; i2 < ne2; i2++) {
-                for (int64_t i1 = 0; i1 < ne1; i1++) {
-                    size_t offset = i3*nb3 + i2*nb2 + i1*nb1;
-                    for (int64_t j = 0; j < soa_elems; j++) { region_f32[j] = dist(gen); }
-                    quantize_soa(region_f32.data(), buf.data() + offset, soa_elems);
+        // per-head SoA: each head independently packed
+        std::vector<float> region(DK);
+
+        for (int64_t i3 = 0; i3 < tensor->ne[3]; i3++) {
+            for (int64_t i2 = 0; i2 < tensor->ne[2]; i2++) {
+                for (int64_t i1 = 0; i1 < tensor->ne[1]; i1++) {
+                    size_t offset = i3*tensor->nb[3] + i2*tensor->nb[2] + i1*tensor->nb[1];
+                    for (int64_t j = 0; j < DK; j++) { region[j] = dist(gen); }
+                    quantize_soa(region.data(), buf.data() + offset, DK);
                 }
             }
         }
@@ -6398,8 +6389,7 @@ struct test_flash_attn_ext : public test_case {
             } else if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
             } else if ((strcmp(t->name, "k") == 0 || strcmp(t->name, "v") == 0) && ggml_is_type_mxfp(t->type)) {
-                // MXFP K/V use SoA layout; nb[1] spans all heads in one KV-position stride
-                init_tensor_mxfp_soa(t, -1.0f, 1.0f, t->nb[1]);
+                init_tensor_mxfp_soa(t);
             } else {
                 init_tensor_uniform(t);
             }

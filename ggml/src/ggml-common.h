@@ -579,6 +579,8 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 #include <string.h>
 #include <math.h>
 
+#define GGML_TABLE_NAN      NAN
+#define GGML_TABLE_INFINITY INFINITY
 #define GGML_TABLE_BEGIN(type, name, size) static const type name[size] = {
 #define GGML_TABLE_END() };
 #define GGML_MXFP_FUNC static inline
@@ -596,6 +598,8 @@ static inline float    ggml_mxfp_u32_as_f32_(uint32_t u) { float f; memcpy(&f, &
 #include <cstring>
 #include <cmath>
 
+#define GGML_TABLE_NAN      NAN
+#define GGML_TABLE_INFINITY INFINITY
 #define GGML_TABLE_BEGIN(type, name, size) static const type name[size] = {
 #define GGML_TABLE_END() };
 #define GGML_MXFP_FUNC static inline
@@ -611,6 +615,8 @@ static inline float    ggml_mxfp_u32_as_f32_(uint32_t u) { float f; memcpy(&f, &
 #elif defined(GGML_COMMON_IMPL_METAL)
 #include <metal_stdlib>
 
+#define GGML_TABLE_NAN      NAN
+#define GGML_TABLE_INFINITY INFINITY
 #define GGML_TABLE_BEGIN(type, name, size) static const constant type name[size] = {
 #define GGML_TABLE_END() };
 #define GGML_MXFP_FUNC static inline
@@ -625,6 +631,16 @@ static inline float    ggml_mxfp_u32_as_f32_(uint32_t u) { float f; memcpy(&f, &
 #include <cstdint>
 #include <cstring>
 
+// __device__ tables need constexpr initializers for NAN/INFINITY.
+// nvcc: __uint_as_float is constexpr; HIP/MUSA (clang): use __builtin_bit_cast.
+#if defined(GGML_COMMON_IMPL_CUDA)
+#define GGML_TABLE_NAN      __uint_as_float(0x7FC00000u)
+#define GGML_TABLE_INFINITY __uint_as_float(0x7F800000u)
+#else
+#define GGML_TABLE_NAN      __builtin_bit_cast(float, 0x7FC00000u)
+#define GGML_TABLE_INFINITY __builtin_bit_cast(float, 0x7F800000u)
+#endif
+
 #define GGML_TABLE_BEGIN(type, name, size) static const __device__ type name[size] = {
 #define GGML_TABLE_END() };
 #define GGML_MXFP_FUNC static __device__ __forceinline__
@@ -636,11 +652,12 @@ static inline float    ggml_mxfp_u32_as_f32_(uint32_t u) { float f; memcpy(&f, &
 
 #define GGML_COMMON_IMPL
 #elif defined(GGML_COMMON_IMPL_SYCL)
-
 #include <cstdint>
 #include <cstring>
 #include <cmath>
 
+#define GGML_TABLE_NAN      NAN
+#define GGML_TABLE_INFINITY INFINITY
 #define GGML_TABLE_BEGIN(type, name, size) static const type name[size] = {
 #define GGML_TABLE_END() };
 #define GGML_MXFP_FUNC static inline
@@ -1325,7 +1342,7 @@ GGML_TABLE_BEGIN(float, kvalues_mxfp8_e4m3, 256)
           32.0f,        36.0f,        40.0f,        44.0f,        48.0f,        52.0f,        56.0f,        60.0f,
           64.0f,        72.0f,        80.0f,        88.0f,        96.0f,       104.0f,       112.0f,       120.0f,
          128.0f,       144.0f,       160.0f,       176.0f,       192.0f,       208.0f,       224.0f,       240.0f,
-         256.0f,       288.0f,       320.0f,       352.0f,       384.0f,       416.0f,       448.0f,          NAN,
+         256.0f,       288.0f,       320.0f,       352.0f,       384.0f,       416.0f,       448.0f, GGML_TABLE_NAN,
           -0.0f,-0.001953125f, -0.00390625f,-0.005859375f,  -0.0078125f,-0.009765625f, -0.01171875f,-0.013671875f,
      -0.015625f,-0.017578125f, -0.01953125f,-0.021484375f,  -0.0234375f,-0.025390625f, -0.02734375f,-0.029296875f,
       -0.03125f, -0.03515625f,  -0.0390625f, -0.04296875f,   -0.046875f, -0.05078125f,  -0.0546875f, -0.05859375f,
@@ -1341,7 +1358,7 @@ GGML_TABLE_BEGIN(float, kvalues_mxfp8_e4m3, 256)
          -32.0f,       -36.0f,       -40.0f,       -44.0f,       -48.0f,       -52.0f,       -56.0f,       -60.0f,
          -64.0f,       -72.0f,       -80.0f,       -88.0f,       -96.0f,      -104.0f,      -112.0f,      -120.0f,
         -128.0f,      -144.0f,      -160.0f,      -176.0f,      -192.0f,      -208.0f,      -224.0f,      -240.0f,
-        -256.0f,      -288.0f,      -320.0f,      -352.0f,      -384.0f,      -416.0f,      -448.0f,          NAN,
+        -256.0f,      -288.0f,      -320.0f,      -352.0f,      -384.0f,      -416.0f,      -448.0f, GGML_TABLE_NAN,
 GGML_TABLE_END()
 
 // FP8 E5M2 dequantization LUT: byte -> float. Entries 124-127 = {Inf, NaN, NaN, NaN}.
@@ -1361,7 +1378,7 @@ GGML_TABLE_BEGIN(float, kvalues_mxfp8_e5m2, 256)
          512.0f,        640.0f,        768.0f,        896.0f,      1024.0f,       1280.0f,       1536.0f,       1792.0f,
         2048.0f,       2560.0f,       3072.0f,       3584.0f,      4096.0f,       5120.0f,       6144.0f,       7168.0f,
         8192.0f,      10240.0f,      12288.0f,      14336.0f,     16384.0f,      20480.0f,      24576.0f,      28672.0f,
-       32768.0f,      40960.0f,      49152.0f,      57344.0f,     INFINITY,          NAN,          NAN,          NAN,
+       32768.0f,      40960.0f,      49152.0f,      57344.0f, GGML_TABLE_INFINITY, GGML_TABLE_NAN, GGML_TABLE_NAN, GGML_TABLE_NAN,
          -0.0f,-1.525879e-05f,-3.051758e-05f,-4.577637e-05f,-6.103516e-05f,-7.629395e-05f,-9.155273e-05f,-1.068115e-04f,
    -1.220703e-04f,-1.525879e-04f,-1.831055e-04f,-2.136230e-04f,-2.441406e-04f,-3.051758e-04f,-3.662109e-04f,-4.272461e-04f,
    -4.882812e-04f,-6.103516e-04f,-7.324219e-04f,-8.544922e-04f,-9.765625e-04f,-1.220703e-03f,-1.464844e-03f,-1.708984e-03f,
@@ -1377,7 +1394,7 @@ GGML_TABLE_BEGIN(float, kvalues_mxfp8_e5m2, 256)
         -512.0f,       -640.0f,       -768.0f,       -896.0f,     -1024.0f,      -1280.0f,      -1536.0f,      -1792.0f,
        -2048.0f,      -2560.0f,      -3072.0f,      -3584.0f,     -4096.0f,      -5120.0f,      -6144.0f,      -7168.0f,
        -8192.0f,     -10240.0f,     -12288.0f,     -14336.0f,    -16384.0f,     -20480.0f,     -24576.0f,     -28672.0f,
-      -32768.0f,     -40960.0f,     -49152.0f,     -57344.0f,    -INFINITY,          NAN,          NAN,          NAN,
+      -32768.0f,     -40960.0f,     -49152.0f,     -57344.0f, -GGML_TABLE_INFINITY, GGML_TABLE_NAN, GGML_TABLE_NAN, GGML_TABLE_NAN,
 GGML_TABLE_END()
 
 // MXFP element converters -- portable IEEE-754 bit manipulation.
