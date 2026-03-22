@@ -5130,9 +5130,15 @@ static void ggml_compute_forward_set_rows_f32(
     ggml_from_float_t mxfp_soa_quantize = dst_traits->from_float_soa;
     ggml_from_float_t from_float = mxfp_soa_quantize ? nullptr : dst_traits->from_float;
 
-    std::vector<float> had_tmp;
-    if (apply_hadamard) {
-        had_tmp.resize(nc);
+    // Fused Hadamard+quantize: one pass per block, 32-float stack buffer, no heap allocation.
+    ggml_from_float_t mxfp_soa_hadamard_quantize = nullptr;
+    if (apply_hadamard && mxfp_soa_quantize) {
+        switch (dst->type) {
+            case GGML_TYPE_MXFP4: mxfp_soa_hadamard_quantize = (ggml_from_float_t)quantize_row_mxfp4_soa_hadamard; break;
+            case GGML_TYPE_MXFP8: mxfp_soa_hadamard_quantize = (ggml_from_float_t)quantize_row_mxfp8_soa_hadamard; break;
+            case GGML_TYPE_MXFP6: mxfp_soa_hadamard_quantize = (ggml_from_float_t)quantize_row_mxfp6_soa_hadamard; break;
+            default: break;
+        }
     }
 
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
@@ -5149,20 +5155,12 @@ static void ggml_compute_forward_set_rows_f32(
                 const float * src_row = (const float *) ((char *) src0->data + i*nb01 + i02*nb02 + i03*nb03);
                 char * dst_row = ((char *) dst->data + i1*nb1 + i02*nb2 + i03*nb3);
 
-                if (apply_hadamard) {
-                    memcpy(had_tmp.data(), src_row, nc * sizeof(float));
-                    ggml_apply_hadamard_blocks(had_tmp.data(), nc);
-                    if (mxfp_soa_quantize) {
-                        mxfp_soa_quantize(had_tmp.data(), dst_row, nc);
-                    } else {
-                        from_float(had_tmp.data(), dst_row, nc);
-                    }
+                if (mxfp_soa_hadamard_quantize) {
+                    mxfp_soa_hadamard_quantize(src_row, dst_row, nc);
+                } else if (mxfp_soa_quantize) {
+                    mxfp_soa_quantize(src_row, dst_row, nc);
                 } else {
-                    if (mxfp_soa_quantize) {
-                        mxfp_soa_quantize(src_row, dst_row, nc);
-                    } else {
-                        from_float(src_row, dst_row, nc);
-                    }
+                    from_float(src_row, dst_row, nc);
                 }
             }
         }

@@ -670,6 +670,48 @@ void quantize_row_mxfp6_soa(const float * GGML_RESTRICT x, void * GGML_RESTRICT 
 void dequantize_row_mxfp6_soa(const void * GGML_RESTRICT src, float * GGML_RESTRICT y, int64_t k) {
     dequantize_row_mxfp_soa_impl(src, y, k, &mxfp6_e2m3_traits);
 }
+
+// Fused Hadamard + SoA quantize: one read, one write, 32-float stack buffer per block.
+// Eliminates the full-row temp buffer and extra memory pass.
+void quantize_row_mxfp4_soa_hadamard(const float * GGML_RESTRICT x, void * GGML_RESTRICT dst, int64_t k) {
+    assert(k % QK_MXFP4 == 0);
+    const int nb = k / QK_MXFP4;
+    char * qs_base   = (char *)dst;
+    char * e8m0_base = qs_base + MXFP_SOA_E8M0_OFFSET(nb, MXFP4_SOA_QS_PER_BLOCK);
+
+    for (int i = 0; i < nb; i++) {
+        float tmp[32];
+        memcpy(tmp, &x[i*QK_MXFP4], QK_MXFP4 * sizeof(float));
+        ggml_mxfp_hadamard_32_inplace(tmp);
+        uint8_t * qs = (uint8_t *)(qs_base + MXFP_SOA_QS_OFFSET(i, MXFP4_SOA_QS_PER_BLOCK));
+        quantize_block_mxfp4(tmp, qs, (uint8_t *)&e8m0_base[i]);
+    }
+}
+
+static void quantize_row_mxfp_soa_hadamard_impl(const float * GGML_RESTRICT x, void * GGML_RESTRICT dst,
+                                                   int64_t k, const mxfp_elem_traits_t * traits) {
+    assert(k % 32 == 0);
+    const int nb = k / 32;
+    const int qpb = traits->qs_per_block;
+    char * qs_base   = (char *)dst;
+    char * e8m0_base = qs_base + MXFP_SOA_E8M0_OFFSET(nb, qpb);
+
+    for (int i = 0; i < nb; i++) {
+        float tmp[32];
+        memcpy(tmp, &x[i*32], 32 * sizeof(float));
+        ggml_mxfp_hadamard_32_inplace(tmp);
+        uint8_t * qs = (uint8_t *)(qs_base + MXFP_SOA_QS_OFFSET(i, qpb));
+        quantize_block_mxfp(tmp, qs, (uint8_t *)&e8m0_base[i], traits);
+    }
+}
+
+void quantize_row_mxfp8_soa_hadamard(const float * GGML_RESTRICT x, void * GGML_RESTRICT dst, int64_t k) {
+    quantize_row_mxfp_soa_hadamard_impl(x, dst, k, &mxfp8_e4m3_traits);
+}
+void quantize_row_mxfp6_soa_hadamard(const float * GGML_RESTRICT x, void * GGML_RESTRICT dst, int64_t k) {
+    quantize_row_mxfp_soa_hadamard_impl(x, dst, k, &mxfp6_e2m3_traits);
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
