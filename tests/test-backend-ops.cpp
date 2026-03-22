@@ -150,7 +150,7 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     }
 }
 
-// MXFP SoA functions (GGML_API, exported from ggml-base — available in both static and DL builds)
+// MXFP SoA quantization functions
 extern "C" {
     void quantize_row_mxfp4_soa(const float * GGML_RESTRICT x, void * GGML_RESTRICT dst, int64_t k);
     void quantize_row_mxfp8_soa(const float * GGML_RESTRICT x, void * GGML_RESTRICT dst, int64_t k);
@@ -182,7 +182,7 @@ static const mxfp_soa_fns * get_mxfp_soa(ggml_type type) {
     return nullptr;
 }
 
-// Initialize an MXFP tensor with SoA layout (soa_bytes = region width, 0 = one row).
+// init MXFP tensor with SoA layout
 static void init_tensor_mxfp_soa(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(ggml_is_type_mxfp(tensor->type));
 
@@ -192,7 +192,7 @@ static void init_tensor_mxfp_soa(ggml_tensor * tensor, float min = -1.0f, float 
     const int64_t DK         = tensor->ne[0];
     const size_t  row_sz     = ggml_row_size(tensor->type, DK);
 
-    // multihead SoA: heads packed contiguously (matches KV cache after permute)
+    // multihead: heads packed contiguously
     const bool multihead = (tensor->nb[2] == row_sz) && (tensor->ne[2] > 1);
 
     std::default_random_engine gen(42);
