@@ -50,6 +50,48 @@ static __device__ __forceinline__ uint8_t mxfp4_quantize_elem(float x, float inv
 }
 
 // ============================================================================
+// MXFP4 branchless nibble extraction from SoA layout.
+// SoA layout: 16 bytes per 32-element block. Positions 0-15 are low nibbles
+// of bytes 0-15, positions 16-31 are high nibbles of bytes 0-15.
+// Given an even pos0 and pos1 = pos0+1 (always same half), extract both nibbles
+// from one byte load (if pos0 is odd in a byte pair) or two adjacent byte loads.
+//
+// Key insight: since elem is always even, pos0 is always even.
+// Even pos → both pos0 and pos1 are in the same nibble-half (both low or both high).
+// We can extract with: byte = qs[pos0 & 15], shift = (pos0 >= 16) ? 4 : 0.
+// ============================================================================
+
+static __device__ __forceinline__ void mxfp4_extract_nibble_pair(
+        const uint8_t * qs, int pos0, uint8_t & nib0, uint8_t & nib1) {
+    // pos0 is always even, pos1 = pos0+1. Both are in the same half (low or high nibbles).
+    const int shift = (pos0 >= 16) ? 4 : 0;
+    const int bi0 = pos0 & 15;  // byte index: equivalent to pos < 16 ? pos : pos - 16
+    const int bi1 = bi0 + 1;    // pos1 = pos0+1, always same half, so bi1 = bi0+1
+    nib0 = (qs[bi0] >> shift) & 0x0F;
+    nib1 = (qs[bi1] >> shift) & 0x0F;
+}
+
+// ============================================================================
+// MXFP6 optimized pair dequant from SoA layout.
+// 32 elements packed as 8 groups of 4, each group = 3 bytes.
+// For an even pos0, pos0 and pos1=pos0+1 are always in the same group
+// (since even/odd pairs only cross groups at pos0=3→pos1=4, 7→8, etc.,
+// but pos0 is always even so this never happens: even%4 ∈ {0,2}, never 3).
+// This means we ALWAYS unpack one group and extract two elements.
+// ============================================================================
+
+static __device__ __forceinline__ void mxfp6_unpack_pair(
+        const uint8_t * qs_block, int pos0, uint8_t & v0, uint8_t & v1) {
+    // pos0 is always even → pos0%4 ∈ {0, 2} → grp0 == grp1 always
+    const int grp  = pos0 / 4;
+    const int slot = pos0 % 4;  // 0 or 2
+    uint8_t vals[4];
+    ggml_mxfp_unpack_fp6x4(qs_block + grp * 3, vals);
+    v0 = vals[slot];
+    v1 = vals[slot + 1];
+}
+
+// ============================================================================
 // MXFP element dequant via hardware intrinsics (CUDA 12.8+ / sm_100+).
 // These replace the portable LUT lookups with single-instruction conversions.
 // Safe decode only — encode intrinsics (float→E8M0) have rounding bugs.

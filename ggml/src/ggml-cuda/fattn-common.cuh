@@ -562,23 +562,18 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4(
         // elem is always even, so elem and elem+1 are always in the same 32-element block.
         const int blk = elem / 32;
         const int pos0 = elem % 32;
-        const int pos1 = pos0 + 1;  // always pos0+1 since elem is even → pos0 <= 30
 
-        const uint8_t * qs = qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk);
-        const int byte_idx0 = pos0 < 16 ? pos0 : pos0 - 16;
-        const uint8_t nibble0 = (pos0 < 16) ? (qs[byte_idx0] & 0x0F) : (qs[byte_idx0] >> 4);
-        const int byte_idx1 = pos1 < 16 ? pos1 : pos1 - 16;
-        const uint8_t nibble1 = (pos1 < 16) ? (qs[byte_idx1] & 0x0F) : (qs[byte_idx1] >> 4);
+        uint8_t nib0, nib1;
+        mxfp4_extract_nibble_pair(qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk), pos0, nib0, nib1);
 
 #if CUDART_VERSION >= 12080
-        // Intrinsic returns raw E2M1 value — use full scale, not half-scale.
         const float d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
-        const float k0 = mxfp4_dequant_intrinsic(nibble0) * d;
-        const float k1 = mxfp4_dequant_intrinsic(nibble1) * d;
+        const float k0 = mxfp4_dequant_intrinsic(nib0) * d;
+        const float k1 = mxfp4_dequant_intrinsic(nib1) * d;
 #else
         const float d = ggml_mxfp_e8m0_to_fp32_half(e8m0_base[blk]);
-        const float k0 = kvalues_mxfp4[nibble0] * d;
-        const float k1 = kvalues_mxfp4[nibble1] * d;
+        const float k0 = kvalues_mxfp4[nib0] * d;
+        const float k1 = kvalues_mxfp4[nib1] * d;
 #endif
 
         const float2 Q_f2 = ((const float2 *)Q_v)[i0/nthreads];
@@ -651,40 +646,20 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp6(
         // elem is always even, so elem and elem+1 are always in the same 32-element block.
         const int blk  = elem / 32;
         const int pos0 = elem % 32;
-        const int pos1 = pos0 + 1;
-        const float d  = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
-        const int qs_off = MXFP_SOA_QS_OFFSET(blk, qs_per_blk);
+        const float d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
 
-        // Unpack 6-bit elements — uses shared ggml_mxfp_unpack_fp6x4() and ggml_mxfp_fp6_e2m3_to_float()
-        // Consecutive even/odd elements may share a group (pos/4) or span two groups.
-        const int grp0  = pos0 / 4, slot0 = pos0 % 4;
-        const int grp1  = pos1 / 4, slot1 = pos1 % 4;
+        // pos0 is always even → grp0 == grp1 always → one unpack for both elements
+        uint8_t v0, v1;
+        mxfp6_unpack_pair(qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk), pos0, v0, v1);
 
         float k0, k1;
-        if (grp0 == grp1) {
-            // Common case: both elements in the same 4-element group — one unpack
-            uint8_t vals[4];
-            ggml_mxfp_unpack_fp6x4(qs_base + qs_off + grp0 * 3, vals);
 #if CUDART_VERSION >= 12080
-            k0 = mxfp6_dequant_intrinsic(vals[slot0]) * d;
-            k1 = mxfp6_dequant_intrinsic(vals[slot1]) * d;
+        k0 = mxfp6_dequant_intrinsic(v0) * d;
+        k1 = mxfp6_dequant_intrinsic(v1) * d;
 #else
-            k0 = ggml_mxfp_fp6_e2m3_to_float(vals[slot0]) * d;
-            k1 = ggml_mxfp_fp6_e2m3_to_float(vals[slot1]) * d;
+        k0 = ggml_mxfp_fp6_e2m3_to_float(v0) * d;
+        k1 = ggml_mxfp_fp6_e2m3_to_float(v1) * d;
 #endif
-        } else {
-            // Boundary case: elements straddle two groups (pos0=3, pos1=4)
-            uint8_t vals0[4], vals1[4];
-            ggml_mxfp_unpack_fp6x4(qs_base + qs_off + grp0 * 3, vals0);
-            ggml_mxfp_unpack_fp6x4(qs_base + qs_off + grp1 * 3, vals1);
-#if CUDART_VERSION >= 12080
-            k0 = mxfp6_dequant_intrinsic(vals0[slot0]) * d;
-            k1 = mxfp6_dequant_intrinsic(vals1[slot1]) * d;
-#else
-            k0 = ggml_mxfp_fp6_e2m3_to_float(vals0[slot0]) * d;
-            k1 = ggml_mxfp_fp6_e2m3_to_float(vals1[slot1]) * d;
-#endif
-        }
 
         const float2 Q_f2 = ((const float2 *)Q_v)[i0/nthreads];
         sum += k0 * Q_f2.x + k1 * Q_f2.y;
@@ -726,8 +701,8 @@ static __device__ __forceinline__ void dequantize_V_mxfp4_D(const void * __restr
             prev_blk = blk;
         }
 
-        const int byte_idx = pos < 16 ? pos : pos - 16;
-        const uint8_t nibble = (pos < 16) ? (qs[byte_idx] & 0x0F) : (qs[byte_idx] >> 4);
+        const int shift = (pos >= 16) ? 4 : 0;
+        const uint8_t nibble = (qs[pos & 15] >> shift) & 0x0F;
 #if CUDART_VERSION >= 12080
         ((float *)dst)[l] = mxfp4_dequant_intrinsic(nibble) * d;
 #else
