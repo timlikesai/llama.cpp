@@ -225,6 +225,35 @@ int main(int argc, char * argv[]) {
         }
     }
 
+    // MXFP traits guards: ALL MXFP flash attention MUST use SoA layout.
+    // Every MXFP type must have SoA traits for flash attention KV cache.
+    // MXFP6/MXFP8 are KV-cache-only — they must NOT have AoS CPU dequant.
+    // MXFP4 has AoS for model weights (upstream) but flash attention still uses SoA.
+    {
+        const ggml_type all_mxfp_types[] = { GGML_TYPE_MXFP4_E2M1, GGML_TYPE_MXFP8_E4M3, GGML_TYPE_MXFP6_E2M3 };
+        for (ggml_type type : all_mxfp_types) {
+            const auto * cpu = ggml_get_type_traits_cpu(type);
+
+            // ALL MXFP types must have SoA paths (flash attention KV cache uses SoA exclusively)
+            failed = !(cpu->from_float_soa && cpu->to_float_soa);
+            num_failed += failed;
+            if (failed || verbose) {
+                printf("%5s SoA traits present:               %s\n", ggml_type_name(type), RESULT_STR[failed]);
+            }
+        }
+
+        // MXFP6/MXFP8 are KV-cache-only — must NOT have AoS CPU dequant
+        const ggml_type kv_only_types[] = { GGML_TYPE_MXFP8_E4M3, GGML_TYPE_MXFP6_E2M3 };
+        for (ggml_type type : kv_only_types) {
+            const auto * cpu = ggml_get_type_traits_cpu(type);
+            failed = (cpu->to_float != nullptr);
+            num_failed += failed;
+            if (failed || verbose) {
+                printf("%5s AoS CPU to_float absent:          %s\n", ggml_type_name(type), RESULT_STR[failed]);
+            }
+        }
+    }
+
     // MXFP element converter validation against canonical LUT reference values.
     // Tests that IEEE-754 bit reconstruction in converters matches the OCP MX spec tables.
     {
