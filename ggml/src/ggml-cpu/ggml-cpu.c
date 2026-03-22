@@ -265,7 +265,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_1,
         .nrows                    = 1,
     },
-    [GGML_TYPE_MXFP4_E2M1] = {
+    [GGML_TYPE_MXFP4] = {
         .from_float               = quantize_row_mxfp4,
         .from_float_soa           = quantize_row_mxfp4_soa,
         .to_float_soa             = dequantize_row_mxfp4_soa_cpu,
@@ -279,7 +279,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
-    [GGML_TYPE_MXFP8_E4M3] = {
+    [GGML_TYPE_MXFP8] = {
         .from_float               = quantize_row_mxfp8,
         .from_float_soa           = quantize_row_mxfp8_soa,
         .to_float_soa             = dequantize_row_mxfp8_soa_cpu,
@@ -287,7 +287,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
-    [GGML_TYPE_MXFP6_E2M3] = {
+    [GGML_TYPE_MXFP6] = {
         .from_float               = quantize_row_mxfp6,
         .from_float_soa           = quantize_row_mxfp6_soa,
         .to_float_soa             = dequantize_row_mxfp6_soa_cpu,
