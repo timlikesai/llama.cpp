@@ -263,6 +263,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     // MXFP SoA flash attention — always included (not behind GGML_CUDA_FA_ALL_QUANTS)
@@ -349,7 +350,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // Allow mixed MXFP K/V — only higher-precision K with MXFP4 V
         const bool mxfp_mixed = ggml_is_type_mxfp(K->type) && V->type == GGML_TYPE_MXFP4
                                 && K->type != GGML_TYPE_MXFP4;
-        if (!mxfp_mixed) {
+        // Allow q8_0 K + q4_0 V — common high-quality mixed config
+        const bool q8_q4_mixed = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0;
+        if (!mxfp_mixed && !q8_q4_mixed) {
             return BEST_FATTN_KERNEL_NONE;
         }
     }
