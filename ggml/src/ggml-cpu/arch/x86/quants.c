@@ -3850,20 +3850,11 @@ static inline __m256 mxfp_dequant_avx2(
     return _mm256_blendv_ps(normal, sub_val, is_sub);
 }
 
-// Unpack 4 tightly-packed 6-bit values from 3 bytes into separate bytes.
-static inline void unpack_fp6x4_avx2(const uint8_t * p, uint8_t out[4]) {
-    const uint32_t pk = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
-    out[0] = (pk >>  0) & 0x3F;
-    out[1] = (pk >>  6) & 0x3F;
-    out[2] = (pk >> 12) & 0x3F;
-    out[3] = (pk >> 18) & 0x3F;
-}
-
 // Unpack 8 FP6 values (two groups of 4) from packed qs data at offset j.
 static inline __m256i unpack_fp6x8_avx2(const uint8_t * qs, int j) {
     uint8_t unpacked[8];
-    unpack_fp6x4_avx2(qs + (j * 3 / 4),       unpacked);
-    unpack_fp6x4_avx2(qs + ((j + 4) * 3 / 4), unpacked + 4);
+    ggml_mxfp_unpack_fp6x4(qs + (j * 3 / 4),       unpacked);
+    ggml_mxfp_unpack_fp6x4(qs + ((j + 4) * 3 / 4), unpacked + 4);
     return _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)unpacked));
 }
 

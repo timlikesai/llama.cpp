@@ -4191,12 +4191,8 @@ static inline float32x4_t mxfp6_dequant_neon(
 
 // Unpack 4 tightly-packed 6-bit values from 3 bytes, widen to uint32x4_t.
 static inline uint32x4_t unpack_fp6x4_neon(const uint8_t * p) {
-    const uint32_t pk = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
     uint8_t u[4];
-    u[0] = (pk >>  0) & 0x3F;
-    u[1] = (pk >>  6) & 0x3F;
-    u[2] = (pk >> 12) & 0x3F;
-    u[3] = (pk >> 18) & 0x3F;
+    ggml_mxfp_unpack_fp6x4(p, u);
     const uint8x8_t raw8 = vcreate_u8(
         (uint64_t)u[0] | ((uint64_t)u[1] << 8) |
         ((uint64_t)u[2] << 16) | ((uint64_t)u[3] << 24));
