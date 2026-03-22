@@ -279,10 +279,9 @@ static inline int best_index_mxfp4(float x, float e);
 
 // MSE error for MXFP4 (kvalues are doubled, so scale is halved)
 static float mse_error_mxfp4(float val, float inv_scale, float scale) {
-    const float d = scale * 0.5f;
-    const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
+    const float inv_d = inv_scale * 2.0f;
     const float normalized = fabsf(val) * inv_d;
-    (void)inv_scale;
+    const float d = scale * 0.5f;
     float qval;
     if      (normalized < 0.5f)  qval = 0.0f;
     else if (normalized < 1.5f)  qval = 1.0f;
@@ -320,10 +319,12 @@ static inline uint8_t mxfp_compute_e8m0_mse(const float * x, int qk, const mxfp_
         const float test_scale = GGML_E8M0_TO_FP32((uint8_t)test_e);
         const float test_inv = 1.0f / test_scale;
         float mse = 0.0f;
-        for (int j = 0; j < qk; ++j) {
-            if (traits->mse_error) {
+        if (traits->mse_error) {
+            for (int j = 0; j < qk; ++j) {
                 mse += traits->mse_error(x[j], test_inv, test_scale);
-            } else {
+            }
+        } else {
+            for (int j = 0; j < qk; ++j) {
                 const float recon = traits->to_float(traits->to_elem(x[j] * test_inv)) * test_scale;
                 const float err = x[j] - recon;
                 mse += err * err;

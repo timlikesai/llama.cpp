@@ -8739,7 +8739,6 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     if (is_mxfp_v) { GGML_ASSERT(DV <= MXFP_FA_MAX_D); }
 
     float k_dequant_buf[MXFP_FA_MAX_D];
-    float v_dequant_buf[MXFP_FA_MAX_D];
 
     char k_head_soa[MXFP_FA_SOA_BUF];
     char v_head_soa[MXFP_FA_SOA_BUF];
@@ -8933,8 +8932,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 } else if (mxfp.v.dequantize) {
                     const char * v_row = mxfp_row_ptr(mxfp.v, (const char *)v->data,
                         ic + tk, nbv1, iv2, nbv2, iv3, nbv3);
-                    mxfp_dequant_head(mxfp.v, v_row, iv2, v_head_soa, v_dequant_buf, DV);
-                    memcpy(V32 + tk * DV, v_dequant_buf, DV * sizeof(float));
+                    mxfp_dequant_head(mxfp.v, v_row, iv2, v_head_soa, V32 + tk * DV, DV);
                 } else {
                     v_to_float(v_data, V32 + tk * DV, DV);
                 }
