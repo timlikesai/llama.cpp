@@ -200,7 +200,8 @@ static_assert(sizeof(block_q4_1) == 2 * sizeof(ggml_half) + QK4_1 / 2, "wrong q4
 
 // E8M0 shared exponent constants (OCP MX v1.0 SS5.3).
 // EMAX_OFFSET = ceil(log2(max_finite)), MSE_RANGE = search radius for optimal scale.
-#define MXFP_E8M0_MSE_RANGE      2
+// ±1 is sufficient — base estimate is always within 1 step of optimal.
+#define MXFP_E8M0_MSE_RANGE      1
 #define MXFP4_E2M1_EMAX_OFFSET   2   // ceil(log2(6.0))
 #define MXFP6_E2M3_EMAX_OFFSET   3   // ceil(log2(7.5))
 #define MXFP6_E3M2_EMAX_OFFSET   5   // ceil(log2(28.0))
