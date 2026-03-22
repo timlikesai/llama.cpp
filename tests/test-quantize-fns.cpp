@@ -391,6 +391,321 @@ int main(int argc, char * argv[]) {
         }
     }
 
+    // Element converter edge cases: subnormals, max finite, saturation, NaN, sign.
+    // These catch the bugs backend implementers hit most often.
+    {
+        struct conv_check {
+            const char * name;
+            float        input;
+            uint8_t      expected_bits;
+            float      (*to_float)(uint8_t);
+            uint8_t    (*to_quant)(float);
+        };
+
+        // FP4 E2M1: subnormal=0.5, max=6.0, negative
+        // FP6 E2M3: subnormal=0.125, max=7.5
+        // FP6 E3M2: subnormal=0.0625, max=28.0, exp=7 is NORMAL (not Inf)
+        // FP8 E4M3: subnormal=1/512, max=448, 0x7F=NaN not max
+        // FP8 E5M2: subnormal=1/16384, max=57344
+
+        const conv_check checks[] = {
+            // FP4 E2M1 — [S(1)|E(2)|M(1)], bias=0
+            { "fp4 zero",      0.0f,    0x00, nullptr, nullptr },
+            { "fp4 sub 0.5",   0.5f,    0x01, nullptr, nullptr },
+            { "fp4 norm 1.0",  1.0f,    0x02, nullptr, nullptr },
+            { "fp4 max 6.0",   6.0f,    0x07, nullptr, nullptr },
+            { "fp4 neg -3.0", -3.0f,    0x0D, nullptr, nullptr },
+            { "fp4 sat 100",  100.0f,   0x07, nullptr, nullptr },  // saturates to max
+
+            // FP8 E4M3 — [S(1)|E(4)|M(3)], bias=7
+            { "e4m3 zero",      0.0f,    0x00, fp8_e4m3_to_float, float_to_fp8_e4m3_rn },
+            { "e4m3 sub",       1.0f/512, 0x01, fp8_e4m3_to_float, float_to_fp8_e4m3_rn },
+            { "e4m3 max 448",   448.0f,  0x7E, fp8_e4m3_to_float, float_to_fp8_e4m3_rn },
+            { "e4m3 sat 500",   500.0f,  0x7E, fp8_e4m3_to_float, float_to_fp8_e4m3_rn },  // NOT 0x7F (NaN)
+            { "e4m3 neg -1",   -1.0f,    0xB8, fp8_e4m3_to_float, float_to_fp8_e4m3_rn },
+
+            // FP6 E2M3 — [S(1)|E(2)|M(3)], no NaN/Inf
+            { "e2m3 zero",      0.0f,    0x00, fp6_e2m3_to_float, float_to_fp6_e2m3_rn },
+            { "e2m3 sub",       0.125f,  0x01, fp6_e2m3_to_float, float_to_fp6_e2m3_rn },
+            { "e2m3 max 7.5",   7.5f,    0x1F, fp6_e2m3_to_float, float_to_fp6_e2m3_rn },
+            { "e2m3 sat 100",   100.0f,  0x1F, fp6_e2m3_to_float, float_to_fp6_e2m3_rn },
+
+            // FP6 E3M2 — [S(1)|E(3)|M(2)], no NaN/Inf, exp=7 is NORMAL
+            { "e3m2 zero",      0.0f,    0x00, fp6_e3m2_to_float, float_to_fp6_e3m2_rn },
+            { "e3m2 sub",       0.0625f, 0x01, fp6_e3m2_to_float, float_to_fp6_e3m2_rn },
+            { "e3m2 max 28.0",  28.0f,   0x1F, fp6_e3m2_to_float, float_to_fp6_e3m2_rn },
+            { "e3m2 exp7 16",   16.0f,   0x1C, fp6_e3m2_to_float, float_to_fp6_e3m2_rn },  // exp=7, mant=0
+
+            // FP8 E5M2 — [S(1)|E(5)|M(2)], bias=15
+            { "e5m2 zero",      0.0f,    0x00, fp8_e5m2_to_float, float_to_fp8_e5m2_rn },
+            { "e5m2 max",       57344.f, 0x7B, fp8_e5m2_to_float, float_to_fp8_e5m2_rn },
+        };
+
+        int conv_bad = 0;
+        for (const auto & c : checks) {
+            uint8_t got;
+            if (c.to_quant) {
+                got = c.to_quant(c.input);
+            } else {
+                got = ggml_mxfp_float_to_fp4_e2m1(c.input);
+            }
+            if (got != c.expected_bits) {
+                if (conv_bad == 0 || verbose) {
+                    printf("  %s: quantize(%.6g) = 0x%02X, expected 0x%02X\n",
+                           c.name, c.input, got, c.expected_bits);
+                }
+                conv_bad++;
+            }
+        }
+
+        // FP8 E4M3: 0x7F must dequantize to NaN
+        {
+            float nan_val = fp8_e4m3_to_float(0x7F);
+            if (!isnan(nan_val)) {
+                if (conv_bad == 0 || verbose) {
+                    printf("  e4m3 0x7F dequant: expected NaN, got %.6g\n", nan_val);
+                }
+                conv_bad++;
+            }
+        }
+
+        // FP6 E3M2: exp=7 must dequant to valid float (NOT Inf/NaN)
+        {
+            float exp7_val = fp6_e3m2_to_float(0x1F);  // max: exp=7, mant=3 → 28.0
+            if (isnan(exp7_val) || exp7_val != 28.0f) {
+                if (conv_bad == 0 || verbose) {
+                    printf("  e3m2 0x1F dequant: expected 28.0, got %.6g\n", exp7_val);
+                }
+                conv_bad++;
+            }
+        }
+
+        failed = (conv_bad > 0);
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("  element converter edge cases:        %s (%d/%d passed)\n",
+                   RESULT_STR[failed],
+                   (int)(sizeof(checks)/sizeof(checks[0])) + 2 - conv_bad,
+                   (int)(sizeof(checks)/sizeof(checks[0])) + 2);
+        }
+    }
+
+    // FP6 pack/unpack round-trip: every backend must reimplement this bit packing.
+    {
+        int pack_bad = 0;
+
+        // Test all 64 possible 6-bit values in each of the 4 positions
+        for (int pos = 0; pos < 4; pos++) {
+            for (int val = 0; val < 64; val++) {
+                uint8_t in[4] = {0, 0, 0, 0};
+                in[pos] = (uint8_t)val;
+
+                uint8_t packed[3], out[4];
+                pack_fp6x4(in, packed);
+                unpack_fp6x4(packed, out);
+
+                if (out[pos] != (uint8_t)val) {
+                    if (pack_bad == 0 || verbose) {
+                        printf("  fp6 pack roundtrip: pos=%d val=0x%02X → got 0x%02X\n",
+                               pos, val, out[pos]);
+                    }
+                    pack_bad++;
+                }
+                // Other positions must remain 0
+                for (int k = 0; k < 4; k++) {
+                    if (k != pos && out[k] != 0) {
+                        if (pack_bad == 0 || verbose) {
+                            printf("  fp6 pack crosstalk: pos=%d val=0x%02X leaked to pos=%d (0x%02X)\n",
+                                   pos, val, k, out[k]);
+                        }
+                        pack_bad++;
+                    }
+                }
+            }
+        }
+
+        // Known-answer: pack [0x3F, 0x00, 0x3F, 0x00] and verify exact bytes
+        {
+            uint8_t in[4] = {0x3F, 0x00, 0x3F, 0x00};
+            uint8_t packed[3];
+            pack_fp6x4(in, packed);
+            // 0x3F = 0b111111, 0x00 = 0b000000
+            // bits: 111111 000000 111111 000000
+            // packed little-endian:
+            //   out[0] = bits[0:7]  = 0x3F (111111|00)
+            //   out[1] = bits[8:15] = 0xF0 (0000|1111|00|00) → 11110000
+            //   out[2] = bits[16:23]= 0x0F (00|000000|1111) wait...
+            // Let me compute: packed = 0x3F | (0x00 << 6) | (0x3F << 12) | (0x00 << 18)
+            //                        = 0x3F | 0 | 0x3F000 | 0 = 0x3F03F
+            // out[0] = 0x3F & 0xFF = 0x3F
+            // out[1] = (0x3F03F >> 8) & 0xFF = 0x3F0 & 0xFF = 0xF0... wait
+            // 0x3F03F = 0000 0000 0000 0011 1111 0000 0011 1111
+            // out[0] = lower 8 bits = 0011 1111 = 0x3F
+            // out[1] = bits 8-15    = 1111 0000 = 0xF0
+            // out[2] = bits 16-23   = 0000 0011 = 0x03
+            uint8_t expected[3] = {0x3F, 0xF0, 0x03};
+            if (packed[0] != expected[0] || packed[1] != expected[1] || packed[2] != expected[2]) {
+                if (pack_bad == 0 || verbose) {
+                    printf("  fp6 known-answer: packed [%02X,%02X,%02X] expected [%02X,%02X,%02X]\n",
+                           packed[0], packed[1], packed[2], expected[0], expected[1], expected[2]);
+                }
+                pack_bad++;
+            }
+        }
+
+        failed = (pack_bad > 0);
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("  fp6 pack/unpack round-trip:           %s\n", RESULT_STR[failed]);
+        }
+    }
+
+    // E8M0 scale: verify HALF vs FULL distinction and known-answer decode.
+    // MXFP4 uses HALF (kvalues_mxfp4 are doubled), MXFP6/8 use FULL.
+    {
+        int e8m0_bad = 0;
+
+        // Known-answer E8M0 decodes
+        struct { uint8_t e; float expected; } e8m0_known[] = {
+            { 127, 1.0f },     // 2^(127-127) = 2^0 = 1.0
+            { 128, 2.0f },     // 2^(128-127) = 2^1 = 2.0
+            { 126, 0.5f },     // 2^(126-127) = 2^(-1) = 0.5
+            { 254, 1.70141183e+38f }, // 2^127 (max representable)
+            {   1, 1.17549435e-38f }, // 2^(-126) (min normal)
+        };
+        for (const auto & t : e8m0_known) {
+            float got = ggml_mxfp_e8m0_to_fp32(t.e);
+            if (got != t.expected) {
+                if (e8m0_bad == 0 || verbose) {
+                    printf("  E8M0 decode e=%d: got %.8g, expected %.8g\n", t.e, got, t.expected);
+                }
+                e8m0_bad++;
+            }
+        }
+
+        // HALF must be exactly half of FULL for all valid exponents
+        for (int e = 2; e < 255; e++) {
+            float full = ggml_mxfp_e8m0_to_fp32((uint8_t)e);
+            float half = ggml_mxfp_e8m0_to_fp32_half((uint8_t)e);
+            if (half != full * 0.5f) {
+                if (e8m0_bad == 0 || verbose) {
+                    printf("  E8M0 HALF!=FULL/2 at e=%d: half=%.8g, full/2=%.8g\n", e, half, full * 0.5f);
+                }
+                e8m0_bad++;
+                break;  // one failure is enough to flag the pattern
+            }
+        }
+
+        failed = (e8m0_bad > 0);
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("  E8M0 known-answer + HALF/FULL:       %s\n", RESULT_STR[failed]);
+        }
+    }
+
+    // E8M0 rounding boundary: the sqrt(2) threshold (mantissa 0x3504F3).
+    // Floor-only implementations miss this and cause PPL regression.
+    {
+        int round_bad = 0;
+
+        // amax=1.0: floor_log2=0, mantissa=0 → no round → e_base = 0 - 0 + 127 = 127
+        {
+            int e = ggml_mxfp_e8m0_base_estimate(1.0f, 0);
+            if (e != 127) {
+                printf("  E8M0 round: amax=1.0 → e=%d, expected 127\n", e);
+                round_bad++;
+            }
+        }
+        // amax=2.0: floor_log2=1, mantissa=0 → no round → e_base = 1 + 127 = 128
+        {
+            int e = ggml_mxfp_e8m0_base_estimate(2.0f, 0);
+            if (e != 128) {
+                printf("  E8M0 round: amax=2.0 → e=%d, expected 128\n", e);
+                round_bad++;
+            }
+        }
+        // amax just below sqrt(2): mantissa < 0x3504F3 → floor only → e=127
+        {
+            // 1.41421 has IEEE mantissa just below 0x3504F3
+            float below = 1.4142f;
+            int e = ggml_mxfp_e8m0_base_estimate(below, 0);
+            if (e != 127) {
+                printf("  E8M0 round: amax=%.6f → e=%d, expected 127 (no round)\n", below, e);
+                round_bad++;
+            }
+        }
+        // amax at sqrt(2): mantissa >= 0x3504F3 → rounds up → e=128
+        {
+            float at_sqrt2 = 1.41422f;
+            int e = ggml_mxfp_e8m0_base_estimate(at_sqrt2, 0);
+            if (e != 128) {
+                printf("  E8M0 round: amax=%.6f → e=%d, expected 128 (rounds up)\n", at_sqrt2, e);
+                round_bad++;
+            }
+        }
+        // Verify emax_offset shifts the result
+        {
+            int e_no_off = ggml_mxfp_e8m0_base_estimate(448.0f, 0);
+            int e_e4m3   = ggml_mxfp_e8m0_base_estimate(448.0f, MXFP8_E4M3_EMAX_OFFSET);
+            if (e_no_off - e_e4m3 != MXFP8_E4M3_EMAX_OFFSET) {
+                printf("  E8M0 emax_offset: diff=%d, expected %d\n",
+                       e_no_off - e_e4m3, MXFP8_E4M3_EMAX_OFFSET);
+                round_bad++;
+            }
+        }
+
+        failed = (round_bad > 0);
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("  E8M0 rounding boundary:              %s\n", RESULT_STR[failed]);
+        }
+    }
+
+    // Element converter exhaustive round-trip: quantize(dequantize(i)) == i for all valid bit patterns.
+    // Catches asymmetries between the to_float and to_quant paths.
+    {
+        struct rt_test {
+            const char * name;
+            int           count;
+            float       (*to_float)(uint8_t);
+            uint8_t     (*to_quant)(float);
+            uint8_t       nan_bits;   // bit pattern for NaN (0 = no NaN in format)
+        };
+
+        const rt_test rt_tests[] = {
+            { "fp8_e4m3", 256, fp8_e4m3_to_float, float_to_fp8_e4m3_rn, 0x7F },
+            { "fp8_e5m2", 256, fp8_e5m2_to_float, float_to_fp8_e5m2_rn, 0    },
+            { "fp6_e2m3",  64, fp6_e2m3_to_float, float_to_fp6_e2m3_rn, 0    },
+            { "fp6_e3m2",  64, fp6_e3m2_to_float, float_to_fp6_e3m2_rn, 0    },
+        };
+
+        for (const auto & t : rt_tests) {
+            int rt_bad = 0;
+            for (int i = 0; i < t.count; i++) {
+                if ((uint8_t)i == t.nan_bits) continue;  // skip NaN — quantize(NaN) is implementation-defined
+
+                float f = t.to_float((uint8_t)i);
+                if (isnan(f) || isinf(f)) continue;  // E5M2 Inf/NaN
+
+                uint8_t back = t.to_quant(f);
+                // Negative zero may round-trip to positive zero — both are valid
+                if (back != (uint8_t)i && !(f == 0.0f && t.to_float(back) == 0.0f)) {
+                    if (rt_bad == 0 || verbose) {
+                        printf("  %s roundtrip: 0x%02X → %.6g → 0x%02X\n",
+                               t.name, i, f, back);
+                    }
+                    rt_bad++;
+                }
+            }
+            failed = (rt_bad > 0);
+            num_failed += failed;
+            if (failed || verbose) {
+                printf("%5s converter round-trip:             %s (%d/%d survived)\n",
+                       t.name, RESULT_STR[failed], t.count - rt_bad, t.count);
+            }
+        }
+    }
+
     // E8M0 scale computation: verify base exponent is reasonable for various amax values
     {
         const float test_amax[] = { 0.001f, 0.1f, 1.0f, 6.0f, 100.0f, 448.0f, 10000.0f };

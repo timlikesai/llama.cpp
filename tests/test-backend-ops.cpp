@@ -163,30 +163,31 @@ extern "C" {
 typedef void (*mxfp_soa_quantize_fn)(const float *, void *, int64_t);
 typedef void (*mxfp_soa_dequantize_fn)(const void *, float *, int64_t);
 
-static mxfp_soa_quantize_fn get_mxfp_soa_quantize(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_MXFP4_E2M1: return quantize_row_mxfp4_soa;
-        case GGML_TYPE_MXFP8_E4M3: return quantize_row_mxfp8_soa;
-        case GGML_TYPE_MXFP6_E2M3: return quantize_row_mxfp6_soa;
-        default: return nullptr;
-    }
-}
+struct mxfp_soa_fns {
+    ggml_type              type;
+    mxfp_soa_quantize_fn   quantize;
+    mxfp_soa_dequantize_fn dequantize;
+};
 
-static mxfp_soa_dequantize_fn get_mxfp_soa_dequantize(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_MXFP4_E2M1: return dequantize_row_mxfp4_soa;
-        case GGML_TYPE_MXFP8_E4M3: return dequantize_row_mxfp8_soa;
-        case GGML_TYPE_MXFP6_E2M3: return dequantize_row_mxfp6_soa;
-        default: return nullptr;
+static const mxfp_soa_fns mxfp_soa_table[] = {
+    { GGML_TYPE_MXFP4_E2M1, quantize_row_mxfp4_soa, dequantize_row_mxfp4_soa },
+    { GGML_TYPE_MXFP8_E4M3, quantize_row_mxfp8_soa, dequantize_row_mxfp8_soa },
+    { GGML_TYPE_MXFP6_E2M3, quantize_row_mxfp6_soa, dequantize_row_mxfp6_soa },
+};
+
+static const mxfp_soa_fns * get_mxfp_soa(ggml_type type) {
+    for (const auto & e : mxfp_soa_table) {
+        if (e.type == type) return &e;
     }
+    return nullptr;
 }
 
 // Initialize an MXFP tensor with SoA layout (soa_bytes = region width, 0 = one row).
 static void init_tensor_mxfp_soa(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(ggml_is_type_mxfp(tensor->type));
 
-    auto quantize_soa = get_mxfp_soa_quantize(tensor->type);
-    GGML_ASSERT(quantize_soa && "unsupported MXFP type for SoA init");
+    const auto * soa = get_mxfp_soa(tensor->type);
+    GGML_ASSERT(soa && "unsupported MXFP type for SoA init");
 
     const int64_t DK         = tensor->ne[0];
     const size_t  row_sz     = ggml_row_size(tensor->type, DK);
@@ -209,7 +210,7 @@ static void init_tensor_mxfp_soa(ggml_tensor * tensor, float min = -1.0f, float 
             for (int64_t i1 = 0; i1 < tensor->ne[1]; i1++) {
                 size_t offset = i3*tensor->nb[3] + i1*tensor->nb[1];
                 for (int64_t j = 0; j < soa_elems; j++) { region[j] = dist(gen); }
-                quantize_soa(region.data(), buf.data() + offset, soa_elems);
+                soa->quantize(region.data(), buf.data() + offset, soa_elems);
             }
         }
     } else {
@@ -221,7 +222,7 @@ static void init_tensor_mxfp_soa(ggml_tensor * tensor, float min = -1.0f, float 
                 for (int64_t i1 = 0; i1 < tensor->ne[1]; i1++) {
                     size_t offset = i3*tensor->nb[3] + i2*tensor->nb[2] + i1*tensor->nb[1];
                     for (int64_t j = 0; j < DK; j++) { region[j] = dist(gen); }
-                    quantize_soa(region.data(), buf.data() + offset, DK);
+                    soa->quantize(region.data(), buf.data() + offset, DK);
                 }
             }
         }
@@ -324,8 +325,9 @@ static std::vector<float> tensor_to_float(const ggml_tensor * t) {
     mxfp_soa_dequantize_fn mxfp_dequant_soa = nullptr;
     std::vector<float> mxfp_row_f32;
     if (is_mxfp) {
-        mxfp_dequant_soa = get_mxfp_soa_dequantize(t->type);
-        GGML_ASSERT(mxfp_dequant_soa && "unsupported MXFP type in tensor_to_float");
+        const auto * soa_fns = get_mxfp_soa(t->type);
+        GGML_ASSERT(soa_fns && "unsupported MXFP type in tensor_to_float");
+        mxfp_dequant_soa = soa_fns->dequantize;
         mxfp_row_f32.resize(t->ne[0]);
     }
 
