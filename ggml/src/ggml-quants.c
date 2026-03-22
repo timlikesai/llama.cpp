@@ -315,6 +315,46 @@ static inline void quantize_block_mxfp4(const float * GGML_RESTRICT src, uint8_t
     }
 }
 
+// Per-block MXFP4 quantize round-trip: apply quantization error without materializing bytes.
+// Used for Q preprocessing in flash attention — matches K's error pattern.
+static inline void roundtrip_block_mxfp4(float * GGML_RESTRICT vals) {
+    const uint8_t e = mxfp_compute_e8m0(vals, QK_MXFP4, MXFP4_E2M1_EMAX_OFFSET);
+    const float d = GGML_E8M0_TO_FP32_HALF(e);
+    for (int j = 0; j < QK_MXFP4; ++j) {
+        const int idx = best_index_mxfp4(vals[j], d);
+        vals[j] = kvalues_mxfp4[idx] * d;  // kvalues are doubled, d is halved — matches dequant
+    }
+}
+
+// Per-block generic MXFP quantize round-trip (MXFP8/MXFP6).
+static inline void roundtrip_block_mxfp(float * GGML_RESTRICT vals, const mxfp_elem_traits_t * traits) {
+    const uint8_t e = mxfp_compute_e8m0(vals, 32, traits->emax_offset);
+    const float d = GGML_E8M0_TO_FP32(e);
+    const float inv_d = d > 0.0f ? 1.0f / d : 0.0f;
+    for (int j = 0; j < 32; ++j) {
+        vals[j] = traits->to_float(traits->to_elem(vals[j] * inv_d)) * d;
+    }
+}
+
+// Fused Hadamard + quantize round-trip: one pass, output is float with quantization error.
+void mxfp4_hadamard_roundtrip(const float * GGML_RESTRICT src, float * GGML_RESTRICT dst, int64_t k) {
+    assert(k % 32 == 0);
+    for (int64_t i = 0; i < k; i += 32) {
+        memcpy(dst + i, src + i, 32 * sizeof(float));
+        ggml_mxfp_hadamard_32_inplace(dst + i);
+        roundtrip_block_mxfp4(dst + i);
+    }
+}
+
+// Non-Hadamard round-trip for MXFP4 (Hadamard disabled or V cache).
+void mxfp4_roundtrip(const float * GGML_RESTRICT src, float * GGML_RESTRICT dst, int64_t k) {
+    assert(k % 32 == 0);
+    for (int64_t i = 0; i < k; i += 32) {
+        memcpy(dst + i, src + i, 32 * sizeof(float));
+        roundtrip_block_mxfp4(dst + i);
+    }
+}
+
 // Per-block MXFP4 dequant: shared between AoS and SoA paths.
 static inline void dequantize_block_mxfp4(const uint8_t * GGML_RESTRICT qs, uint8_t e, float * GGML_RESTRICT dst) {
     const float d = GGML_E8M0_TO_FP32_HALF(e);
@@ -710,6 +750,41 @@ void quantize_row_mxfp8_soa_hadamard(const float * GGML_RESTRICT x, void * GGML_
 }
 void quantize_row_mxfp6_soa_hadamard(const float * GGML_RESTRICT x, void * GGML_RESTRICT dst, int64_t k) {
     quantize_row_mxfp_soa_hadamard_impl(x, dst, k, &mxfp6_e2m3_traits);
+}
+
+// MXFP8/6 quantize round-trips (with and without Hadamard).
+void mxfp8_hadamard_roundtrip(const float * GGML_RESTRICT src, float * GGML_RESTRICT dst, int64_t k) {
+    assert(k % 32 == 0);
+    for (int64_t i = 0; i < k; i += 32) {
+        memcpy(dst + i, src + i, 32 * sizeof(float));
+        ggml_mxfp_hadamard_32_inplace(dst + i);
+        roundtrip_block_mxfp(dst + i, &mxfp8_e4m3_traits);
+    }
+}
+
+void mxfp6_hadamard_roundtrip(const float * GGML_RESTRICT src, float * GGML_RESTRICT dst, int64_t k) {
+    assert(k % 32 == 0);
+    for (int64_t i = 0; i < k; i += 32) {
+        memcpy(dst + i, src + i, 32 * sizeof(float));
+        ggml_mxfp_hadamard_32_inplace(dst + i);
+        roundtrip_block_mxfp(dst + i, &mxfp6_e2m3_traits);
+    }
+}
+
+void mxfp8_roundtrip(const float * GGML_RESTRICT src, float * GGML_RESTRICT dst, int64_t k) {
+    assert(k % 32 == 0);
+    for (int64_t i = 0; i < k; i += 32) {
+        memcpy(dst + i, src + i, 32 * sizeof(float));
+        roundtrip_block_mxfp(dst + i, &mxfp8_e4m3_traits);
+    }
+}
+
+void mxfp6_roundtrip(const float * GGML_RESTRICT src, float * GGML_RESTRICT dst, int64_t k) {
+    assert(k % 32 == 0);
+    for (int64_t i = 0; i < k; i += 32) {
+        memcpy(dst + i, src + i, 32 * sizeof(float));
+        roundtrip_block_mxfp(dst + i, &mxfp6_e2m3_traits);
+    }
 }
 
 //

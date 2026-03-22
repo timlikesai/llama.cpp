@@ -8372,7 +8372,9 @@ struct mxfp_kv_params {
 
 // MXFP dispatch parameters for flash attention.
 struct mxfp_fa_params {
-    mxfp_soa_quantize_fn q_quantize;
+    mxfp_soa_quantize_fn q_quantize;    // SoA quantize for Q (used only when Hadamard is off AND non-MXFP K path)
+    // Fused Q round-trip: Hadamard + quantize + dequant in one pass, no SoA buffer.
+    void (*q_roundtrip)(const float *, float *, int64_t);
     mxfp_kv_params k;
     mxfp_kv_params v;
     bool apply_hadamard;
@@ -8435,6 +8437,17 @@ static mxfp_fa_params mxfp_fa_params_init(
     if (is_mxfp_k) {
         p.q_quantize = ggml_get_type_traits_cpu(k->type)->from_float_soa;
         p.k = mxfp_kv_params_init(k->type, DK, nbk2, nek2);
+    }
+
+    // Select fused Q round-trip (Hadamard + quantize error, no SoA buffer).
+    if (is_mxfp_k) {
+        const bool had = is_mxfp_k && (DK == DV) && ggml_mxfp_use_hadamard(k->type);
+        switch (k->type) {
+            case GGML_TYPE_MXFP4: p.q_roundtrip = had ? mxfp4_hadamard_roundtrip : mxfp4_roundtrip; break;
+            case GGML_TYPE_MXFP8: p.q_roundtrip = had ? mxfp8_hadamard_roundtrip : mxfp8_roundtrip; break;
+            case GGML_TYPE_MXFP6: p.q_roundtrip = had ? mxfp6_hadamard_roundtrip : mxfp6_roundtrip; break;
+            default: break;
+        }
     }
     if (is_mxfp_v) {
         p.v = mxfp_kv_params_init(v->type, DV, nbv2, nev2);
@@ -8599,17 +8612,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
         float Q_f32[MXFP_FA_MAX_D];
-        if (is_mxfp_k) {
-            // Q preprocessing: Hadamard + SoA round-trip captures same quantization loss as K.
-            if (mxfp.apply_hadamard) {
-                float q_tmp[MXFP_FA_MAX_D];
-                memcpy(q_tmp, pq, DK * sizeof(float));
-                ggml_apply_hadamard_blocks(q_tmp, DK);
-                mxfp.q_quantize(q_tmp, Q_q, DK);
-            } else {
-                mxfp.q_quantize(pq, Q_q, DK);
-            }
-            mxfp.k.dequantize(Q_q, Q_f32, DK);
+        if (mxfp.q_roundtrip) {
+            // Q preprocessing: fused Hadamard + quantize round-trip, no SoA buffer.
+            mxfp.q_roundtrip(pq, Q_f32, DK);
         } else {
             if (mxfp.apply_hadamard) {
                 float q_tmp[MXFP_FA_MAX_D];
@@ -8895,13 +8900,9 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 const float * pq = (const float *) ((char *) q->data + ((iq1 + tq)*nbq1 + iq2*nbq2 + iq3*nbq3));
                 memcpy(Q_f32 + tq * DK, pq, DK * sizeof(float));
 
-                if (is_mxfp_k) {
-                    if (mxfp.apply_hadamard) {
-                        ggml_apply_hadamard_blocks(Q_f32 + tq * DK, DK);
-                    }
-                    uint8_t q_mxfp_buf[MXFP_FA_SOA_BUF];
-                    mxfp.q_quantize(Q_f32 + tq * DK, q_mxfp_buf, DK);
-                    mxfp.k.dequantize(q_mxfp_buf, Q_f32 + tq * DK, DK);
+                if (mxfp.q_roundtrip) {
+                    // In-place: Q_f32 is already populated by memcpy above, roundtrip overwrites.
+                    mxfp.q_roundtrip(Q_f32 + tq * DK, Q_f32 + tq * DK, DK);
                 }
             }
             for (int tq = tile_rows; tq < Q_TILE_SZ; tq++) {
