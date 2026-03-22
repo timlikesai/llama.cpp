@@ -8366,7 +8366,6 @@ typedef void (*mxfp_soa_dequantize_fn)(const void *, float *, int64_t);
 struct mxfp_kv_params {
     mxfp_soa_dequantize_fn dequantize;
     bool    multihead;
-    int64_t soa_elems;
     int     qs_per_block;
     int     head_qs_bytes;
     int64_t head_e8m0_offset;
@@ -8417,7 +8416,6 @@ static mxfp_kv_params mxfp_kv_params_init(ggml_type type, int64_t D, size_t nb2,
     mxfp_kv_params kv = {};
     kv.dequantize      = ggml_get_type_traits_cpu(type)->to_float_soa;
     kv.multihead       = (nb2 == (size_t)ggml_row_size(type, D));
-    kv.soa_elems       = kv.multihead ? ne2 * D : D;
     kv.qs_per_block    = ggml_mxfp_qs_per_block(type);
     kv.blocks_per_head = (int)(D / 32);
     kv.head_qs_bytes   = kv.blocks_per_head * kv.qs_per_block;
