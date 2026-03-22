@@ -2,6 +2,11 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "ggml-quants.h"
+
+#define GGML_COMMON_DECL_CPP
+#define GGML_COMMON_IMPL_CPP
+#include "ggml-common.h"
 
 #undef NDEBUG
 #include <assert.h>
@@ -217,6 +222,70 @@ int main(int argc, char * argv[]) {
         num_failed += failed;
         if (failed || verbose) {
             printf("%5s SoA quantization error:          %s (%f)\n", ggml_type_name(type), RESULT_STR[failed], soa_error);
+        }
+    }
+
+    // MXFP element converter validation against canonical LUT reference values.
+    // Tests that IEEE-754 bit reconstruction in converters matches the OCP MX spec tables.
+    {
+        struct lut_test {
+            const char * name;
+            const float * lut;
+            int           count;
+            float       (*converter)(uint8_t);
+        };
+
+        const lut_test lut_tests[] = {
+            { "fp8_e4m3", kvalues_mxfp8_e4m3, 256, fp8_e4m3_to_float },
+            { "fp8_e5m2", kvalues_mxfp8_e5m2, 256, fp8_e5m2_to_float },
+            { "fp6_e2m3", kvalues_mxfp6_e2m3,  64, fp6_e2m3_to_float },
+            { "fp6_e3m2", kvalues_mxfp6_e3m2,  64, fp6_e3m2_to_float },
+        };
+
+        for (const auto & t : lut_tests) {
+            int mismatches = 0;
+            for (int i = 0; i < t.count; i++) {
+                const float converter_val = t.converter((uint8_t)i);
+                const float lut_val       = t.lut[i];
+
+                // Both NaN → match. Otherwise must be bitwise identical.
+                if (isnan(converter_val) && isnan(lut_val)) continue;
+                if (converter_val != lut_val) {
+                    if (mismatches == 0 || verbose) {
+                        printf("  %s LUT mismatch at [%d]: converter=%.8g, lut=%.8g\n",
+                               t.name, i, converter_val, lut_val);
+                    }
+                    mismatches++;
+                }
+            }
+            failed = (mismatches > 0);
+            num_failed += failed;
+            if (failed || verbose) {
+                printf("%5s converter vs LUT:                %s (%d/%d values match)\n",
+                       t.name, RESULT_STR[failed], t.count - mismatches, t.count);
+            }
+        }
+
+        // FP4 E2M1: converter is in ggml-common.h (static inline), LUT is kvalues_mxfp4_float
+        {
+            int mismatches = 0;
+            for (int i = 0; i < 16; i++) {
+                const float converter_val = ggml_mxfp_fp4_e2m1_to_float((uint8_t)i);
+                const float lut_val       = kvalues_mxfp4_float[i];
+                if (converter_val != lut_val) {
+                    if (mismatches == 0 || verbose) {
+                        printf("  fp4_e2m1 LUT mismatch at [%d]: converter=%.8g, lut=%.8g\n",
+                               i, converter_val, lut_val);
+                    }
+                    mismatches++;
+                }
+            }
+            failed = (mismatches > 0);
+            num_failed += failed;
+            if (failed || verbose) {
+                printf("fp4_e2m1 converter vs LUT:                %s (%d/16 values match)\n",
+                       RESULT_STR[failed], 16 - mismatches);
+            }
         }
     }
 
