@@ -4909,8 +4909,106 @@ void ggml_compute_forward_get_rows(
     //}
 }
 
-// NEON-optimized Hadamard; scalar fallback below
-#if defined(__ARM_NEON)
+// SIMD-optimized Hadamard; scalar fallback below
+#if defined(__AVX2__) || defined(__AVX__)
+static void hadamard_32_inplace(float vals[32]) {
+    // 32 floats = 4 × __m256
+    __m256 v0 = _mm256_loadu_ps(vals +  0);
+    __m256 v1 = _mm256_loadu_ps(vals +  8);
+    __m256 v2 = _mm256_loadu_ps(vals + 16);
+    __m256 v3 = _mm256_loadu_ps(vals + 24);
+
+    // Stride 1: butterfly on adjacent pairs within each 256-bit register
+    {
+        // Interleave even/odd elements, add/sub
+        __m256 a, b, s, d;
+        a = _mm256_shuffle_ps(v0, v0, _MM_SHUFFLE(2, 2, 0, 0));
+        b = _mm256_shuffle_ps(v0, v0, _MM_SHUFFLE(3, 3, 1, 1));
+        s = _mm256_add_ps(a, b); d = _mm256_sub_ps(a, b);
+        v0 = _mm256_shuffle_ps(s, d, _MM_SHUFFLE(2, 0, 2, 0));
+        v0 = _mm256_shuffle_ps(v0, v0, _MM_SHUFFLE(3, 1, 2, 0));
+
+        a = _mm256_shuffle_ps(v1, v1, _MM_SHUFFLE(2, 2, 0, 0));
+        b = _mm256_shuffle_ps(v1, v1, _MM_SHUFFLE(3, 3, 1, 1));
+        s = _mm256_add_ps(a, b); d = _mm256_sub_ps(a, b);
+        v1 = _mm256_shuffle_ps(s, d, _MM_SHUFFLE(2, 0, 2, 0));
+        v1 = _mm256_shuffle_ps(v1, v1, _MM_SHUFFLE(3, 1, 2, 0));
+
+        a = _mm256_shuffle_ps(v2, v2, _MM_SHUFFLE(2, 2, 0, 0));
+        b = _mm256_shuffle_ps(v2, v2, _MM_SHUFFLE(3, 3, 1, 1));
+        s = _mm256_add_ps(a, b); d = _mm256_sub_ps(a, b);
+        v2 = _mm256_shuffle_ps(s, d, _MM_SHUFFLE(2, 0, 2, 0));
+        v2 = _mm256_shuffle_ps(v2, v2, _MM_SHUFFLE(3, 1, 2, 0));
+
+        a = _mm256_shuffle_ps(v3, v3, _MM_SHUFFLE(2, 2, 0, 0));
+        b = _mm256_shuffle_ps(v3, v3, _MM_SHUFFLE(3, 3, 1, 1));
+        s = _mm256_add_ps(a, b); d = _mm256_sub_ps(a, b);
+        v3 = _mm256_shuffle_ps(s, d, _MM_SHUFFLE(2, 0, 2, 0));
+        v3 = _mm256_shuffle_ps(v3, v3, _MM_SHUFFLE(3, 1, 2, 0));
+    }
+
+    // Stride 2: butterfly on pairs separated by 2 within 128-bit lanes
+    {
+        __m256 a, b, s, d;
+        a = _mm256_permute_ps(v0, _MM_SHUFFLE(1, 0, 1, 0));
+        b = _mm256_permute_ps(v0, _MM_SHUFFLE(3, 2, 3, 2));
+        s = _mm256_add_ps(a, b); d = _mm256_sub_ps(a, b);
+        v0 = _mm256_blend_ps(s, d, 0xCC); // 0b11001100
+
+        a = _mm256_permute_ps(v1, _MM_SHUFFLE(1, 0, 1, 0));
+        b = _mm256_permute_ps(v1, _MM_SHUFFLE(3, 2, 3, 2));
+        s = _mm256_add_ps(a, b); d = _mm256_sub_ps(a, b);
+        v1 = _mm256_blend_ps(s, d, 0xCC);
+
+        a = _mm256_permute_ps(v2, _MM_SHUFFLE(1, 0, 1, 0));
+        b = _mm256_permute_ps(v2, _MM_SHUFFLE(3, 2, 3, 2));
+        s = _mm256_add_ps(a, b); d = _mm256_sub_ps(a, b);
+        v2 = _mm256_blend_ps(s, d, 0xCC);
+
+        a = _mm256_permute_ps(v3, _MM_SHUFFLE(1, 0, 1, 0));
+        b = _mm256_permute_ps(v3, _MM_SHUFFLE(3, 2, 3, 2));
+        s = _mm256_add_ps(a, b); d = _mm256_sub_ps(a, b);
+        v3 = _mm256_blend_ps(s, d, 0xCC);
+    }
+
+    // Stride 4: butterfly between 128-bit lanes within each 256-bit register
+    {
+        __m128 lo, hi;
+        lo = _mm256_castps256_ps128(v0); hi = _mm256_extractf128_ps(v0, 1);
+        v0 = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_add_ps(lo, hi)), _mm_sub_ps(lo, hi), 1);
+
+        lo = _mm256_castps256_ps128(v1); hi = _mm256_extractf128_ps(v1, 1);
+        v1 = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_add_ps(lo, hi)), _mm_sub_ps(lo, hi), 1);
+
+        lo = _mm256_castps256_ps128(v2); hi = _mm256_extractf128_ps(v2, 1);
+        v2 = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_add_ps(lo, hi)), _mm_sub_ps(lo, hi), 1);
+
+        lo = _mm256_castps256_ps128(v3); hi = _mm256_extractf128_ps(v3, 1);
+        v3 = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_add_ps(lo, hi)), _mm_sub_ps(lo, hi), 1);
+    }
+
+    // Stride 8: butterfly between registers
+    {
+        __m256 s, d;
+        s = _mm256_add_ps(v0, v1); d = _mm256_sub_ps(v0, v1); v0 = s; v1 = d;
+        s = _mm256_add_ps(v2, v3); d = _mm256_sub_ps(v2, v3); v2 = s; v3 = d;
+    }
+
+    // Stride 16: butterfly between register pairs
+    {
+        __m256 s, d;
+        s = _mm256_add_ps(v0, v2); d = _mm256_sub_ps(v0, v2); v0 = s; v2 = d;
+        s = _mm256_add_ps(v1, v3); d = _mm256_sub_ps(v1, v3); v1 = s; v3 = d;
+    }
+
+    // Normalize by 1/sqrt(32)
+    const __m256 norm = _mm256_set1_ps(MXFP_HADAMARD_32_NORM);
+    _mm256_storeu_ps(vals +  0, _mm256_mul_ps(v0, norm));
+    _mm256_storeu_ps(vals +  8, _mm256_mul_ps(v1, norm));
+    _mm256_storeu_ps(vals + 16, _mm256_mul_ps(v2, norm));
+    _mm256_storeu_ps(vals + 24, _mm256_mul_ps(v3, norm));
+}
+#elif defined(__ARM_NEON)
 static void hadamard_32_inplace(float vals[32]) {
     float32x4_t v0 = vld1q_f32(vals +  0);
     float32x4_t v1 = vld1q_f32(vals +  4);
