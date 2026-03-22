@@ -8293,6 +8293,22 @@ static inline void mxfp_dequant_head(
     }
 }
 
+// Initialize per-KV-type params from tensor metadata.
+// Multihead detection: nb2 == row_size(D) means heads are contiguous within
+// one KV-position stride, so SoA spans all heads. Otherwise SoA is per-head.
+static mxfp_kv_params mxfp_kv_params_init(ggml_type type, int64_t D, size_t nb2, int64_t ne2) {
+    mxfp_kv_params kv = {};
+    kv.dequantize      = ggml_get_type_traits_cpu(type)->to_float_soa;
+    kv.multihead       = (nb2 == (size_t)ggml_row_size(type, D));
+    kv.soa_elems       = kv.multihead ? ne2 * D : D;
+    kv.qs_per_block    = ggml_mxfp_qs_per_block(type);
+    kv.blocks_per_head = (int)(D / 32);
+    kv.head_qs_bytes   = kv.blocks_per_head * kv.qs_per_block;
+    const int64_t total_blocks = kv.multihead ? ne2 * kv.blocks_per_head : kv.blocks_per_head;
+    kv.head_e8m0_offset = total_blocks * kv.qs_per_block;
+    return kv;
+}
+
 static mxfp_fa_params mxfp_fa_params_init(
         const ggml_tensor * k, const ggml_tensor * v,
         int64_t DK, int64_t DV,
@@ -8304,27 +8320,11 @@ static mxfp_fa_params mxfp_fa_params_init(
     const bool is_mxfp_v = ggml_is_type_mxfp(v->type);
 
     if (is_mxfp_k) {
-        const struct ggml_type_traits_cpu * k_traits = ggml_get_type_traits_cpu(k->type);
-        p.q_quantize    = k_traits->from_float_soa;
-        p.k.dequantize  = k_traits->to_float_soa;
-        p.k.multihead   = (nbk2 == (size_t)ggml_row_size(k->type, DK));
-        p.k.soa_elems   = p.k.multihead ? nek2 * DK : DK;
-        p.k.qs_per_block    = ggml_mxfp_qs_per_block(k->type);
-        p.k.blocks_per_head = (int)(DK / 32);
-        p.k.head_qs_bytes   = p.k.blocks_per_head * p.k.qs_per_block;
-        const int64_t k_total_blocks = p.k.multihead ? nek2 * p.k.blocks_per_head : p.k.blocks_per_head;
-        p.k.head_e8m0_offset = k_total_blocks * p.k.qs_per_block;
+        p.q_quantize = ggml_get_type_traits_cpu(k->type)->from_float_soa;
+        p.k = mxfp_kv_params_init(k->type, DK, nbk2, nek2);
     }
-
     if (is_mxfp_v) {
-        p.v.dequantize  = ggml_get_type_traits_cpu(v->type)->to_float_soa;
-        p.v.multihead   = (nbv2 == (size_t)ggml_row_size(v->type, DV));
-        p.v.soa_elems   = p.v.multihead ? nev2 * DV : DV;
-        p.v.qs_per_block    = ggml_mxfp_qs_per_block(v->type);
-        p.v.blocks_per_head = (int)(DV / 32);
-        p.v.head_qs_bytes   = p.v.blocks_per_head * p.v.qs_per_block;
-        const int64_t v_total_blocks = p.v.multihead ? nev2 * p.v.blocks_per_head : p.v.blocks_per_head;
-        p.v.head_e8m0_offset = v_total_blocks * p.v.qs_per_block;
+        p.v = mxfp_kv_params_init(v->type, DV, nbv2, nev2);
     }
 
     // Hadamard rotation must match K rotation.
