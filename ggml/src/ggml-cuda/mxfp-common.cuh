@@ -50,6 +50,35 @@ static __device__ __forceinline__ uint8_t mxfp4_quantize_elem(float x, float inv
 }
 
 // ============================================================================
+// MXFP element dequant via hardware intrinsics (CUDA 12.8+ / sm_100+).
+// These replace the portable LUT lookups with single-instruction conversions.
+// Safe decode only — encode intrinsics (float→E8M0) have rounding bugs.
+// ============================================================================
+
+#if CUDART_VERSION >= 12080
+
+// MXFP8 E4M3: single byte → float via hardware CVT instruction
+static __device__ __forceinline__ float mxfp8_dequant_intrinsic(uint8_t x) {
+    __half_raw hr = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)x, __NV_E4M3);
+    return __half2float(*reinterpret_cast<__half *>(&hr));
+}
+
+// MXFP4 E2M1: nibble → float via hardware CVT instruction
+// Returns the raw E2M1 value (NOT doubled), so multiply by full scale, not half-scale.
+static __device__ __forceinline__ float mxfp4_dequant_intrinsic(uint8_t nibble) {
+    __half_raw hr = __nv_cvt_fp4_to_halfraw((__nv_fp4_storage_t)nibble, __NV_E2M1);
+    return __half2float(*reinterpret_cast<__half *>(&hr));
+}
+
+// MXFP6 E2M3: 6-bit value → float via hardware CVT instruction
+static __device__ __forceinline__ float mxfp6_dequant_intrinsic(uint8_t x) {
+    __half_raw hr = __nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)x, __NV_E2M3);
+    return __half2float(*reinterpret_cast<__half *>(&hr));
+}
+
+#endif // CUDART_VERSION >= 12080
+
+// ============================================================================
 // MXFP SoA → F16 dequant kernel for MMA flash attention pre-conversion.
 // Reads SoA layout [qs0..qsN | e0..eN] per row, writes contiguous F16 output.
 // Uses shared constructs from ggml-common.h for all dequant math.
@@ -105,16 +134,25 @@ static __global__ void k_mxfp_soa_to_f16(
 
     float val;
     if (mxfp_type_id == 0) {
-        // MXFP4: nibble-packed SoA, scale is halved
-        const float d = ggml_mxfp_e8m0_to_fp32_half(e8m0_base[blk]);
+        // MXFP4: nibble-packed SoA
         const uint8_t * qs = qs_base + blk * qs_per_blk;
         const int byte_idx = pos < 16 ? pos : pos - 16;
         const uint8_t nibble = (pos < 16) ? (qs[byte_idx] & 0x0F) : (qs[byte_idx] >> 4);
+#if CUDART_VERSION >= 12080
+        const float d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
+        val = mxfp4_dequant_intrinsic(nibble) * d;
+#else
+        const float d = ggml_mxfp_e8m0_to_fp32_half(e8m0_base[blk]);
         val = kvalues_mxfp4[nibble] * d;
+#endif
     } else if (mxfp_type_id == 1) {
         // MXFP8: byte-aligned SoA
         const float d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
+#if CUDART_VERSION >= 12080
+        val = mxfp8_dequant_intrinsic(qs_base[blk * qs_per_blk + pos]) * d;
+#else
         val = ggml_mxfp_fp8_e4m3_to_float(qs_base[blk * qs_per_blk + pos]) * d;
+#endif
     } else {
         // MXFP6: 6-bit packed SoA
         const float d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
@@ -123,7 +161,11 @@ static __global__ void k_mxfp_soa_to_f16(
         const uint8_t * packed = qs_base + blk * qs_per_blk + grp * 3;
         uint8_t vals[4];
         ggml_mxfp_unpack_fp6x4(packed, vals);
+#if CUDART_VERSION >= 12080
+        val = mxfp6_dequant_intrinsic(vals[slot]) * d;
+#else
         val = ggml_mxfp_fp6_e2m3_to_float(vals[slot]) * d;
+#endif
     }
 
     dst[flat_row * D + elem] = __float2half(val);

@@ -557,26 +557,29 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4(
 #pragma unroll
     for (int i0 = 0; i0 < D/2; i0 += nthreads) {
         const int i = i0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-        const int elem = 2 * i;  // element index within row
+        const int elem = 2 * i;  // element index within row (always even)
 
-        // Which block and position within block
-        const int blk0 = elem / 32;
+        // elem is always even, so elem and elem+1 are always in the same 32-element block.
+        const int blk = elem / 32;
         const int pos0 = elem % 32;
-        const int blk1 = (elem + 1) / 32;
-        const int pos1 = (elem + 1) % 32;
+        const int pos1 = pos0 + 1;  // always pos0+1 since elem is even → pos0 <= 30
 
-        // Dequant two consecutive elements — uses kvalues_mxfp4[] from ggml-common.h
-        const float d0 = ggml_mxfp_e8m0_to_fp32_half(e8m0_base[blk0]);
-        const uint8_t * qs0 = qs_base + MXFP_SOA_QS_OFFSET(blk0, qs_per_blk);
+        const uint8_t * qs = qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk);
         const int byte_idx0 = pos0 < 16 ? pos0 : pos0 - 16;
-        const uint8_t nibble0 = (pos0 < 16) ? (qs0[byte_idx0] & 0x0F) : (qs0[byte_idx0] >> 4);
-        const float k0 = kvalues_mxfp4[nibble0] * d0;
-
-        const float d1 = ggml_mxfp_e8m0_to_fp32_half(e8m0_base[blk1]);
-        const uint8_t * qs1 = qs_base + MXFP_SOA_QS_OFFSET(blk1, qs_per_blk);
+        const uint8_t nibble0 = (pos0 < 16) ? (qs[byte_idx0] & 0x0F) : (qs[byte_idx0] >> 4);
         const int byte_idx1 = pos1 < 16 ? pos1 : pos1 - 16;
-        const uint8_t nibble1 = (pos1 < 16) ? (qs1[byte_idx1] & 0x0F) : (qs1[byte_idx1] >> 4);
-        const float k1 = kvalues_mxfp4[nibble1] * d1;
+        const uint8_t nibble1 = (pos1 < 16) ? (qs[byte_idx1] & 0x0F) : (qs[byte_idx1] >> 4);
+
+#if CUDART_VERSION >= 12080
+        // Intrinsic returns raw E2M1 value — use full scale, not half-scale.
+        const float d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
+        const float k0 = mxfp4_dequant_intrinsic(nibble0) * d;
+        const float k1 = mxfp4_dequant_intrinsic(nibble1) * d;
+#else
+        const float d = ggml_mxfp_e8m0_to_fp32_half(e8m0_base[blk]);
+        const float k0 = kvalues_mxfp4[nibble0] * d;
+        const float k1 = kvalues_mxfp4[nibble1] * d;
+#endif
 
         const float2 Q_f2 = ((const float2 *)Q_v)[i0/nthreads];
         sum += k0 * Q_f2.x + k1 * Q_f2.y;
@@ -602,18 +605,22 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp8(
 #pragma unroll
     for (int i0 = 0; i0 < D/2; i0 += nthreads) {
         const int i = i0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-        const int elem = 2 * i;
+        const int elem = 2 * i;  // always even
 
-        const int blk0 = elem / 32;
+        // elem is always even, so elem and elem+1 are always in the same 32-element block.
+        const int blk = elem / 32;
         const int pos0 = elem % 32;
-        const int blk1 = (elem + 1) / 32;
-        const int pos1 = (elem + 1) % 32;
+        const int pos1 = pos0 + 1;
 
-        const float d0 = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk0]);
-        const float k0 = ggml_mxfp_fp8_e4m3_to_float(qs_base[MXFP_SOA_QS_OFFSET(blk0, qs_per_blk) + pos0]) * d0;
-
-        const float d1 = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk1]);
-        const float k1 = ggml_mxfp_fp8_e4m3_to_float(qs_base[MXFP_SOA_QS_OFFSET(blk1, qs_per_blk) + pos1]) * d1;
+        const float d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
+        const int qs_off = MXFP_SOA_QS_OFFSET(blk, qs_per_blk);
+#if CUDART_VERSION >= 12080
+        const float k0 = mxfp8_dequant_intrinsic(qs_base[qs_off + pos0]) * d;
+        const float k1 = mxfp8_dequant_intrinsic(qs_base[qs_off + pos1]) * d;
+#else
+        const float k0 = ggml_mxfp_fp8_e4m3_to_float(qs_base[qs_off + pos0]) * d;
+        const float k1 = ggml_mxfp_fp8_e4m3_to_float(qs_base[qs_off + pos1]) * d;
+#endif
 
         const float2 Q_f2 = ((const float2 *)Q_v)[i0/nthreads];
         sum += k0 * Q_f2.x + k1 * Q_f2.y;
@@ -639,22 +646,45 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp6(
 #pragma unroll
     for (int i0 = 0; i0 < D/2; i0 += nthreads) {
         const int i = i0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-        const int elem = 2 * i;
+        const int elem = 2 * i;  // always even
+
+        // elem is always even, so elem and elem+1 are always in the same 32-element block.
+        const int blk  = elem / 32;
+        const int pos0 = elem % 32;
+        const int pos1 = pos0 + 1;
+        const float d  = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
+        const int qs_off = MXFP_SOA_QS_OFFSET(blk, qs_per_blk);
 
         // Unpack 6-bit elements — uses shared ggml_mxfp_unpack_fp6x4() and ggml_mxfp_fp6_e2m3_to_float()
-        auto unpack_one = [&](int e) -> float {
-            const int blk  = e / 32;
-            const int pos  = e % 32;
-            const int grp  = pos / 4;
-            const int slot = pos % 4;
-            const uint8_t * packed = qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk) + grp * 3;
-            uint8_t vals[4];
-            ggml_mxfp_unpack_fp6x4(packed, vals);
-            return ggml_mxfp_fp6_e2m3_to_float(vals[slot]) * ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
-        };
+        // Consecutive even/odd elements may share a group (pos/4) or span two groups.
+        const int grp0  = pos0 / 4, slot0 = pos0 % 4;
+        const int grp1  = pos1 / 4, slot1 = pos1 % 4;
 
-        const float k0 = unpack_one(elem);
-        const float k1 = unpack_one(elem + 1);
+        float k0, k1;
+        if (grp0 == grp1) {
+            // Common case: both elements in the same 4-element group — one unpack
+            uint8_t vals[4];
+            ggml_mxfp_unpack_fp6x4(qs_base + qs_off + grp0 * 3, vals);
+#if CUDART_VERSION >= 12080
+            k0 = mxfp6_dequant_intrinsic(vals[slot0]) * d;
+            k1 = mxfp6_dequant_intrinsic(vals[slot1]) * d;
+#else
+            k0 = ggml_mxfp_fp6_e2m3_to_float(vals[slot0]) * d;
+            k1 = ggml_mxfp_fp6_e2m3_to_float(vals[slot1]) * d;
+#endif
+        } else {
+            // Boundary case: elements straddle two groups (pos0=3, pos1=4)
+            uint8_t vals0[4], vals1[4];
+            ggml_mxfp_unpack_fp6x4(qs_base + qs_off + grp0 * 3, vals0);
+            ggml_mxfp_unpack_fp6x4(qs_base + qs_off + grp1 * 3, vals1);
+#if CUDART_VERSION >= 12080
+            k0 = mxfp6_dequant_intrinsic(vals0[slot0]) * d;
+            k1 = mxfp6_dequant_intrinsic(vals1[slot1]) * d;
+#else
+            k0 = ggml_mxfp_fp6_e2m3_to_float(vals0[slot0]) * d;
+            k1 = ggml_mxfp_fp6_e2m3_to_float(vals1[slot1]) * d;
+#endif
+        }
 
         const float2 Q_f2 = ((const float2 *)Q_v)[i0/nthreads];
         sum += k0 * Q_f2.x + k1 * Q_f2.y;
@@ -675,16 +705,34 @@ static __device__ __forceinline__ void dequantize_V_mxfp4_D(const void * __restr
     const uint8_t * qs_base   = (const uint8_t *)vx;
     const uint8_t * e8m0_base = qs_base + MXFP_SOA_E8M0_OFFSET(nblocks, qs_per_blk);
 
+    // Hoist per-block state across consecutive elements (ne is typically 4, all within one block).
+    int prev_blk = -1;
+    float d = 0.0f;
+    const uint8_t * qs = nullptr;
+
 #pragma unroll
     for (int l = 0; l < ne; ++l) {
         const int elem = (int)i0 + l;
         const int blk  = elem / 32;
         const int pos  = elem % 32;
+
+        if (blk != prev_blk) {
+#if CUDART_VERSION >= 12080
+            d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
+#else
+            d = ggml_mxfp_e8m0_to_fp32_half(e8m0_base[blk]);
+#endif
+            qs = qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk);
+            prev_blk = blk;
+        }
+
         const int byte_idx = pos < 16 ? pos : pos - 16;
-        const uint8_t * qs = qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk);
         const uint8_t nibble = (pos < 16) ? (qs[byte_idx] & 0x0F) : (qs[byte_idx] >> 4);
-        const float d = ggml_mxfp_e8m0_to_fp32_half(e8m0_base[blk]);
+#if CUDART_VERSION >= 12080
+        ((float *)dst)[l] = mxfp4_dequant_intrinsic(nibble) * d;
+#else
         ((float *)dst)[l] = kvalues_mxfp4[nibble] * d;
+#endif
     }
 }
 
@@ -695,13 +743,27 @@ static __device__ __forceinline__ void dequantize_V_mxfp8_D(const void * __restr
     const uint8_t * qs_base   = (const uint8_t *)vx;
     const uint8_t * e8m0_base = qs_base + MXFP_SOA_E8M0_OFFSET(nblocks, qs_per_blk);
 
+    int prev_blk = -1;
+    float d = 0.0f;
+    int qs_off = 0;
+
 #pragma unroll
     for (int l = 0; l < ne; ++l) {
         const int elem = (int)i0 + l;
         const int blk  = elem / 32;
         const int pos  = elem % 32;
-        const float d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
-        ((float *)dst)[l] = ggml_mxfp_fp8_e4m3_to_float(qs_base[MXFP_SOA_QS_OFFSET(blk, qs_per_blk) + pos]) * d;
+
+        if (blk != prev_blk) {
+            d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
+            qs_off = MXFP_SOA_QS_OFFSET(blk, qs_per_blk);
+            prev_blk = blk;
+        }
+
+#if CUDART_VERSION >= 12080
+        ((float *)dst)[l] = mxfp8_dequant_intrinsic(qs_base[qs_off + pos]) * d;
+#else
+        ((float *)dst)[l] = ggml_mxfp_fp8_e4m3_to_float(qs_base[qs_off + pos]) * d;
+#endif
     }
 }
 
@@ -712,18 +774,31 @@ static __device__ __forceinline__ void dequantize_V_mxfp6_D(const void * __restr
     const uint8_t * qs_base   = (const uint8_t *)vx;
     const uint8_t * e8m0_base = qs_base + MXFP_SOA_E8M0_OFFSET(nblocks, qs_per_blk);
 
+    int prev_blk = -1;
+    float d = 0.0f;
+    int qs_off = 0;
+
 #pragma unroll
     for (int l = 0; l < ne; ++l) {
         const int elem = (int)i0 + l;
         const int blk  = elem / 32;
         const int pos  = elem % 32;
+
+        if (blk != prev_blk) {
+            d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
+            qs_off = MXFP_SOA_QS_OFFSET(blk, qs_per_blk);
+            prev_blk = blk;
+        }
+
         const int grp  = pos / 4;
         const int slot = pos % 4;
-        const uint8_t * packed = qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk) + grp * 3;
         uint8_t vals[4];
-        ggml_mxfp_unpack_fp6x4(packed, vals);
-        const float d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
+        ggml_mxfp_unpack_fp6x4(qs_base + qs_off + grp * 3, vals);
+#if CUDART_VERSION >= 12080
+        ((float *)dst)[l] = mxfp6_dequant_intrinsic(vals[slot]) * d;
+#else
         ((float *)dst)[l] = ggml_mxfp_fp6_e2m3_to_float(vals[slot]) * d;
+#endif
     }
 }
 
