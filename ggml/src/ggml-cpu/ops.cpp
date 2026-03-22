@@ -9199,10 +9199,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     // Split-KV: parallelize across KV chunks for single-query decode (token generation).
     // Only for types whose tiled/one_chunk paths produce identical results (f32, f16, MXFP).
     // Standard quant types (q8_0, q4_0) must use the scalar path to preserve vec_dot semantics.
-    const bool kv_is_f32_f16_or_mxfp = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16
+    const bool k_is_f32_f16_or_mxfp = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16
                                          || ggml_is_type_mxfp(k->type));
     const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1)
-                                   && kv_is_f32_f16_or_mxfp
+                                   && k_is_f32_f16_or_mxfp
                                    && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
@@ -9263,7 +9263,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         // Tiled path: f32, f16, and MXFP only (quant types use one_chunk)
         bool use_tiled = !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
-                                kv_is_f32_f16_or_mxfp &&
+                                k_is_f32_f16_or_mxfp &&
                                 (k->type == v->type || ggml_is_type_mxfp(k->type)) &&
                                 neq1 >= Q_TILE_SZ);
 #ifdef GGML_SIMD
