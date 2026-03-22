@@ -574,13 +574,17 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 
 #ifndef GGML_COMMON_IMPL
 
+// Constexpr-safe NaN/Infinity for static table initializers across all backends.
+// Standard NAN/INFINITY macros may not be constexpr on all toolchains
+// (e.g. MSVC expands INFINITY to (float)(1e+300), which breaks CUDA __device__ tables).
+// Compiler builtins are constexpr on GCC, Clang (incl. HIP/MUSA), MSVC, and nvcc.
+#define GGML_TABLE_NAN      __builtin_nanf("")
+#define GGML_TABLE_INFINITY __builtin_inff()
+
 #if defined(GGML_COMMON_IMPL_C)
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
-
-#define GGML_TABLE_NAN      NAN
-#define GGML_TABLE_INFINITY INFINITY
 #define GGML_TABLE_BEGIN(type, name, size) static const type name[size] = {
 #define GGML_TABLE_END() };
 #define GGML_MXFP_FUNC static inline
@@ -598,8 +602,6 @@ static inline float    ggml_mxfp_u32_as_f32_(uint32_t u) { float f; memcpy(&f, &
 #include <cstring>
 #include <cmath>
 
-#define GGML_TABLE_NAN      NAN
-#define GGML_TABLE_INFINITY INFINITY
 #define GGML_TABLE_BEGIN(type, name, size) static const type name[size] = {
 #define GGML_TABLE_END() };
 #define GGML_MXFP_FUNC static inline
@@ -615,8 +617,6 @@ static inline float    ggml_mxfp_u32_as_f32_(uint32_t u) { float f; memcpy(&f, &
 #elif defined(GGML_COMMON_IMPL_METAL)
 #include <metal_stdlib>
 
-#define GGML_TABLE_NAN      NAN
-#define GGML_TABLE_INFINITY INFINITY
 #define GGML_TABLE_BEGIN(type, name, size) static const constant type name[size] = {
 #define GGML_TABLE_END() };
 #define GGML_MXFP_FUNC static inline
@@ -630,16 +630,6 @@ static inline float    ggml_mxfp_u32_as_f32_(uint32_t u) { float f; memcpy(&f, &
 #elif defined(GGML_COMMON_IMPL_CUDA) || defined(GGML_COMMON_IMPL_HIP) || defined(GGML_COMMON_IMPL_MUSA)
 #include <cstdint>
 #include <cstring>
-
-// __device__ tables need constexpr initializers for NAN/INFINITY.
-// nvcc: __uint_as_float is constexpr; HIP/MUSA (clang): use __builtin_bit_cast.
-#if defined(GGML_COMMON_IMPL_CUDA)
-#define GGML_TABLE_NAN      __uint_as_float(0x7FC00000u)
-#define GGML_TABLE_INFINITY __uint_as_float(0x7F800000u)
-#else
-#define GGML_TABLE_NAN      __builtin_bit_cast(float, 0x7FC00000u)
-#define GGML_TABLE_INFINITY __builtin_bit_cast(float, 0x7F800000u)
-#endif
 
 #define GGML_TABLE_BEGIN(type, name, size) static const __device__ type name[size] = {
 #define GGML_TABLE_END() };
@@ -656,8 +646,6 @@ static inline float    ggml_mxfp_u32_as_f32_(uint32_t u) { float f; memcpy(&f, &
 #include <cstring>
 #include <cmath>
 
-#define GGML_TABLE_NAN      NAN
-#define GGML_TABLE_INFINITY INFINITY
 #define GGML_TABLE_BEGIN(type, name, size) static const type name[size] = {
 #define GGML_TABLE_END() };
 #define GGML_MXFP_FUNC static inline
