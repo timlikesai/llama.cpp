@@ -54,14 +54,6 @@ void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_nvfp4_ref(x, y, k);
 }
 
-void quantize_row_mxfp8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_mxfp8_ref(x, y, k);
-}
-
-void quantize_row_mxfp6(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_mxfp6_ref(x, y, k);
-}
-
 //
 // 2-6 bit quantization in super-blocks
 //
