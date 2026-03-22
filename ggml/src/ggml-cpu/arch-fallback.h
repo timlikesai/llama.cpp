@@ -345,8 +345,6 @@
 
 // MXFP dequantize fallbacks (same GGML_CPU_GENERIC guard as above)
 #if defined(GGML_CPU_GENERIC)
-#define dequantize_row_mxfp8_cpu_generic     dequantize_row_mxfp8_cpu
-#define dequantize_row_mxfp6_cpu_generic     dequantize_row_mxfp6_cpu
 #define dequantize_row_mxfp4_soa_cpu_generic dequantize_row_mxfp4_soa_cpu
 #define dequantize_row_mxfp8_soa_cpu_generic dequantize_row_mxfp8_soa_cpu
 #define dequantize_row_mxfp6_soa_cpu_generic dequantize_row_mxfp6_soa_cpu
