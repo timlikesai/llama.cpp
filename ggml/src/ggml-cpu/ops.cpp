@@ -8283,6 +8283,20 @@ struct mxfp_fa_params {
     bool apply_hadamard;
 };
 
+// Compute the SoA row base pointer for a given KV position and head.
+// In multihead mode, the SoA region spans all heads at one KV position,
+// so the row base must NOT include the per-head offset (head_idx * nb2).
+// mxfp_dequant_head handles per-head indexing within the SoA region.
+// In per-head mode, each head has its own SoA region, so the base includes nb2.
+static inline const char * mxfp_row_ptr(
+        const mxfp_kv_params & kv, const char * data,
+        int64_t kv_pos, size_t nb1, int head_idx, size_t nb2, int batch_idx, size_t nb3) {
+    if (kv.multihead) {
+        return data + kv_pos*nb1 + batch_idx*nb3;
+    }
+    return data + kv_pos*nb1 + head_idx*nb2 + batch_idx*nb3;
+}
+
 // Extract one head's SoA data from a multihead row and dequantize.
 static inline void mxfp_dequant_head(
         const mxfp_kv_params & kv, const char * row, int head_idx,
@@ -8486,8 +8500,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const char * k_base = (const char *) k->data + k_base_offset;
         const char * v_base = (const char *) v->data + v_base_offset;
 
-        const char * k_row_base = mxfp.k.multihead ? ((const char *) k->data + ik3*nbk3) : nullptr;
-        const char * v_row_base = mxfp.v.multihead ? ((const char *) v->data + iv3*nbv3) : nullptr;
+        const char * k_data_base = (const char *) k->data;
+        const char * v_data_base = (const char *) v->data;
 
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
         float Q_f32[MXFP_FA_MAX_D];
@@ -8526,7 +8540,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float s; // KQ value
 
             if (is_mxfp_k) {
-                const char * k_row = mxfp.k.multihead ? k_row_base + ic*nbk1 : k_base + ic*nbk1;
+                const char * k_row = mxfp_row_ptr(mxfp.k, k_data_base,
+                    ic, nbk1, ik2, nbk2, ik3, nbk3);
                 mxfp_dequant_head(mxfp.k, k_row, ik2, k_head_soa, k_dequant_buf, DK);
                 ggml_vec_dot_f32(DK, &s, 0, k_dequant_buf, 0, Q_f32, 0, 1);
             } else {
@@ -8572,7 +8587,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
                 // V += v*expf(s - M)
                 if (mxfp.v.dequantize) {
-                    const char * v_row = mxfp.v.multihead ? v_row_base + ic*nbv1 : v_base + ic*nbv1;
+                    const char * v_row = mxfp_row_ptr(mxfp.v, v_data_base,
+                        ic, nbv1, iv2, nbv2, iv3, nbv3);
                     mxfp_dequant_head(mxfp.v, v_row, iv2, v_head_soa, v_dequant_buf, DV);
                     ggml_vec_mad_f32(DV, VKQ32, v_dequant_buf, vs);
                 } else if (v_to_float) {
@@ -8843,7 +8859,9 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                         K_f32[dk * KV_TILE_SZ + tk] = k_f32_src[dk];
                     }
                 } else if (mxfp.k.dequantize) {
-                    mxfp_dequant_head(mxfp.k, k_data, ik2, k_head_soa, k_dequant_buf, DK);
+                    const char * k_row = mxfp_row_ptr(mxfp.k, (const char *)k->data,
+                        ic + tk, nbk1, ik2, nbk2, ik3, nbk3);
+                    mxfp_dequant_head(mxfp.k, k_row, ik2, k_head_soa, k_dequant_buf, DK);
                     for (int64_t dk = 0; dk < DK; dk++) {
                         K_f32[dk * KV_TILE_SZ + tk] = k_dequant_buf[dk];
                     }
@@ -8913,7 +8931,9 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 } else if (v_type == GGML_TYPE_F32) {
                     memcpy(V32 + tk * DV, v_data, DV * sizeof(float));
                 } else if (mxfp.v.dequantize) {
-                    mxfp_dequant_head(mxfp.v, v_data, iv2, v_head_soa, v_dequant_buf, DV);
+                    const char * v_row = mxfp_row_ptr(mxfp.v, (const char *)v->data,
+                        ic + tk, nbv1, iv2, nbv2, iv3, nbv3);
+                    mxfp_dequant_head(mxfp.v, v_row, iv2, v_head_soa, v_dequant_buf, DV);
                     memcpy(V32 + tk * DV, v_dequant_buf, DV * sizeof(float));
                 } else {
                     v_to_float(v_data, V32 + tk * DV, DV);
