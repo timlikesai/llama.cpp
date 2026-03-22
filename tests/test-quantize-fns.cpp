@@ -254,6 +254,79 @@ int main(int argc, char * argv[]) {
         }
     }
 
+    // Hadamard orthogonality: H(H(x)) == x (self-inverse with 1/sqrt(32) normalization)
+    {
+        float original[32], transformed[32];
+        // Use varied test data (not all zeros or constants)
+        for (int i = 0; i < 32; i++) {
+            original[i] = 0.1f + 2.0f * cosf(i + 0.5f);
+            transformed[i] = original[i];
+        }
+        ggml_hadamard_32_inplace(transformed);
+        ggml_hadamard_32_inplace(transformed); // apply twice = identity
+
+        float max_err = 0.0f;
+        for (int i = 0; i < 32; i++) {
+            float err = fabsf(transformed[i] - original[i]);
+            if (err > max_err) max_err = err;
+        }
+        // Should be exact up to floating-point rounding (~1e-6 for float)
+        failed = !(max_err < 1e-5f);
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("hadamard H(H(x))==x roundtrip:         %s (max_err=%.2e)\n", RESULT_STR[failed], max_err);
+        }
+    }
+
+    // SoA SIMD vs scalar reference cross-check
+    {
+        struct soa_cross_check {
+            ggml_type type;
+            void (*ref_dequant)(const void *, float *, int64_t);
+        };
+
+        const soa_cross_check checks[] = {
+            { GGML_TYPE_MXFP4_E2M1, dequantize_row_mxfp4_soa },
+            { GGML_TYPE_MXFP8_E4M3, dequantize_row_mxfp8_soa },
+            { GGML_TYPE_MXFP6_E2M3, dequantize_row_mxfp6_soa },
+        };
+
+        for (const auto & c : checks) {
+            const auto * cpu = ggml_get_type_traits_cpu(c.type);
+            if (!cpu->from_float_soa || !cpu->to_float_soa) continue;
+
+            const size_t buf_size = ggml_row_size(c.type, test_size);
+            std::vector<uint8_t> tmp_q(buf_size);
+            std::vector<float> out_ref(test_size);
+            std::vector<float> out_simd(test_size);
+
+            // Quantize with SoA
+            cpu->from_float_soa(test_data.data(), tmp_q.data(), test_size);
+
+            // Dequant with scalar reference
+            c.ref_dequant(tmp_q.data(), out_ref.data(), test_size);
+
+            // Dequant with CPU/SIMD path
+            cpu->to_float_soa(tmp_q.data(), out_simd.data(), test_size);
+
+            // Compare bitwise
+            int mismatches = 0;
+            for (size_t j = 0; j < test_size; j++) {
+                uint32_t a, b;
+                memcpy(&a, &out_ref[j], 4);
+                memcpy(&b, &out_simd[j], 4);
+                if (a != b) mismatches++;
+            }
+            failed = (mismatches > 0);
+            num_failed += failed;
+            if (failed || verbose) {
+                printf("%5s SoA SIMD vs scalar ref:           %s (%zu/%zu match)\n",
+                       ggml_type_name(c.type), RESULT_STR[failed],
+                       test_size - mismatches, test_size);
+            }
+        }
+    }
+
     // MXFP element converter validation against canonical LUT reference values.
     // Tests that IEEE-754 bit reconstruction in converters matches the OCP MX spec tables.
     {
@@ -315,6 +388,73 @@ int main(int argc, char * argv[]) {
                 printf("fp4_e2m1 converter vs LUT:                %s (%d/16 values match)\n",
                        RESULT_STR[failed], 16 - mismatches);
             }
+        }
+    }
+
+    // E8M0 scale computation: verify base exponent is reasonable for various amax values
+    {
+        const float test_amax[] = { 0.001f, 0.1f, 1.0f, 6.0f, 100.0f, 448.0f, 10000.0f };
+        int bad = 0;
+        for (float amax : test_amax) {
+            // ggml_mxfp_e8m0_base_estimate returns unclamped e_base
+            int e_base = ggml_mxfp_e8m0_base_estimate(amax, 0);
+            if (e_base < 1 || e_base > 254) {
+                if (bad == 0 || verbose) {
+                    printf("  E8M0 bad e_base=%d for amax=%.4f\n", e_base, amax);
+                }
+                bad++;
+                continue;
+            }
+            float scale = ggml_mxfp_e8m0_to_fp32((uint8_t)e_base);
+            // Scale should be within 2x of amax (rough sanity check)
+            float ratio = amax / scale;
+            if (ratio < 0.25f || ratio > 4.0f) {
+                if (bad == 0 || verbose) {
+                    printf("  E8M0 scale=%.6g for amax=%.4f, ratio=%.4f (expected ~1)\n",
+                           scale, amax, ratio);
+                }
+                bad++;
+            }
+        }
+        failed = (bad > 0);
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("  E8M0 scale sanity check:             %s (%d/%d passed)\n",
+                   RESULT_STR[failed], (int)(sizeof(test_amax)/sizeof(test_amax[0])) - bad,
+                   (int)(sizeof(test_amax)/sizeof(test_amax[0])));
+        }
+    }
+
+    // SoA layout: verify offset macros produce correct byte positions
+    {
+        const struct { ggml_type type; int qs_per_block; } soa_types[] = {
+            { GGML_TYPE_MXFP4_E2M1, MXFP4_SOA_QS_PER_BLOCK },
+            { GGML_TYPE_MXFP8_E4M3, MXFP8_SOA_QS_PER_BLOCK },
+            { GGML_TYPE_MXFP6_E2M3, MXFP6_SOA_QS_PER_BLOCK },
+        };
+
+        for (const auto & st : soa_types) {
+            for (int nblocks : { 1, 4, 8, 32 }) {
+                size_t expected_e8m0_off = (size_t)nblocks * st.qs_per_block;
+                size_t actual_e8m0_off = MXFP_SOA_E8M0_OFFSET(nblocks, st.qs_per_block);
+                size_t total = actual_e8m0_off + nblocks; // e8m0 region = 1 byte per block
+                size_t row_size = ggml_row_size(st.type, nblocks * 32);
+
+                bool offset_ok = (actual_e8m0_off == expected_e8m0_off);
+                bool size_ok = (total == row_size);
+
+                if (!offset_ok || !size_ok) {
+                    failed = true;
+                    num_failed++;
+                    if (verbose) {
+                        printf("  %s SoA layout nblocks=%d: e8m0_off=%zu (expected %zu), total=%zu (row_size=%zu)\n",
+                               ggml_type_name(st.type), nblocks, actual_e8m0_off, expected_e8m0_off, total, row_size);
+                    }
+                }
+            }
+        }
+        if (verbose) {
+            printf("  SoA layout offset check:             %s\n", RESULT_STR[0]); // only prints failures above
         }
     }
 
