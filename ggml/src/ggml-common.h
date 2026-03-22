@@ -575,11 +575,16 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 #ifndef GGML_COMMON_IMPL
 
 // Constexpr-safe NaN/Infinity for static table initializers across all backends.
-// Standard NAN/INFINITY macros may not be constexpr on all toolchains
-// (e.g. MSVC expands INFINITY to (float)(1e+300), which breaks CUDA __device__ tables).
-// Compiler builtins are constexpr on GCC, Clang (incl. HIP/MUSA), MSVC, and nvcc.
+// Standard NAN/INFINITY may not be constexpr on CUDA __device__ tables,
+// so use compiler builtins where available.
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <math.h>
+#define GGML_TABLE_NAN      NAN
+#define GGML_TABLE_INFINITY INFINITY
+#else
 #define GGML_TABLE_NAN      __builtin_nanf("")
 #define GGML_TABLE_INFINITY __builtin_inff()
+#endif
 
 #if defined(GGML_COMMON_IMPL_C)
 #include <stdint.h>
