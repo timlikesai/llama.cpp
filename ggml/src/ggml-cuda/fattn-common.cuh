@@ -559,25 +559,12 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4(
         const int i = i0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         const int elem = 2 * i;  // element index within row (always even)
 
-        // elem is always even, so elem and elem+1 are always in the same 32-element block.
         const int blk = elem / 32;
-        const int pos0 = elem % 32;
-
-        uint8_t nib0, nib1;
-        mxfp4_extract_nibble_pair(qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk), pos0, nib0, nib1);
-
-#if CUDART_VERSION >= 12080
-        const float d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
-        const float k0 = mxfp4_dequant_intrinsic(nib0) * d;
-        const float k1 = mxfp4_dequant_intrinsic(nib1) * d;
-#else
-        const float d = ggml_mxfp_e8m0_to_fp32_half(e8m0_base[blk]);
-        const float k0 = kvalues_mxfp4[nib0] * d;
-        const float k1 = kvalues_mxfp4[nib1] * d;
-#endif
+        const float2 kk = mxfp_dequant_elem_pair<GGML_TYPE_MXFP4>(
+            qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk), e8m0_base[blk], elem % 32);
 
         const float2 Q_f2 = ((const float2 *)Q_v)[i0/nthreads];
-        sum += k0 * Q_f2.x + k1 * Q_f2.y;
+        sum += kk.x * Q_f2.x + kk.y * Q_f2.y;
     }
 
     return sum;
@@ -602,23 +589,12 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp8(
         const int i = i0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         const int elem = 2 * i;  // always even
 
-        // elem is always even, so elem and elem+1 are always in the same 32-element block.
         const int blk = elem / 32;
-        const int pos0 = elem % 32;
-        const int pos1 = pos0 + 1;
-
-        const float d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
-        const int qs_off = MXFP_SOA_QS_OFFSET(blk, qs_per_blk);
-#if CUDART_VERSION >= 12080
-        const float k0 = mxfp8_dequant_intrinsic(qs_base[qs_off + pos0]) * d;
-        const float k1 = mxfp8_dequant_intrinsic(qs_base[qs_off + pos1]) * d;
-#else
-        const float k0 = ggml_mxfp_fp8_e4m3_to_float(qs_base[qs_off + pos0]) * d;
-        const float k1 = ggml_mxfp_fp8_e4m3_to_float(qs_base[qs_off + pos1]) * d;
-#endif
+        const float2 kk = mxfp_dequant_elem_pair<GGML_TYPE_MXFP8>(
+            qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk), e8m0_base[blk], elem % 32);
 
         const float2 Q_f2 = ((const float2 *)Q_v)[i0/nthreads];
-        sum += k0 * Q_f2.x + k1 * Q_f2.y;
+        sum += kk.x * Q_f2.x + kk.y * Q_f2.y;
     }
 
     return sum;
@@ -643,26 +619,12 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp6(
         const int i = i0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         const int elem = 2 * i;  // always even
 
-        // elem is always even, so elem and elem+1 are always in the same 32-element block.
-        const int blk  = elem / 32;
-        const int pos0 = elem % 32;
-        const float d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
-
-        // pos0 is always even → grp0 == grp1 always → one unpack for both elements
-        uint8_t v0, v1;
-        mxfp6_unpack_pair(qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk), pos0, v0, v1);
-
-        float k0, k1;
-#if CUDART_VERSION >= 12080
-        k0 = mxfp6_dequant_intrinsic(v0) * d;
-        k1 = mxfp6_dequant_intrinsic(v1) * d;
-#else
-        k0 = ggml_mxfp_fp6_e2m3_to_float(v0) * d;
-        k1 = ggml_mxfp_fp6_e2m3_to_float(v1) * d;
-#endif
+        const int blk = elem / 32;
+        const float2 kk = mxfp_dequant_elem_pair<GGML_TYPE_MXFP6>(
+            qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk), e8m0_base[blk], elem % 32);
 
         const float2 Q_f2 = ((const float2 *)Q_v)[i0/nthreads];
-        sum += k0 * Q_f2.x + k1 * Q_f2.y;
+        sum += kk.x * Q_f2.x + kk.y * Q_f2.y;
     }
 
     return sum;

@@ -121,6 +121,66 @@ static __device__ __forceinline__ float mxfp6_dequant_intrinsic(uint8_t x) {
 #endif // CUDART_VERSION >= 12080
 
 // ============================================================================
+// Unified MXFP SoA pair dequant: extract + scale + convert two consecutive
+// elements from a single 32-element block.  Encapsulates all type-specific
+// logic (nibble extraction, fp6 unpacking, byte reads) and the intrinsic vs
+// portable fallback selection.
+//
+// qs_block: pointer to this block's qs region (qs_base + blk * qs_per_blk)
+// e8m0:     the raw E8M0 scale byte for this block
+// pos0:     position of first element within the block (MUST be even)
+// Returns:  float2{elem[pos0], elem[pos0+1]} fully dequantized
+// ============================================================================
+
+template <ggml_type type>
+static __device__ __forceinline__ float2 mxfp_dequant_elem_pair(
+        const uint8_t * qs_block, uint8_t e8m0, int pos0);
+
+template <>
+__device__ __forceinline__ float2 mxfp_dequant_elem_pair<GGML_TYPE_MXFP4>(
+        const uint8_t * qs_block, uint8_t e8m0, int pos0) {
+    uint8_t nib0, nib1;
+    mxfp4_extract_nibble_pair(qs_block, pos0, nib0, nib1);
+#if CUDART_VERSION >= 12080
+    const float d = ggml_mxfp_e8m0_to_fp32(e8m0);
+    return make_float2(mxfp4_dequant_intrinsic(nib0) * d,
+                       mxfp4_dequant_intrinsic(nib1) * d);
+#else
+    const float d = ggml_mxfp_e8m0_to_fp32_half(e8m0);
+    return make_float2(kvalues_mxfp4[nib0] * d,
+                       kvalues_mxfp4[nib1] * d);
+#endif
+}
+
+template <>
+__device__ __forceinline__ float2 mxfp_dequant_elem_pair<GGML_TYPE_MXFP8>(
+        const uint8_t * qs_block, uint8_t e8m0, int pos0) {
+    const float d = ggml_mxfp_e8m0_to_fp32(e8m0);
+#if CUDART_VERSION >= 12080
+    return make_float2(mxfp8_dequant_intrinsic(qs_block[pos0])     * d,
+                       mxfp8_dequant_intrinsic(qs_block[pos0 + 1]) * d);
+#else
+    return make_float2(ggml_mxfp_fp8_e4m3_to_float(qs_block[pos0])     * d,
+                       ggml_mxfp_fp8_e4m3_to_float(qs_block[pos0 + 1]) * d);
+#endif
+}
+
+template <>
+__device__ __forceinline__ float2 mxfp_dequant_elem_pair<GGML_TYPE_MXFP6>(
+        const uint8_t * qs_block, uint8_t e8m0, int pos0) {
+    const float d = ggml_mxfp_e8m0_to_fp32(e8m0);
+    uint8_t v0, v1;
+    mxfp6_unpack_pair(qs_block, pos0, v0, v1);
+#if CUDART_VERSION >= 12080
+    return make_float2(mxfp6_dequant_intrinsic(v0) * d,
+                       mxfp6_dequant_intrinsic(v1) * d);
+#else
+    return make_float2(ggml_mxfp_fp6_e2m3_to_float(v0) * d,
+                       ggml_mxfp_fp6_e2m3_to_float(v1) * d);
+#endif
+}
+
+// ============================================================================
 // MXFP SoA → F16 dequant kernel for MMA flash attention pre-conversion.
 // Reads SoA layout [qs0..qsN | e0..eN] per row, writes contiguous F16 output.
 // Uses shared constructs from ggml-common.h for all dequant math.

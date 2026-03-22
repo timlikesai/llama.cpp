@@ -407,49 +407,12 @@ static __global__ void flash_attn_ext_vec(
                         const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
                         const int elem = 2 * i;
                         const int blk  = elem / 32;
-                        const int pos0 = elem % 32;
-                        const int pos1 = pos0 + 1;
 
-                        float k0, k1;
-                        if constexpr (type_K == GGML_TYPE_MXFP4) {
-                            const uint8_t * qs = qs_base + blk * qs_per_blk;
-                            uint8_t nib0, nib1;
-                            mxfp4_extract_nibble_pair(qs, pos0, nib0, nib1);
-#if CUDART_VERSION >= 12080
-                            const float d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
-                            k0 = mxfp4_dequant_intrinsic(nib0) * d;
-                            k1 = mxfp4_dequant_intrinsic(nib1) * d;
-#else
-                            const float d = ggml_mxfp_e8m0_to_fp32_half(e8m0_base[blk]);
-                            k0 = kvalues_mxfp4[nib0] * d;
-                            k1 = kvalues_mxfp4[nib1] * d;
-#endif
-                        } else if constexpr (type_K == GGML_TYPE_MXFP8) {
-                            const float d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
-                            const int qs_off = blk * qs_per_blk;
-#if CUDART_VERSION >= 12080
-                            k0 = mxfp8_dequant_intrinsic(qs_base[qs_off + pos0]) * d;
-                            k1 = mxfp8_dequant_intrinsic(qs_base[qs_off + pos1]) * d;
-#else
-                            k0 = ggml_mxfp_fp8_e4m3_to_float(qs_base[qs_off + pos0]) * d;
-                            k1 = ggml_mxfp_fp8_e4m3_to_float(qs_base[qs_off + pos1]) * d;
-#endif
-                        } else {
-                            // MXFP6: pos0 is always even → grp0 == grp1 always → one unpack
-                            const float d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
-                            uint8_t v0, v1;
-                            mxfp6_unpack_pair(qs_base + blk * qs_per_blk, pos0, v0, v1);
-#if CUDART_VERSION >= 12080
-                            k0 = mxfp6_dequant_intrinsic(v0) * d;
-                            k1 = mxfp6_dequant_intrinsic(v1) * d;
-#else
-                            k0 = ggml_mxfp_fp6_e2m3_to_float(v0) * d;
-                            k1 = ggml_mxfp_fp6_e2m3_to_float(v1) * d;
-#endif
-                        }
+                        const float2 kk = mxfp_dequant_elem_pair<type_K>(
+                            qs_base + blk * qs_per_blk, e8m0_base[blk], elem % 32);
 
                         const float2 Q_f2 = ((const float2 *)Q_reg[j])[i0/nthreads_KQ];
-                        sum += k0 * Q_f2.x + k1 * Q_f2.y;
+                        sum += kk.x * Q_f2.x + kk.y * Q_f2.y;
                     }
                 } else {
                     sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
@@ -553,44 +516,9 @@ static __global__ void flash_attn_ext_vec(
                     for (int l = 0; l < V_rows_per_thread; l += 2) {
                         const int elem = i_base + l;
                         const int blk  = elem / 32;
-                        const int pos0 = elem % 32;
-                        const int pos1 = pos0 + 1;
-                        float v0, v1;
-                        if constexpr (type_V == GGML_TYPE_MXFP4) {
-                            uint8_t nib0, nib1;
-                            mxfp4_extract_nibble_pair(v_qs_base + blk * v_qs_per_blk, pos0, nib0, nib1);
-#if CUDART_VERSION >= 12080
-                            const float d = ggml_mxfp_e8m0_to_fp32(v_e8m0_base[blk]);
-                            v0 = mxfp4_dequant_intrinsic(nib0) * d;
-                            v1 = mxfp4_dequant_intrinsic(nib1) * d;
-#else
-                            const float d = ggml_mxfp_e8m0_to_fp32_half(v_e8m0_base[blk]);
-                            v0 = kvalues_mxfp4[nib0] * d;
-                            v1 = kvalues_mxfp4[nib1] * d;
-#endif
-                        } else if constexpr (type_V == GGML_TYPE_MXFP8) {
-                            const float d = ggml_mxfp_e8m0_to_fp32(v_e8m0_base[blk]);
-                            const int qs_off = blk * v_qs_per_blk;
-#if CUDART_VERSION >= 12080
-                            v0 = mxfp8_dequant_intrinsic(v_qs_base[qs_off + pos0]) * d;
-                            v1 = mxfp8_dequant_intrinsic(v_qs_base[qs_off + pos1]) * d;
-#else
-                            v0 = ggml_mxfp_fp8_e4m3_to_float(v_qs_base[qs_off + pos0]) * d;
-                            v1 = ggml_mxfp_fp8_e4m3_to_float(v_qs_base[qs_off + pos1]) * d;
-#endif
-                        } else {
-                            const float d = ggml_mxfp_e8m0_to_fp32(v_e8m0_base[blk]);
-                            uint8_t u0, u1;
-                            mxfp6_unpack_pair(v_qs_base + blk * v_qs_per_blk, pos0, u0, u1);
-#if CUDART_VERSION >= 12080
-                            v0 = mxfp6_dequant_intrinsic(u0) * d;
-                            v1 = mxfp6_dequant_intrinsic(u1) * d;
-#else
-                            v0 = ggml_mxfp_fp6_e2m3_to_float(u0) * d;
-                            v1 = ggml_mxfp_fp6_e2m3_to_float(u1) * d;
-#endif
-                        }
-                        tmp[l/2] = make_half2(__float2half(v0), __float2half(v1));
+                        const float2 vv = mxfp_dequant_elem_pair<type_V>(
+                            v_qs_base + blk * v_qs_per_blk, v_e8m0_base[blk], elem % 32);
+                        tmp[l/2] = make_half2(__float2half(vv.x), __float2half(vv.y));
                     }
                 } else {
                     dequantize_V(V_row, tmp,
@@ -622,44 +550,8 @@ static __global__ void flash_attn_ext_vec(
                     for (int l = 0; l < V_rows_per_thread; l += 2) {
                         const int elem = i_base + l;
                         const int blk  = elem / 32;
-                        const int pos0 = elem % 32;
-                        const int pos1 = pos0 + 1;
-                        float v0, v1;
-                        if constexpr (type_V == GGML_TYPE_MXFP4) {
-                            uint8_t nib0, nib1;
-                            mxfp4_extract_nibble_pair(v_qs_base + blk * v_qs_per_blk, pos0, nib0, nib1);
-#if CUDART_VERSION >= 12080
-                            const float d = ggml_mxfp_e8m0_to_fp32(v_e8m0_base[blk]);
-                            v0 = mxfp4_dequant_intrinsic(nib0) * d;
-                            v1 = mxfp4_dequant_intrinsic(nib1) * d;
-#else
-                            const float d = ggml_mxfp_e8m0_to_fp32_half(v_e8m0_base[blk]);
-                            v0 = kvalues_mxfp4[nib0] * d;
-                            v1 = kvalues_mxfp4[nib1] * d;
-#endif
-                        } else if constexpr (type_V == GGML_TYPE_MXFP8) {
-                            const float d = ggml_mxfp_e8m0_to_fp32(v_e8m0_base[blk]);
-                            const int qs_off = blk * v_qs_per_blk;
-#if CUDART_VERSION >= 12080
-                            v0 = mxfp8_dequant_intrinsic(v_qs_base[qs_off + pos0]) * d;
-                            v1 = mxfp8_dequant_intrinsic(v_qs_base[qs_off + pos1]) * d;
-#else
-                            v0 = ggml_mxfp_fp8_e4m3_to_float(v_qs_base[qs_off + pos0]) * d;
-                            v1 = ggml_mxfp_fp8_e4m3_to_float(v_qs_base[qs_off + pos1]) * d;
-#endif
-                        } else {
-                            const float d = ggml_mxfp_e8m0_to_fp32(v_e8m0_base[blk]);
-                            uint8_t u0, u1;
-                            mxfp6_unpack_pair(v_qs_base + blk * v_qs_per_blk, pos0, u0, u1);
-#if CUDART_VERSION >= 12080
-                            v0 = mxfp6_dequant_intrinsic(u0) * d;
-                            v1 = mxfp6_dequant_intrinsic(u1) * d;
-#else
-                            v0 = ggml_mxfp_fp6_e2m3_to_float(u0) * d;
-                            v1 = ggml_mxfp_fp6_e2m3_to_float(u1) * d;
-#endif
-                        }
-                        tmp[l/2] = make_float2(v0, v1);
+                        tmp[l/2] = mxfp_dequant_elem_pair<type_V>(
+                            v_qs_base + blk * v_qs_per_blk, v_e8m0_base[blk], elem % 32);
                     }
                 } else {
                     dequantize_V(V_row, tmp,
