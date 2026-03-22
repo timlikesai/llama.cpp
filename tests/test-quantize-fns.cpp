@@ -29,6 +29,12 @@ constexpr float MAX_QUANTIZATION_TOTAL_ERROR_FP4 = 0.0030f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_MXFP4 = 0.0070f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_MXFP6 = 0.0040f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_MXFP8 = 0.0020f;
+// MXFP Hadamard pipeline thresholds (mxfp_rmse, which computes sqrt(sum/n)).
+// These represent actual RMSE through the full KV cache write/read path.
+constexpr float MAX_MXFP_PIPELINE_ERROR_MXFP4 = 0.40f;
+constexpr float MAX_MXFP_PIPELINE_ERROR_MXFP8 = 0.08f;
+constexpr float MAX_MXFP_PIPELINE_ERROR_MXFP6 = 0.10f;
+
 constexpr float MAX_DOT_PRODUCT_ERROR = 0.02f;
 constexpr float MAX_DOT_PRODUCT_ERROR_LOWBIT = 0.04f;
 constexpr float MAX_DOT_PRODUCT_ERROR_FP4 = 0.03f;
@@ -53,6 +59,17 @@ static float array_rmse(const float * a1, const float * a2, size_t n) {
         sum += diff * diff;
     }
     return sqrtf(sum) / n;
+}
+
+// MXFP RMSE: sqrt(sum/n). Differs from array_rmse which computes sqrt(sum)/n.
+// MXFP thresholds (MAX_MXFP_PIPELINE_ERROR_*) are calibrated to this function.
+static float mxfp_rmse(const float * a1, const float * a2, size_t n) {
+    double sum = 0;
+    for (size_t i = 0; i < n; i++) {
+        double diff = a1[i] - a2[i];
+        sum += diff * diff;
+    }
+    return sqrtf((float)(sum / n));
 }
 
 // Total quantization error on test data
@@ -392,56 +409,76 @@ int main(int argc, char * argv[]) {
     }
 
     // Element converter edge cases: subnormals, max finite, saturation, NaN, sign.
+    // Expected bit patterns are validated against canonical LUTs (the OCP MX spec tables).
     // These catch the bugs backend implementers hit most often.
     {
         struct conv_check {
             const char * name;
             float        input;
             uint8_t      expected_bits;
-            float      (*to_float)(uint8_t);
-            uint8_t    (*to_quant)(float);
+            bool         is_saturation;  // true = input overflows, expected_bits is max finite
+            const float * lut;           // canonical LUT to validate expected_bits against (NULL for FP4)
+            float       (*to_float)(uint8_t);
+            uint8_t     (*to_quant)(float);
         };
-
-        // FP4 E2M1: subnormal=0.5, max=6.0, negative
-        // FP6 E2M3: subnormal=0.125, max=7.5
-        // FP6 E3M2: subnormal=0.0625, max=28.0, exp=7 is NORMAL (not Inf)
-        // FP8 E4M3: subnormal=1/512, max=448, 0x7F=NaN not max
-        // FP8 E5M2: subnormal=1/16384, max=57344
 
         const conv_check checks[] = {
             // FP4 E2M1 — [S(1)|E(2)|M(1)], bias=0
-            { "fp4 zero",      0.0f,    0x00, nullptr, nullptr },
-            { "fp4 sub 0.5",   0.5f,    0x01, nullptr, nullptr },
-            { "fp4 norm 1.0",  1.0f,    0x02, nullptr, nullptr },
-            { "fp4 max 6.0",   6.0f,    0x07, nullptr, nullptr },
-            { "fp4 neg -3.0", -3.0f,    0x0D, nullptr, nullptr },
-            { "fp4 sat 100",  100.0f,   0x07, nullptr, nullptr },  // saturates to max
+            { "fp4 zero",      0.0f,    0x00, false, nullptr, nullptr, nullptr },
+            { "fp4 sub 0.5",   0.5f,    0x01, false, nullptr, nullptr, nullptr },
+            { "fp4 norm 1.0",  1.0f,    0x02, false, nullptr, nullptr, nullptr },
+            { "fp4 max 6.0",   6.0f,    0x07, false, nullptr, nullptr, nullptr },
+            { "fp4 neg -3.0", -3.0f,    0x0D, false, nullptr, nullptr, nullptr },
+            { "fp4 sat 100",  100.0f,   0x07, true,  nullptr, nullptr, nullptr },
 
             // FP8 E4M3 — [S(1)|E(4)|M(3)], bias=7
-            { "e4m3 zero",      0.0f,    0x00, fp8_e4m3_to_float, float_to_fp8_e4m3_rn },
-            { "e4m3 sub",       1.0f/512, 0x01, fp8_e4m3_to_float, float_to_fp8_e4m3_rn },
-            { "e4m3 max 448",   448.0f,  0x7E, fp8_e4m3_to_float, float_to_fp8_e4m3_rn },
-            { "e4m3 sat 500",   500.0f,  0x7E, fp8_e4m3_to_float, float_to_fp8_e4m3_rn },  // NOT 0x7F (NaN)
-            { "e4m3 neg -1",   -1.0f,    0xB8, fp8_e4m3_to_float, float_to_fp8_e4m3_rn },
+            { "e4m3 zero",      0.0f,     0x00, false, kvalues_mxfp8_e4m3, fp8_e4m3_to_float, float_to_fp8_e4m3_rn },
+            { "e4m3 sub",       1.f/512,  0x01, false, kvalues_mxfp8_e4m3, fp8_e4m3_to_float, float_to_fp8_e4m3_rn },
+            { "e4m3 max 448",   448.0f,   0x7E, false, kvalues_mxfp8_e4m3, fp8_e4m3_to_float, float_to_fp8_e4m3_rn },
+            { "e4m3 sat 500",   500.0f,   0x7E, true,  kvalues_mxfp8_e4m3, fp8_e4m3_to_float, float_to_fp8_e4m3_rn },
+            { "e4m3 neg -1",   -1.0f,     0xB8, false, kvalues_mxfp8_e4m3, fp8_e4m3_to_float, float_to_fp8_e4m3_rn },
 
             // FP6 E2M3 — [S(1)|E(2)|M(3)], no NaN/Inf
-            { "e2m3 zero",      0.0f,    0x00, fp6_e2m3_to_float, float_to_fp6_e2m3_rn },
-            { "e2m3 sub",       0.125f,  0x01, fp6_e2m3_to_float, float_to_fp6_e2m3_rn },
-            { "e2m3 max 7.5",   7.5f,    0x1F, fp6_e2m3_to_float, float_to_fp6_e2m3_rn },
-            { "e2m3 sat 100",   100.0f,  0x1F, fp6_e2m3_to_float, float_to_fp6_e2m3_rn },
+            { "e2m3 zero",      0.0f,     0x00, false, kvalues_mxfp6_e2m3, fp6_e2m3_to_float, float_to_fp6_e2m3_rn },
+            { "e2m3 sub",       0.125f,   0x01, false, kvalues_mxfp6_e2m3, fp6_e2m3_to_float, float_to_fp6_e2m3_rn },
+            { "e2m3 max 7.5",   7.5f,     0x1F, false, kvalues_mxfp6_e2m3, fp6_e2m3_to_float, float_to_fp6_e2m3_rn },
+            { "e2m3 sat 100",   100.0f,   0x1F, true,  kvalues_mxfp6_e2m3, fp6_e2m3_to_float, float_to_fp6_e2m3_rn },
 
             // FP6 E3M2 — [S(1)|E(3)|M(2)], no NaN/Inf, exp=7 is NORMAL
-            { "e3m2 zero",      0.0f,    0x00, fp6_e3m2_to_float, float_to_fp6_e3m2_rn },
-            { "e3m2 sub",       0.0625f, 0x01, fp6_e3m2_to_float, float_to_fp6_e3m2_rn },
-            { "e3m2 max 28.0",  28.0f,   0x1F, fp6_e3m2_to_float, float_to_fp6_e3m2_rn },
-            { "e3m2 exp7 16",   16.0f,   0x1C, fp6_e3m2_to_float, float_to_fp6_e3m2_rn },  // exp=7, mant=0
+            { "e3m2 zero",      0.0f,     0x00, false, kvalues_mxfp6_e3m2, fp6_e3m2_to_float, float_to_fp6_e3m2_rn },
+            { "e3m2 sub",       0.0625f,  0x01, false, kvalues_mxfp6_e3m2, fp6_e3m2_to_float, float_to_fp6_e3m2_rn },
+            { "e3m2 max 28.0",  28.0f,    0x1F, false, kvalues_mxfp6_e3m2, fp6_e3m2_to_float, float_to_fp6_e3m2_rn },
+            { "e3m2 exp7 16",   16.0f,    0x1C, false, kvalues_mxfp6_e3m2, fp6_e3m2_to_float, float_to_fp6_e3m2_rn },
 
             // FP8 E5M2 — [S(1)|E(5)|M(2)], bias=15
-            { "e5m2 zero",      0.0f,    0x00, fp8_e5m2_to_float, float_to_fp8_e5m2_rn },
-            { "e5m2 max",       57344.f, 0x7B, fp8_e5m2_to_float, float_to_fp8_e5m2_rn },
+            { "e5m2 zero",      0.0f,     0x00, false, kvalues_mxfp8_e5m2, fp8_e5m2_to_float, float_to_fp8_e5m2_rn },
+            { "e5m2 max",       57344.f,  0x7B, false, kvalues_mxfp8_e5m2, fp8_e5m2_to_float, float_to_fp8_e5m2_rn },
         };
 
         int conv_bad = 0;
+
+        // First: validate that our expected_bits are correct by checking against canonical LUTs.
+        // This ensures the test itself isn't wrong.
+        for (const auto & c : checks) {
+            if (c.lut && !c.is_saturation) {
+                float lut_val = c.lut[c.expected_bits];
+                if (c.input != lut_val && !(c.input == 0.0f && lut_val == 0.0f)) {
+                    printf("  TEST BUG %s: expected_bits=0x%02X → LUT=%.8g, but input=%.8g\n",
+                           c.name, c.expected_bits, lut_val, c.input);
+                    conv_bad++;
+                }
+            } else if (!c.lut && !c.is_saturation) {
+                // FP4: validate against kvalues_mxfp4_float
+                float lut_val = kvalues_mxfp4_float[c.expected_bits];
+                if (c.input != lut_val && !(c.input == 0.0f && lut_val == 0.0f)) {
+                    printf("  TEST BUG %s: expected_bits=0x%02X → LUT=%.8g, but input=%.8g\n",
+                           c.name, c.expected_bits, lut_val, c.input);
+                    conv_bad++;
+                }
+            }
+        }
+
+        // Now test the quantize direction
         for (const auto & c : checks) {
             uint8_t got;
             if (c.to_quant) {
@@ -704,6 +741,27 @@ int main(int argc, char * argv[]) {
                        t.name, RESULT_STR[failed], t.count - rt_bad, t.count);
             }
         }
+
+        // FP4 E2M1: uses static inline converters (not GGML_API wrappers), only 16 values
+        {
+            int rt_bad = 0;
+            for (int i = 0; i < 16; i++) {
+                float f = ggml_mxfp_fp4_e2m1_to_float((uint8_t)i);
+                uint8_t back = ggml_mxfp_float_to_fp4_e2m1(f);
+                if (back != (uint8_t)i && !(f == 0.0f && ggml_mxfp_fp4_e2m1_to_float(back) == 0.0f)) {
+                    if (rt_bad == 0 || verbose) {
+                        printf("  fp4_e2m1 roundtrip: 0x%02X → %.6g → 0x%02X\n", i, f, back);
+                    }
+                    rt_bad++;
+                }
+            }
+            failed = (rt_bad > 0);
+            num_failed += failed;
+            if (failed || verbose) {
+                printf("fp4_e2m1 converter round-trip:             %s (%d/16 survived)\n",
+                       RESULT_STR[failed], 16 - rt_bad);
+            }
+        }
     }
 
     // E8M0 scale computation: verify base exponent is reasonable for various amax values
@@ -770,6 +828,322 @@ int main(int argc, char * argv[]) {
         }
         if (verbose) {
             printf("  SoA layout offset check:             %s\n", RESULT_STR[0]); // only prints failures above
+        }
+    }
+
+    // Block size consistency: all MXFP types use 32 elements per block.
+    // A backend that uses 16 or 64 will silently produce garbage.
+    {
+        failed = !(QK_MXFP4 == 32 && QK_MXFP8 == 32 && QK_MXFP6 == 32);
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("  MXFP block size == 32:               %s (QK4=%d, QK8=%d, QK6=%d)\n",
+                   RESULT_STR[failed], QK_MXFP4, QK_MXFP8, QK_MXFP6);
+        }
+    }
+
+    // EMAX_OFFSET vs LUT max consistency: verify the EMAX_OFFSET is appropriate
+    // for the actual max finite value in each format's LUT.
+    {
+        struct emax_check {
+            const char  * name;
+            int           emax_offset;
+            float         max_finite;    // from LUT / converter
+        };
+
+        const emax_check emax_checks[] = {
+            { "fp4_e2m1", MXFP4_E2M1_EMAX_OFFSET, 6.0f     },
+            { "fp6_e2m3", MXFP6_E2M3_EMAX_OFFSET, 7.5f     },
+            { "fp6_e3m2", MXFP6_E3M2_EMAX_OFFSET, 28.0f    },
+            { "fp8_e4m3", MXFP8_E4M3_EMAX_OFFSET, 448.0f   },
+            { "fp8_e5m2", MXFP8_E5M2_EMAX_OFFSET, 57344.0f },
+        };
+
+        int emax_bad = 0;
+        for (const auto & e : emax_checks) {
+            // When amax == max_finite, the base estimate must produce a valid E8M0 (1..254)
+            int e_base = ggml_mxfp_e8m0_base_estimate(e.max_finite, e.emax_offset);
+            if (e_base < 1 || e_base > 254) {
+                if (emax_bad == 0 || verbose) {
+                    printf("  %s emax_offset=%d: max_finite=%.1f gives e_base=%d (out of range)\n",
+                           e.name, e.emax_offset, e.max_finite, e_base);
+                }
+                emax_bad++;
+            }
+        }
+        failed = (emax_bad > 0);
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("  EMAX_OFFSET vs format max:           %s\n", RESULT_STR[failed]);
+        }
+    }
+
+    // AoS ↔ SoA cross-check for MXFP4: two independent code paths, same quantization algorithm.
+    // If AoS and SoA dequant produce the same floats from the same input, both are correct.
+    {
+        const int nelems = 64;  // 2 blocks
+        float input[64];
+        for (int i = 0; i < 64; i++) {
+            input[i] = 0.5f + 2.0f * sinf(i * 0.7f + 0.3f);
+        }
+
+        // Quantize and dequant via AoS (block_mxfp4 structs)
+        std::vector<block_mxfp4> aos_q(nelems / QK_MXFP4);
+        std::vector<float> aos_out(nelems);
+        quantize_row_mxfp4_ref(input, aos_q.data(), nelems);
+        dequantize_row_mxfp4(aos_q.data(), aos_out.data(), nelems);
+
+        // Quantize and dequant via SoA
+        const size_t soa_buf_size = ggml_row_size(GGML_TYPE_MXFP4_E2M1, nelems);
+        std::vector<uint8_t> soa_q(soa_buf_size);
+        std::vector<float> soa_out(nelems);
+        quantize_row_mxfp4_soa(input, soa_q.data(), nelems);
+        dequantize_row_mxfp4_soa(soa_q.data(), soa_out.data(), nelems);
+
+        // Compare: both paths should produce identical results
+        int mismatches = 0;
+        for (int i = 0; i < nelems; i++) {
+            uint32_t a, b;
+            memcpy(&a, &aos_out[i], 4);
+            memcpy(&b, &soa_out[i], 4);
+            if (a != b) {
+                if (mismatches == 0 || verbose) {
+                    printf("  mxfp4 AoS/SoA mismatch at [%d]: AoS=%.8g, SoA=%.8g\n",
+                           i, aos_out[i], soa_out[i]);
+                }
+                mismatches++;
+            }
+        }
+        failed = (mismatches > 0);
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("mxfp4 AoS vs SoA cross-check:          %s (%d/%d match)\n",
+                   RESULT_STR[failed], nelems - mismatches, nelems);
+        }
+    }
+
+    // Full Hadamard + quantize + dequant + Hadamard roundtrip (KV cache pipeline).
+    // This is the actual path data takes through the KV cache:
+    //   write: Hadamard(K) → quantize_soa
+    //   read:  dequant_soa → Hadamard(result)  [Hadamard is self-inverse]
+    // The roundtrip error should be bounded by the format's quantization error.
+    {
+        struct hadamard_pipeline_check {
+            const char * name;
+            ggml_type    type;
+            float        max_err;
+        };
+
+        const hadamard_pipeline_check pipeline_checks[] = {
+            { "mxfp4",     GGML_TYPE_MXFP4_E2M1, MAX_MXFP_PIPELINE_ERROR_MXFP4 },
+            { "mxfp8",     GGML_TYPE_MXFP8_E4M3, MAX_MXFP_PIPELINE_ERROR_MXFP8 },
+            { "mxfp6",     GGML_TYPE_MXFP6_E2M3, MAX_MXFP_PIPELINE_ERROR_MXFP6 },
+        };
+
+        for (const auto & p : pipeline_checks) {
+            const auto * cpu = ggml_get_type_traits_cpu(p.type);
+
+            std::vector<float> original(test_size);
+            std::vector<float> rotated(test_size);
+            std::vector<float> recovered(test_size);
+            generate_data(2.0, test_size, original.data());
+
+            // Write path: Hadamard each block, then quantize
+            memcpy(rotated.data(), original.data(), test_size * sizeof(float));
+            for (size_t b = 0; b < test_size / 32; b++) {
+                ggml_hadamard_32_inplace(&rotated[b * 32]);
+            }
+
+            const size_t buf_size = ggml_row_size(p.type, test_size);
+            std::vector<uint8_t> qbuf(buf_size);
+            cpu->from_float_soa(rotated.data(), qbuf.data(), test_size);
+
+            // Read path: dequant, then Hadamard each block (self-inverse)
+            cpu->to_float_soa(qbuf.data(), recovered.data(), test_size);
+            for (size_t b = 0; b < test_size / 32; b++) {
+                ggml_hadamard_32_inplace(&recovered[b * 32]);
+            }
+
+            float err = mxfp_rmse(original.data(), recovered.data(), test_size);
+            failed = !(err < p.max_err);
+            num_failed += failed;
+            if (failed || verbose) {
+                printf("%5s Hadamard pipeline roundtrip:       %s (err=%.6f, max=%.6f)\n",
+                       p.name, RESULT_STR[failed], err, p.max_err);
+            }
+        }
+    }
+
+    // Hadamard known output: H([1,0,...,0]) must produce [1/sqrt(32)] for all elements.
+    // Tests butterfly structure AND normalization constant — catches 1/32 vs 1/sqrt(32).
+    {
+        float unit[32] = {};
+        unit[0] = 1.0f;
+        ggml_hadamard_32_inplace(unit);
+
+        const float expected = MXFP_HADAMARD_32_NORM;  // 1/sqrt(32)
+        float max_err = 0.0f;
+        for (int i = 0; i < 32; i++) {
+            float err = fabsf(unit[i] - expected);
+            if (err > max_err) max_err = err;
+        }
+        failed = !(max_err < 1e-7f);
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("hadamard unit vector:                  %s (max_err=%.2e, expected %.8f)\n",
+                   RESULT_STR[failed], max_err, expected);
+        }
+    }
+
+    // Zero block E8M0: all-zero input must produce E8M0=0, which decodes to 2^(-127), not 0.0.
+    {
+        float zeros[32] = {};
+        const size_t buf_size = ggml_row_size(GGML_TYPE_MXFP8_E4M3, 32);
+        std::vector<uint8_t> buf(buf_size, 0xFF);  // fill with 0xFF to detect non-writes
+
+        quantize_row_mxfp8_soa(zeros, buf.data(), 32);
+
+        // E8M0 scale is at offset MXFP8_SOA_QS_PER_BLOCK (32) for 1 block
+        uint8_t e8m0 = buf[MXFP8_SOA_QS_PER_BLOCK];
+        failed = (e8m0 != 0);
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("  zero block E8M0:                     %s (e8m0=%d, expected 0)\n",
+                   RESULT_STR[failed], e8m0);
+        }
+    }
+
+    // SoA format specification test: quantize with reference, manually walk raw bytes
+    // using element converters + E8M0 scale, compare against reference dequant.
+    // This IS the executable format specification. Any backend that can replicate
+    // this manual dequant has a correct implementation.
+    {
+        // Use 2 blocks (64 elements) with asymmetric data to stress scale boundaries
+        const int nblocks = 2;
+        const int nelems = nblocks * 32;
+        float input[64];
+        for (int i = 0; i < 64; i++) {
+            // Block 0: small values, Block 1: large values — different E8M0 scales
+            input[i] = (i < 32) ? 0.1f * sinf(i + 0.5f) : 3.0f * cosf(i + 0.5f);
+        }
+
+        // --- MXFP4 SoA format spec ---
+        {
+            const size_t buf_size = ggml_row_size(GGML_TYPE_MXFP4_E2M1, nelems);
+            std::vector<uint8_t> buf(buf_size);
+            std::vector<float> ref_out(nelems);
+            std::vector<float> manual_out(nelems);
+
+            quantize_row_mxfp4_soa(input, buf.data(), nelems);
+            dequantize_row_mxfp4_soa(buf.data(), ref_out.data(), nelems);
+
+            // Manual dequant: qs at offset 0, e8m0 at offset nblocks * 16
+            const uint8_t * qs = buf.data();
+            const uint8_t * e8m0 = buf.data() + MXFP_SOA_E8M0_OFFSET(nblocks, MXFP4_SOA_QS_PER_BLOCK);
+
+            for (int b = 0; b < nblocks; b++) {
+                const float d = ggml_mxfp_e8m0_to_fp32_half(e8m0[b]);
+                const uint8_t * block_qs = qs + MXFP_SOA_QS_OFFSET(b, MXFP4_SOA_QS_PER_BLOCK);
+                for (int j = 0; j < 16; j++) {
+                    // Low nibble = elements 0..15, high nibble = elements 16..31
+                    int8_t v_lo = kvalues_mxfp4[block_qs[j] & 0x0F];
+                    int8_t v_hi = kvalues_mxfp4[block_qs[j] >>   4];
+                    manual_out[b*32 + j]      = v_lo * d;
+                    manual_out[b*32 + j + 16] = v_hi * d;
+                }
+            }
+
+            int mismatches = 0;
+            for (int i = 0; i < nelems; i++) {
+                uint32_t a, b;
+                memcpy(&a, &ref_out[i], 4);
+                memcpy(&b, &manual_out[i], 4);
+                if (a != b) mismatches++;
+            }
+            failed = (mismatches > 0);
+            num_failed += failed;
+            if (failed || verbose) {
+                printf("mxfp4 SoA format spec:                 %s (%d/%d match)\n",
+                       RESULT_STR[failed], nelems - mismatches, nelems);
+            }
+        }
+
+        // --- MXFP8 SoA format spec ---
+        {
+            const size_t buf_size = ggml_row_size(GGML_TYPE_MXFP8_E4M3, nelems);
+            std::vector<uint8_t> buf(buf_size);
+            std::vector<float> ref_out(nelems);
+            std::vector<float> manual_out(nelems);
+
+            quantize_row_mxfp8_soa(input, buf.data(), nelems);
+            dequantize_row_mxfp8_soa(buf.data(), ref_out.data(), nelems);
+
+            const uint8_t * qs = buf.data();
+            const uint8_t * e8m0 = buf.data() + MXFP_SOA_E8M0_OFFSET(nblocks, MXFP8_SOA_QS_PER_BLOCK);
+
+            for (int b = 0; b < nblocks; b++) {
+                const float d = ggml_mxfp_e8m0_to_fp32(e8m0[b]);
+                const uint8_t * block_qs = qs + MXFP_SOA_QS_OFFSET(b, MXFP8_SOA_QS_PER_BLOCK);
+                for (int j = 0; j < 32; j++) {
+                    // Linear byte order, one FP8 per byte
+                    manual_out[b*32 + j] = fp8_e4m3_to_float(block_qs[j]) * d;
+                }
+            }
+
+            int mismatches = 0;
+            for (int i = 0; i < nelems; i++) {
+                uint32_t a, b;
+                memcpy(&a, &ref_out[i], 4);
+                memcpy(&b, &manual_out[i], 4);
+                if (a != b) mismatches++;
+            }
+            failed = (mismatches > 0);
+            num_failed += failed;
+            if (failed || verbose) {
+                printf("mxfp8 SoA format spec:                 %s (%d/%d match)\n",
+                       RESULT_STR[failed], nelems - mismatches, nelems);
+            }
+        }
+
+        // --- MXFP6 SoA format spec ---
+        {
+            const size_t buf_size = ggml_row_size(GGML_TYPE_MXFP6_E2M3, nelems);
+            std::vector<uint8_t> buf(buf_size);
+            std::vector<float> ref_out(nelems);
+            std::vector<float> manual_out(nelems);
+
+            quantize_row_mxfp6_soa(input, buf.data(), nelems);
+            dequantize_row_mxfp6_soa(buf.data(), ref_out.data(), nelems);
+
+            const uint8_t * qs = buf.data();
+            const uint8_t * e8m0 = buf.data() + MXFP_SOA_E8M0_OFFSET(nblocks, MXFP6_SOA_QS_PER_BLOCK);
+
+            for (int b = 0; b < nblocks; b++) {
+                const float d = ggml_mxfp_e8m0_to_fp32(e8m0[b]);
+                const uint8_t * block_qs = qs + MXFP_SOA_QS_OFFSET(b, MXFP6_SOA_QS_PER_BLOCK);
+                for (int j = 0; j < 32; j += 4) {
+                    // 4 elements packed into 3 bytes at offset j*3/4
+                    uint8_t vals[4];
+                    unpack_fp6x4(&block_qs[j * 3 / 4], vals);
+                    for (int k = 0; k < 4; k++) {
+                        manual_out[b*32 + j + k] = fp6_e2m3_to_float(vals[k]) * d;
+                    }
+                }
+            }
+
+            int mismatches = 0;
+            for (int i = 0; i < nelems; i++) {
+                uint32_t a, b;
+                memcpy(&a, &ref_out[i], 4);
+                memcpy(&b, &manual_out[i], 4);
+                if (a != b) mismatches++;
+            }
+            failed = (mismatches > 0);
+            num_failed += failed;
+            if (failed || verbose) {
+                printf("mxfp6 SoA format spec:                 %s (%d/%d match)\n",
+                       RESULT_STR[failed], nelems - mismatches, nelems);
+            }
         }
     }
 
