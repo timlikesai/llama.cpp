@@ -280,13 +280,11 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
     },
     [GGML_TYPE_MXFP8] = {
-        .from_float               = quantize_row_mxfp8,
         .from_float_soa           = quantize_row_mxfp8_soa,
         .to_float_soa             = dequantize_row_mxfp8_soa_cpu,
         .nrows                    = 1,
     },
     [GGML_TYPE_MXFP6] = {
-        .from_float               = quantize_row_mxfp6,
         .from_float_soa           = quantize_row_mxfp6_soa,
         .to_float_soa             = dequantize_row_mxfp6_soa_cpu,
         .nrows                    = 1,
