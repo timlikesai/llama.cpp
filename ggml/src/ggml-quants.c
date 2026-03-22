@@ -270,7 +270,7 @@ typedef struct {
     int      emax_offset;  // type-specific offset to max representable exponent
     uint8_t  (*to_elem)(float);
     float    (*to_float)(uint8_t);
-    float    (*mse_error)(float val, float inv_scale, float scale);
+    float    (*mse_error)(float val, float inv_scale, float scale); // NULL = use generic round-trip via to_elem/to_float
 } mxfp_elem_traits_t;
 
 static inline int best_index_mxfp4(float x, float e);
@@ -319,7 +319,13 @@ static inline uint8_t mxfp_compute_e8m0_mse(const float * x, int qk, const mxfp_
         const float test_inv = 1.0f / test_scale;
         float mse = 0.0f;
         for (int j = 0; j < qk; ++j) {
-            mse += traits->mse_error(x[j], test_inv, test_scale);
+            if (traits->mse_error) {
+                mse += traits->mse_error(x[j], test_inv, test_scale);
+            } else {
+                const float recon = traits->to_float(traits->to_elem(x[j] * test_inv)) * test_scale;
+                const float err = x[j] - recon;
+                mse += err * err;
+            }
         }
         if (mse < best_mse) {
             best_mse = mse;
@@ -574,18 +580,8 @@ uint8_t float_to_fp8_e5m2_rn(float x) { return ggml_mxfp_float_to_fp8_e5m2(x); }
 void pack_fp6x4(const uint8_t v[4], uint8_t out[3])   { ggml_mxfp_pack_fp6x4(v, out); }
 void unpack_fp6x4(const uint8_t in[3], uint8_t v[4])   { ggml_mxfp_unpack_fp6x4(in, v); }
 
-static float mse_error_fp8_e4m3(float val, float inv_scale, float scale) {
-    const float recon = fp8_e4m3_to_float(float_to_fp8_e4m3_rn(val * inv_scale)) * scale;
-    const float err = val - recon;
-    return err * err;
-}
-static float mse_error_fp6_e2m3(float val, float inv_scale, float scale) {
-    const float recon = fp6_e2m3_to_float(float_to_fp6_e2m3_rn(val * inv_scale)) * scale;
-    const float err = val - recon;
-    return err * err;
-}
-static const mxfp_elem_traits_t mxfp8_e4m3_traits = { MXFP8_E4M3_EMAX_OFFSET,  float_to_fp8_e4m3_rn, fp8_e4m3_to_float, mse_error_fp8_e4m3 };
-static const mxfp_elem_traits_t mxfp6_e2m3_traits = { MXFP6_E2M3_EMAX_OFFSET,  float_to_fp6_e2m3_rn, fp6_e2m3_to_float, mse_error_fp6_e2m3 };
+static const mxfp_elem_traits_t mxfp8_e4m3_traits = { MXFP8_E4M3_EMAX_OFFSET, float_to_fp8_e4m3_rn, fp8_e4m3_to_float, NULL };
+static const mxfp_elem_traits_t mxfp6_e2m3_traits = { MXFP6_E2M3_EMAX_OFFSET, float_to_fp6_e2m3_rn, fp6_e2m3_to_float, NULL };
 
 static void quantize_row_mxfp8_impl(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y,
                                      int64_t k, const mxfp_elem_traits_t * traits) {

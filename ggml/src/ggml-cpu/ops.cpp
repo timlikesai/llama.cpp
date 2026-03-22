@@ -8255,6 +8255,11 @@ void ggml_compute_forward_top_k(
     }
 }
 
+// Max head dimension for stack-allocated MXFP buffers.
+static constexpr int64_t MXFP_FA_MAX_D = 1024;
+// SoA buffer size for MXFP_FA_MAX_D with MXFP8 (worst case: 1024 + 32 e8m0 = 1056, rounded up).
+static constexpr int     MXFP_FA_SOA_BUF = 1088;
+
 // SoA function pointer types for MXFP flash attention paths.
 typedef void (*mxfp_soa_quantize_fn)(const float *, void *, int64_t);
 typedef void (*mxfp_soa_dequantize_fn)(const void *, float *, int64_t);
@@ -8432,14 +8437,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
     int ith = params->ith;
 
-    if (is_mxfp_k) { GGML_ASSERT(DK <= 1024); }
-    if (is_mxfp_v) { GGML_ASSERT(DV <= 1024); }
+    if (is_mxfp_k) { GGML_ASSERT(DK <= MXFP_FA_MAX_D); }
+    if (is_mxfp_v) { GGML_ASSERT(DV <= MXFP_FA_MAX_D); }
 
-    float k_dequant_buf[1024];
-    float v_dequant_buf[1024];
+    float k_dequant_buf[MXFP_FA_MAX_D];
+    float v_dequant_buf[MXFP_FA_MAX_D];
 
-    char k_head_soa[1088]; // max: DK=1024 MXFP8 -> 1056 bytes, rounded up
-    char v_head_soa[1088];
+    char k_head_soa[MXFP_FA_SOA_BUF]; // max: DK=1024 MXFP8 -> 1056 bytes, rounded up
+    char v_head_soa[MXFP_FA_SOA_BUF];
 
     float       * VKQ32 = (float       *) params->wdata + ith*(1*DK + 2*DV + CACHE_LINE_SIZE_F32);
     float       * V32   =                 (VKQ32 + 1*DV);
@@ -8485,11 +8490,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const char * v_row_base = mxfp.v.multihead ? ((const char *) v->data + iv3*nbv3) : nullptr;
 
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
-        float Q_f32[1024];
+        float Q_f32[MXFP_FA_MAX_D];
         if (is_mxfp_k) {
             // Q preprocessing: Hadamard + SoA round-trip captures same quantization loss as K.
             if (mxfp.apply_hadamard) {
-                float q_tmp[1024];
+                float q_tmp[MXFP_FA_MAX_D];
                 memcpy(q_tmp, pq, DK * sizeof(float));
                 ggml_apply_hadamard_blocks(q_tmp, DK);
                 mxfp.q_quantize(q_tmp, Q_q, DK);
@@ -8499,7 +8504,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             mxfp.k.dequantize(Q_q, Q_f32, DK);
         } else {
             if (mxfp.apply_hadamard) {
-                float q_tmp[1024];
+                float q_tmp[MXFP_FA_MAX_D];
                 memcpy(q_tmp, pq, DK * sizeof(float));
                 ggml_apply_hadamard_blocks(q_tmp, DK);
                 q_to_vec_dot(q_tmp, Q_q, DK);
@@ -8714,14 +8719,14 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     static constexpr int Q_TILE_SZ  = ggml_fa_tile_config::Q;
     static constexpr int KV_TILE_SZ = ggml_fa_tile_config::KV;
 
-    if (is_mxfp_k) { GGML_ASSERT(DK <= 1024); }
-    if (is_mxfp_v) { GGML_ASSERT(DV <= 1024); }
+    if (is_mxfp_k) { GGML_ASSERT(DK <= MXFP_FA_MAX_D); }
+    if (is_mxfp_v) { GGML_ASSERT(DV <= MXFP_FA_MAX_D); }
 
-    float k_dequant_buf[1024];
-    float v_dequant_buf[1024];
+    float k_dequant_buf[MXFP_FA_MAX_D];
+    float v_dequant_buf[MXFP_FA_MAX_D];
 
-    char k_head_soa[1088];
-    char v_head_soa[1088];
+    char k_head_soa[MXFP_FA_SOA_BUF];
+    char v_head_soa[MXFP_FA_SOA_BUF];
 
     int ir = ir0;
     while (ir < ir1) {
@@ -8785,7 +8790,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                     if (mxfp.apply_hadamard) {
                         ggml_apply_hadamard_blocks(Q_f32 + tq * DK, DK);
                     }
-                    uint8_t q_mxfp_buf[1088]; // max: DK=1024 MXFP8 -> 1056 bytes
+                    uint8_t q_mxfp_buf[MXFP_FA_SOA_BUF];
                     mxfp.q_quantize(Q_f32 + tq * DK, q_mxfp_buf, DK);
                     mxfp.k.dequantize(q_mxfp_buf, Q_f32 + tq * DK, DK);
                 }
@@ -8843,7 +8848,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                         K_f32[dk * KV_TILE_SZ + tk] = k_dequant_buf[dk];
                     }
                 } else {
-                    float k_tmp[1024];
+                    float k_tmp[MXFP_FA_MAX_D];
                     k_to_float(k_data, k_tmp, DK);
                     for (int64_t dk = 0; dk < DK; dk++) {
                         K_f32[dk * KV_TILE_SZ + tk] = k_tmp[dk];
