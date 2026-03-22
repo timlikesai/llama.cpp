@@ -6390,7 +6390,7 @@ struct test_flash_attn_ext : public test_case {
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
-            } else if ((strcmp(t->name, "k") == 0 || strcmp(t->name, "v") == 0) && ggml_is_type_mxfp(t->type)) {
+            } else if (ggml_is_type_mxfp(t->type)) {
                 init_tensor_mxfp_soa(t);
             } else {
                 init_tensor_uniform(t);
