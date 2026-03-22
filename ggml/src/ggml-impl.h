@@ -431,8 +431,14 @@ static inline ggml_fp16_t ggml_compute_fp32_to_fp16(float f) {
 #define GGML_FP32_TO_FP16(x) GGML_COMPUTE_FP32_TO_FP16(x)
 
 // E8M0 shared exponent to float: returns 2^(x - 127).
-// NOTE: duplicated in ggml-common.h as ggml_mxfp_e8m0_to_fp32 — keep in sync.
+// Canonical implementation is ggml_mxfp_e8m0_to_fp32 in ggml-common.h.
+// This thin wrapper exists because not all callers include ggml-common.h.
+// MUST stay in sync — if you change the logic, change ggml-common.h too.
+//
+// E8M0 = 255 is NaN per MX spec; clamped to 254 (max finite) to match
+// the encode path which also clamps to 254, preventing Inf * 0 = NaN.
 static inline float ggml_e8m0_to_fp32(uint8_t x) {
+    if (x == 255) { x = 254; }
     uint32_t bits = (x == 0) ? 0x00400000u : ((uint32_t)x << 23);
     float result;
     memcpy(&result, &bits, sizeof(float));
@@ -441,6 +447,7 @@ static inline float ggml_e8m0_to_fp32(uint8_t x) {
 
 // E8M0 to float/2: returns 2^(x - 128).
 static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
+    if (x == 255) { x = 254; }
     uint32_t bits = (x < 2) ? (0x00200000u << x) : ((uint32_t)(x - 1) << 23);
     float result;
     memcpy(&result, &bits, sizeof(float));

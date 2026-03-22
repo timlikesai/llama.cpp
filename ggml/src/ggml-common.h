@@ -1634,13 +1634,17 @@ GGML_MXFP_FUNC void ggml_mxfp_unpack_fp6x4(const uint8_t in[3], uint8_t v[4]) {
 
 // E8M0 shared exponent → float conversion.
 // E8M0 encoding: value = 2^(x - 127) for x > 0, 2^(-127) for x == 0.
+// E8M0 = 255 is NaN per MX spec, but we clamp to 254 (max finite) to match
+// the encode path which also clamps to 254, preventing Inf * 0 = NaN in dequant.
 GGML_MXFP_FUNC float ggml_mxfp_e8m0_to_fp32(uint8_t x) {
+    if (x == 255) { x = 254; }
     uint32_t bits = (x == 0) ? 0x00400000u : ((uint32_t)x << 23);
     return GGML_MXFP_U32_AS_F32(bits);
 }
 
 // E8M0 → float/2. Used with MXFP4 since E2M1 values are doubled in kvalues_mxfp4.
 GGML_MXFP_FUNC float ggml_mxfp_e8m0_to_fp32_half(uint8_t x) {
+    if (x == 255) { x = 254; }
     uint32_t bits = (x < 2) ? (0x00200000u << x) : ((uint32_t)(x - 1) << 23);
     return GGML_MXFP_U32_AS_F32(bits);
 }
