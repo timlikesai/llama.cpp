@@ -574,12 +574,8 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 
 #ifndef GGML_COMMON_IMPL
 
-// Constexpr-safe NaN/Infinity for static table initializers across all backends.
-// CUDA __device__ tables require constexpr initializers — standard NAN/INFINITY
-// from MSVC expand to non-constexpr ((float)(1e+300)), breaking nvcc compilation.
-// Use __builtin_nanf/__builtin_inff on compilers that support them (GCC, Clang, nvcc).
-// Fall back to standard NAN/INFINITY only on pure MSVC (no CUDA device tables).
-#if defined(_MSC_VER) && !defined(__clang__) && !defined(__CUDACC__)
+// NaN/Infinity for FP8 LUT initializers (CPU-only, guarded out of GPU builds).
+#if defined(_MSC_VER) && !defined(__clang__)
 #include <math.h>
 #define GGML_TABLE_NAN      NAN
 #define GGML_TABLE_INFINITY INFINITY
@@ -1320,6 +1316,10 @@ GGML_TABLE_BEGIN(float, kvalues_mxfp6_e3m2, 64)
      -8.0f,  -10.0f,   -12.0f,  -14.0f,  -16.0f,  -20.0f,  -24.0f,  -28.0f,
 GGML_TABLE_END()
 
+// FP8 E4M3/E5M2 LUTs contain NaN/Inf which cannot be constexpr-initialized in
+// __device__ tables. GPU backends use the converter functions instead.
+#if !defined(GGML_COMMON_DECL_CUDA) && !defined(GGML_COMMON_DECL_HIP) && !defined(GGML_COMMON_DECL_MUSA)
+
 // FP8 E4M3 dequantization LUT: byte -> float. Entry 127 = 448 (max finite), 255 = NaN.
 GGML_TABLE_BEGIN(float, kvalues_mxfp8_e4m3, 256)
            0.0f, 0.001953125f,  0.00390625f, 0.005859375f,   0.0078125f, 0.009765625f,  0.01171875f, 0.013671875f,
@@ -1392,6 +1392,8 @@ GGML_TABLE_BEGIN(float, kvalues_mxfp8_e5m2, 256)
    -8.192000000e+03f,-1.024000000e+04f,-1.228800000e+04f,-1.433600000e+04f,-1.638400000e+04f,-2.048000000e+04f,-2.457600000e+04f,-2.867200000e+04f,
    -3.276800000e+04f,-4.096000000e+04f,-4.915200000e+04f,-5.734400000e+04f, -GGML_TABLE_INFINITY, GGML_TABLE_NAN, GGML_TABLE_NAN, GGML_TABLE_NAN,
 GGML_TABLE_END()
+
+#endif // !CUDA && !HIP && !MUSA
 
 // MXFP element converters -- portable IEEE-754 bit manipulation.
 #if defined(GGML_MXFP_FUNC)
