@@ -122,6 +122,8 @@ if (CUDAToolkit_FOUND)
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
         file(GLOB   SRCS "template-instances/fattn-vec*f16-f16.cu")
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        file(GLOB   SRCS "template-instances/fattn-vec*mxfp*.cu")
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
     endif()
 
     ggml_add_backend_library(ggml-cuda
