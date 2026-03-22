@@ -199,9 +199,7 @@ typedef struct {
 static_assert(sizeof(block_q4_1) == 2 * sizeof(ggml_half) + QK4_1 / 2, "wrong q4_1 block size/padding");
 
 // E8M0 shared exponent constants (OCP MX v1.0 SS5.3).
-// EMAX_OFFSET = approximate log2(max_finite), MSE_RANGE = search radius for optimal scale.
-// ±1 is sufficient — base estimate is always within 1 step of optimal.
-#define MXFP_E8M0_MSE_RANGE      1
+// EMAX_OFFSET ≈ log2(max_finite), used by round(log2(amax)) base estimate.
 #define MXFP4_E2M1_EMAX_OFFSET   2   // floor(log2(6.0))   = 2
 #define MXFP6_E2M3_EMAX_OFFSET   3   //  ceil(log2(7.5))   = 3
 #define MXFP6_E3M2_EMAX_OFFSET   5   //  ceil(log2(28.0))  = 5
