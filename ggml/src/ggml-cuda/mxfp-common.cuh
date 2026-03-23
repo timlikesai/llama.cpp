@@ -3,16 +3,21 @@
 #include "common.cuh"
 
 // CUDA warp-cooperative helpers for MXFP SoA flash attention.
-//
-// Shared type traits, E8M0 computation, quantize/dequant, and roundtrip
-// templates live here — used by fattn-vec.cuh, fattn-common.cuh, and set-rows.cu.
-// All per-element math calls shared portable functions from ggml-common.h
-// (available as __device__ __forceinline__ via GGML_MXFP_FUNC), with
-// ggml_cuda_e8m0_to_fp32 (common.cuh) for intrinsic E8M0 decode.
+// Used by fattn-vec.cuh, fattn-common.cuh, and set-rows.cu.
+// Per-element math via ggml-common.h (GGML_MXFP_FUNC).
 
-// ============================================================================
+// 3-way MXFP type dispatch: expands EXPR once per type with `mxfp_type` as the template arg.
+// Use in switch(runtime_type) bodies to eliminate repetitive MXFP4/8/6 case blocks.
+#define MXFP_DISPATCH(runtime_type, ...) do {               \
+    switch (runtime_type) {                                 \
+        case GGML_TYPE_MXFP4: { constexpr ggml_type mxfp_type = GGML_TYPE_MXFP4; __VA_ARGS__; } break; \
+        case GGML_TYPE_MXFP8: { constexpr ggml_type mxfp_type = GGML_TYPE_MXFP8; __VA_ARGS__; } break; \
+        case GGML_TYPE_MXFP6: { constexpr ggml_type mxfp_type = GGML_TYPE_MXFP6; __VA_ARGS__; } break; \
+        default: GGML_ABORT("unsupported MXFP type"); break; \
+    }                                                       \
+} while (0)
+
 // Type traits: compile-time constants per MXFP type.
-// ============================================================================
 
 template <ggml_type type> struct mxfp_type_traits;
 
@@ -58,9 +63,7 @@ static __device__ __forceinline__ void mxfp_multihead_ptrs(
     }
 }
 
-// ============================================================================
-// Warp-cooperative primitives (must be defined first — used by everything below).
-// ============================================================================
+// Warp-cooperative primitives.
 
 // Warp-wide max absolute value via __shfl_xor_sync.
 static __device__ __forceinline__ float mxfp_warp_amax(float val) {
@@ -83,11 +86,7 @@ static __device__ __forceinline__ float mxfp_hadamard_warp(float val) {
     return val * MXFP_HADAMARD_32_NORM;
 }
 
-// ============================================================================
-// Shared E8M0 scale computation from amax.
-// Calls ggml_mxfp_e8m0_base_estimate (ggml-common.h) + clamp.
-// ============================================================================
-
+// E8M0 scale from amax: ggml_mxfp_e8m0_base_estimate (ggml-common.h) + clamp.
 template <ggml_type type>
 static __device__ __forceinline__ uint8_t mxfp_compute_e8m0(float amax) {
     if (!(amax > 0.0f)) {
@@ -97,15 +96,9 @@ static __device__ __forceinline__ uint8_t mxfp_compute_e8m0(float amax) {
     return (uint8_t)(e_base < 0 ? 0 : (e_base > 254 ? 254 : e_base));
 }
 
-// ============================================================================
 // MXFP element dequant/quant via hardware intrinsics (CUDA 12.8+ / sm_100+).
-// These replace the portable LUT lookups with single-instruction conversions.
-// Safe decode only for E8M0 — encode intrinsics (float→E8M0) have rounding bugs.
-//
-// Both single-element and x2 paired dequant variants provided. The x2 variants
-// convert two elements in one instruction, halving CVT instruction count.
-// Quantize intrinsics for fp8/fp6/fp4 encode are also provided.
-// ============================================================================
+// Single-element, x2 paired dequant, and quantize variants.
+// E8M0 encode intrinsic (__nv_cvt_float_to_e8m0) is BROKEN — never use it.
 
 #if CUDART_VERSION >= 12080
 
@@ -163,59 +156,48 @@ static __device__ __forceinline__ uint8_t mxfp4_quantize_intrinsic(float x) {
 
 #endif // CUDART_VERSION >= 12080
 
-// ============================================================================
-// Shared quantize-roundtrip: float → quantize → dequant → float.
-// Used by Q Hadamard roundtrip (MMA and VEC paths).
-// Caller provides the pre-broadcast E8M0 scale byte.
-// ============================================================================
-
+// Quantize one float element given its E8M0 scale byte → uint8_t.
+// Encapsulates d/inv_d + intrinsic vs portable dispatch.
 template <ggml_type type>
-static __device__ __forceinline__ float mxfp_quantize_roundtrip(float val, uint8_t e8m0);
-
-template <>
-__device__ __forceinline__ float mxfp_quantize_roundtrip<GGML_TYPE_MXFP4>(float val, uint8_t e8m0) {
+static __device__ __forceinline__ uint8_t mxfp_quantize_elem(float val, uint8_t e8m0) {
+    const float d     = ggml_cuda_e8m0_to_fp32(e8m0);
+    const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
+    const float scaled = val * inv_d;
 #if CUDART_VERSION >= 12080
-    const float d     = ggml_cuda_e8m0_to_fp32(e8m0);
-    const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
-    const uint8_t q   = mxfp4_quantize_intrinsic(val * inv_d);
-    return mxfp4_dequant_intrinsic(q) * d;
+    if constexpr (type == GGML_TYPE_MXFP4) { return mxfp4_quantize_intrinsic(scaled); }
+    if constexpr (type == GGML_TYPE_MXFP8) { return mxfp8_quantize_intrinsic(scaled); }
+    if constexpr (type == GGML_TYPE_MXFP6) { return mxfp6_quantize_intrinsic(scaled); }
 #else
-    const float d     = ggml_cuda_e8m0_to_fp32(e8m0);
-    const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
-    const uint8_t q   = ggml_mxfp_float_to_fp4_e2m1(val * inv_d);
-    return ggml_mxfp_fp4_e2m1_to_float(q) * d;
+    if constexpr (type == GGML_TYPE_MXFP4) { return ggml_mxfp_float_to_fp4_e2m1(scaled); }
+    if constexpr (type == GGML_TYPE_MXFP8) { return ggml_mxfp_float_to_fp8_e4m3(scaled); }
+    if constexpr (type == GGML_TYPE_MXFP6) { return ggml_mxfp_float_to_fp6_e2m3(scaled); }
 #endif
 }
 
-template <>
-__device__ __forceinline__ float mxfp_quantize_roundtrip<GGML_TYPE_MXFP8>(float val, uint8_t e8m0) {
-    const float d     = ggml_cuda_e8m0_to_fp32(e8m0);
-    const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
+// Dequant one raw element value (after type-specific extraction).
+template <ggml_type type>
+static __device__ __forceinline__ float mxfp_dequant_raw(uint8_t raw) {
 #if CUDART_VERSION >= 12080
-    const uint8_t q = mxfp8_quantize_intrinsic(val * inv_d);
-    return mxfp8_dequant_intrinsic(q) * d;
+    if constexpr (type == GGML_TYPE_MXFP4) { return mxfp4_dequant_intrinsic(raw); }
+    if constexpr (type == GGML_TYPE_MXFP8) { return mxfp8_dequant_intrinsic(raw); }
+    if constexpr (type == GGML_TYPE_MXFP6) { return mxfp6_dequant_intrinsic(raw); }
 #else
-    return ggml_mxfp_fp8_e4m3_to_float(ggml_mxfp_float_to_fp8_e4m3(val * inv_d)) * d;
+    if constexpr (type == GGML_TYPE_MXFP4) { return ggml_mxfp_fp4_e2m1_to_float(raw); }
+    if constexpr (type == GGML_TYPE_MXFP8) { return ggml_mxfp_fp8_e4m3_to_float(raw); }
+    if constexpr (type == GGML_TYPE_MXFP6) { return ggml_mxfp_fp6_e2m3_to_float(raw); }
 #endif
 }
 
-template <>
-__device__ __forceinline__ float mxfp_quantize_roundtrip<GGML_TYPE_MXFP6>(float val, uint8_t e8m0) {
-    const float d     = ggml_cuda_e8m0_to_fp32(e8m0);
-    const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
-#if CUDART_VERSION >= 12080
-    const uint8_t q = mxfp6_quantize_intrinsic(val * inv_d);
-    return mxfp6_dequant_intrinsic(q) * d;
-#else
-    return ggml_mxfp_fp6_e2m3_to_float(ggml_mxfp_float_to_fp6_e2m3(val * inv_d)) * d;
-#endif
+// Quantize-roundtrip: float → quantize → dequant → float.
+// Used by Q Hadamard roundtrip (MMA and VEC paths).
+template <ggml_type type>
+static __device__ __forceinline__ float mxfp_quantize_roundtrip(float val, uint8_t e8m0) {
+    const float d   = ggml_cuda_e8m0_to_fp32(e8m0);
+    const uint8_t q = mxfp_quantize_elem<type>(val, e8m0);
+    return mxfp_dequant_raw<type>(q) * d;
 }
 
-// ============================================================================
-// Shared Hadamard + E8M0 + roundtrip: the complete Q preprocessing step.
-// Fuses Hadamard transform, warp-wide amax, E8M0 computation, and roundtrip.
-// Used by both VEC and MMA Q paths.
-// ============================================================================
+// Complete Q preprocessing: Hadamard + amax + E8M0 + roundtrip.
 
 template <ggml_type type>
 static __device__ __forceinline__ float mxfp_hadamard_roundtrip(float val) {
@@ -226,17 +208,8 @@ static __device__ __forceinline__ float mxfp_hadamard_roundtrip(float val) {
     return mxfp_quantize_roundtrip<type>(val, e8m0);
 }
 
-// ============================================================================
-// MXFP4 branchless nibble extraction from SoA layout.
-// SoA layout: 16 bytes per 32-element block. Positions 0-15 are low nibbles
-// of bytes 0-15, positions 16-31 are high nibbles of bytes 0-15.
-// Given an even pos0 and pos1 = pos0+1 (always same half), extract both nibbles
-// from one byte load (if pos0 is odd in a byte pair) or two adjacent byte loads.
-//
-// Key insight: since elem is always even, pos0 is always even.
-// Even pos → both pos0 and pos1 are in the same nibble-half (both low or both high).
-// We can extract with: byte = qs[pos0 & 15], shift = (pos0 >= 16) ? 4 : 0.
-// ============================================================================
+// MXFP4 branchless nibble-pair extraction from SoA layout.
+// pos0 is always even → both in same half (low or high nibbles).
 
 static __device__ __forceinline__ void mxfp4_extract_nibble_pair(
         const uint8_t * qs, int pos0, uint8_t & nib0, uint8_t & nib1) {
@@ -248,14 +221,8 @@ static __device__ __forceinline__ void mxfp4_extract_nibble_pair(
     nib1 = (qs[bi1] >> shift) & 0x0F;
 }
 
-// ============================================================================
-// MXFP6 optimized pair dequant from SoA layout.
-// 32 elements packed as 8 groups of 4, each group = 3 bytes.
-// For an even pos0, pos0 and pos1=pos0+1 are always in the same group
-// (since even/odd pairs only cross groups at pos0=3→pos1=4, 7→8, etc.,
-// but pos0 is always even so this never happens: even%4 ∈ {0,2}, never 3).
-// This means we ALWAYS unpack one group and extract two elements.
-// ============================================================================
+// MXFP6 pair extraction from SoA layout.
+// pos0 is always even → pos0%4 ∈ {0,2} → always same group.
 
 static __device__ __forceinline__ void mxfp6_unpack_pair(
         const uint8_t * qs_block, int pos0, uint8_t & v0, uint8_t & v1) {
@@ -268,136 +235,73 @@ static __device__ __forceinline__ void mxfp6_unpack_pair(
     v1 = vals[slot + 1];
 }
 
-// ============================================================================
-// Unified MXFP SoA pair dequant: extract + scale + convert two consecutive
-// elements from a single 32-element block.  Encapsulates all type-specific
-// logic (nibble extraction, fp6 unpacking, byte reads) and the intrinsic vs
-// portable fallback selection.
-//
-// qs_block: pointer to this block's qs region (qs_base + blk * qs_per_blk)
-// e8m0:     the raw E8M0 scale byte for this block
-// pos0:     position of first element within the block (MUST be even)
-// Returns:  float2{elem[pos0], elem[pos0+1]} fully dequantized
-// ============================================================================
+// Unified SoA pair dequant: two consecutive elements from one 32-element block.
+// pos0 MUST be even. Returns float2{elem[pos0], elem[pos0+1]}.
 
 template <ggml_type type>
 static __device__ __forceinline__ float2 mxfp_dequant_elem_pair(
-        const uint8_t * qs_block, uint8_t e8m0, int pos0);
-
-template <>
-__device__ __forceinline__ float2 mxfp_dequant_elem_pair<GGML_TYPE_MXFP4>(
-        const uint8_t * qs_block, uint8_t e8m0, int pos0) {
-#if CUDART_VERSION >= 12080
-    // x2 intrinsic: extract both nibbles as a packed byte, convert in one instruction.
-    // SoA layout: pos0 < 16 → low nibbles, pos0 >= 16 → high nibbles.
-    // nib0 is in bits [0:3] or [4:7], nib1 in the adjacent byte's same half.
-    // Pack nib0 in low nibble, nib1 in high nibble for fp4x2 intrinsic.
-    const int shift = (pos0 >= 16) ? 4 : 0;
-    const int bi0 = pos0 & 15;
-    const uint8_t packed = ((qs_block[bi0] >> shift) & 0x0F) | (((qs_block[bi0 + 1] >> shift) & 0x0F) << 4);
-    const float d = ggml_cuda_e8m0_to_fp32(e8m0);
-    const float2 raw = mxfp4_dequant_x2_intrinsic(packed);
-    return make_float2(raw.x * d, raw.y * d);
-#else
-    uint8_t nib0, nib1;
-    mxfp4_extract_nibble_pair(qs_block, pos0, nib0, nib1);
-    const float d = ggml_cuda_e8m0_to_fp32(e8m0);
-    return make_float2(ggml_mxfp_fp4_e2m1_to_float(nib0) * d,
-                       ggml_mxfp_fp4_e2m1_to_float(nib1) * d);
-#endif
-}
-
-template <>
-__device__ __forceinline__ float2 mxfp_dequant_elem_pair<GGML_TYPE_MXFP8>(
         const uint8_t * qs_block, uint8_t e8m0, int pos0) {
     const float d = ggml_cuda_e8m0_to_fp32(e8m0);
+
+    // Type-specific extraction + x2 intrinsic dequant when available.
+    if constexpr (type == GGML_TYPE_MXFP4) {
 #if CUDART_VERSION >= 12080
-    // x2 intrinsic: load two consecutive bytes as uint16, convert in one instruction.
-    const __nv_fp8x2_storage_t x2 = *reinterpret_cast<const __nv_fp8x2_storage_t *>(qs_block + pos0);
-    const float2 raw = mxfp8_dequant_x2_intrinsic(x2);
-    return make_float2(raw.x * d, raw.y * d);
+        const int shift = (pos0 >= 16) ? 4 : 0;
+        const int bi0 = pos0 & 15;
+        const uint8_t packed = ((qs_block[bi0] >> shift) & 0x0F) | (((qs_block[bi0 + 1] >> shift) & 0x0F) << 4);
+        const float2 raw = mxfp4_dequant_x2_intrinsic(packed);
+        return make_float2(raw.x * d, raw.y * d);
 #else
-    return make_float2(ggml_mxfp_fp8_e4m3_to_float(qs_block[pos0])     * d,
-                       ggml_mxfp_fp8_e4m3_to_float(qs_block[pos0 + 1]) * d);
+        uint8_t nib0, nib1;
+        mxfp4_extract_nibble_pair(qs_block, pos0, nib0, nib1);
+        return make_float2(mxfp_dequant_raw<type>(nib0) * d, mxfp_dequant_raw<type>(nib1) * d);
 #endif
+    } else if constexpr (type == GGML_TYPE_MXFP8) {
+#if CUDART_VERSION >= 12080
+        const __nv_fp8x2_storage_t x2 = *reinterpret_cast<const __nv_fp8x2_storage_t *>(qs_block + pos0);
+        const float2 raw = mxfp8_dequant_x2_intrinsic(x2);
+        return make_float2(raw.x * d, raw.y * d);
+#else
+        return make_float2(mxfp_dequant_raw<type>(qs_block[pos0]) * d,
+                           mxfp_dequant_raw<type>(qs_block[pos0 + 1]) * d);
+#endif
+    } else {
+        uint8_t v0, v1;
+        mxfp6_unpack_pair(qs_block, pos0, v0, v1);
+#if CUDART_VERSION >= 12080
+        const __nv_fp6x2_storage_t x2 = (__nv_fp6x2_storage_t)(v0 | ((uint16_t)v1 << 8));
+        const float2 raw = mxfp6_dequant_x2_intrinsic(x2);
+        return make_float2(raw.x * d, raw.y * d);
+#else
+        return make_float2(mxfp_dequant_raw<type>(v0) * d, mxfp_dequant_raw<type>(v1) * d);
+#endif
+    }
 }
 
-template <>
-__device__ __forceinline__ float2 mxfp_dequant_elem_pair<GGML_TYPE_MXFP6>(
-        const uint8_t * qs_block, uint8_t e8m0, int pos0) {
-    const float d = ggml_cuda_e8m0_to_fp32(e8m0);
-    uint8_t v0, v1;
-    mxfp6_unpack_pair(qs_block, pos0, v0, v1);
-#if CUDART_VERSION >= 12080
-    // x2 intrinsic: pack two 6-bit values into uint16, convert in one instruction.
-    const __nv_fp6x2_storage_t x2 = (__nv_fp6x2_storage_t)(v0 | ((uint16_t)v1 << 8));
-    const float2 raw = mxfp6_dequant_x2_intrinsic(x2);
-    return make_float2(raw.x * d, raw.y * d);
-#else
-    return make_float2(ggml_mxfp_fp6_e2m3_to_float(v0) * d,
-                       ggml_mxfp_fp6_e2m3_to_float(v1) * d);
-#endif
-}
-
-// ============================================================================
-// MXFP SoA single-element dequant for SoA→F16 conversion.
-// Unlike the pair variant, this handles arbitrary positions (not just even).
-// ============================================================================
-
+// Single-element SoA dequant (arbitrary position, used by SoA→F16 conversion).
 template <ggml_type type>
 static __device__ __forceinline__ float mxfp_dequant_elem(
         const uint8_t * qs_base, const uint8_t * e8m0_base,
-        int blk, int pos, int qs_per_blk);
-
-template <>
-__device__ __forceinline__ float mxfp_dequant_elem<GGML_TYPE_MXFP4>(
-        const uint8_t * qs_base, const uint8_t * e8m0_base,
         int blk, int pos, int qs_per_blk) {
+    const float d = ggml_cuda_e8m0_to_fp32(e8m0_base[blk]);
     const uint8_t * qs = qs_base + blk * qs_per_blk;
-    const int byte_idx = pos < 16 ? pos : pos - 16;
-    const uint8_t nibble = (pos < 16) ? (qs[byte_idx] & 0x0F) : (qs[byte_idx] >> 4);
-#if CUDART_VERSION >= 12080
-    const float d = ggml_cuda_e8m0_to_fp32(e8m0_base[blk]);
-    return mxfp4_dequant_intrinsic(nibble) * d;
-#else
-    const float d = ggml_cuda_e8m0_to_fp32(e8m0_base[blk]);
-    return ggml_mxfp_fp4_e2m1_to_float(nibble) * d;
-#endif
+    uint8_t raw;
+    if constexpr (type == GGML_TYPE_MXFP4) {
+        const int byte_idx = pos < 16 ? pos : pos - 16;
+        raw = (pos < 16) ? (qs[byte_idx] & 0x0F) : (qs[byte_idx] >> 4);
+    } else if constexpr (type == GGML_TYPE_MXFP8) {
+        raw = qs[pos];
+    } else {
+        const int grp  = pos / 4;
+        const int slot = pos % 4;
+        uint8_t vals[4];
+        ggml_mxfp_unpack_fp6x4(qs + grp * 3, vals);
+        raw = vals[slot];
+    }
+    return mxfp_dequant_raw<type>(raw) * d;
 }
 
-template <>
-__device__ __forceinline__ float mxfp_dequant_elem<GGML_TYPE_MXFP8>(
-        const uint8_t * qs_base, const uint8_t * e8m0_base,
-        int blk, int pos, int qs_per_blk) {
-    const float d = ggml_cuda_e8m0_to_fp32(e8m0_base[blk]);
-#if CUDART_VERSION >= 12080
-    return mxfp8_dequant_intrinsic(qs_base[blk * qs_per_blk + pos]) * d;
-#else
-    return ggml_mxfp_fp8_e4m3_to_float(qs_base[blk * qs_per_blk + pos]) * d;
-#endif
-}
-
-template <>
-__device__ __forceinline__ float mxfp_dequant_elem<GGML_TYPE_MXFP6>(
-        const uint8_t * qs_base, const uint8_t * e8m0_base,
-        int blk, int pos, int qs_per_blk) {
-    const float d = ggml_cuda_e8m0_to_fp32(e8m0_base[blk]);
-    const int grp  = pos / 4;
-    const int slot = pos % 4;
-    uint8_t vals[4];
-    ggml_mxfp_unpack_fp6x4(qs_base + blk * qs_per_blk + grp * 3, vals);
-#if CUDART_VERSION >= 12080
-    return mxfp6_dequant_intrinsic(vals[slot]) * d;
-#else
-    return ggml_mxfp_fp6_e2m3_to_float(vals[slot]) * d;
-#endif
-}
-
-// ============================================================================
 // MXFP SoA → F16 dequant kernel for MMA flash attention pre-conversion.
-// Templatized on MXFP type for compile-time optimization.
-// Reads SoA layout [qs0..qsN | e0..eN] per row, writes contiguous F16 output.
-// ============================================================================
 
 template <ggml_type mxfp_type>
 static __global__ void k_mxfp_soa_to_f16(
@@ -452,7 +356,6 @@ static __global__ void k_mxfp_soa_to_f16(
 }
 
 // Host dispatch for MXFP SoA → F16 conversion.
-// Host dispatch for MXFP SoA → F16 conversion.
 static void mxfp_soa_to_f16_cuda(
         const char * src, half * dst, ggml_type type,
         int64_t D, int64_t ne1, int64_t ne2, int64_t ne3,
@@ -464,55 +367,25 @@ static void mxfp_soa_to_f16_cuda(
     // multihead = (nb2 == ggml_row_size(type, D))
     const bool multihead = (nb2 == (size_t)ggml_row_size(type, D));
 
-    int qs_per_blk;
-    switch (type) {
-        case GGML_TYPE_MXFP4: qs_per_blk = MXFP4_SOA_QS_PER_BLOCK; break;
-        case GGML_TYPE_MXFP8: qs_per_blk = MXFP8_SOA_QS_PER_BLOCK; break;
-        case GGML_TYPE_MXFP6: qs_per_blk = MXFP6_SOA_QS_PER_BLOCK; break;
-        default: GGML_ABORT("unsupported MXFP type"); return;
-    }
-
-    const int head_qs_bytes = blocks_per_head * qs_per_blk;
-    const int total_blocks = multihead ? (int)ne2 * blocks_per_head : blocks_per_head;
-    const int head_e8m0_offset = total_blocks * qs_per_blk;
-
     const int64_t nrows = ne1 * ne2 * ne3;
-
-    // One CUDA block per row, D threads per block (D <= 256 for FA)
     const int threads = (int)D;
     const int grid    = (int)nrows;
     if (grid <= 0 || threads <= 0) return;
 
-    switch (type) {
-        case GGML_TYPE_MXFP4:
-            k_mxfp_soa_to_f16<GGML_TYPE_MXFP4><<<grid, threads, 0, stream>>>(
-                src, dst, (int)D, ne1, ne2, ne3,
-                (int64_t)nb1, (int64_t)nb2, (int64_t)nb3,
-                blocks_per_head, multihead, head_qs_bytes, head_e8m0_offset);
-            break;
-        case GGML_TYPE_MXFP8:
-            k_mxfp_soa_to_f16<GGML_TYPE_MXFP8><<<grid, threads, 0, stream>>>(
-                src, dst, (int)D, ne1, ne2, ne3,
-                (int64_t)nb1, (int64_t)nb2, (int64_t)nb3,
-                blocks_per_head, multihead, head_qs_bytes, head_e8m0_offset);
-            break;
-        case GGML_TYPE_MXFP6:
-            k_mxfp_soa_to_f16<GGML_TYPE_MXFP6><<<grid, threads, 0, stream>>>(
-                src, dst, (int)D, ne1, ne2, ne3,
-                (int64_t)nb1, (int64_t)nb2, (int64_t)nb3,
-                blocks_per_head, multihead, head_qs_bytes, head_e8m0_offset);
-            break;
-        default:
-            break;
-    }
+    MXFP_DISPATCH(type, {
+        constexpr int qs_per_blk = mxfp_type_traits<mxfp_type>::qs_per_blk;
+        const int head_qs_bytes = blocks_per_head * qs_per_blk;
+        const int total_blocks = multihead ? (int)ne2 * blocks_per_head : blocks_per_head;
+        const int head_e8m0_offset = total_blocks * qs_per_blk;
+        k_mxfp_soa_to_f16<mxfp_type><<<grid, threads, 0, stream>>>(
+            src, dst, (int)D, ne1, ne2, ne3,
+            (int64_t)nb1, (int64_t)nb2, (int64_t)nb3,
+            blocks_per_head, multihead, head_qs_bytes, head_e8m0_offset);
+    });
 }
 
-// ============================================================================
-// MXFP Q Hadamard + roundtrip kernel for MMA flash attention pre-processing.
-// Templatized on MXFP type. Uses shared mxfp_hadamard_roundtrip template.
-// Operates on contiguous F32 Q rows in-place.
-// One warp per 32-element block (same pattern as VEC kernel Q path and set_rows).
-// ============================================================================
+// Q Hadamard + roundtrip kernel for MMA flash attention pre-processing.
+// One warp per 32-element block, operates on F32 Q rows in-place.
 
 template <ggml_type mxfp_type>
 static __global__ void k_mxfp_q_hadamard_roundtrip(
@@ -570,21 +443,8 @@ static void mxfp_q_hadamard_roundtrip_cuda(
     const int64_t s02 = (int64_t)(nb02 / sizeof(float));
     const int64_t s03 = (int64_t)(nb03 / sizeof(float));
 
-    switch (k_type) {
-        case GGML_TYPE_MXFP4:
-            k_mxfp_q_hadamard_roundtrip<GGML_TYPE_MXFP4><<<grid, threads, 0, stream>>>(
-                Q, (int)D, ne1, ne2, ne3, s01, s02, s03);
-            break;
-        case GGML_TYPE_MXFP8:
-            k_mxfp_q_hadamard_roundtrip<GGML_TYPE_MXFP8><<<grid, threads, 0, stream>>>(
-                Q, (int)D, ne1, ne2, ne3, s01, s02, s03);
-            break;
-        case GGML_TYPE_MXFP6:
-            k_mxfp_q_hadamard_roundtrip<GGML_TYPE_MXFP6><<<grid, threads, 0, stream>>>(
-                Q, (int)D, ne1, ne2, ne3, s01, s02, s03);
-            break;
-        default:
-            GGML_ABORT("unsupported MXFP type");
-            break;
-    }
+    MXFP_DISPATCH(k_type,
+        k_mxfp_q_hadamard_roundtrip<mxfp_type><<<grid, threads, 0, stream>>>(
+            Q, (int)D, ne1, ne2, ne3, s01, s02, s03)
+    );
 }

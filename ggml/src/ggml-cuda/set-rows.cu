@@ -210,15 +210,8 @@ static void set_rows_cuda(
     }
 }
 
-// ============================================================================
-// MXFP SoA set_rows kernel — Struct-of-Arrays layout: [qs0..qsN | e0..eN]
-//
-// One warp (32 threads) per 32-element block. Follows the CPU scalar
-// quantize_row_mxfp*_soa, using shared constructs from
-// ggml-common.h for all per-element math.
-//
-// CANNOT reuse k_set_rows_quant — that template is for AoS block types.
-// ============================================================================
+// MXFP SoA set_rows: one warp per 32-element block, SoA layout [qs|e8m0].
+// Cannot reuse k_set_rows_quant (AoS block types only).
 
 template <ggml_type mxfp_type, bool apply_hadamard, typename idx_t>
 static __global__ void k_set_rows_mxfp_soa(
@@ -297,47 +290,23 @@ static __global__ void k_set_rows_mxfp_soa(
 
     // Step 5: Per-type quantize + write to SoA qs region
     uint8_t * qs = (uint8_t *)dst_row_ptr + MXFP_SOA_QS_OFFSET(block_in_row, qs_per_blk);
+    const uint8_t idx = mxfp_quantize_elem<mxfp_type>(val, e8m0);
 
     if constexpr (mxfp_type == GGML_TYPE_MXFP4) {
-#if CUDART_VERSION >= 12080
-        // Intrinsic path: full E8M0 scale, intrinsic quantize uses true E2M1 values.
-        const float d     = ggml_cuda_e8m0_to_fp32(e8m0);
-        const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
-        const uint8_t idx = mxfp4_quantize_intrinsic(val * inv_d);
-#else
-        // Portable path: full scale + shared quantize from ggml-common.h.
-        const float d     = ggml_cuda_e8m0_to_fp32(e8m0);
-        const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
-        const uint8_t idx = ggml_mxfp_float_to_fp4_e2m1(val * inv_d);
-#endif
         // Nibble packing: lanes 0-15 = low nibble, lanes 16-31 = high nibble
-        // Matches CPU: qs[j] = x0 | (x1 << 4) where x0=elem[j], x1=elem[j+16]
         const uint8_t hi = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)idx, lane + 16);
         if (lane < 16) {
             qs[lane] = idx | (hi << 4);
         }
     } else if constexpr (mxfp_type == GGML_TYPE_MXFP8) {
-        const float d = ggml_cuda_e8m0_to_fp32(e8m0);
-        const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
-#if CUDART_VERSION >= 12080
-        qs[lane] = mxfp8_quantize_intrinsic(val * inv_d);
-#else
-        qs[lane] = ggml_mxfp_float_to_fp8_e4m3(val * inv_d);
-#endif
+        qs[lane] = idx;
     } else if constexpr (mxfp_type == GGML_TYPE_MXFP6) {
-        const float d = ggml_cuda_e8m0_to_fp32(e8m0);
-        const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
-#if CUDART_VERSION >= 12080
-        const uint8_t elem = mxfp6_quantize_intrinsic(val * inv_d);
-#else
-        const uint8_t elem = ggml_mxfp_float_to_fp6_e2m3(val * inv_d);
-#endif
         // Pack 4 elements per 3 bytes — gather group of 4 via shuffles
         const int group = lane / 4;
-        const uint8_t v0 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)elem, group * 4 + 0);
-        const uint8_t v1 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)elem, group * 4 + 1);
-        const uint8_t v2 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)elem, group * 4 + 2);
-        const uint8_t v3 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)elem, group * 4 + 3);
+        const uint8_t v0 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)idx, group * 4 + 0);
+        const uint8_t v1 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)idx, group * 4 + 1);
+        const uint8_t v2 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)idx, group * 4 + 2);
+        const uint8_t v3 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)idx, group * 4 + 3);
         if (lane % 4 == 0) {
             const uint8_t vals[4] = { v0, v1, v2, v3 };
             ggml_mxfp_pack_fp6x4(vals, qs + group * 3);
@@ -483,28 +452,14 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_MXFP4 || dst->type == GGML_TYPE_MXFP8 || dst->type == GGML_TYPE_MXFP6) {
-        // MXFP uses Struct-of-Arrays layout: [qs0..qsN | e0..eN] per row.
-        // Cannot reuse k_set_rows_quant — that's for AoS block types.
         const bool hadamard = ((const int32_t *)dst->op_params)[0] != 0;
-        if (dst->type == GGML_TYPE_MXFP4) {
-            set_rows_mxfp_soa_cuda<GGML_TYPE_MXFP4, idx_t>(
+        MXFP_DISPATCH(dst->type,
+            set_rows_mxfp_soa_cuda<mxfp_type, idx_t>(
                 src0_d, src1_d, (char *)dst->data,
                 ne00, ne01, ne02, ne03,
                 nb01, nb02, nb03, nb10, nb11, nb12,
-                nb1, nb2, nb3, ne11, ne12, hadamard, stream);
-        } else if (dst->type == GGML_TYPE_MXFP8) {
-            set_rows_mxfp_soa_cuda<GGML_TYPE_MXFP8, idx_t>(
-                src0_d, src1_d, (char *)dst->data,
-                ne00, ne01, ne02, ne03,
-                nb01, nb02, nb03, nb10, nb11, nb12,
-                nb1, nb2, nb3, ne11, ne12, hadamard, stream);
-        } else {
-            set_rows_mxfp_soa_cuda<GGML_TYPE_MXFP6, idx_t>(
-                src0_d, src1_d, (char *)dst->data,
-                ne00, ne01, ne02, ne03,
-                nb01, nb02, nb03, nb10, nb11, nb12,
-                nb1, nb2, nb3, ne11, ne12, hadamard, stream);
-        }
+                nb1, nb2, nb3, ne11, ne12, hadamard, stream)
+        );
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }
