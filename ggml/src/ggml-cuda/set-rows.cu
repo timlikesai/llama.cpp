@@ -214,7 +214,7 @@ static void set_rows_cuda(
 // MXFP SoA set_rows kernel — Struct-of-Arrays layout: [qs0..qsN | e0..eN]
 //
 // One warp (32 threads) per 32-element block. Follows the CPU scalar
-// quantize_row_mxfp*_soa step-by-step, using shared constructs from
+// quantize_row_mxfp*_soa, using shared constructs from
 // ggml-common.h for all per-element math.
 //
 // CANNOT reuse k_set_rows_quant — that template is for AoS block types.
@@ -259,7 +259,7 @@ static __global__ void k_set_rows_mxfp_soa(
     const int i02 = (int)(tmp % ne02); tmp /= ne02;
     const int i03 = (int)tmp;
 
-    // Index mapping (same as CPU set_rows)
+    // Index mapping
     const int i12 = i03 % (int)ne12;
     const int i11 = i02 % (int)ne11;
     const int i10 = i01;
@@ -305,10 +305,10 @@ static __global__ void k_set_rows_mxfp_soa(
         const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
         const uint8_t idx = mxfp4_quantize_intrinsic(val * inv_d);
 #else
-        // Portable path: half-scale convention (kvalues are doubled).
-        const float d     = ggml_mxfp_e8m0_to_fp32_half(e8m0);
+        // Portable path: full scale + shared quantize from ggml-common.h.
+        const float d     = ggml_cuda_e8m0_to_fp32(e8m0);
         const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
-        const uint8_t idx = mxfp4_quantize_elem(val, inv_d);
+        const uint8_t idx = ggml_mxfp_float_to_fp4_e2m1(val * inv_d);
 #endif
         // Nibble packing: lanes 0-15 = low nibble, lanes 16-31 = high nibble
         // Matches CPU: qs[j] = x0 | (x1 << 4) where x0=elem[j], x1=elem[j+16]

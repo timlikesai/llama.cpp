@@ -73,9 +73,7 @@ static __device__ __forceinline__ float mxfp_warp_amax(float val) {
 }
 
 // Warp-cooperative block-32 Walsh-Hadamard transform.
-// Matches ggml_mxfp_hadamard_32_inplace exactly:
-//   CPU: vals[i+j] = a + b;  vals[i+j+stride] = a - b;
-//   GPU: lower lane (bit clear) = val + other;  upper lane (bit set) = other - val.
+// GPU warp-shuffle equivalent of ggml_mxfp_hadamard_32_inplace (ggml-common.h).
 static __device__ __forceinline__ float mxfp_hadamard_warp(float val) {
     #pragma unroll
     for (int stride = 1; stride < 32; stride *= 2) {
@@ -83,24 +81,6 @@ static __device__ __forceinline__ float mxfp_hadamard_warp(float val) {
         val = (threadIdx.x & stride) ? (other - val) : (val + other);
     }
     return val * MXFP_HADAMARD_32_NORM;
-}
-
-// MXFP4 E2M1 quantize: float → 4-bit index (0-15, high bit = sign).
-// Same decision boundaries as CPU best_index_mxfp4.
-// Takes inv_scale (pre-computed 1/scale) rather than scale, to avoid
-// redundant division across 32 lanes.
-static __device__ __forceinline__ uint8_t mxfp4_quantize_elem(float x, float inv_scale) {
-    const float normalized = fabsf(x) * inv_scale;
-    int idx;
-    if      (normalized < 0.5f)  idx = 0;
-    else if (normalized < 1.5f)  idx = 1;
-    else if (normalized < 2.5f)  idx = 2;
-    else if (normalized < 3.5f)  idx = 3;
-    else if (normalized < 5.0f)  idx = 4;
-    else if (normalized < 7.0f)  idx = 5;
-    else if (normalized < 10.0f) idx = 6;
-    else                         idx = 7;
-    return (uint8_t)((x < 0.0f) ? (idx + 8) : idx);
 }
 
 // ============================================================================
@@ -200,10 +180,10 @@ __device__ __forceinline__ float mxfp_quantize_roundtrip<GGML_TYPE_MXFP4>(float 
     const uint8_t q   = mxfp4_quantize_intrinsic(val * inv_d);
     return mxfp4_dequant_intrinsic(q) * d;
 #else
-    const float d     = ggml_mxfp_e8m0_to_fp32_half(e8m0);
+    const float d     = ggml_cuda_e8m0_to_fp32(e8m0);
     const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
-    const uint8_t idx = mxfp4_quantize_elem(val, inv_d);
-    return kvalues_mxfp4[idx] * d;
+    const uint8_t q   = ggml_mxfp_float_to_fp4_e2m1(val * inv_d);
+    return ggml_mxfp_fp4_e2m1_to_float(q) * d;
 #endif
 }
 
@@ -321,9 +301,9 @@ __device__ __forceinline__ float2 mxfp_dequant_elem_pair<GGML_TYPE_MXFP4>(
 #else
     uint8_t nib0, nib1;
     mxfp4_extract_nibble_pair(qs_block, pos0, nib0, nib1);
-    const float d = ggml_mxfp_e8m0_to_fp32_half(e8m0);
-    return make_float2(kvalues_mxfp4[nib0] * d,
-                       kvalues_mxfp4[nib1] * d);
+    const float d = ggml_cuda_e8m0_to_fp32(e8m0);
+    return make_float2(ggml_mxfp_fp4_e2m1_to_float(nib0) * d,
+                       ggml_mxfp_fp4_e2m1_to_float(nib1) * d);
 #endif
 }
 
@@ -380,8 +360,8 @@ __device__ __forceinline__ float mxfp_dequant_elem<GGML_TYPE_MXFP4>(
     const float d = ggml_cuda_e8m0_to_fp32(e8m0_base[blk]);
     return mxfp4_dequant_intrinsic(nibble) * d;
 #else
-    const float d = ggml_mxfp_e8m0_to_fp32_half(e8m0_base[blk]);
-    return kvalues_mxfp4[nibble] * d;
+    const float d = ggml_cuda_e8m0_to_fp32(e8m0_base[blk]);
+    return ggml_mxfp_fp4_e2m1_to_float(nibble) * d;
 #endif
 }
 
@@ -447,8 +427,7 @@ static __global__ void k_mxfp_soa_to_f16(
     const int64_t i2 = (flat_row / ne1) % ne2;
     const int64_t i1 = flat_row % ne1;
 
-    // Matches CPU mxfp_row_ptr: multihead skips head offset in row pointer,
-    // and mxfp_dequant_head extracts per-head data within the row.
+    // Multihead: row spans all heads, extract per-head qs/e8m0 offsets.
     const char * src_row;
     const uint8_t * qs_base;
     const uint8_t * e8m0_base;
@@ -473,7 +452,7 @@ static __global__ void k_mxfp_soa_to_f16(
 }
 
 // Host dispatch for MXFP SoA → F16 conversion.
-// Matches CPU mxfp_kv_params_init for multihead detection.
+// Host dispatch for MXFP SoA → F16 conversion.
 static void mxfp_soa_to_f16_cuda(
         const char * src, half * dst, ggml_type type,
         int64_t D, int64_t ne1, int64_t ne2, int64_t ne3,
@@ -481,7 +460,7 @@ static void mxfp_soa_to_f16_cuda(
 
     const int blocks_per_head = (int)(D / 32);
 
-    // Multihead detection — matches CPU mxfp_kv_params_init exactly:
+    // Multihead detection:
     // multihead = (nb2 == ggml_row_size(type, D))
     const bool multihead = (nb2 == (size_t)ggml_row_size(type, D));
 

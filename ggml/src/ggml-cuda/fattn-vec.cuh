@@ -215,7 +215,6 @@ static __global__ void flash_attn_ext_vec(
     } else if constexpr (is_mxfp_k) {
         // MXFP Q path: fuse Hadamard + quantize roundtrip via warp shuffles + shared memory.
         // K has Hadamard from set_rows — Q MUST have the same rotation for correct Q·K dot product.
-        // Follows CPU scalar implementation step-by-step (ops.cpp mxfp_fa_params_init).
         float * Q_shmem = (float *)&KQ[0];
 
 #pragma unroll
@@ -409,8 +408,7 @@ static __global__ void flash_attn_ext_vec(
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
 
-            // V dequant — for MXFP, compute multihead-aware pointers matching
-            // CPU mxfp_row_ptr + mxfp_dequant_head exactly.
+            // V dequant — for MXFP, compute multihead-aware pointers.
             const char * V_row = V + k*nb21;
 
             // MXFP V: compute qs_base/e8m0_base directly from multihead layout.
