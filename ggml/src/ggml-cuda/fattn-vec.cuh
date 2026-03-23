@@ -105,17 +105,9 @@ static __global__ void flash_attn_ext_vec(
     // KV-position stride, so the SoA region spans all heads. In this case,
     // do NOT add the per-head offset here — mxfp_dequant_head handles it.
     // Row size = type_size * D / blck_size (same as ggml_row_size).
-    constexpr int mxfp_K_row_bytes = is_mxfp_k ?
-        (type_K == GGML_TYPE_MXFP4 ? (int)(sizeof(block_mxfp4) * D / QK_MXFP4) :
-         type_K == GGML_TYPE_MXFP8 ? (int)(sizeof(block_mxfp8) * D / QK_MXFP8) :
-                                      (int)(sizeof(block_mxfp6) * D / QK_MXFP6)) : 0;
-    const bool mxfp_K_multihead = is_mxfp_k && (nb12 == mxfp_K_row_bytes);
+    const bool mxfp_K_multihead = is_mxfp_k && (nb12 == (size_t)MXFP_ROW_BYTES_EXPLICIT(type_K, D));
     constexpr bool is_mxfp_v = (type_V == GGML_TYPE_MXFP4 || type_V == GGML_TYPE_MXFP8 || type_V == GGML_TYPE_MXFP6);
-    constexpr int mxfp_V_row_bytes = is_mxfp_v ?
-        (type_V == GGML_TYPE_MXFP4 ? (int)(sizeof(block_mxfp4) * D / QK_MXFP4) :
-         type_V == GGML_TYPE_MXFP8 ? (int)(sizeof(block_mxfp8) * D / QK_MXFP8) :
-                                      (int)(sizeof(block_mxfp6) * D / QK_MXFP6)) : 0;
-    const bool mxfp_V_multihead = is_mxfp_v && (nb22 == mxfp_V_row_bytes);
+    const bool mxfp_V_multihead = is_mxfp_v && (nb22 == (size_t)MXFP_ROW_BYTES_EXPLICIT(type_V, D));
 
     if (mxfp_K_multihead) {
         K += nb13*sequence;  // no head offset — mxfp_dequant_head extracts per-head data
@@ -248,44 +240,8 @@ static __global__ void flash_attn_ext_vec(
             for (int b = warp_id; b < nblocks_q; b += nwarps) {
                 float val = Q_shmem[b * 32 + lane_id];
 
-                // Fused Hadamard via warp shuffles — matches ggml_mxfp_hadamard_32_inplace
-                val = mxfp_hadamard_warp(val);
-
-                // Fused quantize roundtrip: amax → E8M0 → quantize → dequant
-                // Uses shared constructs from ggml-common.h
-                const float amax = mxfp_warp_amax(val);
-                if constexpr (type_K == GGML_TYPE_MXFP4) {
-                    uint8_t e = 0;
-                    if (amax > 0.0f) {
-                        const int e_base = ggml_mxfp_e8m0_base_estimate(amax, MXFP4_E2M1_EMAX_OFFSET);
-                        e = (uint8_t)(e_base < 0 ? 0 : (e_base > 254 ? 254 : e_base));
-                    }
-                    e = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)e, 0);
-                    const float d = ggml_mxfp_e8m0_to_fp32_half(e);
-                    const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
-                    const uint8_t idx = mxfp4_quantize_elem(val, inv_d);
-                    val = kvalues_mxfp4[idx] * d;
-                } else if constexpr (type_K == GGML_TYPE_MXFP8) {
-                    uint8_t e = 0;
-                    if (amax > 0.0f) {
-                        const int e_base = ggml_mxfp_e8m0_base_estimate(amax, MXFP8_E4M3_EMAX_OFFSET);
-                        e = (uint8_t)(e_base < 0 ? 0 : (e_base > 254 ? 254 : e_base));
-                    }
-                    e = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)e, 0);
-                    const float d = ggml_mxfp_e8m0_to_fp32(e);
-                    const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
-                    val = ggml_mxfp_fp8_e4m3_to_float(ggml_mxfp_float_to_fp8_e4m3(val * inv_d)) * d;
-                } else {
-                    uint8_t e = 0;
-                    if (amax > 0.0f) {
-                        const int e_base = ggml_mxfp_e8m0_base_estimate(amax, MXFP6_E2M3_EMAX_OFFSET);
-                        e = (uint8_t)(e_base < 0 ? 0 : (e_base > 254 ? 254 : e_base));
-                    }
-                    e = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)e, 0);
-                    const float d = ggml_mxfp_e8m0_to_fp32(e);
-                    const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
-                    val = ggml_mxfp_fp6_e2m3_to_float(ggml_mxfp_float_to_fp6_e2m3(val * inv_d)) * d;
-                }
+                // Fused Hadamard + quantize roundtrip via shared template
+                val = mxfp_hadamard_roundtrip<type_K>(val);
 
                 Q_shmem[b * 32 + lane_id] = val;
             }
@@ -376,31 +332,13 @@ static __global__ void flash_attn_ext_vec(
             for (int j = 0; j < ncols; ++j) {
                 float sum;
                 if constexpr (is_mxfp_k) {
-                    // MXFP multihead-aware KQ dot — matches CPU mxfp_row_ptr + mxfp_dequant_head.
-                    // For multihead, the SoA row at K + i_KQ*nb11 spans all heads.
-                    // We must read this head's qs and e8m0 from the correct offsets.
+                    // MXFP multihead-aware KQ dot
                     const char * K_row = K + i_KQ*nb11;
-                    const int kv_head = head / gqa_ratio;
+                    const uint8_t * qs_base;
+                    const uint8_t * e8m0_base;
+                    mxfp_multihead_ptrs<type_K, D>(K_row, head / gqa_ratio, (int)ne12, mxfp_K_multihead, qs_base, e8m0_base);
 
-                    constexpr int blocks_per_head = D / 32;
-                    constexpr int qs_per_blk = (type_K == GGML_TYPE_MXFP4) ? MXFP4_SOA_QS_PER_BLOCK :
-                                               (type_K == GGML_TYPE_MXFP8) ? MXFP8_SOA_QS_PER_BLOCK :
-                                                                               MXFP6_SOA_QS_PER_BLOCK;
-                    constexpr int head_qs_bytes = blocks_per_head * qs_per_blk;
-
-                    // In multihead mode, qs for this head starts at head*head_qs_bytes,
-                    // and e8m0 starts at total_blocks*qs_per_blk + head*blocks_per_head.
-                    // In non-multihead mode, the row IS one head's SoA data.
-                    const int qs_off = mxfp_K_multihead ? kv_head * head_qs_bytes : 0;
-                    const int total_blocks = mxfp_K_multihead ? ne12 * blocks_per_head : blocks_per_head;
-                    const int e8m0_off = total_blocks * qs_per_blk + (mxfp_K_multihead ? kv_head * blocks_per_head : 0);
-
-                    const uint8_t * qs_base   = (const uint8_t *)K_row + qs_off;
-                    const uint8_t * e8m0_base = (const uint8_t *)K_row + e8m0_off;
-
-                    // Inline dot product with Q — same math as vec_dot_fattn_vec_KQ_mxfp*
-                    // elem is always even (elem = 2*i), so elem and elem+1 are always
-                    // in the same 32-element block. One scale decode per pair.
+                    constexpr int qs_per_blk = mxfp_type_traits<type_K>::qs_per_blk;
                     sum = 0.0f;
 #pragma unroll
                     for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
@@ -481,20 +419,7 @@ static __global__ void flash_attn_ext_vec(
             const uint8_t * v_qs_base   = nullptr;
             const uint8_t * v_e8m0_base = nullptr;
             if constexpr (is_mxfp_v) {
-                constexpr int v_blocks_per_head = D / 32;
-                constexpr int v_qs_per_blk = (type_V == GGML_TYPE_MXFP4) ? MXFP4_SOA_QS_PER_BLOCK :
-                                             (type_V == GGML_TYPE_MXFP8) ? MXFP8_SOA_QS_PER_BLOCK :
-                                                                            MXFP6_SOA_QS_PER_BLOCK;
-                if (mxfp_V_multihead) {
-                    constexpr int v_head_qs_bytes = v_blocks_per_head * v_qs_per_blk;
-                    const int v_kv_head = head / gqa_ratio;
-                    const int v_total_blocks = ne12 * v_blocks_per_head;
-                    v_qs_base   = (const uint8_t *)V_row + v_kv_head * v_head_qs_bytes;
-                    v_e8m0_base = (const uint8_t *)V_row + v_total_blocks * v_qs_per_blk + v_kv_head * v_blocks_per_head;
-                } else {
-                    v_qs_base   = (const uint8_t *)V_row;
-                    v_e8m0_base = v_qs_base + v_blocks_per_head * v_qs_per_blk;
-                }
+                mxfp_multihead_ptrs<type_V, D>(V_row, head / gqa_ratio, (int)ne12, mxfp_V_multihead, v_qs_base, v_e8m0_base);
             }
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
@@ -508,9 +433,7 @@ static __global__ void flash_attn_ext_vec(
                 half2 tmp[V_rows_per_thread/2];
                 if constexpr (is_mxfp_v) {
                     // Inline MXFP V dequant — reads directly from multihead layout, no buffer copy.
-                    constexpr int v_qs_per_blk = (type_V == GGML_TYPE_MXFP4) ? MXFP4_SOA_QS_PER_BLOCK :
-                                                 (type_V == GGML_TYPE_MXFP8) ? MXFP8_SOA_QS_PER_BLOCK :
-                                                                                MXFP6_SOA_QS_PER_BLOCK;
+                    constexpr int v_qs_per_blk = mxfp_type_traits<type_V>::qs_per_blk;
                     const int i_base = 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread;
 #pragma unroll
                     for (int l = 0; l < V_rows_per_thread; l += 2) {
@@ -542,9 +465,7 @@ static __global__ void flash_attn_ext_vec(
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 float2 tmp[V_rows_per_thread/2];
                 if constexpr (is_mxfp_v) {
-                    constexpr int v_qs_per_blk = (type_V == GGML_TYPE_MXFP4) ? MXFP4_SOA_QS_PER_BLOCK :
-                                                 (type_V == GGML_TYPE_MXFP8) ? MXFP8_SOA_QS_PER_BLOCK :
-                                                                                MXFP6_SOA_QS_PER_BLOCK;
+                    constexpr int v_qs_per_blk = mxfp_type_traits<type_V>::qs_per_blk;
                     const int i_base = 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread;
 #pragma unroll
                     for (int l = 0; l < V_rows_per_thread; l += 2) {

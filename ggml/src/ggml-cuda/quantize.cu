@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include "mxfp-common.cuh"
 #include <cstdint>
 
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
@@ -45,29 +46,6 @@ static __global__ void quantize_q8_1(
     }
 
     y[ib].ds = make_half2(d, sum);
-}
-
-__device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
-    if (!(amax > 0.0f)) {
-        return 0;
-    }
-
-    // FP4 E2M1: max exponent (unbiased) is 2.
-    constexpr int FP4_E2M1_EMAX = 2;
-
-    const float e = log2f(amax);
-
-    // "even" -> round-to-nearest integer, ties-to-even
-    const int e_int = __float2int_rn(e);
-
-    const int shared_exp = e_int - FP4_E2M1_EMAX;
-
-    int biased = shared_exp + 127;
-
-    biased = max(biased, 0);
-    biased = min(biased, 254);
-
-    return static_cast<uint8_t>(biased);
 }
 
 // quantize values in the format mxfp4 is stored which is interleaved nibbles
@@ -131,7 +109,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
             amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, WARP_SIZE));
         }
 
-        const uint8_t e = compute_e8m0_scale(amax);
+        const uint8_t e = mxfp_compute_e8m0<GGML_TYPE_MXFP4>(amax);
         scales[b] = e;
         const float inv_s = (amax == 0.0f) ? 0.0f : __frcp_rn(ggml_cuda_e8m0_to_fp32(e));
 

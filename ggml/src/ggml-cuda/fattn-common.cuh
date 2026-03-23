@@ -536,19 +536,18 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
 
 // ============================================================================
 // MXFP SoA K dequant + dot product for VEC flash attention.
-// Reads K from SoA layout: [qs0..qsN | e0..eN] per row.
-// Uses shared constructs from ggml-common.h for all dequant math.
+// Unified template — type-specific logic is in mxfp_dequant_elem_pair.
 // ============================================================================
 
-template<int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4(
+template<ggml_type mxfp_type, int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
     GGML_UNUSED(Q_q8);
     GGML_UNUSED(Q_ds_v);
 
     constexpr int nblocks = D / 32;
-    constexpr int qs_per_blk = MXFP4_SOA_QS_PER_BLOCK;  // 16
+    constexpr int qs_per_blk = mxfp_type_traits<mxfp_type>::qs_per_blk;
     const uint8_t * qs_base   = (const uint8_t *)K_c;
     const uint8_t * e8m0_base = qs_base + MXFP_SOA_E8M0_OFFSET(nblocks, qs_per_blk);
 
@@ -557,70 +556,10 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4(
 #pragma unroll
     for (int i0 = 0; i0 < D/2; i0 += nthreads) {
         const int i = i0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-        const int elem = 2 * i;  // element index within row (always even)
+        const int elem = 2 * i;
 
         const int blk = elem / 32;
-        const float2 kk = mxfp_dequant_elem_pair<GGML_TYPE_MXFP4>(
-            qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk), e8m0_base[blk], elem % 32);
-
-        const float2 Q_f2 = ((const float2 *)Q_v)[i0/nthreads];
-        sum += kk.x * Q_f2.x + kk.y * Q_f2.y;
-    }
-
-    return sum;
-}
-
-template<int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp8(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-
-    GGML_UNUSED(Q_q8);
-    GGML_UNUSED(Q_ds_v);
-
-    constexpr int nblocks = D / 32;
-    constexpr int qs_per_blk = MXFP8_SOA_QS_PER_BLOCK;  // 32
-    const uint8_t * qs_base   = (const uint8_t *)K_c;
-    const uint8_t * e8m0_base = qs_base + MXFP_SOA_E8M0_OFFSET(nblocks, qs_per_blk);
-
-    float sum = 0.0f;
-
-#pragma unroll
-    for (int i0 = 0; i0 < D/2; i0 += nthreads) {
-        const int i = i0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-        const int elem = 2 * i;  // always even
-
-        const int blk = elem / 32;
-        const float2 kk = mxfp_dequant_elem_pair<GGML_TYPE_MXFP8>(
-            qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk), e8m0_base[blk], elem % 32);
-
-        const float2 Q_f2 = ((const float2 *)Q_v)[i0/nthreads];
-        sum += kk.x * Q_f2.x + kk.y * Q_f2.y;
-    }
-
-    return sum;
-}
-
-template<int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp6(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-
-    GGML_UNUSED(Q_q8);
-    GGML_UNUSED(Q_ds_v);
-
-    constexpr int nblocks = D / 32;
-    constexpr int qs_per_blk = MXFP6_SOA_QS_PER_BLOCK;  // 24
-    const uint8_t * qs_base   = (const uint8_t *)K_c;
-    const uint8_t * e8m0_base = qs_base + MXFP_SOA_E8M0_OFFSET(nblocks, qs_per_blk);
-
-    float sum = 0.0f;
-
-#pragma unroll
-    for (int i0 = 0; i0 < D/2; i0 += nthreads) {
-        const int i = i0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-        const int elem = 2 * i;  // always even
-
-        const int blk = elem / 32;
-        const float2 kk = mxfp_dequant_elem_pair<GGML_TYPE_MXFP6>(
+        const float2 kk = mxfp_dequant_elem_pair<mxfp_type>(
             qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk), e8m0_base[blk], elem % 32);
 
         const float2 Q_f2 = ((const float2 *)Q_v)[i0/nthreads];
@@ -632,110 +571,26 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp6(
 
 // ============================================================================
 // MXFP SoA V dequant for VEC flash attention.
+// Unified template — type-specific logic is in mxfp_dequant_elem_pair.
 // D_V template parameter needed because E8M0 offset depends on nblocks = D_V/32.
 // ============================================================================
 
-template<int D_V, typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_mxfp4_D(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+template<ggml_type mxfp_type, int D_V, typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_mxfp_D(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    static_assert(ne % 2 == 0, "V_rows_per_thread must be even for pair dequant");
     constexpr int nblocks = D_V / 32;
-    constexpr int qs_per_blk = MXFP4_SOA_QS_PER_BLOCK;
+    constexpr int qs_per_blk = mxfp_type_traits<mxfp_type>::qs_per_blk;
     const uint8_t * qs_base   = (const uint8_t *)vx;
     const uint8_t * e8m0_base = qs_base + MXFP_SOA_E8M0_OFFSET(nblocks, qs_per_blk);
 
-    // Hoist per-block state across consecutive elements (ne is typically 4, all within one block).
-    int prev_blk = -1;
-    float d = 0.0f;
-    const uint8_t * qs = nullptr;
-
 #pragma unroll
-    for (int l = 0; l < ne; ++l) {
+    for (int l = 0; l < ne; l += 2) {
         const int elem = (int)i0 + l;
         const int blk  = elem / 32;
-        const int pos  = elem % 32;
-
-        if (blk != prev_blk) {
-#if CUDART_VERSION >= 12080
-            d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
-#else
-            d = ggml_mxfp_e8m0_to_fp32_half(e8m0_base[blk]);
-#endif
-            qs = qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk);
-            prev_blk = blk;
-        }
-
-        const int shift = (pos >= 16) ? 4 : 0;
-        const uint8_t nibble = (qs[pos & 15] >> shift) & 0x0F;
-#if CUDART_VERSION >= 12080
-        ((float *)dst)[l] = mxfp4_dequant_intrinsic(nibble) * d;
-#else
-        ((float *)dst)[l] = kvalues_mxfp4[nibble] * d;
-#endif
-    }
-}
-
-template<int D_V, typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_mxfp8_D(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-    constexpr int nblocks = D_V / 32;
-    constexpr int qs_per_blk = MXFP8_SOA_QS_PER_BLOCK;
-    const uint8_t * qs_base   = (const uint8_t *)vx;
-    const uint8_t * e8m0_base = qs_base + MXFP_SOA_E8M0_OFFSET(nblocks, qs_per_blk);
-
-    int prev_blk = -1;
-    float d = 0.0f;
-    int qs_off = 0;
-
-#pragma unroll
-    for (int l = 0; l < ne; ++l) {
-        const int elem = (int)i0 + l;
-        const int blk  = elem / 32;
-        const int pos  = elem % 32;
-
-        if (blk != prev_blk) {
-            d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
-            qs_off = MXFP_SOA_QS_OFFSET(blk, qs_per_blk);
-            prev_blk = blk;
-        }
-
-#if CUDART_VERSION >= 12080
-        ((float *)dst)[l] = mxfp8_dequant_intrinsic(qs_base[qs_off + pos]) * d;
-#else
-        ((float *)dst)[l] = ggml_mxfp_fp8_e4m3_to_float(qs_base[qs_off + pos]) * d;
-#endif
-    }
-}
-
-template<int D_V, typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_mxfp6_D(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-    constexpr int nblocks = D_V / 32;
-    constexpr int qs_per_blk = MXFP6_SOA_QS_PER_BLOCK;
-    const uint8_t * qs_base   = (const uint8_t *)vx;
-    const uint8_t * e8m0_base = qs_base + MXFP_SOA_E8M0_OFFSET(nblocks, qs_per_blk);
-
-    int prev_blk = -1;
-    float d = 0.0f;
-    int qs_off = 0;
-
-#pragma unroll
-    for (int l = 0; l < ne; ++l) {
-        const int elem = (int)i0 + l;
-        const int blk  = elem / 32;
-        const int pos  = elem % 32;
-
-        if (blk != prev_blk) {
-            d = ggml_mxfp_e8m0_to_fp32(e8m0_base[blk]);
-            qs_off = MXFP_SOA_QS_OFFSET(blk, qs_per_blk);
-            prev_blk = blk;
-        }
-
-        const int grp  = pos / 4;
-        const int slot = pos % 4;
-        uint8_t vals[4];
-        ggml_mxfp_unpack_fp6x4(qs_base + qs_off + grp * 3, vals);
-#if CUDART_VERSION >= 12080
-        ((float *)dst)[l] = mxfp6_dequant_intrinsic(vals[slot]) * d;
-#else
-        ((float *)dst)[l] = ggml_mxfp_fp6_e2m3_to_float(vals[slot]) * d;
-#endif
+        const float2 pair = mxfp_dequant_elem_pair<mxfp_type>(
+            qs_base + blk * qs_per_blk, e8m0_base[blk], elem % 32);
+        ((float *)dst)[l]     = pair.x;
+        ((float *)dst)[l + 1] = pair.y;
     }
 }
 
@@ -754,11 +609,11 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_MXFP4) {
-        return vec_dot_fattn_vec_KQ_mxfp4<D, nthreads>;
+        return vec_dot_fattn_vec_KQ_mxfp<GGML_TYPE_MXFP4, D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_MXFP8) {
-        return vec_dot_fattn_vec_KQ_mxfp8<D, nthreads>;
+        return vec_dot_fattn_vec_KQ_mxfp<GGML_TYPE_MXFP8, D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_MXFP6) {
-        return vec_dot_fattn_vec_KQ_mxfp6<D, nthreads>;
+        return vec_dot_fattn_vec_KQ_mxfp<GGML_TYPE_MXFP6, D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -780,13 +635,11 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
     } else if constexpr (type_V == GGML_TYPE_Q8_0) {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_MXFP4) {
-        // D_V = D for same-type K/V. T is ignored (MXFP always outputs float).
-        // ne is V_rows_per_thread (4 for quantized types).
-        return dequantize_V_mxfp4_D<D, T, ne>;
+        return dequantize_V_mxfp_D<GGML_TYPE_MXFP4, D, T, ne>;
     } else if constexpr (type_V == GGML_TYPE_MXFP8) {
-        return dequantize_V_mxfp8_D<D, T, ne>;
+        return dequantize_V_mxfp_D<GGML_TYPE_MXFP8, D, T, ne>;
     } else if constexpr (type_V == GGML_TYPE_MXFP6) {
-        return dequantize_V_mxfp6_D<D, T, ne>;
+        return dequantize_V_mxfp_D<GGML_TYPE_MXFP6, D, T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

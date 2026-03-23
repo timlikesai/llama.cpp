@@ -272,10 +272,8 @@ static __global__ void k_set_rows_mxfp_soa(
     // Destination: SoA byte region for this row
     char * dst_row_ptr = dst + dst_row * nb1 + i02 * nb2 + i03 * nb3;
 
-    // SoA layout constants — from ggml-common.h shared macros
-    constexpr int qs_per_blk = (mxfp_type == GGML_TYPE_MXFP4) ? MXFP4_SOA_QS_PER_BLOCK :
-                               (mxfp_type == GGML_TYPE_MXFP8) ? MXFP8_SOA_QS_PER_BLOCK :
-                                                                  MXFP6_SOA_QS_PER_BLOCK;
+    // SoA layout constants — from shared type traits
+    constexpr int qs_per_blk = mxfp_type_traits<mxfp_type>::qs_per_blk;
 
     // Step 1: Each lane loads one element (matches CPU's x[i*32 + j])
     float val = src_block[lane];
@@ -288,30 +286,30 @@ static __global__ void k_set_rows_mxfp_soa(
     // Step 3: Warp-wide amax (matches CPU's loop over 32 elements)
     const float amax = mxfp_warp_amax(val);
 
-    // Step 4: E8M0 computation — calls shared ggml_mxfp_e8m0_base_estimate()
-    constexpr int emax_offset = (mxfp_type == GGML_TYPE_MXFP4) ? MXFP4_E2M1_EMAX_OFFSET :
-                                (mxfp_type == GGML_TYPE_MXFP8) ? MXFP8_E4M3_EMAX_OFFSET :
-                                                                   MXFP6_E2M3_EMAX_OFFSET;
+    // Step 4: E8M0 computation — calls shared mxfp_compute_e8m0 template
     uint8_t e8m0 = 0;
     if (lane == 0) {
-        if (amax > 0.0f) {
-            const int e_base = ggml_mxfp_e8m0_base_estimate(amax, emax_offset);
-            e8m0 = (uint8_t)(e_base < 0 ? 0 : (e_base > 254 ? 254 : e_base));
-        }
-        // Write E8M0 to SoA scale region — uses shared MXFP_SOA_E8M0_OFFSET macro
+        e8m0 = mxfp_compute_e8m0<mxfp_type>(amax);
+        // Write E8M0 to SoA scale region
         ((uint8_t *)dst_row_ptr)[MXFP_SOA_E8M0_OFFSET(nblocks_per_row, qs_per_blk) + block_in_row] = e8m0;
     }
     e8m0 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)e8m0, 0);
 
-    // Step 5: Compute scale — calls shared ggml_mxfp_e8m0_to_fp32[_half]()
-    // Step 6: Per-type quantize + write to SoA qs region using shared MXFP_SOA_QS_OFFSET macro
+    // Step 5: Per-type quantize + write to SoA qs region
     uint8_t * qs = (uint8_t *)dst_row_ptr + MXFP_SOA_QS_OFFSET(block_in_row, qs_per_blk);
 
     if constexpr (mxfp_type == GGML_TYPE_MXFP4) {
-        // MXFP4: scale is halved (kvalues are doubled) — call shared e8m0_to_fp32_half
-        const float d = ggml_mxfp_e8m0_to_fp32_half(e8m0);
+#if CUDART_VERSION >= 12080
+        // Intrinsic path: full E8M0 scale, intrinsic quantize uses true E2M1 values.
+        const float d     = ggml_cuda_e8m0_to_fp32(e8m0);
+        const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
+        const uint8_t idx = mxfp4_quantize_intrinsic(val * inv_d);
+#else
+        // Portable path: half-scale convention (kvalues are doubled).
+        const float d     = ggml_mxfp_e8m0_to_fp32_half(e8m0);
         const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
         const uint8_t idx = mxfp4_quantize_elem(val, inv_d);
+#endif
         // Nibble packing: lanes 0-15 = low nibble, lanes 16-31 = high nibble
         // Matches CPU: qs[j] = x0 | (x1 << 4) where x0=elem[j], x1=elem[j+16]
         const uint8_t hi = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)idx, lane + 16);
@@ -319,22 +317,27 @@ static __global__ void k_set_rows_mxfp_soa(
             qs[lane] = idx | (hi << 4);
         }
     } else if constexpr (mxfp_type == GGML_TYPE_MXFP8) {
-        // MXFP8: call shared ggml_mxfp_float_to_fp8_e4m3()
-        const float d = ggml_mxfp_e8m0_to_fp32(e8m0);
+        const float d = ggml_cuda_e8m0_to_fp32(e8m0);
         const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
+#if CUDART_VERSION >= 12080
+        qs[lane] = mxfp8_quantize_intrinsic(val * inv_d);
+#else
         qs[lane] = ggml_mxfp_float_to_fp8_e4m3(val * inv_d);
+#endif
     } else if constexpr (mxfp_type == GGML_TYPE_MXFP6) {
-        // MXFP6: call shared ggml_mxfp_float_to_fp6_e2m3() + ggml_mxfp_pack_fp6x4()
-        const float d = ggml_mxfp_e8m0_to_fp32(e8m0);
+        const float d = ggml_cuda_e8m0_to_fp32(e8m0);
         const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
+#if CUDART_VERSION >= 12080
+        const uint8_t elem = mxfp6_quantize_intrinsic(val * inv_d);
+#else
         const uint8_t elem = ggml_mxfp_float_to_fp6_e2m3(val * inv_d);
+#endif
         // Pack 4 elements per 3 bytes — gather group of 4 via shuffles
         const int group = lane / 4;
         const uint8_t v0 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)elem, group * 4 + 0);
         const uint8_t v1 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)elem, group * 4 + 1);
         const uint8_t v2 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)elem, group * 4 + 2);
         const uint8_t v3 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)elem, group * 4 + 3);
-        // Lane 0 of each group writes — calls shared ggml_mxfp_pack_fp6x4()
         if (lane % 4 == 0) {
             const uint8_t vals[4] = { v0, v1, v2, v3 };
             ggml_mxfp_pack_fp6x4(vals, qs + group * 3);
@@ -353,6 +356,7 @@ static void set_rows_mxfp_soa_cuda(
         const int64_t ne11, const int64_t ne12,
         bool hadamard, cudaStream_t stream) {
 
+    GGML_ASSERT(ne00 % 32 == 0);
     const int nblocks_per_row = (int)(ne00 / 32);
     const int64_t total_warps = (int64_t)nblocks_per_row * ne01 * ne02 * ne03;
     if (total_warps == 0) return;
