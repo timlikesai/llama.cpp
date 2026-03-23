@@ -96,77 +96,31 @@ static __device__ __forceinline__ uint8_t mxfp_compute_e8m0(float amax) {
     return (uint8_t)(e_base < 0 ? 0 : (e_base > 254 ? 254 : e_base));
 }
 
-// MXFP element dequant/quant via hardware intrinsics (CUDA 12.8+ / sm_100+).
-// Single-element, x2 paired dequant, and quantize variants.
+// MXFP intrinsic helpers (CUDA 12.8+ / sm_100+).
 // E8M0 encode intrinsic (__nv_cvt_float_to_e8m0) is BROKEN — never use it.
-
 #if CUDART_VERSION >= 12080
 
-// --- Single-element dequant intrinsics ---
-
-static __device__ __forceinline__ float mxfp8_dequant_intrinsic(uint8_t x) {
-    __half_raw hr = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)x, __NV_E4M3);
+// halfraw → float / half2raw → float2 conversion helpers.
+static __device__ __forceinline__ float  halfraw_to_float(__half_raw hr) {
     return __half2float(*reinterpret_cast<__half *>(&hr));
 }
-
-// Returns raw E2M1 value (NOT doubled), multiply by full scale, not half-scale.
-static __device__ __forceinline__ float mxfp4_dequant_intrinsic(uint8_t nibble) {
-    __half_raw hr = __nv_cvt_fp4_to_halfraw((__nv_fp4_storage_t)nibble, __NV_E2M1);
-    return __half2float(*reinterpret_cast<__half *>(&hr));
-}
-
-static __device__ __forceinline__ float mxfp6_dequant_intrinsic(uint8_t x) {
-    __half_raw hr = __nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)x, __NV_E2M3);
-    return __half2float(*reinterpret_cast<__half *>(&hr));
-}
-
-// --- Paired (x2) dequant intrinsics: convert 2 elements in 1 instruction ---
-
-static __device__ __forceinline__ float2 mxfp8_dequant_x2_intrinsic(__nv_fp8x2_storage_t x2) {
-    __half2_raw hr2 = __nv_cvt_fp8x2_to_halfraw2(x2, __NV_E4M3);
+static __device__ __forceinline__ float2 half2raw_to_float2(__half2_raw hr2) {
     __half2 h2 = *reinterpret_cast<__half2 *>(&hr2);
     return make_float2(__low2float(h2), __high2float(h2));
-}
-
-static __device__ __forceinline__ float2 mxfp4_dequant_x2_intrinsic(__nv_fp4x2_storage_t x2) {
-    __half2_raw hr2 = __nv_cvt_fp4x2_to_halfraw2(x2, __NV_E2M1);
-    __half2 h2 = *reinterpret_cast<__half2 *>(&hr2);
-    return make_float2(__low2float(h2), __high2float(h2));
-}
-
-static __device__ __forceinline__ float2 mxfp6_dequant_x2_intrinsic(__nv_fp6x2_storage_t x2) {
-    __half2_raw hr2 = __nv_cvt_fp6x2_to_halfraw2(x2, __NV_E2M3);
-    __half2 h2 = *reinterpret_cast<__half2 *>(&hr2);
-    return make_float2(__low2float(h2), __high2float(h2));
-}
-
-// --- Quantize intrinsics: float → fp8/fp6/fp4 in one instruction ---
-
-static __device__ __forceinline__ uint8_t mxfp8_quantize_intrinsic(float x) {
-    return (__nv_fp8_storage_t)__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
-}
-
-static __device__ __forceinline__ uint8_t mxfp6_quantize_intrinsic(float x) {
-    return (__nv_fp6_storage_t)__nv_cvt_float_to_fp6(x, __NV_E2M3, cudaRoundNearest);
-}
-
-static __device__ __forceinline__ uint8_t mxfp4_quantize_intrinsic(float x) {
-    return (__nv_fp4_storage_t)__nv_cvt_float_to_fp4(x, __NV_E2M1, cudaRoundNearest);
 }
 
 #endif // CUDART_VERSION >= 12080
 
 // Quantize one float element given its E8M0 scale byte → uint8_t.
-// Encapsulates d/inv_d + intrinsic vs portable dispatch.
 template <ggml_type type>
 static __device__ __forceinline__ uint8_t mxfp_quantize_elem(float val, uint8_t e8m0) {
     const float d     = ggml_cuda_e8m0_to_fp32(e8m0);
     const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
     const float scaled = val * inv_d;
 #if CUDART_VERSION >= 12080
-    if constexpr (type == GGML_TYPE_MXFP4) { return mxfp4_quantize_intrinsic(scaled); }
-    if constexpr (type == GGML_TYPE_MXFP8) { return mxfp8_quantize_intrinsic(scaled); }
-    if constexpr (type == GGML_TYPE_MXFP6) { return mxfp6_quantize_intrinsic(scaled); }
+    if constexpr (type == GGML_TYPE_MXFP4) { return (__nv_fp4_storage_t)__nv_cvt_float_to_fp4(scaled, __NV_E2M1, cudaRoundNearest); }
+    if constexpr (type == GGML_TYPE_MXFP8) { return (__nv_fp8_storage_t)__nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3); }
+    if constexpr (type == GGML_TYPE_MXFP6) { return (__nv_fp6_storage_t)__nv_cvt_float_to_fp6(scaled, __NV_E2M3, cudaRoundNearest); }
 #else
     if constexpr (type == GGML_TYPE_MXFP4) { return ggml_mxfp_float_to_fp4_e2m1(scaled); }
     if constexpr (type == GGML_TYPE_MXFP8) { return ggml_mxfp_float_to_fp8_e4m3(scaled); }
@@ -178,9 +132,9 @@ static __device__ __forceinline__ uint8_t mxfp_quantize_elem(float val, uint8_t 
 template <ggml_type type>
 static __device__ __forceinline__ float mxfp_dequant_raw(uint8_t raw) {
 #if CUDART_VERSION >= 12080
-    if constexpr (type == GGML_TYPE_MXFP4) { return mxfp4_dequant_intrinsic(raw); }
-    if constexpr (type == GGML_TYPE_MXFP8) { return mxfp8_dequant_intrinsic(raw); }
-    if constexpr (type == GGML_TYPE_MXFP6) { return mxfp6_dequant_intrinsic(raw); }
+    if constexpr (type == GGML_TYPE_MXFP4) { return halfraw_to_float(__nv_cvt_fp4_to_halfraw((__nv_fp4_storage_t)raw, __NV_E2M1)); }
+    if constexpr (type == GGML_TYPE_MXFP8) { return halfraw_to_float(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)raw, __NV_E4M3)); }
+    if constexpr (type == GGML_TYPE_MXFP6) { return halfraw_to_float(__nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)raw, __NV_E2M3)); }
 #else
     if constexpr (type == GGML_TYPE_MXFP4) { return ggml_mxfp_fp4_e2m1_to_float(raw); }
     if constexpr (type == GGML_TYPE_MXFP8) { return ggml_mxfp_fp8_e4m3_to_float(raw); }
@@ -249,7 +203,7 @@ static __device__ __forceinline__ float2 mxfp_dequant_elem_pair(
         const int shift = (pos0 >= 16) ? 4 : 0;
         const int bi0 = pos0 & 15;
         const uint8_t packed = ((qs_block[bi0] >> shift) & 0x0F) | (((qs_block[bi0 + 1] >> shift) & 0x0F) << 4);
-        const float2 raw = mxfp4_dequant_x2_intrinsic(packed);
+        const float2 raw = half2raw_to_float2(__nv_cvt_fp4x2_to_halfraw2(packed, __NV_E2M1));
         return make_float2(raw.x * d, raw.y * d);
 #else
         uint8_t nib0, nib1;
@@ -259,7 +213,7 @@ static __device__ __forceinline__ float2 mxfp_dequant_elem_pair(
     } else if constexpr (type == GGML_TYPE_MXFP8) {
 #if CUDART_VERSION >= 12080
         const __nv_fp8x2_storage_t x2 = *reinterpret_cast<const __nv_fp8x2_storage_t *>(qs_block + pos0);
-        const float2 raw = mxfp8_dequant_x2_intrinsic(x2);
+        const float2 raw = half2raw_to_float2(__nv_cvt_fp8x2_to_halfraw2(x2, __NV_E4M3));
         return make_float2(raw.x * d, raw.y * d);
 #else
         return make_float2(mxfp_dequant_raw<type>(qs_block[pos0]) * d,
@@ -270,7 +224,7 @@ static __device__ __forceinline__ float2 mxfp_dequant_elem_pair(
         mxfp6_unpack_pair(qs_block, pos0, v0, v1);
 #if CUDART_VERSION >= 12080
         const __nv_fp6x2_storage_t x2 = (__nv_fp6x2_storage_t)(v0 | ((uint16_t)v1 << 8));
-        const float2 raw = mxfp6_dequant_x2_intrinsic(x2);
+        const float2 raw = half2raw_to_float2(__nv_cvt_fp6x2_to_halfraw2(x2, __NV_E2M3));
         return make_float2(raw.x * d, raw.y * d);
 #else
         return make_float2(mxfp_dequant_raw<type>(v0) * d, mxfp_dequant_raw<type>(v1) * d);
