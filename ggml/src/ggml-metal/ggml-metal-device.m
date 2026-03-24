@@ -1159,6 +1159,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             if (op->src[1]->type != op->src[2]->type) {
                 return false;
             }
+            if (ggml_is_mxfp(op->src[1]->type)) {
+                return false;
+            }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
