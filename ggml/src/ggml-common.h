@@ -71,6 +71,33 @@ typedef sycl::half2 ggml_half2;
 #define GGML_COMMON_DECL
 #endif
 
+// OCP Microscaling (MX) format constants.
+// Ref: OCP MX Spec v1.0, arXiv 2310.10537v3 (Table 1, Algorithm 1).
+// Block size 32, E8M0 shared scale, element formats: E2M1 (4-bit), E2M3 (6-bit), E4M3 (8-bit).
+
+#define MXFP_HADAMARD_32_NORM  0.17677669529663689f  // 1/sqrt(32)
+
+#define MXFP4_E2M1_MAX_FINITE  6.0f   // 2^2 * (1 + 1/2)
+#define MXFP6_E2M3_MAX_FINITE  7.5f   // 2^2 * (1 + 7/8)
+#define MXFP8_E4M3_MAX_FINITE  448.0f // 2^8 * (1 + 6/8)
+
+#define MXFP4_E2M1_EMAX_OFFSET   2   // floor(log2(6.0))
+#define MXFP6_E2M3_EMAX_OFFSET   2   // floor(log2(7.5))
+#define MXFP8_E4M3_EMAX_OFFSET   8   // floor(log2(448.0))
+
+#define MXFP_QS_PER_BLOCK_E2M1  16   // 32 * 4 / 8
+#define MXFP_QS_PER_BLOCK_E2M3  24   // 32 * 6 / 8
+#define MXFP_QS_PER_BLOCK_E4M3  32   // 32 * 8 / 8
+
+#define MXFP6_E3M2_MAX_FINITE  28.0f    // 2^4 * (1 + 3/4)
+#define MXFP8_E5M2_MAX_FINITE  57344.0f // 2^15 * (1 + 3/4)
+
+#define MXFP6_E3M2_EMAX_OFFSET   4   // floor(log2(28.0))
+#define MXFP8_E5M2_EMAX_OFFSET  15   // floor(log2(57344.0))
+
+#define MXFP_QS_PER_BLOCK_E3M2  24   // 32 * 6 / 8 (same as E2M3)
+#define MXFP_QS_PER_BLOCK_E5M2  32   // 32 * 8 / 8 (same as E4M3)
+
 #if defined(GGML_COMMON_DECL)
 
 #ifndef __cplusplus
@@ -104,6 +131,12 @@ typedef sycl::half2 ggml_half2;
 
 #define QI_NVFP4 (QK_NVFP4 / (4 * QR_NVFP4))
 #define QR_NVFP4 2
+
+#define QI_MXFP6 (QK_MXFP6 / (4 * QR_MXFP6))
+#define QR_MXFP6 1
+
+#define QI_MXFP8 (QK_MXFP8 / (4 * QR_MXFP8))
+#define QR_MXFP8 1
 
 #define QI5_0 (QK5_0 / (4 * QR5_0))
 #define QR5_0 2
@@ -192,8 +225,8 @@ static_assert(sizeof(block_q4_1) == 2 * sizeof(ggml_half) + QK4_1 / 2, "wrong q4
 
 #define QK_MXFP4 32
 typedef struct {
-    uint8_t e; // E8M0
-    uint8_t qs[QK_MXFP4/2];
+    uint8_t e;              // E8M0 scales
+    uint8_t qs[QK_MXFP4/2]; // 4-bit E2M1 values (16 bytes)
 } block_mxfp4;
 static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
 
@@ -204,6 +237,20 @@ typedef struct {
     uint8_t qs[QK_NVFP4/2];           // packed 4-bit E2M1 values (32 bytes)
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
+
+#define QK_MXFP6 32
+typedef struct {
+    uint8_t e;                    // E8M0 scales
+    uint8_t qs[QK_MXFP6 * 6 / 8]; // packed 6-bit E2M3 values (24 bytes)
+} block_mxfp6;
+static_assert(sizeof(block_mxfp6) == sizeof(uint8_t) + QK_MXFP6 * 6 / 8, "wrong mxfp6 block size/padding");
+
+#define QK_MXFP8 32
+typedef struct {
+    uint8_t e;            // E8M0 scales
+    uint8_t qs[QK_MXFP8]; // 8-bit E4M3 values (32 bytes)
+} block_mxfp8;
+static_assert(sizeof(block_mxfp8) == sizeof(uint8_t) + QK_MXFP8, "wrong mxfp8 block size/padding");
 
 #define QK5_0 32
 typedef struct {
@@ -447,16 +494,26 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 
 #if defined(GGML_COMMON_IMPL_C)
 #include <stdint.h>
+#include <string.h>
 
 #define GGML_TABLE_BEGIN(type, name, size) static const type name[size] = {
 #define GGML_TABLE_END() };
+static inline uint32_t ggml_mxfp_f32_as_u32_(float f) { uint32_t u; memcpy(&u, &f, sizeof(u)); return u; }
+static inline float    ggml_mxfp_u32_as_f32_(uint32_t u) { float f; memcpy(&f, &u, sizeof(f)); return f; }
+#define GGML_MXFP_F32_AS_U32(f) ggml_mxfp_f32_as_u32_(f)
+#define GGML_MXFP_U32_AS_F32(u) ggml_mxfp_u32_as_f32_(u)
 
 #define GGML_COMMON_IMPL
 #elif defined(GGML_COMMON_IMPL_CPP)
 #include <cstdint>
+#include <cstring>
 
 #define GGML_TABLE_BEGIN(type, name, size) static const type name[size] = {
 #define GGML_TABLE_END() };
+static inline uint32_t ggml_mxfp_f32_as_u32_(float f) { uint32_t u; std::memcpy(&u, &f, sizeof(u)); return u; }
+static inline float    ggml_mxfp_u32_as_f32_(uint32_t u) { float f; std::memcpy(&f, &u, sizeof(f)); return f; }
+#define GGML_MXFP_F32_AS_U32(f) ggml_mxfp_f32_as_u32_(f)
+#define GGML_MXFP_U32_AS_F32(u) ggml_mxfp_u32_as_f32_(u)
 
 #define GGML_COMMON_IMPL
 #elif defined(GGML_COMMON_IMPL_METAL)
@@ -474,7 +531,6 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 
 #define GGML_COMMON_IMPL
 #elif defined(GGML_COMMON_IMPL_SYCL)
-
 #include <cstdint>
 
 #define GGML_TABLE_BEGIN(type, name, size) static const type name[size] = {
@@ -1100,11 +1156,351 @@ GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16)
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 GGML_TABLE_END()
 
-// e2m1 values (doubled)
+// E2M1 values doubled (for integer arithmetic with half-scale).
 // ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
 GGML_TABLE_BEGIN(int8_t, kvalues_mxfp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 GGML_TABLE_END()
+
+// MXFP element converters
+
+// FP4: pure arithmetic
+// FP6: IEEE bit extraction + float rounding.
+// FP8: full IEEE bit manipulation
+
+#if defined(GGML_COMMON_IMPL_C) || defined(GGML_COMMON_IMPL_CPP)
+
+// FP4 E2M1: [S(1) | E(2) | M(1)], bias=1, no Inf/NaN
+// Ref: OCP MX Spec v1.0, Table 4 (E2M1 element data format)
+// values: 0, 0.5, 1, 1.5, 2, 3, 4, 6 (and negatives)
+
+static inline float ggml_mxfp_fp4_e2m1_to_float(uint8_t v) {
+    const float sign = (v & 0x8) ? -1.0f : 1.0f;
+    const int   exp  = (v >> 1) & 0x3;
+    const int   man  = v & 0x1;
+    if (exp == 0) {
+        return sign * (float)man * 0.5f; // subnormal: M * 2^(1-bias-1)
+    }
+    return sign * (1.0f + man * 0.5f) * (float)(1 << (exp - 1)); // normal: (1 + M/2) * 2^(E-1)
+}
+
+// Quantize float to FP4 E2M1 using round-half-away-from-zero.
+static inline uint8_t ggml_mxfp_float_to_fp4_e2m1(float x) {
+    uint8_t sign = 0;
+    if (x < 0) { sign = 0x8; x = -x; }
+    if (x == 0) return sign;
+    if (x >= MXFP4_E2M1_MAX_FINITE) return sign | 0x7; // saturate to 6.0
+    
+    // thresholds are midpoints between consecutive E2M1 values
+    if      (x < 0.25f) return sign | 0x0; // → 0
+    else if (x < 0.75f) return sign | 0x1; // → 0.5
+    else if (x < 1.25f) return sign | 0x2; // → 1.0
+    else if (x < 1.75f) return sign | 0x3; // → 1.5
+    else if (x <  2.5f) return sign | 0x4; // → 2.0
+    else if (x <  3.5f) return sign | 0x5; // → 3.0
+    else if (x <  5.0f) return sign | 0x6; // → 4.0
+    else                return sign | 0x7; // → 6.0
+}
+
+// FP6 E2M3: [S(1) | E(2) | M(3)], bias=1, no Inf/NaN
+// Ref: OCP MX, Table 5 (E2M3)
+// 32 positive values per octave, max normal = 7.5
+
+static inline float ggml_mxfp_fp6_e2m3_to_float(uint8_t v) {
+    const float sign = (v & 0x20) ? -1.0f : 1.0f;
+    const int   exp  = (v >> 3) & 0x3;
+    const int   man  = v & 0x7;
+    if (exp == 0) {
+        return sign * (float)man * 0.125f; // subnormal: M * 2^(1-bias-3)
+    }
+    return sign * (1.0f + man * 0.125f) * (float)(1 << (exp - 1)); // normal: (1 + M/8) * 2^(E-1)
+}
+
+// Quantize float to FP6 E2M3 using round-half-away-from-zero
+static inline uint8_t ggml_mxfp_float_to_fp6_e2m3(float x) {
+    uint8_t sign = 0;
+    if (x < 0) { sign = 0x20; x = -x; }
+    if (x == 0) return sign;
+    if (x >= MXFP6_E2M3_MAX_FINITE) return sign | 0x1F; // saturate to 7.5
+
+    uint32_t bits     = GGML_MXFP_F32_AS_U32(x);
+    int      fp32_exp = (int)((bits >> 23) & 0xFF) - 127;
+
+    if (fp32_exp < 0) {
+        // subnormal in E2M3: value = M * 2^(-3), so M = round(x * 8)
+        int e2m3_man = (int)(x * 8.0f + 0.5f);
+        if (e2m3_man > 7) {
+            return sign | 0x08; // overflow to smallest normal (E=1, M=0)
+        }
+        return sign | (uint8_t)e2m3_man;
+    }
+    if (fp32_exp > 2) {
+        fp32_exp = 2; // clamp to max E2M3 exponent
+    }
+
+    // normal: extract 3-bit mantissa from fractional part
+    float frac     = (x / (float)(1 << fp32_exp)) - 1.0f; // fractional part of significand
+    int   e2m3_man = (int)(frac * 8.0f + 0.5f);           // round to 3-bit mantissa
+    if (e2m3_man > 7) {
+        e2m3_man = 0;
+        fp32_exp++;
+    }
+    if (fp32_exp > 2) {
+        return sign | 0x1F; // overflow to max
+    }
+    // encode: biased_exp = fp32_exp + bias = fp32_exp + 1
+    return sign | (uint8_t)(((fp32_exp + 1) << 3) | e2m3_man);
+}
+
+// FP8 E4M3: [S(1) | E(4) | M(3)], bias=7, NaN=0x7F/0xFF, max finite=448
+// Ref: OCP FP8, Table 1 (E4M3)
+
+static inline float ggml_mxfp_fp8_e4m3_to_float(uint8_t v) {
+    const uint32_t sign = ((uint32_t)(v & 0x80)) << 24; // F32 sign bit position
+    const uint32_t exp  = (v >> 3) & 0xF;
+    const uint32_t man  = v & 0x7;
+
+    if (exp == 0) {
+        if (man == 0) {
+            return GGML_MXFP_U32_AS_F32(sign); // ±0
+        }
+        // subnormal: M * 2^(1-bias) * 2^(-3) = M * 2^(-9)
+        float val     = (float)man * (1.0f / 512.0f);
+        uint32_t bits = GGML_MXFP_F32_AS_U32(val);
+        bits = (bits & 0x7FFFFFFFu) | sign;
+        return GGML_MXFP_U32_AS_F32(bits);
+    }
+    if (exp == 15 && man == 7) {
+        return GGML_MXFP_U32_AS_F32(sign | 0x7FC00000u); // NaN
+    }
+    // normal: (1 + M/8) * 2^(E-7) → F32 biased exp = E - 7 + 127 = E + 120
+    return GGML_MXFP_U32_AS_F32(sign | ((exp + 120) << 23) | (man << 20));
+}
+
+// Quantize float to FP8 E4M3 using round-to-nearest-even
+static inline uint8_t ggml_mxfp_float_to_fp8_e4m3(float x) {
+    uint32_t bits = GGML_MXFP_F32_AS_U32(x);
+    uint8_t  sign = (bits >> 24) & 0x80;
+    bits &= 0x7FFFFFFFu; // abs
+    if (bits == 0) {
+        return sign;
+    }
+
+    uint32_t fp32_exp = (bits >> 23) & 0xFF;
+    uint32_t fp32_man = bits & 0x7FFFFF;
+    int      e4m3_exp = (int)fp32_exp - 120; // F32 bias(127) - E4M3 bias(7) = 120
+
+    if (e4m3_exp <= 0) {
+        // subnormal in E4M3: denormalize the F32 significand
+        int      shift     = 1 - e4m3_exp;
+        uint32_t full_man  = (1u << 23) | fp32_man; // implicit leading 1
+        int      total_shift = 20 + shift;          // 23 - 3 + shift
+        if (total_shift >= 32) {
+            return sign;  // too small to represent
+        }
+        uint32_t e4m3_man = full_man >> total_shift;
+        // round-to-nearest-even
+        if (total_shift > 0 && total_shift < 32) {
+            uint32_t round_bit = (full_man >> (total_shift - 1)) & 1;
+            uint32_t sticky    = (total_shift > 1) ? (full_man & ((1u << (total_shift - 1)) - 1)) : 0;
+            if (round_bit && (sticky || (e4m3_man & 1))) {
+                e4m3_man++;
+            }
+        }
+        if (e4m3_man > 7) {
+            return sign | 0x08; // overflow to smallest normal
+        }
+        return sign | (uint8_t)e4m3_man;
+    }
+
+    // normal: truncate F32 23-bit mantissa to 3-bit with round-to-nearest-even
+    uint32_t round_bit = (fp32_man >> 19) & 1;
+    uint32_t sticky    = fp32_man & ((1u << 19) - 1);
+    uint32_t e4m3_man  = fp32_man >> 20;
+    if (round_bit && (sticky || (e4m3_man & 1))) {
+        e4m3_man++;
+        if (e4m3_man > 7) {
+            e4m3_man = 0;
+            e4m3_exp++;
+        }
+    }
+    if (e4m3_exp > 15 || (e4m3_exp == 15 && e4m3_man >= 7)) {
+        return sign | 0x7E; // saturate to max finite (avoid NaN at 0x7F)
+    }
+    return sign | (uint8_t)((e4m3_exp << 3) | e4m3_man);
+}
+
+// FP6 E3M2: [S(1) | E(3) | M(2)], bias=3, no Inf/NaN
+// Ref: OCP MX Spec v1.0 (E3M2 element data format)
+// Wider dynamic range than E2M3 (max=28 vs 7.5) but coarser mantissa (4 vs 8 levels)
+
+static inline float ggml_mxfp_fp6_e3m2_to_float(uint8_t v) {
+    const float sign = (v & 0x20) ? -1.0f : 1.0f;
+    const int   exp  = (v >> 2) & 0x7;
+    const int   man  = v & 0x3;
+    if (exp == 0) {
+        return sign * (float)man * (1.0f / 16.0f); // subnormal: M * 2^(1-3-2)
+    }
+    // normal: (1 + M/4) * 2^(E-3) — use IEEE bit assembly for negative exponents
+    uint32_t f32_bits = ((uint32_t)(exp + 124) << 23) | ((uint32_t)man << 21);
+    float result = GGML_MXFP_U32_AS_F32(f32_bits);
+    return sign > 0 ? result : -result;
+}
+
+static inline uint8_t ggml_mxfp_float_to_fp6_e3m2(float x) {
+    uint8_t sign = 0;
+    if (x < 0) { sign = 0x20; x = -x; }
+    if (x == 0) return sign;
+    if (x >= MXFP6_E3M2_MAX_FINITE) return sign | 0x1F; // saturate to max (28.0)
+
+    uint32_t bits     = GGML_MXFP_F32_AS_U32(x);
+    uint32_t fp32_exp = (bits >> 23) & 0xFF;
+    uint32_t fp32_man = bits & 0x7FFFFF;
+    int      e3m2_exp = (int)fp32_exp - 124; // F32 bias(127) - E3M2 bias(3) = 124
+
+    if (e3m2_exp <= 0) {
+        // subnormal in E3M2
+        int      shift     = 1 - e3m2_exp;
+        uint32_t full_man  = (1u << 23) | fp32_man;
+        int      total_shift = 21 + shift;
+        if (total_shift >= 32) return sign;
+        uint32_t e3m2_man = full_man >> total_shift;
+        if (total_shift > 0 && total_shift < 32) {
+            uint32_t round_bit = (full_man >> (total_shift - 1)) & 1;
+            uint32_t sticky    = (total_shift > 1) ? (full_man & ((1u << (total_shift - 1)) - 1)) : 0;
+            if (round_bit && (sticky || (e3m2_man & 1))) e3m2_man++;
+        }
+        if (e3m2_man > 3) return sign | 0x04; // overflow to smallest normal
+        return sign | (uint8_t)e3m2_man;
+    }
+
+    // normal: truncate 23-bit mantissa to 2-bit with round-to-nearest-even
+    uint32_t round_bit = (fp32_man >> 20) & 1;
+    uint32_t sticky    = fp32_man & ((1u << 20) - 1);
+    uint32_t e3m2_man  = fp32_man >> 21;
+    if (round_bit && (sticky || (e3m2_man & 1))) {
+        e3m2_man++;
+        if (e3m2_man > 3) { e3m2_man = 0; e3m2_exp++; }
+    }
+    if (e3m2_exp >= 8) return sign | 0x1F; // overflow to max
+    return sign | (uint8_t)((e3m2_exp << 2) | e3m2_man);
+}
+
+// FP8 E5M2: [S(1) | E(5) | M(2)], bias=15, IEEE-like with Inf/NaN
+// Ref: OCP FP8, Table 2 (E5M2)
+// Wide dynamic range (max=57344) with coarse mantissa (4 levels per octave)
+
+static inline float ggml_mxfp_fp8_e5m2_to_float(uint8_t v) {
+    const uint32_t sign = ((uint32_t)(v & 0x80)) << 24;
+    const uint32_t exp  = (v >> 2) & 0x1F;
+    const uint32_t man  = v & 0x3;
+
+    if (exp == 0) {
+        if (man == 0) return GGML_MXFP_U32_AS_F32(sign); // +/-0
+        // subnormal: M * 2^(1-15-2) = M * 2^(-16)
+        float val     = (float)man * (1.0f / 65536.0f);
+        uint32_t bits = GGML_MXFP_F32_AS_U32(val);
+        bits = (bits & 0x7FFFFFFFu) | sign;
+        return GGML_MXFP_U32_AS_F32(bits);
+    }
+    if (exp == 31) {
+        if (man == 0) return GGML_MXFP_U32_AS_F32(sign | 0x7F800000u); // +/-Inf
+        return GGML_MXFP_U32_AS_F32(sign | 0x7FC00000u); // NaN
+    }
+    // normal: (1 + M/4) * 2^(E-15) -> F32 biased exp = E - 15 + 127 = E + 112
+    return GGML_MXFP_U32_AS_F32(sign | ((exp + 112) << 23) | (man << 21));
+}
+
+static inline uint8_t ggml_mxfp_float_to_fp8_e5m2(float x) {
+    uint32_t bits = GGML_MXFP_F32_AS_U32(x);
+    uint8_t  sign = (bits >> 24) & 0x80;
+    bits &= 0x7FFFFFFFu;
+    if (bits == 0) return sign;
+
+    uint32_t fp32_exp = (bits >> 23) & 0xFF;
+    uint32_t fp32_man = bits & 0x7FFFFF;
+    int      e5m2_exp = (int)fp32_exp - 112; // F32 bias(127) - E5M2 bias(15) = 112
+
+    if (e5m2_exp <= 0) {
+        // subnormal in E5M2
+        int      shift     = 1 - e5m2_exp;
+        uint32_t full_man  = (1u << 23) | fp32_man;
+        int      total_shift = 21 + shift;
+        if (total_shift >= 32) return sign;
+        uint32_t e5m2_man = full_man >> total_shift;
+        if (total_shift > 0 && total_shift < 32) {
+            uint32_t round_bit = (full_man >> (total_shift - 1)) & 1;
+            uint32_t sticky    = (total_shift > 1) ? (full_man & ((1u << (total_shift - 1)) - 1)) : 0;
+            if (round_bit && (sticky || (e5m2_man & 1))) e5m2_man++;
+        }
+        if (e5m2_man > 3) return sign | 0x04; // overflow to smallest normal
+        return sign | (uint8_t)e5m2_man;
+    }
+
+    // normal: truncate 23-bit mantissa to 2-bit with round-to-nearest-even
+    uint32_t round_bit = (fp32_man >> 20) & 1;
+    uint32_t sticky    = fp32_man & ((1u << 20) - 1);
+    uint32_t e5m2_man  = fp32_man >> 21;
+    if (round_bit && (sticky || (e5m2_man & 1))) {
+        e5m2_man++;
+        if (e5m2_man > 3) { e5m2_man = 0; e5m2_exp++; }
+    }
+    // E5M2: exp=31 is Inf/NaN. Saturate to max finite (exp=30, man=3 = 0x7B)
+    if (e5m2_exp > 30 || (e5m2_exp == 30 && e5m2_man > 3)) return sign | 0x7B;
+    return sign | (uint8_t)((e5m2_exp << 2) | e5m2_man);
+}
+
+// FP6 packing/unpacking
+
+// Pack 4 six-bit values into 3 bytes
+static inline void ggml_mxfp_pack_fp6x4(const uint8_t v[4], uint8_t out[3]) {
+    uint32_t packed = (v[0] & 0x3F) | ((v[1] & 0x3F) << 6) |
+                      ((v[2] & 0x3F) << 12) | ((v[3] & 0x3F) << 18);
+    out[0] = (uint8_t)(packed);
+    out[1] = (uint8_t)(packed >> 8);
+    out[2] = (uint8_t)(packed >> 16);
+}
+
+// Unpack 3 bytes into 4 six-bit values
+static inline void ggml_mxfp_unpack_fp6x4(const uint8_t in[3], uint8_t v[4]) {
+    uint32_t packed = (uint32_t)in[0] | ((uint32_t)in[1] << 8) | ((uint32_t)in[2] << 16);
+    v[0] = packed & 0x3F;
+    v[1] = (packed >> 6) & 0x3F;
+    v[2] = (packed >> 12) & 0x3F;
+    v[3] = (packed >> 18) & 0x3F;
+}
+
+// E8M0 base exponent estimate: round(log2(amax)) - emax_offset + 127.
+// Uses round instead of the MX spec's floor for lower MSE (spec allows this,
+// ref: arXiv 2310.10537v3 Sec 3). Portable integer bit extraction, no log2f()
+static inline int ggml_mxfp_e8m0_base_estimate(float amax, int emax_offset) {
+    uint32_t amax_bits = GGML_MXFP_F32_AS_U32(amax);
+    const int floor_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
+    // Round: add 1 if mantissa >= sqrt(2)-1 (0x3504F3 in 23-bit IEEE mantissa).
+    const int round_log2 = floor_log2 + ((amax_bits & 0x7FFFFF) >= 0x3504F3 ? 1 : 0);
+    return round_log2 - emax_offset + 127;
+}
+
+// Block-32 Walsh-Hadamard Transform, normalized by 1/sqrt(32).
+// Applied to K (before quantization) and Q (roundtrip) to reduce MXFP
+// quantization error in the Q·K dot product. Ref: QuIP# (arXiv 2402.04396)
+static inline void ggml_mxfp_hadamard_32_inplace(float * vals) {
+    for (int stride = 1; stride < 32; stride *= 2) {
+        for (int i = 0; i < 32; i += 2 * stride) {
+            for (int j = 0; j < stride; ++j) {
+                const float a = vals[i + j];
+                const float b = vals[i + j + stride];
+                vals[i + j]          = a + b;
+                vals[i + j + stride] = a - b;
+            }
+        }
+    }
+    for (int i = 0; i < 32; ++i) {
+        vals[i] *= MXFP_HADAMARD_32_NORM;
+    }
+}
+
+#endif // GGML_COMMON_IMPL_C || GGML_COMMON_IMPL_CPP
 
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f

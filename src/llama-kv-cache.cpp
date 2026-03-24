@@ -1104,7 +1104,17 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     }
 
     // store the current K values into the cache
-    return ggml_set_rows(ctx, k, k_cur, k_idxs);
+    ggml_tensor * result = ggml_set_rows(ctx, k, k_cur, k_idxs);
+
+    // MXFP types with FA: use SoA layout + Hadamard rotation for K cache
+    if (!v_trans && ggml_is_mxfp(k->type)) {
+        static const bool no_hadamard = (getenv("GGML_MXFP_NO_HADAMARD") != nullptr);
+        result->op_params[0] = 1; // SoA layout
+        result->op_params[1] = no_hadamard ? 0 : 1; // apply Hadamard unless disabled
+        memcpy(&result->op_params[2], &n_embd_head, sizeof(int64_t)); // SoA chunk size = head dim
+    }
+
+    return result;
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
@@ -1139,7 +1149,15 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
         }
 
-        return ggml_set_rows(ctx, v, v_cur, v_idxs);
+        ggml_tensor * result = ggml_set_rows(ctx, v, v_cur, v_idxs);
+
+        // MXFP types with FA: use SoA layout for V cache (no Hadamard)
+        if (ggml_is_mxfp(v->type)) {
+            result->op_params[0] = 1; // SoA layout
+            memcpy(&result->op_params[2], &n_embd_head, sizeof(int64_t)); // SoA chunk size = head dim
+        }
+
+        return result;
     }
 
     if (ggml_row_size(v_cur->type, n_embd_gqa) == v_cur->nb[2]) {
