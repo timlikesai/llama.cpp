@@ -4924,7 +4924,34 @@ static void ggml_compute_forward_set_rows_f32(
     const int64_t ir0 = dr*ith;
     const int64_t ir1 = std::min(ir0 + dr, nr);
 
-    ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
+    // MXFP flash attention: Struct-of-Arrays (SoA) memory layout.
+    //
+    // AoS (standard ggml block format) interleaves scale and data per block:
+    //   {[e0][qs0 qs0 ..][e1][qs1 qs1 ..][e2][qs2 qs2 ..]...}
+    //    ^-- scale bytes break alignment, preventing wide parallel loads
+    //
+    // SoA groups all quantized element bytes contiguously, scales at end:
+    //   [[qs0 qs0 ..][qs1 qs1 ..][qs2 qs2 ..][e0 e1 e2 ..]]
+    //   ^-- contiguous qs region enables     ^-- scale array
+    //       byte-aligned parallel loads
+    //
+    // SoA is written in per-head chunks (not full-row), because the FA kernel indexes
+    // K/V data per attention head. Each chunk is independently addressable.
+    //
+    // op_params[0]    = use SoA layout (set when FA + MXFP)
+    // op_params[1]    = apply Hadamard rotation before quantization (K cache only)
+    // op_params[2..3] = head dimension (int64_t, SoA chunk size in elements)
+
+    const bool use_soa        = dst->op_params[0];
+    const bool apply_hadamard = dst->op_params[1];
+
+    int64_t soa_chunk = 0;
+    if (use_soa) {
+        memcpy(&soa_chunk, &dst->op_params[2], sizeof(int64_t));
+        GGML_ASSERT(soa_chunk > 0 && soa_chunk % 32 == 0 && nc % soa_chunk == 0);
+    }
+
+    ggml_from_float_t const from_float = use_soa ? nullptr : ggml_get_type_traits_cpu(dst->type)->from_float;
 
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
         for (int64_t i02 = 0; i02 < ne02; ++i02) {
@@ -4937,9 +4964,20 @@ static void ggml_compute_forward_set_rows_f32(
 
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
-                from_float(
-                        (const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03),
-                                        ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3), nc);
+                const float * src_row = (const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03);
+                      char  * dst_row =                  ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3);
+
+                if (use_soa) {
+                    // quantize each head's worth of elements as an independent SoA block
+                    const size_t chunk_bytes = ggml_row_size(dst->type, soa_chunk);
+                    for (int64_t off = 0, dst_off = 0; off < nc; off += soa_chunk, dst_off += chunk_bytes) {
+                        ggml_mxfp_quantize_soa(dst->type, src_row + off,
+                                               dst_row + dst_off,
+                                               soa_chunk, apply_hadamard);
+                    }
+                } else {
+                    from_float(src_row, dst_row, nc);
+                }
             }
         }
     }
@@ -5561,6 +5599,8 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP6:
+        case GGML_TYPE_MXFP8:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -8276,7 +8316,24 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const int iv2 = iq2 / rv2;
 
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
-        q_to_vec_dot(pq, Q_q, DK);
+
+        // MXFP flash attention: Q preprocessing + SoA data path.
+        //
+        // Q gets Hadamard rotation + quantize/dequant roundtrip to match K's preprocessing
+        // (K was Hadamard-rotated in set_rows before SoA quantization). The roundtrip
+        // injects the same quantization noise pattern so the Q·K dot product is balanced.
+        // Q_f32 stays in rotated space — we use F32 dot product with SoA-dequantized K.
+        //
+        // K and V are stored in SoA layout (set_rows wrote per-head SoA chunks).
+        // We dequantize each head's SoA data to F32 for the dot product / accumulation.
+        const bool is_mxfp = ggml_is_mxfp(k->type);
+        float Q_f32[4096];
+        if (is_mxfp) {
+            GGML_ASSERT(DK <= 4096);
+            ggml_mxfp_hadamard_roundtrip(k->type, pq, Q_f32, DK);
+        } else {
+            q_to_vec_dot(pq, Q_q, DK);
+        }
 
         // online softmax / attention
         // loop over n_kv and n_head_kv
@@ -8291,7 +8348,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float s; // KQ value
 
             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-            kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            if (is_mxfp) {
+                // K is in SoA layout — dequantize to F32, dot with rotated Q
+                float K_tmp[4096];
+                ggml_mxfp_dequantize_soa(k->type, k_data, K_tmp, DK);
+                ggml_vec_dot_f32(DK, &s, 0, Q_f32, 0, K_tmp, 0, 1);
+            } else {
+                kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            }
 
             s = s*scale; // scale KQ value
 
@@ -8337,7 +8401,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 }
 
                 // V += v*expf(s - M)
-                if (v_to_float) {
+                if (is_mxfp) {
+                    // V is in SoA layout — dequantize to F32 for accumulation
+                    ggml_mxfp_dequantize_soa(v->type, v_data, V32, DV);
+                    ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+                } else if (v_to_float) {
                     v_to_float(v_data, V32, DV);
                     ggml_vec_mad_f32(DV, VKQ32, V32, vs);
                 } else {
