@@ -84,7 +84,8 @@ static __global__ void flash_attn_ext_vec(
     constexpr int V_rows_per_thread = type_V == GGML_TYPE_F16 ? 2*cpy_ne : 4;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
-    constexpr bool is_mxfp_k = (type_K == GGML_TYPE_MXFP4 || type_K == GGML_TYPE_MXFP8 || type_K == GGML_TYPE_MXFP6);
+    constexpr bool is_mxfp_k = (type_K == GGML_TYPE_MXFP4 || type_K == GGML_TYPE_MXFP8 || type_K == GGML_TYPE_MXFP6 ||
+                                 type_K == GGML_TYPE_MXFP6_E3M2 || type_K == GGML_TYPE_MXFP8_E5M2);
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
     constexpr bool Q_q8_1 = !is_mxfp_k && type_K != GGML_TYPE_F16;
 #ifdef V_DOT2_F32_F16_AVAILABLE
@@ -213,8 +214,8 @@ static __global__ void flash_attn_ext_vec(
 
         __syncthreads();
     } else if constexpr (is_mxfp_k) {
-        // MXFP Q path: fuse Hadamard + quantize roundtrip via warp shuffles + shared memory.
-        // K has Hadamard from set_rows — Q MUST have the same rotation for correct Q·K dot product.
+        // MXFP Q path: Q is already Hadamard-rotated by launch_fattn (host pre-processing).
+        // Just load into shared memory and convert to register format.
         float * Q_shmem = (float *)&KQ[0];
 
 #pragma unroll
@@ -222,27 +223,11 @@ static __global__ void flash_attn_ext_vec(
             const float * Q_f = (const float *)(Q + j*nb01);
             const bool valid = (ncols == 1 || ic0 + j < int(ne01.z));
 
-            // Step 1: Load Q into shared memory (all threads cooperate)
+            // Load Q into shared memory (all threads cooperate).
+            // Hadamard rotation was applied by mxfp_q_hadamard_cuda() before kernel launch.
 #pragma unroll
             for (int i = tid; i < D; i += nthreads) {
                 Q_shmem[i] = valid ? Q_f[i] : 0.0f;
-            }
-            __syncthreads();
-
-            // Step 2: Hadamard + roundtrip per 32-element block.
-            // Strided loop handles D > nwarps*32 (e.g., D=256 with 4 warps).
-            constexpr int nblocks_q = D / 32;
-            const int warp_id = threadIdx.y;
-            const int lane_id = threadIdx.x;
-
-#pragma unroll
-            for (int b = warp_id; b < nblocks_q; b += nwarps) {
-                float val = Q_shmem[b * 32 + lane_id];
-
-                // Fused Hadamard + quantize roundtrip via shared template
-                val = mxfp_hadamard_roundtrip<type_K>(val);
-
-                Q_shmem[b * 32 + lane_id] = val;
             }
             __syncthreads();
 
@@ -727,16 +712,28 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_MXFP( 64, GGML_TYPE_MXFP4)
 EXTERN_DECL_FATTN_VEC_MXFP( 64, GGML_TYPE_MXFP8)
 EXTERN_DECL_FATTN_VEC_MXFP( 64, GGML_TYPE_MXFP6)
+EXTERN_DECL_FATTN_VEC_MXFP( 64, GGML_TYPE_MXFP6_E3M2)
+EXTERN_DECL_FATTN_VEC_MXFP( 64, GGML_TYPE_MXFP8_E5M2)
 EXTERN_DECL_FATTN_VEC_MXFP(128, GGML_TYPE_MXFP4)
 EXTERN_DECL_FATTN_VEC_MXFP(128, GGML_TYPE_MXFP8)
 EXTERN_DECL_FATTN_VEC_MXFP(128, GGML_TYPE_MXFP6)
+EXTERN_DECL_FATTN_VEC_MXFP(128, GGML_TYPE_MXFP6_E3M2)
+EXTERN_DECL_FATTN_VEC_MXFP(128, GGML_TYPE_MXFP8_E5M2)
 EXTERN_DECL_FATTN_VEC_MXFP(256, GGML_TYPE_MXFP4)
 EXTERN_DECL_FATTN_VEC_MXFP(256, GGML_TYPE_MXFP8)
 EXTERN_DECL_FATTN_VEC_MXFP(256, GGML_TYPE_MXFP6)
+EXTERN_DECL_FATTN_VEC_MXFP(256, GGML_TYPE_MXFP6_E3M2)
+EXTERN_DECL_FATTN_VEC_MXFP(256, GGML_TYPE_MXFP8_E5M2)
 
-EXTERN_DECL_FATTN_VEC_MXFP_MIXED( 64, GGML_TYPE_MXFP8, GGML_TYPE_MXFP4)
-EXTERN_DECL_FATTN_VEC_MXFP_MIXED( 64, GGML_TYPE_MXFP6, GGML_TYPE_MXFP4)
-EXTERN_DECL_FATTN_VEC_MXFP_MIXED(128, GGML_TYPE_MXFP8, GGML_TYPE_MXFP4)
-EXTERN_DECL_FATTN_VEC_MXFP_MIXED(128, GGML_TYPE_MXFP6, GGML_TYPE_MXFP4)
-EXTERN_DECL_FATTN_VEC_MXFP_MIXED(256, GGML_TYPE_MXFP8, GGML_TYPE_MXFP4)
-EXTERN_DECL_FATTN_VEC_MXFP_MIXED(256, GGML_TYPE_MXFP6, GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED( 64, GGML_TYPE_MXFP8,      GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED( 64, GGML_TYPE_MXFP6,      GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED( 64, GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED( 64, GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED(128, GGML_TYPE_MXFP8,      GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED(128, GGML_TYPE_MXFP6,      GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED(128, GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED(128, GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED(256, GGML_TYPE_MXFP8,      GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED(256, GGML_TYPE_MXFP6,      GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED(256, GGML_TYPE_MXFP6_E3M2, GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED(256, GGML_TYPE_MXFP8_E5M2, GGML_TYPE_MXFP4)

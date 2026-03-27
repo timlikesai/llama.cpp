@@ -6,13 +6,16 @@
 // Used by fattn-vec.cuh, fattn-common.cuh, and set-rows.cu.
 // Per-element math via ggml-common.h (GGML_MXFP_FUNC).
 
-// 3-way MXFP type dispatch: expands EXPR once per type with `mxfp_type` as the template arg.
-// Use in switch(runtime_type) bodies to eliminate repetitive MXFP4/8/6 case blocks.
+
+// 5-way MXFP type dispatch: expands EXPR once per type with `mxfp_type` as the template arg.
+// Use in switch(runtime_type) bodies to eliminate repetitive MXFP case blocks.
 #define MXFP_DISPATCH(runtime_type, ...) do {               \
     switch (runtime_type) {                                 \
-        case GGML_TYPE_MXFP4: { constexpr ggml_type mxfp_type = GGML_TYPE_MXFP4; __VA_ARGS__; } break; \
-        case GGML_TYPE_MXFP8: { constexpr ggml_type mxfp_type = GGML_TYPE_MXFP8; __VA_ARGS__; } break; \
-        case GGML_TYPE_MXFP6: { constexpr ggml_type mxfp_type = GGML_TYPE_MXFP6; __VA_ARGS__; } break; \
+        case GGML_TYPE_MXFP4:      { constexpr ggml_type mxfp_type = GGML_TYPE_MXFP4;      __VA_ARGS__; } break; \
+        case GGML_TYPE_MXFP8:      { constexpr ggml_type mxfp_type = GGML_TYPE_MXFP8;      __VA_ARGS__; } break; \
+        case GGML_TYPE_MXFP6:      { constexpr ggml_type mxfp_type = GGML_TYPE_MXFP6;      __VA_ARGS__; } break; \
+        case GGML_TYPE_MXFP6_E3M2: { constexpr ggml_type mxfp_type = GGML_TYPE_MXFP6_E3M2; __VA_ARGS__; } break; \
+        case GGML_TYPE_MXFP8_E5M2: { constexpr ggml_type mxfp_type = GGML_TYPE_MXFP8_E5M2; __VA_ARGS__; } break; \
         default: GGML_ABORT("unsupported MXFP type"); break; \
     }                                                       \
 } while (0)
@@ -36,13 +39,25 @@ template <> struct mxfp_type_traits<GGML_TYPE_MXFP6> {
     static constexpr int qs_per_blk  = MXFP6_SOA_QS_PER_BLOCK;
 };
 
+template <> struct mxfp_type_traits<GGML_TYPE_MXFP6_E3M2> {
+    static constexpr int emax_offset = MXFP6_E3M2_EMAX_OFFSET;
+    static constexpr int qs_per_blk  = MXFP6_SOA_QS_PER_BLOCK;  // same 6-bit packing as E2M3
+};
+
+template <> struct mxfp_type_traits<GGML_TYPE_MXFP8_E5M2> {
+    static constexpr int emax_offset = MXFP8_E5M2_EMAX_OFFSET;
+    static constexpr int qs_per_blk  = MXFP8_SOA_QS_PER_BLOCK;  // same 8-bit packing as E4M3
+};
+
 // Row bytes = AoS block size * blocks_per_row = (qs_per_blk + 1) * (D / 32).
 // Used for multihead SoA detection: multihead = (nb2 == MXFP_ROW_BYTES_EXPLICIT(type, D)).
 // Uses explicit constants (not traits) to avoid incomplete-type errors for non-MXFP types.
-#define MXFP_ROW_BYTES_EXPLICIT(type, D) (                                      \
-    ((type) == GGML_TYPE_MXFP4) ? ((MXFP4_SOA_QS_PER_BLOCK + 1) * ((D) / 32)) : \
-    ((type) == GGML_TYPE_MXFP8) ? ((MXFP8_SOA_QS_PER_BLOCK + 1) * ((D) / 32)) : \
-    ((type) == GGML_TYPE_MXFP6) ? ((MXFP6_SOA_QS_PER_BLOCK + 1) * ((D) / 32)) : 0)
+#define MXFP_ROW_BYTES_EXPLICIT(type, D) (                                              \
+    ((type) == GGML_TYPE_MXFP4)      ? ((MXFP4_SOA_QS_PER_BLOCK + 1) * ((D) / 32)) : \
+    ((type) == GGML_TYPE_MXFP8)      ? ((MXFP8_SOA_QS_PER_BLOCK + 1) * ((D) / 32)) : \
+    ((type) == GGML_TYPE_MXFP6)      ? ((MXFP6_SOA_QS_PER_BLOCK + 1) * ((D) / 32)) : \
+    ((type) == GGML_TYPE_MXFP6_E3M2) ? ((MXFP6_SOA_QS_PER_BLOCK + 1) * ((D) / 32)) : \
+    ((type) == GGML_TYPE_MXFP8_E5M2) ? ((MXFP8_SOA_QS_PER_BLOCK + 1) * ((D) / 32)) : 0)
 
 // Compute multihead-aware qs_base and e8m0_base pointers from a SoA row.
 // Deduplicates the K and V multihead offset logic in fattn-vec.cuh.
@@ -118,13 +133,17 @@ static __device__ __forceinline__ uint8_t mxfp_quantize_elem(float val, uint8_t 
     const float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
     const float scaled = val * inv_d;
 #if CUDART_VERSION >= 12080
-    if constexpr (type == GGML_TYPE_MXFP4) { return (__nv_fp4_storage_t)__nv_cvt_float_to_fp4(scaled, __NV_E2M1, cudaRoundNearest); }
-    if constexpr (type == GGML_TYPE_MXFP8) { return (__nv_fp8_storage_t)__nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3); }
-    if constexpr (type == GGML_TYPE_MXFP6) { return (__nv_fp6_storage_t)__nv_cvt_float_to_fp6(scaled, __NV_E2M3, cudaRoundNearest); }
+    if constexpr (type == GGML_TYPE_MXFP4)      { return (__nv_fp4_storage_t)__nv_cvt_float_to_fp4(scaled, __NV_E2M1, cudaRoundNearest); }
+    if constexpr (type == GGML_TYPE_MXFP8)      { return (__nv_fp8_storage_t)__nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3); }
+    if constexpr (type == GGML_TYPE_MXFP6)      { return (__nv_fp6_storage_t)__nv_cvt_float_to_fp6(scaled, __NV_E2M3, cudaRoundNearest); }
+    if constexpr (type == GGML_TYPE_MXFP6_E3M2) { return (__nv_fp6_storage_t)__nv_cvt_float_to_fp6(scaled, __NV_E3M2, cudaRoundNearest); }
+    if constexpr (type == GGML_TYPE_MXFP8_E5M2) { return (__nv_fp8_storage_t)__nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E5M2); }
 #else
-    if constexpr (type == GGML_TYPE_MXFP4) { return ggml_mxfp_float_to_fp4_e2m1(scaled); }
-    if constexpr (type == GGML_TYPE_MXFP8) { return ggml_mxfp_float_to_fp8_e4m3(scaled); }
-    if constexpr (type == GGML_TYPE_MXFP6) { return ggml_mxfp_float_to_fp6_e2m3(scaled); }
+    if constexpr (type == GGML_TYPE_MXFP4)      { return ggml_mxfp_float_to_fp4_e2m1(scaled); }
+    if constexpr (type == GGML_TYPE_MXFP8)      { return ggml_mxfp_float_to_fp8_e4m3(scaled); }
+    if constexpr (type == GGML_TYPE_MXFP6)      { return ggml_mxfp_float_to_fp6_e2m3(scaled); }
+    if constexpr (type == GGML_TYPE_MXFP6_E3M2) { return ggml_mxfp_float_to_fp6_e3m2(scaled); }
+    if constexpr (type == GGML_TYPE_MXFP8_E5M2) { return ggml_mxfp_float_to_fp8_e5m2(scaled); }
 #endif
 }
 
@@ -132,13 +151,17 @@ static __device__ __forceinline__ uint8_t mxfp_quantize_elem(float val, uint8_t 
 template <ggml_type type>
 static __device__ __forceinline__ float mxfp_dequant_raw(uint8_t raw) {
 #if CUDART_VERSION >= 12080
-    if constexpr (type == GGML_TYPE_MXFP4) { return halfraw_to_float(__nv_cvt_fp4_to_halfraw((__nv_fp4_storage_t)raw, __NV_E2M1)); }
-    if constexpr (type == GGML_TYPE_MXFP8) { return halfraw_to_float(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)raw, __NV_E4M3)); }
-    if constexpr (type == GGML_TYPE_MXFP6) { return halfraw_to_float(__nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)raw, __NV_E2M3)); }
+    if constexpr (type == GGML_TYPE_MXFP4)      { return halfraw_to_float(__nv_cvt_fp4_to_halfraw((__nv_fp4_storage_t)raw, __NV_E2M1)); }
+    if constexpr (type == GGML_TYPE_MXFP8)      { return halfraw_to_float(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)raw, __NV_E4M3)); }
+    if constexpr (type == GGML_TYPE_MXFP6)      { return halfraw_to_float(__nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)raw, __NV_E2M3)); }
+    if constexpr (type == GGML_TYPE_MXFP6_E3M2) { return halfraw_to_float(__nv_cvt_fp6_to_halfraw((__nv_fp6_storage_t)raw, __NV_E3M2)); }
+    if constexpr (type == GGML_TYPE_MXFP8_E5M2) { return halfraw_to_float(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)raw, __NV_E5M2)); }
 #else
-    if constexpr (type == GGML_TYPE_MXFP4) { return ggml_mxfp_fp4_e2m1_to_float(raw); }
-    if constexpr (type == GGML_TYPE_MXFP8) { return ggml_mxfp_fp8_e4m3_to_float(raw); }
-    if constexpr (type == GGML_TYPE_MXFP6) { return ggml_mxfp_fp6_e2m3_to_float(raw); }
+    if constexpr (type == GGML_TYPE_MXFP4)      { return ggml_mxfp_fp4_e2m1_to_float(raw); }
+    if constexpr (type == GGML_TYPE_MXFP8)      { return ggml_mxfp_fp8_e4m3_to_float(raw); }
+    if constexpr (type == GGML_TYPE_MXFP6)      { return ggml_mxfp_fp6_e2m3_to_float(raw); }
+    if constexpr (type == GGML_TYPE_MXFP6_E3M2) { return ggml_mxfp_fp6_e3m2_to_float(raw); }
+    if constexpr (type == GGML_TYPE_MXFP8_E5M2) { return ggml_mxfp_fp8_e5m2_to_float(raw); }
 #endif
 }
 
@@ -152,6 +175,7 @@ static __device__ __forceinline__ float mxfp_quantize_roundtrip(float val, uint8
 }
 
 // Complete Q preprocessing: Hadamard + amax + E8M0 + roundtrip.
+// DEPRECATED — rotate-only is strictly better (no quantization noise on Q).
 
 template <ggml_type type>
 static __device__ __forceinline__ float mxfp_hadamard_roundtrip(float val) {
@@ -160,6 +184,15 @@ static __device__ __forceinline__ float mxfp_hadamard_roundtrip(float val) {
     uint8_t e8m0 = mxfp_compute_e8m0<type>(amax);
     e8m0 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)e8m0, 0);
     return mxfp_quantize_roundtrip<type>(val, e8m0);
+}
+
+// Q preprocessing: Hadamard rotation only (no quantize/dequant roundtrip).
+// Q is computed fresh every token and never stored — injecting quantization
+// noise was unnecessary and hurts PPL. Rotate-only beats f16 baseline on
+// some models (Qwen3-0.6B mxfp8: rotate-only=22.0 vs f16=25.1).
+
+static __device__ __forceinline__ float mxfp_hadamard_only(float val) {
+    return mxfp_hadamard_warp(val);
 }
 
 // MXFP4 branchless nibble-pair extraction from SoA layout.
@@ -210,21 +243,24 @@ static __device__ __forceinline__ float2 mxfp_dequant_elem_pair(
         mxfp4_extract_nibble_pair(qs_block, pos0, nib0, nib1);
         return make_float2(mxfp_dequant_raw<type>(nib0) * d, mxfp_dequant_raw<type>(nib1) * d);
 #endif
-    } else if constexpr (type == GGML_TYPE_MXFP8) {
+    } else if constexpr (type == GGML_TYPE_MXFP8 || type == GGML_TYPE_MXFP8_E5M2) {
 #if CUDART_VERSION >= 12080
+        constexpr auto fmt = (type == GGML_TYPE_MXFP8) ? __NV_E4M3 : __NV_E5M2;
         const __nv_fp8x2_storage_t x2 = *reinterpret_cast<const __nv_fp8x2_storage_t *>(qs_block + pos0);
-        const float2 raw = half2raw_to_float2(__nv_cvt_fp8x2_to_halfraw2(x2, __NV_E4M3));
+        const float2 raw = half2raw_to_float2(__nv_cvt_fp8x2_to_halfraw2(x2, fmt));
         return make_float2(raw.x * d, raw.y * d);
 #else
         return make_float2(mxfp_dequant_raw<type>(qs_block[pos0]) * d,
                            mxfp_dequant_raw<type>(qs_block[pos0 + 1]) * d);
 #endif
     } else {
+        // 6-bit formats: E2M3 and E3M2
         uint8_t v0, v1;
         mxfp6_unpack_pair(qs_block, pos0, v0, v1);
 #if CUDART_VERSION >= 12080
+        constexpr auto fmt = (type == GGML_TYPE_MXFP6) ? __NV_E2M3 : __NV_E3M2;
         const __nv_fp6x2_storage_t x2 = (__nv_fp6x2_storage_t)(v0 | ((uint16_t)v1 << 8));
-        const float2 raw = half2raw_to_float2(__nv_cvt_fp6x2_to_halfraw2(x2, __NV_E2M3));
+        const float2 raw = half2raw_to_float2(__nv_cvt_fp6x2_to_halfraw2(x2, fmt));
         return make_float2(raw.x * d, raw.y * d);
 #else
         return make_float2(mxfp_dequant_raw<type>(v0) * d, mxfp_dequant_raw<type>(v1) * d);
@@ -243,9 +279,10 @@ static __device__ __forceinline__ float mxfp_dequant_elem(
     if constexpr (type == GGML_TYPE_MXFP4) {
         const int byte_idx = pos < 16 ? pos : pos - 16;
         raw = (pos < 16) ? (qs[byte_idx] & 0x0F) : (qs[byte_idx] >> 4);
-    } else if constexpr (type == GGML_TYPE_MXFP8) {
+    } else if constexpr (type == GGML_TYPE_MXFP8 || type == GGML_TYPE_MXFP8_E5M2) {
         raw = qs[pos];
     } else {
+        // 6-bit formats: E2M3 and E3M2
         const int grp  = pos / 4;
         const int slot = pos % 4;
         uint8_t vals[4];
@@ -338,11 +375,11 @@ static void mxfp_soa_to_f16_cuda(
     });
 }
 
-// Q Hadamard + roundtrip kernel for MMA flash attention pre-processing.
+// Q Hadamard rotation kernel for MMA flash attention pre-processing.
 // One warp per 32-element block, operates on F32 Q rows in-place.
+// Rotate-only: no quantize/dequant roundtrip — Q stays in full precision.
 
-template <ggml_type mxfp_type>
-static __global__ void k_mxfp_q_hadamard_roundtrip(
+static __global__ void k_mxfp_q_hadamard(
         float * __restrict__ Q,
         const int D,
         const int64_t ne1,
@@ -374,13 +411,13 @@ static __global__ void k_mxfp_q_hadamard_roundtrip(
     float * q_block = Q + i1*s01 + i2*s02 + i3*s03 + blk * 32;
 
     float val = q_block[lane];
-    val = mxfp_hadamard_roundtrip<mxfp_type>(val);
+    val = mxfp_hadamard_only(val);
     q_block[lane] = val;
 }
 
-// Host dispatch for Q Hadamard+roundtrip.
-static void mxfp_q_hadamard_roundtrip_cuda(
-        float * Q, ggml_type k_type, int64_t D,
+// Host dispatch for Q Hadamard rotation (MMA path).
+static void mxfp_q_hadamard_cuda(
+        float * Q, int64_t D,
         int64_t ne1, int64_t ne2, int64_t ne3,
         size_t nb01, size_t nb02, size_t nb03, cudaStream_t stream) {
 
@@ -397,8 +434,6 @@ static void mxfp_q_hadamard_roundtrip_cuda(
     const int64_t s02 = (int64_t)(nb02 / sizeof(float));
     const int64_t s03 = (int64_t)(nb03 / sizeof(float));
 
-    MXFP_DISPATCH(k_type,
-        k_mxfp_q_hadamard_roundtrip<mxfp_type><<<grid, threads, 0, stream>>>(
-            Q, (int)D, ne1, ne2, ne3, s01, s02, s03)
-    );
+    k_mxfp_q_hadamard<<<grid, threads, 0, stream>>>(
+        Q, (int)D, ne1, ne2, ne3, s01, s02, s03);
 }

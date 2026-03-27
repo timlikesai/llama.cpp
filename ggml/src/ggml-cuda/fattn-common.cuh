@@ -614,6 +614,10 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_mxfp<GGML_TYPE_MXFP8, D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_MXFP6) {
         return vec_dot_fattn_vec_KQ_mxfp<GGML_TYPE_MXFP6, D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_MXFP6_E3M2) {
+        return vec_dot_fattn_vec_KQ_mxfp<GGML_TYPE_MXFP6_E3M2, D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_MXFP8_E5M2) {
+        return vec_dot_fattn_vec_KQ_mxfp<GGML_TYPE_MXFP8_E5M2, D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -640,6 +644,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_mxfp_D<GGML_TYPE_MXFP8, D, T, ne>;
     } else if constexpr (type_V == GGML_TYPE_MXFP6) {
         return dequantize_V_mxfp_D<GGML_TYPE_MXFP6, D, T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_MXFP6_E3M2) {
+        return dequantize_V_mxfp_D<GGML_TYPE_MXFP6_E3M2, D, T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_MXFP8_E5M2) {
+        return dequantize_V_mxfp_D<GGML_TYPE_MXFP8_E5M2, D, T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;
@@ -936,12 +944,14 @@ void launch_fattn(
         nb23 = nb13;
     }
 
-    // MXFP Q Hadamard + roundtrip for MMA path.
-    // Q must have the same Hadamard rotation + quantization error as K for correct dot products.
-    // This matches the CPU scalar Q roundtrip step-by-step.
-    // Only needed for MMA — VEC handles Q roundtrip internally in the kernel.
-    if (need_f16_K && ggml_is_type_mxfp(K->type)) {
-        mxfp_q_hadamard_roundtrip_cuda((float *)Q->data, K->type, Q->ne[0],
+    // MXFP Q Hadamard rotation (both MMA and VEC paths).
+    // K has Hadamard from set_rows — Q must have the same rotation for correct Q·K dot product.
+    // Rotate-only: no quantize/dequant roundtrip. Q is never stored, so injecting
+    // quantization noise was unnecessary and hurts PPL.
+    // Applied here (before kernel launch) rather than inside the kernel, so both MMA and VEC
+    // see pre-rotated Q without needing to pass a hadamard flag through the kernel signature.
+    if (ggml_is_type_mxfp(K->type) && ggml_mxfp_use_hadamard(K->type)) {
+        mxfp_q_hadamard_cuda((float *)Q->data, Q->ne[0],
             Q->ne[1], Q->ne[2], Q->ne[3],
             Q->nb[1], Q->nb[2], Q->nb[3], main_stream);
     }

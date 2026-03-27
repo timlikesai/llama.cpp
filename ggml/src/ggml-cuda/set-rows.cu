@@ -298,9 +298,9 @@ static __global__ void k_set_rows_mxfp_soa(
         if (lane < 16) {
             qs[lane] = idx | (hi << 4);
         }
-    } else if constexpr (mxfp_type == GGML_TYPE_MXFP8) {
+    } else if constexpr (mxfp_type == GGML_TYPE_MXFP8 || mxfp_type == GGML_TYPE_MXFP8_E5M2) {
         qs[lane] = idx;
-    } else if constexpr (mxfp_type == GGML_TYPE_MXFP6) {
+    } else if constexpr (mxfp_type == GGML_TYPE_MXFP6 || mxfp_type == GGML_TYPE_MXFP6_E3M2) {
         // Pack 4 elements per 3 bytes — gather group of 4 via shuffles
         const int group = lane / 4;
         const uint8_t v0 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)idx, group * 4 + 0);
@@ -451,7 +451,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
-    } else if (dst->type == GGML_TYPE_MXFP4 || dst->type == GGML_TYPE_MXFP8 || dst->type == GGML_TYPE_MXFP6) {
+    } else if (ggml_is_type_mxfp(dst->type)) {
         const bool hadamard = ((const int32_t *)dst->op_params)[0] != 0;
         MXFP_DISPATCH(dst->type,
             set_rows_mxfp_soa_cuda<mxfp_type, idx_t>(

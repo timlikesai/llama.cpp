@@ -401,6 +401,8 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_MXFP4,
     GGML_TYPE_MXFP8,
     GGML_TYPE_MXFP6,
+    GGML_TYPE_MXFP6_E3M2,
+    GGML_TYPE_MXFP8_E5M2,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {

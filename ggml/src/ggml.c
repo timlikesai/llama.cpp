@@ -742,6 +742,22 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_mxfp6,
         .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp6_ref,
     },
+    [GGML_TYPE_MXFP6_E3M2] = {
+        .type_name                = "mxfp6_e3m2",
+        .blck_size                = QK_MXFP6,
+        .type_size                = sizeof(block_mxfp6),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_mxfp6_e3m2,
+        .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp6_e3m2_ref,
+    },
+    [GGML_TYPE_MXFP8_E5M2] = {
+        .type_name                = "mxfp8_e5m2",
+        .blck_size                = QK_MXFP8,
+        .type_size                = sizeof(block_mxfp8),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_mxfp8_e5m2,
+        .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp8_e5m2_ref,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -1331,23 +1347,40 @@ bool ggml_is_quantized(enum ggml_type type) {
 bool ggml_is_type_mxfp(enum ggml_type type) {
     return type == GGML_TYPE_MXFP4 ||
            type == GGML_TYPE_MXFP8 ||
-           type == GGML_TYPE_MXFP6;
+           type == GGML_TYPE_MXFP6 ||
+           type == GGML_TYPE_MXFP6_E3M2 ||
+           type == GGML_TYPE_MXFP8_E5M2;
 }
 
 bool ggml_mxfp_use_hadamard(enum ggml_type type) {
+    // Runtime override: GGML_MXFP_NO_HADAMARD=1 disables rotation for all types.
+    // Useful for A/B testing — Hadamard helps most models but can hurt small dense ones.
+    static int env_override = -1;
+    if (env_override < 0) {
+        const char * env = getenv("GGML_MXFP_NO_HADAMARD");
+        env_override = (env && env[0] == '1') ? 1 : 0;
+    }
+    if (env_override) {
+        return false;
+    }
+
     switch (type) {
-        case GGML_TYPE_MXFP4:  return MXFP_USE_HADAMARD_E2M1;
-        case GGML_TYPE_MXFP8:  return MXFP_USE_HADAMARD_E4M3;
-        case GGML_TYPE_MXFP6:  return MXFP_USE_HADAMARD_E2M3;
+        case GGML_TYPE_MXFP4:      return MXFP_USE_HADAMARD_E2M1;
+        case GGML_TYPE_MXFP8:      return MXFP_USE_HADAMARD_E4M3;
+        case GGML_TYPE_MXFP6:      return MXFP_USE_HADAMARD_E2M3;
+        case GGML_TYPE_MXFP6_E3M2: return MXFP_USE_HADAMARD_E3M2;
+        case GGML_TYPE_MXFP8_E5M2: return MXFP_USE_HADAMARD_E5M2;
         default: return false;
     }
 }
 
 int ggml_mxfp_qs_per_block(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_MXFP4:  return MXFP_QS_PER_BLOCK_E2M1;
-        case GGML_TYPE_MXFP8:  return MXFP_QS_PER_BLOCK_E4M3;
-        case GGML_TYPE_MXFP6:  return MXFP_QS_PER_BLOCK_E2M3;
+        case GGML_TYPE_MXFP4:      return MXFP_QS_PER_BLOCK_E2M1;
+        case GGML_TYPE_MXFP8:      return MXFP_QS_PER_BLOCK_E4M3;
+        case GGML_TYPE_MXFP6:      return MXFP_QS_PER_BLOCK_E2M3;
+        case GGML_TYPE_MXFP6_E3M2: return MXFP_QS_PER_BLOCK_E3M2;
+        case GGML_TYPE_MXFP8_E5M2: return MXFP_QS_PER_BLOCK_E5M2;
         default: return 0;
     }
 }

@@ -433,7 +433,9 @@ extern "C" {
         GGML_TYPE_MXFP8       = GGML_TYPE_MXFP8_E4M3, // compat alias
         GGML_TYPE_MXFP6_E2M3  = 42, // MX FP6 E2M3
         GGML_TYPE_MXFP6       = GGML_TYPE_MXFP6_E2M3, // compat alias
-        GGML_TYPE_COUNT        = 43,
+        GGML_TYPE_MXFP6_E3M2  = 43, // MX FP6 E3M2
+        GGML_TYPE_MXFP8_E5M2  = 44, // MX FP8 E5M2
+        GGML_TYPE_COUNT        = 45,
     };
 
     // precision

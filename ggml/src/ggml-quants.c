@@ -607,7 +607,9 @@ void pack_fp6x4(const uint8_t v[4], uint8_t out[3])   { ggml_mxfp_pack_fp6x4(v, 
 void unpack_fp6x4(const uint8_t in[3], uint8_t v[4])   { ggml_mxfp_unpack_fp6x4(in, v); }
 
 static const mxfp_elem_traits_t mxfp8_e4m3_traits = { MXFP8_E4M3_EMAX_OFFSET, MXFP8_SOA_QS_PER_BLOCK, 8, float_to_fp8_e4m3_rn, fp8_e4m3_to_float };
+static const mxfp_elem_traits_t mxfp8_e5m2_traits = { MXFP8_E5M2_EMAX_OFFSET, MXFP8_SOA_QS_PER_BLOCK, 8, float_to_fp8_e5m2_rn, fp8_e5m2_to_float };
 static const mxfp_elem_traits_t mxfp6_e2m3_traits = { MXFP6_E2M3_EMAX_OFFSET, MXFP6_SOA_QS_PER_BLOCK, 6, float_to_fp6_e2m3_rn, fp6_e2m3_to_float };
+static const mxfp_elem_traits_t mxfp6_e3m2_traits = { MXFP6_E3M2_EMAX_OFFSET, MXFP6_SOA_QS_PER_BLOCK, 6, float_to_fp6_e3m2_rn, fp6_e3m2_to_float };
 
 // MXFP8 AoS quantize/dequant — uses shared per-block helpers.
 void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
@@ -640,6 +642,40 @@ void dequantize_row_mxfp6(const block_mxfp6 * GGML_RESTRICT x, float * GGML_REST
     const int nb = k / QK_MXFP6;
     for (int i = 0; i < nb; i++) {
         dequantize_block_mxfp(x[i].qs, x[i].e, &y[i*QK_MXFP6], &mxfp6_e2m3_traits);
+    }
+}
+
+// MXFP6 E3M2 AoS quantize/dequant — same block layout as E2M3, different element encoding.
+void quantize_row_mxfp6_e3m2_ref(const float * GGML_RESTRICT x, block_mxfp6 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MXFP6 == 0);
+    const int nb = k / QK_MXFP6;
+    for (int i = 0; i < nb; i++) {
+        quantize_block_mxfp(&x[i*QK_MXFP6], y[i].qs, &y[i].e, &mxfp6_e3m2_traits);
+    }
+}
+
+void dequantize_row_mxfp6_e3m2(const block_mxfp6 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MXFP6 == 0);
+    const int nb = k / QK_MXFP6;
+    for (int i = 0; i < nb; i++) {
+        dequantize_block_mxfp(x[i].qs, x[i].e, &y[i*QK_MXFP6], &mxfp6_e3m2_traits);
+    }
+}
+
+// MXFP8 E5M2 AoS quantize/dequant — same block layout as E4M3, different element encoding.
+void quantize_row_mxfp8_e5m2_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MXFP8 == 0);
+    const int nb = k / QK_MXFP8;
+    for (int i = 0; i < nb; i++) {
+        quantize_block_mxfp(&x[i*QK_MXFP8], y[i].qs, &y[i].e, &mxfp8_e5m2_traits);
+    }
+}
+
+void dequantize_row_mxfp8_e5m2(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MXFP8 == 0);
+    const int nb = k / QK_MXFP8;
+    for (int i = 0; i < nb; i++) {
+        dequantize_block_mxfp(x[i].qs, x[i].e, &y[i*QK_MXFP8], &mxfp8_e5m2_traits);
     }
 }
 
@@ -710,6 +746,18 @@ void quantize_row_mxfp6_soa(const float * GGML_RESTRICT x, void * GGML_RESTRICT 
 void dequantize_row_mxfp6_soa(const void * GGML_RESTRICT src, float * GGML_RESTRICT y, int64_t k) {
     dequantize_row_mxfp_soa_impl(src, y, k, &mxfp6_e2m3_traits);
 }
+void quantize_row_mxfp6_e3m2_soa(const float * GGML_RESTRICT x, void * GGML_RESTRICT dst, int64_t k) {
+    quantize_row_mxfp_soa_impl(x, dst, k, &mxfp6_e3m2_traits);
+}
+void dequantize_row_mxfp6_e3m2_soa(const void * GGML_RESTRICT src, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_mxfp_soa_impl(src, y, k, &mxfp6_e3m2_traits);
+}
+void quantize_row_mxfp8_e5m2_soa(const float * GGML_RESTRICT x, void * GGML_RESTRICT dst, int64_t k) {
+    quantize_row_mxfp_soa_impl(x, dst, k, &mxfp8_e5m2_traits);
+}
+void dequantize_row_mxfp8_e5m2_soa(const void * GGML_RESTRICT src, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_mxfp_soa_impl(src, y, k, &mxfp8_e5m2_traits);
+}
 
 // Fused Hadamard + SoA quantize: one read, one write, 32-float stack buffer per block.
 // Eliminates the full-row temp buffer and extra memory pass.
@@ -750,6 +798,12 @@ void quantize_row_mxfp8_soa_hadamard(const float * GGML_RESTRICT x, void * GGML_
 }
 void quantize_row_mxfp6_soa_hadamard(const float * GGML_RESTRICT x, void * GGML_RESTRICT dst, int64_t k) {
     quantize_row_mxfp_soa_hadamard_impl(x, dst, k, &mxfp6_e2m3_traits);
+}
+void quantize_row_mxfp6_e3m2_soa_hadamard(const float * GGML_RESTRICT x, void * GGML_RESTRICT dst, int64_t k) {
+    quantize_row_mxfp_soa_hadamard_impl(x, dst, k, &mxfp6_e3m2_traits);
+}
+void quantize_row_mxfp8_e5m2_soa_hadamard(const float * GGML_RESTRICT x, void * GGML_RESTRICT dst, int64_t k) {
+    quantize_row_mxfp_soa_hadamard_impl(x, dst, k, &mxfp8_e5m2_traits);
 }
 
 // MXFP8/6 quantize round-trips (with and without Hadamard).
@@ -5620,8 +5674,13 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp8, data, nb);
             } break;
         case GGML_TYPE_MXFP6:
+        case GGML_TYPE_MXFP6_E3M2:
             {
                 VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp6, data, nb);
+            } break;
+        case GGML_TYPE_MXFP8_E5M2:
+            {
+                VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp8, data, nb);
             } break;
         case GGML_TYPE_NVFP4:
             {
