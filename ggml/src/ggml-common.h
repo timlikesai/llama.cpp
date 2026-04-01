@@ -216,6 +216,20 @@ typedef struct {
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
 
+#define QK_MXFP6 32
+typedef struct {
+    uint8_t e; // E8M0
+    uint8_t qs[QK_MXFP6 * 6 / 8];
+} block_mxfp6;
+static_assert(sizeof(block_mxfp6) == sizeof(uint8_t) + QK_MXFP6 * 6 / 8, "wrong mxfp6 block size/padding");
+
+#define QK_MXFP8 32
+typedef struct {
+    uint8_t e; // E8M0
+    uint8_t qs[QK_MXFP8];
+} block_mxfp8;
+static_assert(sizeof(block_mxfp8) == sizeof(uint8_t) + QK_MXFP8, "wrong mxfp8 block size/padding");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta

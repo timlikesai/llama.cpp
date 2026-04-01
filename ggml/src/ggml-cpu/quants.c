@@ -4,6 +4,7 @@
 #include "ggml-cpu-impl.h"
 #include "simd-mappings.h"
 #include "ggml-quants.h"
+#include "ggml-mxfp.h"
 #include "quants.h"
 
 #include "arch-fallback.h"
@@ -52,6 +53,14 @@ void quantize_row_q8_1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
 
 void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_mxfp4_ref(x, y, k);
+}
+
+void quantize_row_mxfp6(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp6_ref(x, y, k);
+}
+
+void quantize_row_mxfp8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp8_ref(x, y, k);
 }
 
 void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
@@ -233,6 +242,76 @@ void ggml_vec_dot_q4_1_q8_1_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 
         int sumi = sumi0 + sumi1;
         sumf += (GGML_CPU_FP16_TO_FP32(x[ib].d)*GGML_CPU_FP16_TO_FP32(y[ib].d))*sumi + GGML_CPU_FP16_TO_FP32(x[ib].m)*GGML_CPU_FP16_TO_FP32(y[ib].s);
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_mxfp6_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_MXFP6;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    static_assert(QK_MXFP6 == QK8_0, "QK_MXFP6 and QK8_0 must be the same");
+
+    const block_mxfp6 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    int ib = 0;
+    float sumf = 0;
+
+    for (; ib < nb; ++ib) {
+        const float d = GGML_CPU_FP16_TO_FP32(y[ib].d) * GGML_E8M0_TO_FP32(x[ib].e);
+
+        float sumi = 0;
+        for (int j = 0, qi = 0; j < qk; j += 4, qi += 3) {
+            uint8_t vals[4];
+            ggml_mxfp_unpack_fp6x4(&x[ib].qs[qi], vals);
+            for (int jj = 0; jj < 4; jj++) {
+                sumi += y[ib].qs[j + jj] * ggml_mxfp_fp6_e2m3_to_float(vals[jj]);
+            }
+        }
+
+        sumf += d * sumi;
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_mxfp8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_MXFP8;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    static_assert(QK_MXFP8 == QK8_0, "QK_MXFP8 and QK8_0 must be the same");
+
+    const block_mxfp8 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    int ib = 0;
+    float sumf = 0;
+
+    for (; ib < nb; ++ib) {
+        const float d = GGML_CPU_FP16_TO_FP32(y[ib].d) * GGML_E8M0_TO_FP32(x[ib].e);
+
+        float sumi = 0;
+        for (int j = 0; j < qk; ++j) {
+            sumi += y[ib].qs[j] * ggml_mxfp_fp8_e4m3_to_float(x[ib].qs[j]);
+        }
+
+        sumf += d * sumi;
     }
 
     *s = sumf;

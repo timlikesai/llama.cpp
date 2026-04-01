@@ -670,6 +670,8 @@ void ggml_compute_forward_add(
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP6:
+        case GGML_TYPE_MXFP8:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -1120,6 +1122,8 @@ void ggml_compute_forward_add1(
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP6:
+        case GGML_TYPE_MXFP8:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -1249,6 +1253,8 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP6:
+        case GGML_TYPE_MXFP8:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -4337,6 +4343,8 @@ void ggml_compute_forward_out_prod(
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP6:
+        case GGML_TYPE_MXFP8:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -4613,6 +4621,8 @@ void ggml_compute_forward_set(
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP6:
+        case GGML_TYPE_MXFP8:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -4837,6 +4847,8 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP6:
+        case GGML_TYPE_MXFP8:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -4925,6 +4937,14 @@ static void ggml_compute_forward_set_rows_f32(
     const int64_t ir0 = dr*ith;
     const int64_t ir1 = std::min(ir0 + dr, nr);
 
+    const bool use_soa = dst->op_params[0] != 0 && ggml_is_mxfp(dst->type);
+
+    int64_t soa_chunk = 0;
+    if (use_soa) {
+        soa_chunk = (int64_t)dst->op_params[1];
+        GGML_ASSERT(soa_chunk > 0 && soa_chunk % 32 == 0 && nc % soa_chunk == 0);
+    }
+
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
 
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
@@ -4938,9 +4958,19 @@ static void ggml_compute_forward_set_rows_f32(
 
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
-                from_float(
-                        (const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03),
-                                        ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3), nc);
+                const float * src_row = (const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03);
+                      char  * dst_row =                  ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3);
+
+                if (use_soa) {
+                    const size_t chunk_bytes = ggml_row_size(dst->type, soa_chunk);
+                    for (int64_t off = 0, dst_off = 0; off < nc; off += soa_chunk, dst_off += chunk_bytes) {
+                        ggml_mxfp_quantize_soa(dst->type, src_row + off,
+                                               dst_row + dst_off,
+                                               soa_chunk);
+                    }
+                } else {
+                    from_float(src_row, dst_row, nc);
+                }
             }
         }
     }
@@ -5563,6 +5593,8 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP6:
+        case GGML_TYPE_MXFP8:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -8234,6 +8266,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
+    const bool is_mxfp = ggml_is_mxfp(k->type);
+
     ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
     ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
     ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
@@ -8241,6 +8275,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
+
+    if (is_mxfp) {
+        GGML_ASSERT(ggml_is_mxfp(v->type) && "fattn: MXFP K requires MXFP V");
+    }
 
     int ith = params->ith;
 
@@ -8278,7 +8316,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const int iv2 = iq2 / rv2;
 
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
-        q_to_vec_dot(pq, Q_q, DK);
+
+        if (!is_mxfp) {
+            q_to_vec_dot(pq, Q_q, DK);
+        }
 
         // online softmax / attention
         // loop over n_kv and n_head_kv
@@ -8293,7 +8334,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float s; // KQ value
 
             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-            kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            if (is_mxfp) {
+                // Q_q is unused for MXFP (Q stays F32), reuse as dequant scratch
+                float * K_tmp = (float *) ((void *) Q_q);
+                ggml_mxfp_dequantize_soa(k->type, k_data, K_tmp, DK);
+                ggml_vec_dot_f32(DK, &s, 0, pq, 0, K_tmp, 0, 1);
+            } else {
+                kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            }
 
             s = s*scale; // scale KQ value
 
@@ -8339,7 +8387,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 }
 
                 // V += v*expf(s - M)
-                if (v_to_float) {
+                if (is_mxfp) {
+                    ggml_mxfp_dequantize_soa(v->type, v_data, V32, DV);
+                    ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+                } else if (v_to_float) {
                     v_to_float(v_data, V32, DV);
                     ggml_vec_mad_f32(DV, VKQ32, V32, vs);
                 } else {

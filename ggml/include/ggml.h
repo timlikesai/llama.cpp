@@ -426,10 +426,15 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_4_4 = 36,
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
-        GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
-        GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
-        GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_COUNT   = 42,
+        GGML_TYPE_MXFP4_E2M1  = 39, // MX FP4 (1 block, E2M1 elements, E8M0 scale)
+        GGML_TYPE_MXFP4       = GGML_TYPE_MXFP4_E2M1,
+        GGML_TYPE_NVFP4       = 40, // NVFP4 (4 blocks, E4M3 scale)
+        GGML_TYPE_Q1_0        = 41,
+        GGML_TYPE_MXFP8_E4M3  = 42, // MX FP8 (1 block, E4M3 elements, E8M0 scale)
+        GGML_TYPE_MXFP8       = GGML_TYPE_MXFP8_E4M3,
+        GGML_TYPE_MXFP6_E2M3  = 43, // MX FP6 (1 block, E2M3 elements, E8M0 scale)
+        GGML_TYPE_MXFP6       = GGML_TYPE_MXFP6_E2M3,
+        GGML_TYPE_COUNT       = 44,
     };
 
     // precision
@@ -750,6 +755,11 @@ extern "C" {
     GGML_API size_t  ggml_element_size(const struct ggml_tensor * tensor);
 
     GGML_API bool    ggml_is_quantized(enum ggml_type type);
+    GGML_API bool    ggml_is_mxfp(enum ggml_type type);
+
+    // MXFP SoA (struct-of-arrays) quantize/dequantize for flash attention KV cache.
+    GGML_API void ggml_mxfp_quantize_soa  (enum ggml_type type, const float * src, void  * dst, int64_t k);
+    GGML_API void ggml_mxfp_dequantize_soa(enum ggml_type type, const void  * src, float * dst, int64_t k);
 
     // TODO: temporary until model loading of ggml examples is refactored
     GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);
