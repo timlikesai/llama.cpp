@@ -446,6 +446,10 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE) {
                 new_type = GGML_TYPE_Q8_0;
             }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_MXFP6 ||
+                     ftype == LLAMA_FTYPE_MOSTLY_MXFP8) {
+                new_type = GGML_TYPE_MXFP8;
+            }
             else if (arch == LLM_ARCH_FALCON || nx % qk_k != 0) {
                 new_type = GGML_TYPE_Q8_0;
             }
@@ -801,6 +805,8 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_ALL_F32:     return GGML_TYPE_F32;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
+        case LLAMA_FTYPE_MOSTLY_MXFP6:     return GGML_TYPE_MXFP6;
+        case LLAMA_FTYPE_MOSTLY_MXFP8:     return GGML_TYPE_MXFP8;
 
         // K-quants
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:

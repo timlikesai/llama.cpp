@@ -106,7 +106,17 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         }
 
         std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
-        {
+        // MXFP types use SoA layout for FA — quantize directly from float, skip AoS path
+        if (ggml_is_mxfp(tensor->type)) {
+            const int64_t row_elems = tensor->ne[0];
+            GGML_ASSERT(row_elems % 32 == 0);
+            const size_t  row_size  = ggml_row_size(tensor->type, row_elems);
+            const size_t  nrows     = nels / row_elems;
+            for (size_t r = 0; r < nrows; r++) {
+                ggml_mxfp_quantize_soa(tensor->type, &data[r * row_elems],
+                                       &dataq[r * row_size], row_elems);
+            }
+        } else {
             // parallel quantization by block
             size_t blck_size = ggml_blck_size(tensor->type);
             size_t n_blocks = nels / blck_size;
@@ -8611,8 +8621,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                             for (int nb : { 1, 3, 32, 75, }) {
                                                 for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
                                                     if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
-                                                    for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+                                                    for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
+                                                                              GGML_TYPE_MXFP4, GGML_TYPE_MXFP6, GGML_TYPE_MXFP8}) {
                                                         if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72) continue;
+                                                        if (ggml_is_mxfp(type_KV) && (hsk % 32 != 0 || hsv % 32 != 0)) continue;
                                                         test_cases.emplace_back(new test_flash_attn_ext(
                                                                     hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV));
                                                         // run fewer test cases permuted
