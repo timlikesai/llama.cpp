@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "mxfp-common.cuh"
 
 #include <cstdint>
 
@@ -577,6 +578,61 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+// MXFP SoA K dequant + dot product for VEC flash attention.
+template<ggml_type mxfp_type, int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    constexpr int nblocks = D / 32;
+    constexpr int qs_per_blk = mxfp_type_traits<mxfp_type>::qs_per_blk;
+    const uint8_t * qs_base   = (const uint8_t *)K_c;
+    const uint8_t * e8m0_base = qs_base + MXFP_SOA_E8M0_OFFSET(nblocks, qs_per_blk);
+
+    uint8_t e8m0_cache[nblocks];
+#pragma unroll
+    for (int b = 0; b < nblocks; ++b) {
+        e8m0_cache[b] = __ldg(e8m0_base + b);
+    }
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int i0 = 0; i0 < D/2; i0 += nthreads) {
+        const int i = i0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int elem = 2 * i;
+        const int blk = elem / 32;
+        const float2 kk = mxfp_dequant_elem_pair<mxfp_type>(
+            qs_base + MXFP_SOA_QS_OFFSET(blk, qs_per_blk), e8m0_cache[blk], elem % 32);
+        const float2 Q_f2 = ((const float2 *)Q_v)[i0/nthreads];
+        sum += kk.x * Q_f2.x + kk.y * Q_f2.y;
+    }
+
+    return sum;
+}
+
+// MXFP SoA V dequant for VEC flash attention.
+template<ggml_type mxfp_type, int D_V, typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_mxfp_D(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    static_assert(ne % 2 == 0, "V_rows_per_thread must be even for pair dequant");
+    constexpr int nblocks = D_V / 32;
+    constexpr int qs_per_blk = mxfp_type_traits<mxfp_type>::qs_per_blk;
+    const uint8_t * qs_base   = (const uint8_t *)vx;
+    const uint8_t * e8m0_base = qs_base + MXFP_SOA_E8M0_OFFSET(nblocks, qs_per_blk);
+
+#pragma unroll
+    for (int l = 0; l < ne; l += 2) {
+        const int elem = (int)i0 + l;
+        const int blk  = elem / 32;
+        const float2 pair = mxfp_dequant_elem_pair<mxfp_type>(
+            qs_base + blk * qs_per_blk, e8m0_base[blk], elem % 32);
+        ((float *)dst)[l]     = pair.x;
+        ((float *)dst)[l + 1] = pair.y;
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -593,13 +649,19 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_MXFP4) {
+        return vec_dot_fattn_vec_KQ_mxfp<GGML_TYPE_MXFP4, D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_MXFP8) {
+        return vec_dot_fattn_vec_KQ_mxfp<GGML_TYPE_MXFP8, D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_MXFP6) {
+        return vec_dot_fattn_vec_KQ_mxfp<GGML_TYPE_MXFP6, D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
     }
 }
 
-template <ggml_type type_V, typename T, int ne>
+template <ggml_type type_V, typename T, int ne, int D = 0>
 constexpr __device__ dequantize_V_t get_dequantize_V() {
     if constexpr (type_V == GGML_TYPE_F16) {
         return dequantize_V_f16<T, ne>;
@@ -615,6 +677,12 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+    } else if constexpr (type_V == GGML_TYPE_MXFP4) {
+        return dequantize_V_mxfp_D<GGML_TYPE_MXFP4, D, T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_MXFP8) {
+        return dequantize_V_mxfp_D<GGML_TYPE_MXFP8, D, T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_MXFP6) {
+        return dequantize_V_mxfp_D<GGML_TYPE_MXFP6, D, T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;
@@ -946,8 +1014,13 @@ void launch_fattn(
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
-    ggml_cuda_pool_alloc<half>   K_f16(pool);
-    ggml_cuda_pool_alloc<half>   V_f16(pool);
+    // K/V F16 conversion buffers use stream-ordered allocation instead of the pool.
+    // The pool requires strict LIFO ordering which is violated when other graph nodes
+    // allocate from the same pool between launch_fattn's alloc and free.
+    half * K_f16_ptr = nullptr;
+    half * V_f16_ptr = nullptr;
+    size_t K_f16_size = 0;
+    size_t V_f16_size = 0;
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
@@ -962,14 +1035,47 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    // MXFP SoA → F16 conversion for MMA kernels (must happen before generic F16 path).
+    if (need_f16_K && ggml_is_mxfp(K->type)) {
+        const int64_t D = K->ne[0];
+        const int64_t nrows = K->ne[1] * K->ne[2] * K->ne[3];
+        K_f16_size = D * nrows * sizeof(half);
+        CUDA_CHECK(cudaMallocAsync(&K_f16_ptr, K_f16_size, main_stream));
+        mxfp_soa_to_f16_cuda(K_data, K_f16_ptr, K->type, D,
+            K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13, main_stream);
+        K_data = (char *)K_f16_ptr;
+        nb11 = D * sizeof(half);
+        nb12 = K->ne[1] * nb11;
+        nb13 = K->ne[2] * nb12;
+    }
+
+    if (need_f16_V && ggml_is_mxfp(V->type) && !V_is_K_view) {
+        const int64_t D = V->ne[0];
+        const int64_t nrows = V->ne[1] * V->ne[2] * V->ne[3];
+        V_f16_size = D * nrows * sizeof(half);
+        CUDA_CHECK(cudaMallocAsync(&V_f16_ptr, V_f16_size, main_stream));
+        mxfp_soa_to_f16_cuda(V_data, V_f16_ptr, V->type, D,
+            V->ne[1], V->ne[2], V->ne[3], nb21, nb22, nb23, main_stream);
+        V_data = (char *)V_f16_ptr;
+        nb21 = D * sizeof(half);
+        nb22 = V->ne[1] * nb21;
+        nb23 = V->ne[2] * nb22;
+    } else if (need_f16_V && ggml_is_mxfp(V->type) && V_is_K_view) {
+        V_data = K_data;
+        nb21 = nb11;
+        nb22 = nb12;
+        nb23 = nb13;
+    }
+
+    if (need_f16_K && K->type != GGML_TYPE_F16 && !ggml_is_mxfp(K->type)) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
-        K_f16.alloc(ggml_nelements(K));
+        K_f16_size = ggml_nelements(K) * sizeof(half);
+        CUDA_CHECK(cudaMallocAsync(&K_f16_ptr, K_f16_size, main_stream));
         if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
-            to_fp16(K_data, K_f16.ptr, ggml_nelements(K), main_stream);
+            to_fp16(K_data, K_f16_ptr, ggml_nelements(K), main_stream);
 
             nb11 = nb11*bs*sizeof(half)/ts;
             nb12 = nb12*bs*sizeof(half)/ts;
@@ -980,16 +1086,16 @@ void launch_fattn(
             const int64_t s01 = nb11 / ts;
             const int64_t s02 = nb12 / ts;
             const int64_t s03 = nb13 / ts;
-            to_fp16(K_data, K_f16.ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+            to_fp16(K_data, K_f16_ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
 
             nb11 = K->ne[0] * sizeof(half);
             nb12 = K->ne[1] * nb11;
             nb13 = K->ne[2] * nb12;
         }
-        K_data = (char *) K_f16.ptr;
+        K_data = (char *) K_f16_ptr;
     }
 
-    if (need_f16_V && V->type != GGML_TYPE_F16) {
+    if (need_f16_V && V->type != GGML_TYPE_F16 && !ggml_is_mxfp(V->type)) {
         if (V_is_K_view) {
             V_data = K_data;
             nb21   = nb11;
@@ -999,11 +1105,12 @@ void launch_fattn(
             const size_t bs = ggml_blck_size(V->type);
             const size_t ts = ggml_type_size(V->type);
 
-            V_f16.alloc(ggml_nelements(V));
+            V_f16_size = ggml_nelements(V) * sizeof(half);
+            CUDA_CHECK(cudaMallocAsync(&V_f16_ptr, V_f16_size, main_stream));
             if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
-                to_fp16(V_data, V_f16.ptr, ggml_nelements(V), main_stream);
-                V_data = (char *) V_f16.ptr;
+                to_fp16(V_data, V_f16_ptr, ggml_nelements(V), main_stream);
+                V_data = (char *) V_f16_ptr;
 
                 nb21 = nb21*bs*sizeof(half)/ts;
                 nb22 = nb22*bs*sizeof(half)/ts;
@@ -1014,13 +1121,13 @@ void launch_fattn(
                 const int64_t s01 = nb21 / ts;
                 const int64_t s02 = nb22 / ts;
                 const int64_t s03 = nb23 / ts;
-                to_fp16(V_data, V_f16.ptr, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
+                to_fp16(V_data, V_f16_ptr, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
 
                 nb21 = V->ne[0] * sizeof(half);
                 nb22 = V->ne[1] * nb21;
                 nb23 = V->ne[2] * nb22;
             }
-            V_data = (char *) V_f16.ptr;
+            V_data = (char *) V_f16_ptr;
         }
     }
 
@@ -1209,4 +1316,8 @@ void launch_fattn(
             (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
     }
     CUDA_CHECK(cudaGetLastError());
+
+    // Free stream-ordered F16 conversion buffers.
+    if (K_f16_ptr) { CUDA_CHECK(cudaFreeAsync(K_f16_ptr, main_stream)); }
+    if (V_f16_ptr) { CUDA_CHECK(cudaFreeAsync(V_f16_ptr, main_stream)); }
 }

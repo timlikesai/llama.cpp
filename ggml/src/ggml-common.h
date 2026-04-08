@@ -71,6 +71,26 @@ typedef sycl::half2 ggml_half2;
 #define GGML_COMMON_DECL
 #endif
 
+// MXFP constants — visible to all backends (pure macros, no code).
+
+#define MXFP_HADAMARD_32_NORM  0.17677669529663689f  // 1/sqrt(32)
+
+// Bitmask flags for MXFP pre-quantization transform stages.
+#define GGML_MXFP_XFORM_HADAMARD    1  // Walsh-Hadamard (energy spreading)
+#define GGML_MXFP_XFORM_NYQUIST     2  // RHT sign diagonal (pseudorandom, non-Walsh)
+#define GGML_MXFP_XFORM_INTERLEAVE  4  // Inter-block channel interleaving
+#define GGML_MXFP_XFORM_INVERSE     8  // Inverse transform order
+
+// Sign diagonal patterns for pre-Hadamard sign injection.
+// Davis-Jedwab zigzag (universal default): path 1-3-0-4-2, max scale distance=11.
+#define GGML_MXFP_SIGNS_DJ_ZIGZAG   0x3C5A6600u
+// Legacy pseudorandom RHT pattern (for backward compatibility / A-B testing)
+#define GGML_MXFP_SIGNS_RHT         0xA7D3E1B5u
+// Alternating (-1)^i
+#define GGML_MXFP_SIGNS_ALTERNATING 0xAAAAAAAAu
+// Default sign pattern
+#define GGML_MXFP_RHT_SIGNS GGML_MXFP_SIGNS_DJ_ZIGZAG
+
 #if defined(GGML_COMMON_DECL)
 
 #ifndef __cplusplus
@@ -229,6 +249,21 @@ typedef struct {
     uint8_t qs[QK_MXFP8];
 } block_mxfp8;
 static_assert(sizeof(block_mxfp8) == sizeof(uint8_t) + QK_MXFP8, "wrong mxfp8 block size/padding");
+
+// E8M0 shared exponent constants (OCP MX v1.0 SS5.3).
+// EMAX_OFFSET ≈ log2(max_finite), used by round(log2(amax)) base estimate.
+#define MXFP4_E2M1_EMAX_OFFSET   2   // floor(log2(6.0))   = 2
+#define MXFP6_E2M3_EMAX_OFFSET   2   // floor(log2(7.5))   = 2
+#define MXFP8_E4M3_EMAX_OFFSET   8   // floor(log2(448))   = 8
+
+// SoA layout constants: quantized bytes per 32-element block.
+#define MXFP4_SOA_QS_PER_BLOCK  16   // 32 * 4 / 8
+#define MXFP6_SOA_QS_PER_BLOCK  24   // 32 * 6 / 8
+#define MXFP8_SOA_QS_PER_BLOCK  32   // 32 * 8 / 8
+
+// SoA offset helpers: [qs0 qs1 ... qsN | e0 e1 ... eN]
+#define MXFP_SOA_QS_OFFSET(block_idx, qs_per_block)     ((block_idx) * (qs_per_block))
+#define MXFP_SOA_E8M0_OFFSET(nblocks, qs_per_block)     ((nblocks) * (qs_per_block))
 
 #define QK5_0 32
 typedef struct {

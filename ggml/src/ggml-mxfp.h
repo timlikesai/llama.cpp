@@ -1,8 +1,9 @@
 #pragma once
 
-// MXFP element format converters and packing utilities.
+// MXFP element format converters and packing utilities (host/CPU).
 // Ref: OCP Microscaling Formats (MX) Specification v1.0
 // Requires: ggml-common.h included before this header.
+// CUDA __device__ equivalents: ggml-cuda/mxfp-common.cuh
 
 #include "ggml-impl.h"
 
@@ -10,9 +11,7 @@
 #define MXFP6_E2M3_MAX_FINITE  7.5f   // 2^2 * (1 + 7/8)
 #define MXFP8_E4M3_MAX_FINITE  448.0f // 2^8 * (1 + 6/8)
 
-#define MXFP4_E2M1_EMAX_OFFSET   2   // floor(log2(6.0))
-#define MXFP6_E2M3_EMAX_OFFSET   2   // floor(log2(7.5))
-#define MXFP8_E4M3_EMAX_OFFSET   8   // floor(log2(448.0))
+// EMAX_OFFSET constants are in ggml-common.h (shared with CUDA).
 
 #ifdef __cplusplus
 extern "C" {

@@ -1,5 +1,6 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
+#include "mxfp-common.cuh"
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -209,6 +210,142 @@ static void set_rows_cuda(
     }
 }
 
+// MXFP SoA set_rows: one warp per 32-element block.
+// Each head's SoA chunk ([qs_blocks | e8m0_scales]) is written contiguously so that
+// standard per-head tensor strides address each head without multihead offset math.
+// Hadamard rotation is applied upstream in the graph.
+
+template <ggml_type mxfp_type, typename idx_t>
+static __global__ void k_set_rows_mxfp_soa(
+        const float * __restrict__ src0,
+        const idx_t * __restrict__ src1,
+        char * __restrict__ dst,
+        const int64_t ne00,
+        const int64_t ne01,
+        const int64_t ne02,
+        const int64_t ne03,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03,
+        const int64_t s10,
+        const int64_t s11,
+        const int64_t s12,
+        const int64_t nb1,
+        const int64_t nb2,
+        const int64_t nb3,
+        const int64_t ne11,
+        const int64_t ne12,
+        const int nblocks_per_chunk) {
+
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const int warps_per_block = blockDim.x / 32;
+
+    const int64_t global_warp = (int64_t)blockIdx.x * warps_per_block + warp;
+
+    const int nblocks_per_row = (int)(ne00 / 32);
+    const int64_t total_blocks = (int64_t)nblocks_per_row * ne01 * ne02 * ne03;
+    if (global_warp >= total_blocks) return;
+
+    int64_t tmp = global_warp;
+    const int block_in_row = (int)(tmp % nblocks_per_row); tmp /= nblocks_per_row;
+    const int i01 = (int)(tmp % ne01); tmp /= ne01;
+    const int i02 = (int)(tmp % ne02); tmp /= ne02;
+    const int i03 = (int)tmp;
+
+    const int i12 = i03 % (int)ne12;
+    const int i11 = i02 % (int)ne11;
+    const int i10 = i01;
+
+    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+
+    const float * src_block = src0 + i01*s01 + i02*s02 + i03*s03 + block_in_row * 32;
+    char * dst_row_ptr = dst + dst_row * nb1 + i02 * nb2 + i03 * nb3;
+
+    constexpr int qs_per_blk = mxfp_type_traits<mxfp_type>::qs_per_blk;
+
+    // Per-head chunking: each head's SoA is contiguous [qs | e8m0].
+    const int chunk          = block_in_row / nblocks_per_chunk;
+    const int block_in_chunk = block_in_row % nblocks_per_chunk;
+    const int chunk_bytes    = nblocks_per_chunk * (qs_per_blk + 1);
+    uint8_t * chunk_base     = (uint8_t *)dst_row_ptr + chunk * chunk_bytes;
+
+    // Load one element per lane
+    float val = src_block[lane];
+
+    // Warp-wide amax
+    float amax = fabsf(val);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset));
+    }
+
+    // E8M0 computation
+    uint8_t e8m0 = 0;
+    if (lane == 0) {
+        e8m0 = mxfp_compute_e8m0<mxfp_type>(amax);
+        chunk_base[MXFP_SOA_E8M0_OFFSET(nblocks_per_chunk, qs_per_blk) + block_in_chunk] = e8m0;
+    }
+    e8m0 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)e8m0, 0);
+
+    // Quantize + write to SoA qs region
+    uint8_t * qs = chunk_base + MXFP_SOA_QS_OFFSET(block_in_chunk, qs_per_blk);
+    const uint8_t idx = mxfp_quantize_elem<mxfp_type>(val, e8m0);
+
+    if constexpr (mxfp_type == GGML_TYPE_MXFP4) {
+        const uint8_t hi = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)idx, lane + 16);
+        if (lane < 16) {
+            qs[lane] = idx | (hi << 4);
+        }
+    } else if constexpr (mxfp_type == GGML_TYPE_MXFP8) {
+        qs[lane] = idx;
+    } else if constexpr (mxfp_type == GGML_TYPE_MXFP6) {
+        const int group = lane / 4;
+        const uint8_t v0 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)idx, group * 4 + 0);
+        const uint8_t v1 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)idx, group * 4 + 1);
+        const uint8_t v2 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)idx, group * 4 + 2);
+        const uint8_t v3 = (uint8_t)__shfl_sync(0xFFFFFFFF, (int)idx, group * 4 + 3);
+        if (lane % 4 == 0) {
+            const uint8_t vals[4] = { v0, v1, v2, v3 };
+            mxfp_pack_fp6x4(vals, qs + group * 3);
+        }
+    }
+}
+
+template <ggml_type mxfp_type, typename idx_t>
+static void set_rows_mxfp_soa_cuda(
+        const float * src0_d, const idx_t * src1_d, char * dst_d,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        const int64_t ne11, const int64_t ne12,
+        const int soa_chunk,
+        cudaStream_t stream) {
+
+    GGML_ASSERT(ne00 % 32 == 0);
+    GGML_ASSERT(soa_chunk % 32 == 0 && ne00 % soa_chunk == 0);
+    const int nblocks_per_row = (int)(ne00 / 32);
+    const int nblocks_per_chunk = soa_chunk / 32;
+    const int64_t total_warps = (int64_t)nblocks_per_row * ne01 * ne02 * ne03;
+    if (total_warps == 0) return;
+
+    const int warps_per_cuda_block = 4;
+    const int threads = warps_per_cuda_block * 32;
+    const int grid = (int)((total_warps + warps_per_cuda_block - 1) / warps_per_cuda_block);
+
+    const int64_t s01 = nb01 / sizeof(float);
+    const int64_t s02 = nb02 / sizeof(float);
+    const int64_t s03 = nb03 / sizeof(float);
+    const int64_t s10 = nb10 / sizeof(idx_t);
+    const int64_t s11 = nb11 / sizeof(idx_t);
+    const int64_t s12 = nb12 / sizeof(idx_t);
+
+    k_set_rows_mxfp_soa<mxfp_type, idx_t><<<grid, threads, 0, stream>>>(
+        src0_d, src1_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, s10, s11, s12,
+        nb1, nb2, nb3, ne11, ne12, nblocks_per_chunk);
+}
+
 template<typename src_t, typename idx_t>
 static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const src_t * src0_d = (const src_t *)src0->data;
@@ -217,7 +354,6 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     GGML_TENSOR_BINARY_OP_LOCALS
 
     cudaStream_t stream = ctx.stream();
-
 
     if (dst->type == GGML_TYPE_F32) {
         set_rows_cuda(
@@ -308,6 +444,15 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb10, nb11, nb12,
             nb1, nb2, nb3,
             stream
+        );
+    } else if (ggml_is_mxfp(dst->type)) {
+        const int soa_chunk = dst->op_params[0] ? dst->op_params[1] : (int)ne00;
+        MXFP_DISPATCH(dst->type,
+            set_rows_mxfp_soa_cuda<mxfp_type, idx_t>(
+                src0_d, src1_d, (char *)dst->data,
+                ne00, ne01, ne02, ne03,
+                nb01, nb02, nb03, nb10, nb11, nb12,
+                nb1, nb2, nb3, ne11, ne12, soa_chunk, stream)
         );
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));

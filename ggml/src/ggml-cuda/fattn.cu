@@ -284,6 +284,13 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
+    // MXFP SoA flash attention — always included
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP4, GGML_TYPE_MXFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8, GGML_TYPE_MXFP8)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6, GGML_TYPE_MXFP6)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP8, GGML_TYPE_MXFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP6, GGML_TYPE_MXFP4)
+
     GGML_ABORT("fatal error");
 }
 
@@ -366,7 +373,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
     if (K->type != V->type) {
-        return BEST_FATTN_KERNEL_NONE;
+        // Allow mixed MXFP K/V — higher-precision K with MXFP4 V
+        const bool mxfp_mixed = ggml_is_mxfp(K->type) && V->type == GGML_TYPE_MXFP4
+                                && K->type != GGML_TYPE_MXFP4;
+        if (!mxfp_mixed) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
@@ -384,12 +396,27 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
             break;
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP8:
+        case GGML_TYPE_MXFP6:
+            break;
         default:
             return BEST_FATTN_KERNEL_NONE;
     }
 
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+
+    // MXFP: VEC for decode (small batch), MMA F16 for prefill (large batch).
+    if (ggml_is_mxfp(K->type)) {
+        if (!(Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        if (turing_mma_available(cc) && Q->ne[1] > 1) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+        return BEST_FATTN_KERNEL_VEC;
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:

@@ -84,12 +84,13 @@ static __global__ void flash_attn_ext_vec(
     constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne : 4;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
+    constexpr bool is_mxfp_k = (type_K == GGML_TYPE_MXFP4 || type_K == GGML_TYPE_MXFP8 || type_K == GGML_TYPE_MXFP6);
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
-    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16;
+    constexpr bool Q_q8_1 = !is_mxfp_k && type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16;
 #ifdef V_DOT2_F32_F16_AVAILABLE
-    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
+    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread, D>();
 #else
-    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, float, V_rows_per_thread>();
+    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, float, V_rows_per_thread, D>();
 #endif // V_DOT2_F32_F16_AVAILABLE
 
     const int ic0 = blockIdx.x * ncols; // Index of the Q/QKV column to work on.
@@ -112,12 +113,13 @@ static __global__ void flash_attn_ext_vec(
 
     constexpr int ne_KQ      = ncols*D;
     constexpr int ne_combine = nwarps*V_cols_per_iter*D;
+    constexpr int ne_shmem   = ne_KQ > ne_combine ? ne_KQ : ne_combine;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     half2            VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
-    __shared__ half   KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
+    __shared__ half   KQ[ne_shmem];
 #else
     float2           VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
-    __shared__ float  KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
+    __shared__ float  KQ[ne_shmem];
 #endif // V_DOT2_F32_F16_AVAILABLE
 
     float KQ_max[ncols];
@@ -190,6 +192,26 @@ static __global__ void flash_attn_ext_vec(
         }
 
         __syncthreads();
+    } else if constexpr (is_mxfp_k) {
+        // MXFP Q path: Q stays F32 (Hadamard rotation applied upstream in graph).
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            const float * Q_f = (const float *)(Q + j*nb01);
+#pragma unroll
+            for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
+                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
+                float q0 = 0.0f, q1 = 0.0f;
+                if (ncols == 1 || ic0 + j < int(ne01.z)) {
+                    q0 = Q_f[2*i]     * scale;
+                    q1 = Q_f[2*i + 1] * scale;
+                }
+#ifdef V_DOT2_F32_F16_AVAILABLE
+                Q_reg[j][i0/nthreads_KQ] = make_half2(__float2half(q0), __float2half(q1));
+#else
+                Q_reg[j][i0/nthreads_KQ] = make_float2(q0, q1);
+#endif
+            }
+        }
     } else {
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const half2 scale_h2 = make_half2(scale, scale);
@@ -314,6 +336,8 @@ static __global__ void flash_attn_ext_vec(
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
 
+            const char * V_row = V + k*nb21;
+
 #ifdef V_DOT2_F32_F16_AVAILABLE
             half2 KQ_k[ncols];
 #pragma unroll
@@ -323,16 +347,16 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 half2 tmp[V_rows_per_thread/2];
-                if constexpr (type_V == GGML_TYPE_BF16) {
+                if constexpr (type_V == GGML_TYPE_BF16 || type_V == GGML_TYPE_MXFP4 || type_V == GGML_TYPE_MXFP8 || type_V == GGML_TYPE_MXFP6) {
                     float2 tmp_f[V_rows_per_thread/2];
-                    dequantize_V(V + k*nb21, tmp_f,
+                    dequantize_V(V_row, tmp_f,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
                     }
                 } else {
-                    dequantize_V(V + k*nb21, tmp,
+                    dequantize_V(V_row, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
                 }
 #pragma unroll
@@ -352,7 +376,7 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 float2 tmp[V_rows_per_thread/2];
-                dequantize_V(V + k*nb21, tmp,
+                dequantize_V(V_row, tmp,
                     2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
@@ -598,3 +622,27 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
+
+// MXFP SoA flash attention — same-type K/V pairs.
+#define EXTERN_DECL_FATTN_VEC_MXFP(D, type_KV) \
+    extern DECL_FATTN_VEC_CASE(D, type_KV, type_KV);
+
+#define EXTERN_DECL_FATTN_VEC_MXFP_MIXED(D, type_K, type_V) \
+    extern DECL_FATTN_VEC_CASE(D, type_K, type_V);
+
+EXTERN_DECL_FATTN_VEC_MXFP( 64, GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP( 64, GGML_TYPE_MXFP8)
+EXTERN_DECL_FATTN_VEC_MXFP( 64, GGML_TYPE_MXFP6)
+EXTERN_DECL_FATTN_VEC_MXFP(128, GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP(128, GGML_TYPE_MXFP8)
+EXTERN_DECL_FATTN_VEC_MXFP(128, GGML_TYPE_MXFP6)
+EXTERN_DECL_FATTN_VEC_MXFP(256, GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP(256, GGML_TYPE_MXFP8)
+EXTERN_DECL_FATTN_VEC_MXFP(256, GGML_TYPE_MXFP6)
+
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED( 64, GGML_TYPE_MXFP8, GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED( 64, GGML_TYPE_MXFP6, GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED(128, GGML_TYPE_MXFP8, GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED(128, GGML_TYPE_MXFP6, GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED(256, GGML_TYPE_MXFP8, GGML_TYPE_MXFP4)
+EXTERN_DECL_FATTN_VEC_MXFP_MIXED(256, GGML_TYPE_MXFP6, GGML_TYPE_MXFP4)

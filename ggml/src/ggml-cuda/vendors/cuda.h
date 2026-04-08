@@ -13,6 +13,7 @@
 
 #if CUDART_VERSION >= 12080
 #include <cuda_fp4.h>
+#include <cuda_fp6.h>
 #endif // CUDART_VERSION >= 12080
 
 #if CUDART_VERSION < 11020
