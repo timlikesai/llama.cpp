@@ -4,6 +4,7 @@
 #include "ggml-cpu-impl.h"
 #include "simd-mappings.h"
 #include "ggml-quants.h"
+#include "ggml-mxfp.h"
 #include "quants.h"
 
 #include "arch-fallback.h"
@@ -53,7 +54,6 @@ void quantize_row_q8_1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
 void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_mxfp4_ref(x, y, k);
 }
-
 void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_nvfp4_ref(x, y, k);
 }
@@ -243,6 +243,8 @@ void ggml_vec_dot_q4_1_q8_1_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 
     *s = sumf;
 }
+
+//====================================== MXFP dot products ======================================
 
 void ggml_vec_dot_mxfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);

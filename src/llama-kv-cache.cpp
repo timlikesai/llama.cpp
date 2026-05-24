@@ -302,10 +302,10 @@ llama_kv_cache::llama_kv_cache(
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
     LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
 
-    // pre-compute the haramard matrices and keep them in host memory
+    // pre-compute the Hadamard matrices and keep them in host memory
     // TODO: in the future, we can make copies in the backend buffers to avoid host -> device transfers
     if (attn_rot_k || attn_rot_v) {
-        for (int64_t n = 64; n <= std::max(n_embd_head_k_all, n_embd_head_v_all); n *= 2) {
+        for (int64_t n = 32; n <= std::max(n_embd_head_k_all, n_embd_head_v_all); n *= 2) {
             attn_rot_hadamard[n] = std::vector<float>(n*n);
 
             ggml_init_params params = {
@@ -1226,7 +1226,14 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     }
 
     // store the current K values into the cache
-    return ggml_set_rows(ctx, k, k_cur, k_idxs);
+    ggml_tensor * result = ggml_set_rows(ctx, k, k_cur, k_idxs);
+
+    if (!v_trans && ggml_is_mxfp(k->type)) {
+        result->op_params[0] = 1;                    // SoA layout
+        result->op_params[1] = (int32_t)n_embd_head; // chunk size
+    }
+
+    return result;
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
@@ -1343,6 +1350,12 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
         //    nrot *= 2;
         //} while (hparams.n_embd_head_v() % nrot == 0);
         //nrot /= 2;
+
+        // MXFP block size is 32 - Hadamard must align with quantization groups
+        if (ggml_is_mxfp(type_v())) {
+            GGML_ASSERT(hparams.n_embd_head_v() % 32 == 0);
+            nrot = 32;
+        }
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);

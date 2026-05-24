@@ -150,6 +150,33 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     }
 }
 
+// initialize MXFP tensor with SoA layout (used by flash attention KV cache)
+static void init_tensor_uniform_mxfp_soa(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
+    GGML_ASSERT(ggml_is_mxfp(tensor->type));
+
+    const size_t nels = ggml_nelements(tensor);
+    std::vector<float> data(nels);
+
+    std::random_device rd;
+    std::default_random_engine gen(rd());
+    std::uniform_real_distribution<float> dist(min, max);
+    for (size_t i = 0; i < nels; i++) {
+        data[i] = dist(gen);
+    }
+
+    const int64_t row_elems = tensor->ne[0];
+    GGML_ASSERT(row_elems % 32 == 0);
+    const size_t row_size = ggml_row_size(tensor->type, row_elems);
+    const size_t nrows    = nels / row_elems;
+
+    std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
+    for (size_t r = 0; r < nrows; r++) {
+        ggml_mxfp_quantize_soa(tensor->type, &data[r * row_elems],
+                               &dataq[r * row_size], row_elems);
+    }
+    ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
+}
+
 // generate an F16 mask where certain blocks are randomly masked with -INF value
 static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
@@ -6537,6 +6564,8 @@ struct test_flash_attn_ext : public test_case {
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
+            } else if (ggml_is_mxfp(t->type)) {
+                init_tensor_uniform_mxfp_soa(t);
             } else {
                 init_tensor_uniform(t);
             }
@@ -8994,8 +9023,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                             for (int nb : { 1, 3, 32, 75, }) {
                                                 for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
                                                     if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
-                                                    for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
+                                                    for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL,
+                                                                              GGML_TYPE_MXFP4}) {
                                                         if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72) continue;
+                                                        if (ggml_is_mxfp(type_KV) && (hsk % 32 != 0 || hsv % 32 != 0)) continue;
                                                         test_cases.emplace_back(new test_flash_attn_ext(
                                                                     hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV));
                                                         // run fewer test cases permuted

@@ -2,6 +2,7 @@
 #include "ggml-common.h"
 
 #include "ggml-quants.h"
+#include "ggml-mxfp.h"
 #include "ggml-impl.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu.h"
@@ -292,20 +293,11 @@ void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_REST
     }
 }
 
-static inline int best_index_mxfp4(float x, float e) {
-    int best_index = 0;
-    float best_err = fabsf(kvalues_mxfp4[0]*e - x);
-    for (int i = 1; i < 16; i++) {
-        float err = fabsf(kvalues_mxfp4[i]*e - x);
-        if (err < best_err) {
-            best_index = i;
-            best_err = err;
-        }
-    }
-    return best_index;
+void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k) {
+    ggml_mxfp_quantize_row(x, y, k, GGML_TYPE_MXFP4);
 }
 
-void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k) {
+void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_MXFP4;
 
     assert(k % qk == 0);
@@ -313,30 +305,23 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
     const int nb = k / qk;
 
     for (int i = 0; i < nb; i++) {
-        float amax = 0.0f; // absolute max
-
-        for (int j = 0; j < qk; j++) {
-            const float v = x[i*qk + j];
-
-            if (amax < fabsf(v)) {
-                amax = fabsf(v);
-            }
-        }
-
-        const uint8_t e = amax > 0.0f ? (uint8_t) (floorf(log2f(amax)) - 2 + 127) : 0;
-
-        const float d = GGML_E8M0_TO_FP32_HALF(e);
-
-        y[i].e = e;
+        const float d = GGML_E8M0_TO_FP32_HALF(x[i].e);
 
         for (int j = 0; j < qk/2; ++j) {
-            const uint8_t x0 = best_index_mxfp4(x[i*qk + 0    + j], d);
-            const uint8_t x1 = best_index_mxfp4(x[i*qk + qk/2 + j], d);
+            const int8_t x0 = kvalues_mxfp4[x[i].qs[j] & 0x0F];
+            const int8_t x1 = kvalues_mxfp4[x[i].qs[j] >>   4];
 
-            y[i].qs[j]  = x0;
-            y[i].qs[j] |= x1 << 4;
+            y[i*qk + j + 0   ] = x0*d;
+            y[i*qk + j + qk/2] = x1*d;
         }
     }
+}
+void ggml_mxfp_quantize_soa(enum ggml_type type, const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t k) {
+    ggml_mxfp_quantize_soa_row(type, src, dst, k);
+}
+
+void ggml_mxfp_dequantize_soa(enum ggml_type type, const void * GGML_RESTRICT src, float * GGML_RESTRICT dst, int64_t k) {
+    ggml_mxfp_dequantize_soa_row(type, src, dst, k);
 }
 
 void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k) {
@@ -504,25 +489,6 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
-void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    static const int qk = QK_MXFP4;
-
-    assert(k % qk == 0);
-
-    const int nb = k / qk;
-
-    for (int i = 0; i < nb; i++) {
-        const float d = GGML_E8M0_TO_FP32_HALF(x[i].e);
-
-        for (int j = 0; j < qk/2; ++j) {
-            const int8_t x0 = kvalues_mxfp4[x[i].qs[j] & 0x0F];
-            const int8_t x1 = kvalues_mxfp4[x[i].qs[j] >>   4];
-
-            y[i*qk + j + 0   ] = x0*d;
-            y[i*qk + j + qk/2] = x1*d;
-        }
-    }
-}
 
 void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_NVFP4;
@@ -2224,7 +2190,7 @@ size_t quantize_q8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
 }
 
 size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    GGML_UNUSED(quant_weights);
+    GGML_UNUSED(quant_weights); // MXFP does not use importance-matrix weighting
     quantize_row_mxfp4_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_MXFP4, n_per_row);
 }

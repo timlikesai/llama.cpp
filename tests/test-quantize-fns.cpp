@@ -21,10 +21,12 @@ constexpr float MAX_QUANTIZATION_TOTAL_ERROR_TERNARY = 0.01f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_2BITS = 0.0075f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_3BITS = 0.0040f;
 constexpr float MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS = 0.0050f;
-constexpr float MAX_QUANTIZATION_TOTAL_ERROR_FP4 = 0.0030f;
+constexpr float MAX_QUANTIZATION_TOTAL_ERROR_FP4   = 0.0030f;
+constexpr float MAX_QUANTIZATION_TOTAL_ERROR_MXFP4 = 0.0025f;
 constexpr float MAX_DOT_PRODUCT_ERROR = 0.02f;
 constexpr float MAX_DOT_PRODUCT_ERROR_LOWBIT = 0.04f;
 constexpr float MAX_DOT_PRODUCT_ERROR_FP4 = 0.03f;
+constexpr float MAX_DOT_PRODUCT_ERROR_MXFP4 = 0.007f;
 constexpr float MAX_DOT_PRODUCT_ERROR_BINARY = 0.40f;
 constexpr float MAX_DOT_PRODUCT_ERROR_TERNARY = 0.15f;
 
@@ -155,7 +157,9 @@ int main(int argc, char * argv[]) {
                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_S   ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_XXS ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS :
-                type == GGML_TYPE_NVFP4   ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 : MAX_QUANTIZATION_TOTAL_ERROR;
+                type == GGML_TYPE_NVFP4   ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 :
+                type == GGML_TYPE_MXFP4   ? MAX_QUANTIZATION_TOTAL_ERROR_MXFP4 :
+                MAX_QUANTIZATION_TOTAL_ERROR;
             failed = !(total_error < max_quantization_error);
             num_failed += failed;
             if (failed || verbose) {
@@ -179,12 +183,31 @@ int main(int argc, char * argv[]) {
                                           ? MAX_DOT_PRODUCT_ERROR_TERNARY
                                           : type == GGML_TYPE_NVFP4
                                           ? MAX_DOT_PRODUCT_ERROR_FP4
+                                          : type == GGML_TYPE_MXFP4
+                                          ? MAX_DOT_PRODUCT_ERROR_MXFP4
                                           : MAX_DOT_PRODUCT_ERROR;
             failed = !(vec_dot_error < max_allowed_error);
             num_failed += failed;
             if (failed || verbose) {
                 printf("%5s dot product error:              %s (%f)\n", ggml_type_name(type), RESULT_STR[failed], vec_dot_error);
             }
+        }
+    }
+
+    // MXFP4 SoA layout roundtrip (used by flash attention)
+    {
+        const size_t buf_size = ggml_row_size(GGML_TYPE_MXFP4, test_size);
+        std::vector<uint8_t> qbuf(buf_size);
+        std::vector<float> out(test_size);
+
+        ggml_mxfp_quantize_soa(GGML_TYPE_MXFP4, test_data.data(), qbuf.data(), test_size);
+        ggml_mxfp_dequantize_soa(GGML_TYPE_MXFP4, qbuf.data(), out.data(), test_size);
+
+        const float err = array_rmse(test_data.data(), out.data(), test_size);
+        failed = !(err < MAX_QUANTIZATION_TOTAL_ERROR_MXFP4);
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("%5s SoA quantization error:          %s (%f)\n", ggml_type_name(GGML_TYPE_MXFP4), RESULT_STR[failed], err);
         }
     }
 
