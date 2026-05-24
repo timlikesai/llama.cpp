@@ -528,6 +528,78 @@ void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+//====================================== MXFP4 SoA layout ======================================
+// SoA layout for flash attention KV cache: [qs0 qs1 ... qsN | e0 e1 ... eN]
+// Uses round(log2) for scale computation to reduce softmax bias
+
+#define MXFP4_EMAX_OFFSET   2
+
+static inline uint8_t ggml_mxfp_compute_e8m0_round(const float * x, int n) {
+    float amax = 0.0f;
+    for (int j = 0; j < n; j++) {
+        const float a = fabsf(x[j]);
+        if (a > amax) amax = a;
+    }
+    if (amax == 0.0f) return 0;
+
+    const uint32_t amax_bits = fp32_to_bits(amax);
+    int biased_log2 = (int)((amax_bits >> 23) & 0xFF) - 127;
+    // IEEE 754 mantissa of sqrt(2) ≈ 1.4142: fractional bits = 0x3504F3
+    biased_log2 += ((amax_bits & 0x7FFFFF) >= 0x3504F3 ? 1 : 0);
+
+    const int e = biased_log2 - MXFP4_EMAX_OFFSET + 127;
+    return (uint8_t)(e < 0 ? 0 : (e > 254 ? 254 : e));
+}
+
+static inline void ggml_mxfp_quantize_block_soa(const float * GGML_RESTRICT src,
+                                                 uint8_t * GGML_RESTRICT qs, uint8_t * e_out) {
+    const uint8_t e = ggml_mxfp_compute_e8m0_round(src, 32);
+    *e_out = e;
+    const float d = GGML_E8M0_TO_FP32_HALF(e);
+    for (int j = 0; j < 16; ++j) {
+        const uint8_t x0 = best_index_mxfp4(src[j],      d);
+        const uint8_t x1 = best_index_mxfp4(src[j + 16], d);
+        qs[j] = x0 | (x1 << 4);
+    }
+}
+
+static inline void ggml_mxfp_dequantize_block_soa(const uint8_t * GGML_RESTRICT qs,
+                                                    uint8_t e, float * GGML_RESTRICT dst) {
+    const float d = GGML_E8M0_TO_FP32_HALF(e);
+    for (int j = 0; j < 16; ++j) {
+        dst[j]      = kvalues_mxfp4[qs[j] & 0x0F] * d;
+        dst[j + 16] = kvalues_mxfp4[qs[j] >> 4]   * d;
+    }
+}
+
+void ggml_mxfp_quantize_soa(enum ggml_type type, const float * GGML_RESTRICT src,
+                             void * GGML_RESTRICT dst, int64_t k) {
+    GGML_ASSERT(type == GGML_TYPE_MXFP4);
+    assert(k % 32 == 0);
+    const int nb   = k / 32;
+    const int qpb  = 16; // qs bytes per block
+    uint8_t * qs   = (uint8_t *)dst;
+    uint8_t * e8m0 = qs + nb * qpb;
+
+    for (int i = 0; i < nb; i++) {
+        ggml_mxfp_quantize_block_soa(&src[i*32], &qs[i * qpb], &e8m0[i]);
+    }
+}
+
+void ggml_mxfp_dequantize_soa(enum ggml_type type, const void * GGML_RESTRICT src,
+                                float * GGML_RESTRICT dst, int64_t k) {
+    GGML_ASSERT(type == GGML_TYPE_MXFP4);
+    assert(k % 32 == 0);
+    const int nb   = k / 32;
+    const int qpb  = 16;
+    const uint8_t * qs   = (const uint8_t *)src;
+    const uint8_t * e8m0 = qs + nb * qpb;
+
+    for (int i = 0; i < nb; i++) {
+        ggml_mxfp_dequantize_block_soa(&qs[i * qpb], e8m0[i], &dst[i*32]);
+    }
+}
+
 void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_NVFP4;
     static const int qk_sub = QK_NVFP4_SUB;

@@ -757,6 +757,12 @@ extern "C" {
 
     GGML_API bool    ggml_is_quantized(enum ggml_type type);
 
+    GGML_API bool    ggml_is_mxfp(enum ggml_type type);
+
+    // MXFP SoA (struct-of-arrays) quantize/dequantize for flash attention KV cache.
+    GGML_API void ggml_mxfp_quantize_soa  (enum ggml_type type, const float * src, void  * dst, int64_t k);
+    GGML_API void ggml_mxfp_dequantize_soa(enum ggml_type type, const void  * src, float * dst, int64_t k);
+
     // TODO: temporary until model loading of ggml examples is refactored
     GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);
 
