@@ -531,6 +531,11 @@ struct server_task_result_metrics : server_task_result {
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();
 
+    // GPU pool metrics (populated when CUDA backend is available)
+    // Per-device pool sizes in bytes
+    std::vector<uint64_t> pool_sizes;   // Total pool size (peak allocations mapped)
+    std::vector<uint64_t> pool_used;   // Current pool usage
+
     virtual json to_json() override;
 };
 

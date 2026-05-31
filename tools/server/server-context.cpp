@@ -6,6 +6,70 @@
 #include "server-task.h"
 #include "server-queue.h"
 
+#include <dlfcn.h>
+
+// Runtime-resolved CUDA backend functions
+// With GGML_BACKEND_DL=ON, the CUDA backend is a shared library loaded at runtime
+namespace {
+    bool g_cuda_available = false;
+    void * g_cuda_handle = nullptr;
+
+    using ggml_backend_cuda_get_device_count_fn = int(void);
+    using ggml_backend_cuda_get_device_memory_fn = void(int, size_t*, size_t*);
+    using ggml_backend_cuda_pool_shrink_all_fn = void(void);
+
+    ggml_backend_cuda_get_device_count_fn * g_cuda_device_count = nullptr;
+    ggml_backend_cuda_get_device_memory_fn * g_cuda_device_memory = nullptr;
+    ggml_backend_cuda_pool_shrink_all_fn * g_cuda_pool_shrink_all = nullptr;
+
+    // Minimum interval between pool shrinks to avoid excessive driver syscalls
+    static constexpr int POOL_SHRINK_INTERVAL_MS = 30000;
+    int64_t g_last_pool_shrink_ms = 0;
+
+    void ggml_cuda_init_runtime() {
+        if (g_cuda_available) return;
+
+        // Try to resolve CUDA backend symbols from the shared library
+#if defined(GGML_USE_HIP)
+        static const char * libname = "libggml-hip.so";
+#elif defined(GGML_USE_MUSA)
+        static const char * libname = "libggml-musa.so";
+#else
+        static const char * libname = "libggml-cuda.so";
+#endif
+        g_cuda_handle = dlopen(libname, RTLD_LAZY);
+        if (g_cuda_handle) {
+            g_cuda_device_count  = (ggml_backend_cuda_get_device_count_fn *)
+                dlsym(g_cuda_handle, "ggml_backend_cuda_get_device_count");
+            g_cuda_device_memory = (ggml_backend_cuda_get_device_memory_fn *)
+                dlsym(g_cuda_handle, "ggml_backend_cuda_get_device_memory");
+            g_cuda_pool_shrink_all = (ggml_backend_cuda_pool_shrink_all_fn *)
+                dlsym(g_cuda_handle, "ggml_backend_cuda_pool_shrink_all");
+            if (g_cuda_device_count) {
+                g_cuda_available = true;
+            }
+        }
+    }
+
+    void ggml_cuda_shrink_if_needed() {
+        if (!g_cuda_available || !g_cuda_pool_shrink_all) return;
+
+        int64_t now = ggml_time_ms();
+        if (now - g_last_pool_shrink_ms < POOL_SHRINK_INTERVAL_MS) return;
+
+        g_cuda_pool_shrink_all();
+        g_last_pool_shrink_ms = now;
+    }
+
+    void ggml_cuda_free_runtime() {
+        if (g_cuda_handle) {
+            dlclose(g_cuda_handle);
+            g_cuda_handle = nullptr;
+            g_cuda_available = false;
+        }
+    }
+}
+
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
@@ -2160,7 +2224,21 @@ private:
 
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
-
+// Collect GPU pool metrics
+                    {
+                        ggml_cuda_init_runtime();
+                        if (g_cuda_available && g_cuda_device_count) {
+                            const int n_devices = g_cuda_device_count();
+                            res->pool_sizes.reserve(n_devices);
+                            res->pool_used.reserve(n_devices);
+                            for (int i = 0; i < n_devices; ++i) {
+                                size_t free_mem, total;
+                                g_cuda_device_memory(i, &free_mem, &total);
+                                res->pool_sizes.push_back(total);
+                                res->pool_used.push_back(total - free_mem);
+                            }
+                        }
+                    }
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
@@ -2339,6 +2417,9 @@ private:
 
             if (all_idle) {
                 SRV_INF("%s", "all slots are idle\n");
+
+                // Proactively shrink GPU memory pools when idle
+                ggml_cuda_shrink_if_needed();
 
                 return;
             }
@@ -3998,7 +4079,19 @@ void server_routes::init_routes() {
                             << "llamacpp:"        << name << " " << value << "\n";
             }
         }
-
+        // Add GPU pool metrics if available
+        if (!res_task->pool_sizes.empty()) {
+            prometheus << "# HELP llamacpp:gpu_vram_total_bytes Total VRAM per GPU device\n"
+                       << "# TYPE llamacpp:gpu_vram_total_bytes gauge\n";
+            for (size_t i = 0; i < res_task->pool_sizes.size(); ++i) {
+                prometheus << "llamacpp:gpu_vram_total_bytes{device=" << i << "} " << res_task->pool_sizes[i] << "\n";
+            }
+            prometheus << "# HELP llamacpp:gpu_vram_used_bytes VRAM in use per GPU device\n"
+                       << "# TYPE llamacpp:gpu_vram_used_bytes gauge\n";
+            for (size_t i = 0; i < res_task->pool_used.size(); ++i) {
+                prometheus << "llamacpp:gpu_vram_used_bytes{device=" << i << "} " << res_task->pool_used[i] << "\n";
+            }
+        }
         res->headers["Process-Start-Time-Unix"] = std::to_string(res_task->t_start);
         res->content_type = "text/plain; version=0.0.4";
         res->status = 200;

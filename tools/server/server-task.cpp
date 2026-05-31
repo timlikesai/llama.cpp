@@ -1905,6 +1905,9 @@ json server_task_result_metrics::to_json() {
         { "n_decode_total",                  n_decode_total },
         { "n_busy_slots_total",              n_busy_slots_total },
 
+        { "pool_sizes",                      pool_sizes },
+        { "pool_used",                       pool_used },
+
         { "slots",                           slots_data },
     };
 }

@@ -1145,6 +1145,9 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+    virtual void shrink() {} // Optional: release unused memory back to the driver
+    virtual size_t get_pool_size() const { return 0; }
+    virtual size_t get_pool_used() const { return 0; }
 };
 
 template<typename T>

@@ -367,7 +367,8 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     };
 
     ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
-    size_t pool_size = 0;
+    size_t pool_size = 0;   // Total cached memory (in pool + currently allocated)
+    size_t pool_used = 0;   // Memory currently allocated (not in pool)
 
     explicit ggml_cuda_pool_leg(int device) :
         device(device) {
@@ -413,6 +414,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                         if (!best_diff) {
                             void * ptr = b.ptr;
                             *actual_size = b.size;
+                            pool_used += b.size;
                             b.ptr = nullptr;
                             b.size = 0;
                             return ptr;
@@ -449,6 +451,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
+        pool_used  += look_ahead_size;
 #ifdef DEBUG_CUDA_MALLOC
         GGML_LOG_INFO("%s[%d]: %d buffers, max_size = %u MB, pool_size = %u MB, requested %u MB\n", __func__, device, nnz,
                            (uint32_t)(max_size / 1024 / 1024), (uint32_t)(pool_size / 1024 / 1024), (uint32_t)(size / 1024 / 1024));
@@ -462,6 +465,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             if (b.ptr == nullptr) {
                 b.ptr = ptr;
                 b.size = size;
+                pool_used -= size;
                 return;
             }
         }
@@ -469,11 +473,31 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
+        pool_used -= size;
     }
+
+    void shrink() override {
+        clear_pool();
+    }
+
+    size_t get_pool_size() const override { return pool_size; }
+    size_t get_pool_used() const override { return pool_used; }
 };
+
+// Global list of all CUDA backend contexts for pool shrink management
+static std::mutex g_cuda_ctx_mutex;
+static std::vector<ggml_backend_cuda_context *> g_cuda_contexts;
 
 // pool with virtual memory
 #if defined(GGML_USE_VMM)
+
+// Tracks a single physical allocation mapped into the VMM pool
+struct vmm_mapping {
+    CUdeviceptr virt_addr; // Start of virtual address range
+    size_t size;           // Size of the mapping
+    CUmemGenericAllocationHandle handle; // Physical allocation handle
+};
+
 struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 35; // 32 GB
 
@@ -482,9 +506,9 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     size_t pool_used = 0;
     size_t pool_size = 0;
     size_t granularity;
-#if defined(GGML_USE_HIP)
-    std::vector<std::pair<CUdeviceptr, size_t>> mappings;
-#endif
+
+    // Track physical allocations, sorted by virtual address (contiguous from pool_addr)
+    std::vector<vmm_mapping> mappings;
 
     explicit ggml_cuda_pool_vmm(int device) :
         device(device),
@@ -495,12 +519,17 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         if (pool_addr != 0) {
 #if defined(GGML_USE_HIP)
             // Workaround for https://github.com/ROCm/ROCR-Runtime/issues/285
-            for (std::pair<CUdeviceptr, size_t> & mapping : mappings) {
-                CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
+            for (auto & mapping : mappings) {
+                CU_CHECK(cuMemUnmap(mapping.virt_addr, mapping.size));
             }
 #else
+            // Per CUDA VMM docs: cuMemUnmap must precede cuMemRelease
             CU_CHECK(cuMemUnmap(pool_addr, pool_size));
 #endif
+            for (auto & mapping : mappings) {
+                CU_CHECK(cuMemRelease(mapping.handle));
+            }
+            mappings.clear();
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
         }
     }
@@ -535,12 +564,9 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // map at the end of the pool
             CUdeviceptr start_ptr = (CUdeviceptr)((char *)(pool_addr) + pool_size);
             CU_CHECK(cuMemMap(start_ptr, reserve_size, 0, handle, 0));
-#if defined(GGML_USE_HIP)
-            mappings.push_back({start_ptr, reserve_size});
-#endif
 
-            // the memory allocation handle is no longer needed after mapping
-            CU_CHECK(cuMemRelease(handle));
+            // track the mapping so we can release it on shrink
+            mappings.push_back({start_ptr, reserve_size, handle});
 
             // set access
             CUmemAccessDesc access = {};
@@ -551,10 +577,6 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
             // add to the pool
             pool_size += reserve_size;
-
-            //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
-            //       device, (unsigned long long) (pool_size/1024/1024),
-            //       (unsigned long long) (reserve_size/1024/1024));
         }
 
         GGML_ASSERT(pool_addr != 0);
@@ -580,8 +602,96 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
     }
+
+    /**
+     * Shrink the pool by unmapping unused physical pages and returning them to the driver.
+     * Only the tail region (pool_used to pool_size) is eligible for unmapping.
+     */
+    void shrink() override {
+        if (pool_addr == 0 || pool_used == pool_size) {
+            return; // nothing to shrink
+        }
+
+        // Round pool_used down to granularity boundary to avoid unsplitting allocations
+        size_t shrink_below = granularity * (pool_used / granularity);
+        if (shrink_below >= pool_size) {
+            return; // nothing to shrink after alignment
+        }
+
+        // Unmap the unused tail region
+        CUdeviceptr unmap_start = (CUdeviceptr)((char *)(pool_addr) + shrink_below);
+        size_t unmap_size = pool_size - shrink_below;
+
+        // Collect handles to release: any mapping fully within [shrink_below, pool_size)
+        std::vector<CUmemGenericAllocationHandle> handles_to_release;
+        {
+            // Iterating from the end since tail mappings are at the highest offsets
+            for (int i = (int)mappings.size() - 1; i >= 0; --i) {
+                CUdeviceptr map_start = mappings[i].virt_addr;
+                size_t map_size = mappings[i].size;
+                size_t map_offset = (size_t)((char *)map_start - (char *)pool_addr);
+
+                if (map_offset + map_size <= shrink_below) {
+                    break; // In order, all remaining mappings are below shrink_below
+                }
+                if (map_offset >= shrink_below) {
+                    handles_to_release.push_back(mappings[i].handle);
+                }
+                // If the mapping straddles shrink_below, we can't release it
+                // (this shouldn't happen with proper granularity alignment)
+            }
+        }
+
+        // Per CUDA VMM docs: cuMemUnmap must precede cuMemRelease
+        CU_CHECK(cuMemUnmap(unmap_start, unmap_size));
+
+        for (auto handle : handles_to_release) {
+            CU_CHECK(cuMemRelease(handle));
+        }
+
+        // Remove released mappings from our tracking
+        while (!mappings.empty()) {
+            size_t map_offset = (size_t)((char *)mappings.back().virt_addr - (char *)pool_addr);
+            if (map_offset >= shrink_below) {
+                mappings.pop_back();
+            } else {
+                break;
+            }
+        }
+
+        pool_size = shrink_below;
+
+        GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d] shrink: pool_size reduced to %zu MiB (unmapped %zu MiB)\n",
+                       device, pool_size / 1024 / 1024, unmap_size / 1024 / 1024);
+    }
+
+    size_t get_pool_size() const override { return pool_size; }
+    size_t get_pool_used() const override { return pool_used; }
 };
 #endif // defined(GGML_USE_VMM)
+
+// Trim the CUDA async allocator pool to force the NVIDIA driver to release cached memory
+static void ggml_cuda_async_pool_trim(int device) {
+    ggml_cuda_set_device(device);
+    cudaMemPool_t pool = nullptr;
+    CUDA_CHECK(cudaDeviceGetDefaultMemPool(&pool, device));
+    // Trim to 0 to force release of all cached allocations
+    CUDA_CHECK(cudaMemPoolTrimTo(pool, 0));
+}
+
+// Shrink all pools for a single device, including the CUDA async allocator
+static void ggml_cuda_device_shrink_all(int device) {
+    std::lock_guard<std::mutex> lock(g_cuda_ctx_mutex);
+    for (auto * ctx : g_cuda_contexts) {
+        for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
+            if (ctx->pools[device][i] != nullptr) {
+                ctx->pools[device][i]->shrink();
+            }
+        }
+    }
+    // Also trim the CUDA async allocator pool to force driver cache release
+    ggml_cuda_async_pool_trim(device);
+}
 
 std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(int                  device,
                                                                                [[maybe_unused]] int stream_no) {
@@ -3138,6 +3248,13 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    // Unregister context from pool management
+    {
+        std::lock_guard<std::mutex> lock(g_cuda_ctx_mutex);
+        auto it = std::remove(g_cuda_contexts.begin(), g_cuda_contexts.end(), cuda_ctx);
+        g_cuda_contexts.erase(it, g_cuda_contexts.end());
+    }
+
     delete cuda_ctx;
     delete backend;
 }
@@ -5692,7 +5809,20 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         /* .context = */ ctx,
     };
 
+    // Register context for pool management
+    {
+        std::lock_guard<std::mutex> lock(g_cuda_ctx_mutex);
+        g_cuda_contexts.push_back(ctx);
+    }
+
     return cuda_backend;
+}
+
+GGML_BACKEND_API void ggml_backend_cuda_pool_shrink_all() {
+    int n_devices = ggml_backend_cuda_get_device_count();
+    for (int i = 0; i < n_devices; ++i) {
+        ggml_cuda_device_shrink_all(i);
+    }
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)

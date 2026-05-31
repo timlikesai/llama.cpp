@@ -45,6 +45,13 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
+/**
+ * Shrink all memory pools across all CUDA backends to release unused
+ * physical pages back to the driver. Useful for proactive memory management.
+ * This is a no-op if VMM is not enabled or if pools are already empty.
+ */
+GGML_BACKEND_API void ggml_backend_cuda_pool_shrink_all(void);
+
 #ifdef  __cplusplus
 }
 #endif
