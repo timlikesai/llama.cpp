@@ -16,22 +16,15 @@ namespace {
 
     using ggml_backend_cuda_get_device_count_fn = int(void);
     using ggml_backend_cuda_get_device_memory_fn = void(int, size_t*, size_t*);
-    using ggml_backend_cuda_pool_shrink_all_fn = void(void);
     using ggml_backend_cuda_shrink_all_fn = void(void);
-    using ggml_backend_cuda_get_pool_stats_fn = void(int, size_t*, size_t*);
 
     ggml_backend_cuda_get_device_count_fn * g_cuda_device_count = nullptr;
     ggml_backend_cuda_get_device_memory_fn * g_cuda_device_memory = nullptr;
-    ggml_backend_cuda_pool_shrink_all_fn * g_cuda_pool_shrink = nullptr;    // Pools only (safe during inference)
-    ggml_backend_cuda_shrink_all_fn * g_cuda_shrink_all = nullptr;           // Pools + async trim (idle only)
-    ggml_backend_cuda_get_pool_stats_fn * g_cuda_get_pool_stats = nullptr;
+    ggml_backend_cuda_shrink_all_fn * g_cuda_shrink_all = nullptr;
 
     // Minimum interval between pool shrinks to avoid excessive driver syscalls
-    static constexpr int POOL_SHRINK_INTERVAL_MS = 5000;
+    static constexpr int POOL_SHRINK_INTERVAL_MS = 30000;
     int64_t g_last_pool_shrink_ms = 0;
-
-    // Fraction of pool that must be free to trigger shrink
-    static constexpr float POOL_SHRINK_THRESHOLD = 0.3f;
 
     void ggml_cuda_init_runtime() {
         if (g_cuda_available) return;
@@ -49,51 +42,15 @@ namespace {
                 dlsym(g_cuda_handle, "ggml_backend_cuda_get_device_count");
             g_cuda_device_memory = (ggml_backend_cuda_get_device_memory_fn *)
                 dlsym(g_cuda_handle, "ggml_backend_cuda_get_device_memory");
-            g_cuda_pool_shrink   = (ggml_backend_cuda_pool_shrink_all_fn *)
-                dlsym(g_cuda_handle, "ggml_backend_cuda_pool_shrink_all");
             g_cuda_shrink_all    = (ggml_backend_cuda_shrink_all_fn *)
                 dlsym(g_cuda_handle, "ggml_backend_cuda_shrink_all");
-            g_cuda_get_pool_stats = (ggml_backend_cuda_get_pool_stats_fn *)
-                dlsym(g_cuda_handle, "ggml_backend_cuda_get_pool_stats");
             if (g_cuda_device_count) {
                 g_cuda_available = true;
             }
         }
     }
 
-    // Shrink pools only — safe during active inference (releases freed VMM tail / buffer pool only).
-    // Gated by interval timer and utilization check.
-    void ggml_cuda_shrink_pools_if_needed() {
-        if (!g_cuda_available || !g_cuda_pool_shrink) return;
-
-        int64_t now = ggml_time_ms();
-        if (now - g_last_pool_shrink_ms < POOL_SHRINK_INTERVAL_MS) return;
-
-        // Skip if pools are heavily utilized
-        if (g_cuda_device_count && g_cuda_get_pool_stats) {
-            size_t pool_size = 0;
-            size_t pool_used = 0;
-            for (int i = 0; i < g_cuda_device_count(); ++i) {
-                size_t dev_size = 0, dev_used = 0;
-                g_cuda_get_pool_stats(i, &dev_size, &dev_used);
-                pool_size += dev_size;
-                pool_used += dev_used;
-            }
-            if (pool_size > 0) {
-                float util = (float)pool_used / (float)pool_size;
-                if (util > (1.0f - POOL_SHRINK_THRESHOLD)) {
-                    return; // nothing meaningful to release
-                }
-                SRV_DBG("gpu pool utilization: %.0f%% (size=%zu MiB, used=%zu MiB), shrinking\n",
-                        util * 100.0f, pool_size / 1024 / 1024, pool_used / 1024 / 1024);
-            }
-        }
-
-        g_cuda_pool_shrink();
-        g_last_pool_shrink_ms = now;
-    }
-
-    // Full shrink: pools + async allocator trim. ONLY call when all slots are idle.
+    // Shrink pools + async allocator trim. ONLY call when all slots are idle.
     void ggml_cuda_shrink_all_if_needed() {
         if (!g_cuda_available || !g_cuda_shrink_all) return;
 
@@ -2469,9 +2426,14 @@ private:
             }
         }
 
-        // Continuous pool shrink: release freed memory even during active inference.
-        // Only touches VMM tail region (already-freed memory), safe during decoding.
-        ggml_cuda_shrink_pools_if_needed();
+        // NOTE: Continuous pool shrink during active inference is NOT safe.
+        // llama_decode() submits kernels asynchronously to inference streams,
+        // then returns. The pool shrink calls cuMemUnmap() on stream 0 (default),
+        // which has no ordering guarantee with inference streams. The GPU can
+        // still be reading from memory we just unmapped → illegal memory access.
+        // To fix this properly we would need to synchronize all inference streams
+        // before shrinking, which blocks for the full kernel latency — negating
+        // the benefit of proactive shrinking.
 
         {
             SRV_DBG("%s", "posting NEXT_RESPONSE\n");
