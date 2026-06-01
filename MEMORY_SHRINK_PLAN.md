@@ -152,13 +152,15 @@ Depends on Phase 2 revised (stream polling API).
 
 1. ~~Phase 1 (decouple) — DONE~~
 2. ~~Phase 2 (continuous main loop) — ABANDONED (unsafe)~~
-3. Phase 2 revised (background thread with stream polling) — pending
-4. Phase 3 (background thread) — pending (depends on Phase 2 revised)
-5. Phase 4 (config) — polish
+3. ~~Phase 2 revised (background thread with stream polling) — DONE~~
+4. ~~Phase 3 (background thread) — DONE (merged with Phase 2 revised)~~
+5. Phase 4 (config) — polish (optional)
 
 ## Current State
 
 - Pool + async trim APIs split cleanly in CUDA backend
-- Idle path uses `ggml_backend_cuda_shrink_all()` (pools + async trim)
+- Idle path uses `ggml_backend_cuda_shrink_all()` (pools + async trim, 30s interval)
+- Background thread: polls streams, shrinks pools-only when quiescent (5s interval)
+- `ggml_backend_cuda_are_streams_quiescent()` — non-blocking stream polling
 - Pool stats API available for monitoring
-- Continuous shrink removed from main loop (documented why unsafe)
+- Thread started at server init, joined at destroy
