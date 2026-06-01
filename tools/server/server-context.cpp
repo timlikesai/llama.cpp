@@ -18,12 +18,14 @@ namespace {
     using ggml_backend_cuda_get_device_memory_fn = void(int, size_t*, size_t*);
     using ggml_backend_cuda_pool_shrink_all_fn = void(void);
     using ggml_backend_cuda_shrink_all_fn = void(void);
+    using ggml_backend_cuda_get_pool_stats_fn = void(int, size_t*, size_t*);
     using ggml_backend_cuda_are_streams_quiescent_fn = bool(void);
 
     ggml_backend_cuda_get_device_count_fn * g_cuda_device_count = nullptr;
     ggml_backend_cuda_get_device_memory_fn * g_cuda_device_memory = nullptr;
     ggml_backend_cuda_pool_shrink_all_fn * g_cuda_pool_shrink = nullptr;
     ggml_backend_cuda_shrink_all_fn * g_cuda_shrink_all = nullptr;
+    ggml_backend_cuda_get_pool_stats_fn * g_cuda_get_pool_stats = nullptr;
     ggml_backend_cuda_are_streams_quiescent_fn * g_cuda_are_streams_quiescent = nullptr;
 
     // Minimum interval between pool shrinks to avoid excessive driver syscalls
@@ -57,6 +59,8 @@ namespace {
                 dlsym(g_cuda_handle, "ggml_backend_cuda_pool_shrink_all");
             g_cuda_shrink_all = (ggml_backend_cuda_shrink_all_fn *)
                 dlsym(g_cuda_handle, "ggml_backend_cuda_shrink_all");
+            g_cuda_get_pool_stats = (ggml_backend_cuda_get_pool_stats_fn *)
+                dlsym(g_cuda_handle, "ggml_backend_cuda_get_pool_stats");
             g_cuda_are_streams_quiescent = (ggml_backend_cuda_are_streams_quiescent_fn *)
                 dlsym(g_cuda_handle, "ggml_backend_cuda_are_streams_quiescent");
             if (g_cuda_device_count) {
@@ -72,7 +76,32 @@ namespace {
         int64_t now = ggml_time_ms();
         if (now - g_last_pool_shrink_ms < POOL_SHRINK_INTERVAL_MS) return;
 
+        size_t pool_size_before = 0, pool_used_before = 0;
+        size_t pool_size_after = 0, pool_used_after = 0;
+        if (g_cuda_device_count && g_cuda_get_pool_stats) {
+            for (int i = 0; i < g_cuda_device_count(); ++i) {
+                size_t sz, us;
+                g_cuda_get_pool_stats(i, &sz, &us);
+                pool_size_before += sz;
+                pool_used_before += us;
+            }
+        }
+
         g_cuda_shrink_all();
+
+        if (g_cuda_device_count && g_cuda_get_pool_stats) {
+            for (int i = 0; i < g_cuda_device_count(); ++i) {
+                size_t sz, us;
+                g_cuda_get_pool_stats(i, &sz, &us);
+                pool_size_after += sz;
+                pool_used_after += us;
+            }
+            if (pool_size_before > pool_size_after) {
+                SRV_INF("gpu pool shrink (idle): size %zu -> %zu MiB, freed %zu MiB\n",
+                        pool_size_before / 1024 / 1024, pool_size_after / 1024 / 1024,
+                        (pool_size_before - pool_size_after) / 1024 / 1024);
+            }
+        }
         g_last_pool_shrink_ms = now;
     }
 
@@ -96,7 +125,29 @@ namespace {
             }
 
             if (g_cuda_are_streams_quiescent()) {
+                size_t pool_size_before = 0, pool_size_after = 0;
+                if (g_cuda_device_count && g_cuda_get_pool_stats) {
+                    for (int i = 0; i < g_cuda_device_count(); ++i) {
+                        size_t sz, us;
+                        g_cuda_get_pool_stats(i, &sz, &us);
+                        pool_size_before += sz;
+                    }
+                }
+
                 g_cuda_pool_shrink();
+
+                if (g_cuda_device_count && g_cuda_get_pool_stats) {
+                    for (int i = 0; i < g_cuda_device_count(); ++i) {
+                        size_t sz, us;
+                        g_cuda_get_pool_stats(i, &sz, &us);
+                        pool_size_after += sz;
+                    }
+                    if (pool_size_before > pool_size_after) {
+                        SRV_INF("gpu pool shrink (bg): size %zu -> %zu MiB, freed %zu MiB\n",
+                                pool_size_before / 1024 / 1024, pool_size_after / 1024 / 1024,
+                                (pool_size_before - pool_size_after) / 1024 / 1024);
+                    }
+                }
                 g_last_pool_shrink_ms = now;
             }
         }
@@ -2485,8 +2536,6 @@ private:
             }
 
             if (all_idle) {
-                SRV_INF("%s", "all slots are idle\n");
-
                 // Full shrink: pools + async allocator trim.
                 // Safe here since nothing is running.
                 ggml_cuda_shrink_all_if_needed();
