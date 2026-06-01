@@ -72,6 +72,14 @@ GGML_BACKEND_API void ggml_backend_cuda_async_trim_all(void);
  */
 GGML_BACKEND_API void ggml_backend_cuda_get_pool_stats(int device, size_t * out_pool_size, size_t * out_pool_used);
 
+/**
+ * Poll all CUDA streams across all contexts and return true if all are
+ * quiescent (no in-flight kernels). Non-blocking — uses cudaStreamQuery().
+ * Use this to determine when it is safe to call pool_shrink_all() during
+ * active inference without racing with pending GPU work.
+ */
+GGML_BACKEND_API bool ggml_backend_cuda_are_streams_quiescent(void);
+
 #ifdef  __cplusplus
 }
 #endif

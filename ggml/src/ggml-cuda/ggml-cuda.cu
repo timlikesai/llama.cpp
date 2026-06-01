@@ -5875,4 +5875,33 @@ GGML_BACKEND_API void ggml_backend_cuda_get_pool_stats(int device, size_t * out_
     ggml_cuda_device_get_pool_stats(device, out_pool_size, out_pool_used);
 }
 
+// Poll all CUDA streams across all contexts and return true if all are
+// quiescent (no in-flight kernels). Non-blocking — uses cudaStreamQuery().
+static bool ggml_cuda_are_streams_quiescent() {
+    std::lock_guard<std::mutex> lock(g_cuda_ctx_mutex);
+    for (auto * ctx : g_cuda_contexts) {
+        for (int d = 0; d < ggml_cuda_info().device_count; ++d) {
+            for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
+                cudaStream_t stream = ctx->streams[d][i];
+                if (stream == nullptr) {
+                    continue;
+                }
+                cudaError_t err = cudaStreamQuery(stream);
+                if (err != cudaSuccess && err != cudaErrorNotReady) {
+                    // Unexpected error (e.g., context destroyed) — conservatively return false
+                    return false;
+                }
+                if (err == cudaErrorNotReady) {
+                    return false; // Still has work in flight
+                }
+            }
+        }
+    }
+    return true;
+}
+
+GGML_BACKEND_API bool ggml_backend_cuda_are_streams_quiescent() {
+    return ggml_cuda_are_streams_quiescent();
+}
+
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)

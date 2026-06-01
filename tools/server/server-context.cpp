@@ -16,15 +16,26 @@ namespace {
 
     using ggml_backend_cuda_get_device_count_fn = int(void);
     using ggml_backend_cuda_get_device_memory_fn = void(int, size_t*, size_t*);
+    using ggml_backend_cuda_pool_shrink_all_fn = void(void);
     using ggml_backend_cuda_shrink_all_fn = void(void);
+    using ggml_backend_cuda_are_streams_quiescent_fn = bool(void);
 
     ggml_backend_cuda_get_device_count_fn * g_cuda_device_count = nullptr;
     ggml_backend_cuda_get_device_memory_fn * g_cuda_device_memory = nullptr;
+    ggml_backend_cuda_pool_shrink_all_fn * g_cuda_pool_shrink = nullptr;
     ggml_backend_cuda_shrink_all_fn * g_cuda_shrink_all = nullptr;
+    ggml_backend_cuda_are_streams_quiescent_fn * g_cuda_are_streams_quiescent = nullptr;
 
     // Minimum interval between pool shrinks to avoid excessive driver syscalls
     static constexpr int POOL_SHRINK_INTERVAL_MS = 30000;
     int64_t g_last_pool_shrink_ms = 0;
+
+    // Interval for background pool shrink thread (ms)
+    static constexpr int POOL_SHRINK_BACKGROUND_INTERVAL_MS = 5000;
+
+    // Background pool shrink thread
+    std::atomic<bool> g_pool_shrink_thread_running{false};
+    std::thread g_pool_shrink_thread;
 
     void ggml_cuda_init_runtime() {
         if (g_cuda_available) return;
@@ -38,12 +49,16 @@ namespace {
 #endif
         g_cuda_handle = dlopen(libname, RTLD_LAZY);
         if (g_cuda_handle) {
-            g_cuda_device_count  = (ggml_backend_cuda_get_device_count_fn *)
+            g_cuda_device_count = (ggml_backend_cuda_get_device_count_fn *)
                 dlsym(g_cuda_handle, "ggml_backend_cuda_get_device_count");
             g_cuda_device_memory = (ggml_backend_cuda_get_device_memory_fn *)
                 dlsym(g_cuda_handle, "ggml_backend_cuda_get_device_memory");
-            g_cuda_shrink_all    = (ggml_backend_cuda_shrink_all_fn *)
+            g_cuda_pool_shrink = (ggml_backend_cuda_pool_shrink_all_fn *)
+                dlsym(g_cuda_handle, "ggml_backend_cuda_pool_shrink_all");
+            g_cuda_shrink_all = (ggml_backend_cuda_shrink_all_fn *)
                 dlsym(g_cuda_handle, "ggml_backend_cuda_shrink_all");
+            g_cuda_are_streams_quiescent = (ggml_backend_cuda_are_streams_quiescent_fn *)
+                dlsym(g_cuda_handle, "ggml_backend_cuda_are_streams_quiescent");
             if (g_cuda_device_count) {
                 g_cuda_available = true;
             }
@@ -61,7 +76,53 @@ namespace {
         g_last_pool_shrink_ms = now;
     }
 
+    // Background thread: polls streams and shrinks pools when quiescent.
+    // Releases freed VMM tail memory without blocking inference.
+    void ggml_cuda_pool_shrink_loop() {
+        while (g_pool_shrink_thread_running.load(std::memory_order_relaxed)) {
+            // Sleep for the interval
+            for (int i = 0; i < 10 && g_pool_shrink_thread_running.load(std::memory_order_relaxed); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(POOL_SHRINK_BACKGROUND_INTERVAL_MS / 10));
+            }
+
+            // Only shrink if streams are quiescent and interval has elapsed
+            if (!g_cuda_pool_shrink || !g_cuda_are_streams_quiescent) {
+                continue;
+            }
+
+            int64_t now = ggml_time_ms();
+            if (now - g_last_pool_shrink_ms < POOL_SHRINK_BACKGROUND_INTERVAL_MS) {
+                continue;
+            }
+
+            if (g_cuda_are_streams_quiescent()) {
+                g_cuda_pool_shrink();
+                g_last_pool_shrink_ms = now;
+            }
+        }
+    }
+
+    // Stop the background pool shrink thread.
+    void ggml_cuda_stop_pool_shrink_thread() {
+        g_pool_shrink_thread_running.store(false, std::memory_order_relaxed);
+        if (g_pool_shrink_thread.joinable()) {
+            g_pool_shrink_thread.join();
+        }
+    }
+
+    // Start the background pool shrink thread.
+    void ggml_cuda_start_pool_shrink_thread() {
+        if (!g_cuda_available || !g_cuda_pool_shrink) return;
+
+        // Stop existing thread if running
+        ggml_cuda_stop_pool_shrink_thread();
+
+        g_pool_shrink_thread_running.store(true, std::memory_order_relaxed);
+        g_pool_shrink_thread = std::thread(ggml_cuda_pool_shrink_loop);
+    }
+
     void ggml_cuda_free_runtime() {
+        ggml_cuda_stop_pool_shrink_thread();
         if (g_cuda_handle) {
             dlclose(g_cuda_handle);
             g_cuda_handle = nullptr;
@@ -84,7 +145,9 @@ namespace {
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
+#include <atomic>
 #include <memory>
+#include <thread>
 #include <filesystem>
 #include <utility>
 
@@ -797,6 +860,8 @@ private:
         mctx = nullptr;
 
         llama_batch_free(batch);
+
+        ggml_cuda_stop_pool_shrink_thread();
     }
 
     void slot_save_and_clear(server_slot & slot) {
@@ -1310,6 +1375,10 @@ private:
                 /* force_pure_content    */ params_base.force_pure_content_parser
             };
         }
+
+        // Start background pool shrink thread
+        ggml_cuda_init_runtime();
+        ggml_cuda_start_pool_shrink_thread();
 
         return true;
     }
