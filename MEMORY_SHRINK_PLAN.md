@@ -5,6 +5,31 @@
 
 ---
 
+## Lessons Learned
+
+### Continuous Pool Shrink During Active Inference Is Unsafe
+
+`llama_decode()` submits CUDA kernels **asynchronously** to inference streams, then returns. The VMM pool shrink calls `cuMemUnmap()` which runs on the **default stream (stream 0)**. There is no ordering guarantee between the inference stream and stream 0 — the GPU can still be reading from memory we just unmapped → **illegal memory access**.
+
+This was confirmed by a crash during MTP speculative decoding:
+```
+CUDA error: an illegal memory access was encountered
+... common_speculative_impl_draft_mtp::process → llama_get_embeddings_pre_norm
+```
+
+### Why Stream Synchronization Doesn't Help
+
+To make pool shrink safe during inference, we'd need to `cudaStreamSynchronize()` all inference streams before calling `cuMemUnmap()`. This blocks for the full kernel execution latency (milliseconds per decode step), completely negating the benefit of proactive shrinking.
+
+### What Works
+
+- **Idle-only shrink:** Safe — all kernels are complete, streams are quiescent
+- **VMM pool shrink:** Safe when no inference is active — releases freed tail region
+- **Async allocator trim:** Safe when no inference is active — releases cached pages
+- **Pool stats API:** Useful for monitoring, no safety concerns
+
+---
+
 ## Problem
 
 With 2 parallel slots serving continuous requests, the system almost never reaches "all idle". The VMM pool and CUDA async allocator grow to peak allocation and hold it forever, causing memory pressure to creep upward during long inference sessions (e.g., coding agents with 262K context).
@@ -18,69 +43,76 @@ With 2 parallel slots serving continuous requests, the system almost never reach
 
 ---
 
-## Phase 1 — Decouple VMM Pool Shrink from Async Allocator Trim
+## Phase 1 — Decouple VMM Pool Shrink from Async Allocator Trim (DONE)
 
 **Risk: Low | Effort: Small | Impact: High**
 
-The VMM pool's `shrink()` only releases already-freed tail memory — safe during active inference.
-The async allocator trim (`cudaMemPoolTrimTo`) is NOT safe — it can cause driver re-allocation latency spikes.
+The VMM pool's `shrink()` only releases already-freed tail memory. The async allocator trim
+(`cudaMemPoolTrimTo`) is NOT safe during active inference — it can cause driver re-allocation latency spikes.
 
-### Changes
+### Changes (committed)
 
 **`ggml/src/ggml-cuda/ggml-cuda.cu`:**
-- Split `ggml_cuda_device_shrink_all()` into two functions:
-  - `ggml_cuda_device_shrink_pools(device)` — pool shrink only (safe during inference)
-  - `ggml_cuda_device_shrink_all(device)` — pools + async trim (idle-only)
-- Export `ggml_backend_cuda_pool_shrink_all()` to shrink pools only (rename for clarity)
-- Add `ggml_backend_cuda_async_trim_all()` as new API for async trim (idle path)
+- Split `ggml_cuda_device_shrink_all()` into `ggml_cuda_device_shrink_pools()` + async trim
+- Exported `ggml_backend_cuda_pool_shrink_all()` (pools only)
+- Exported `ggml_backend_cuda_shrink_all()` (pools + async trim)
+- Exported `ggml_backend_cuda_async_trim_all()` (async trim only)
+- Added `ggml_backend_cuda_get_pool_stats()` for monitoring
 
 **`ggml/include/ggml-cuda.h`:**
-- Update declarations for the split APIs
+- Updated declarations for split APIs
 
 **`tools/server/server-context.cpp`:**
-- Add runtime-resolved `g_cuda_async_trim_all` symbol
-- Rename `g_cuda_pool_shrink_all` usage to `g_cuda_pool_shrink` (pools only)
-- In `update_slots()` all-idle path: call pool shrink + async trim
-- In `ggml_cuda_shrink_if_needed()`: call pool shrink only (no async trim)
+- Runtime-resolved symbols for split APIs
+- Idle path uses `ggml_backend_cuda_shrink_all()` (pools + async trim)
 
 ---
 
-## Phase 2 — Continuous Pool Shrink in Main Loop
+## Phase 2 — Continuous Pool Shrink in Main Loop (ABANDONED)
 
-**Risk: Low | Effort: Small | Impact: Medium**
+**Status: ABANDONED — unsafe during active inference**
 
-Call pool shrink on every `update_slots()` iteration, not just idle. Guarded by utilization check and interval.
+`llama_decode()` submits kernels asynchronously. Pool shrink calls `cuMemUnmap()` on
+stream 0, racing with in-flight kernels on other streams → illegal memory access.
+Stream synchronization would block for full kernel latency, negating the benefit.
+
+## Phase 2 (Revised) — Background Shrink Thread With Stream Synchronization
+
+**Risk: Medium | Effort: Medium | Impact: Medium**
+
+A dedicated background thread that waits for stream quiescence before shrinking.
+Instead of synchronizing (which blocks), it polls stream activity and shrinks only
+when no kernels are in flight.
 
 ### Changes
 
 **`tools/server/server-context.cpp`:**
-- Reduce `POOL_SHRINK_INTERVAL_MS` from 30000 to 5000 (5 seconds)
-- Move `ggml_cuda_shrink_if_needed()` call from inside `if (all_idle)` to after it — runs every iteration, gated by interval timer
-- Add utilization-aware check: resolve `ggml_backend_cuda_get_pool_stats(device)` to get per-pool `pool_size`/`pool_used`, skip shrink if utilization > 70%
-- Add `ggml_backend_cuda_get_pool_stats()` API in CUDA backend that returns per-pool metrics
+- `std::thread g_pool_shrink_thread` — low-priority background thread
+- Poll `cudaStreamQuery()` on all inference streams before shrinking
+- Only shrink when all streams report complete (no in-flight kernels)
+- 5-second sleep interval between checks
 
 **`ggml/src/ggml-cuda/ggml-cuda.cu`:**
-- Add `ggml_backend_cuda_get_pool_stats(device, &total_size, &total_used)` — aggregates across all contexts/streams for a device
+- Export `ggml_backend_cuda_stream_query(device, stream_idx)` — non-blocking query
+- Or expose `streams()` accessor on `ggml_backend_cuda_context`
 
 ---
 
-## Phase 3 — Background Shrink Thread
+## Phase 3 — Background Shrink Thread (Deferred Until Phase 2 Revised)
 
-**Risk: Medium | Effort: Medium | Impact: High**
+**Risk: Medium | Effort: Medium | Impact: Medium**
 
-Dedicated low-priority thread that shrinks pools independently of the inference loop. Provides finer-grained control and doesn't add latency to decode.
+Dedicated low-priority thread that shrinks pools only when inference streams are quiescent.
+Depends on Phase 2 revised (stream polling API).
 
 ### Changes
 
 **`tools/server/server-context.cpp`:**
-- Add `std::atomic<bool> g_shutdown` + `std::thread g_pool_shrink_thread`
-- `pool_shrink_loop()`: sleep 5s → check utilization → shrink if needed → repeat
-- Thread started at server init (`init()`), joined at shutdown (`server_context_free`)
+- `std::thread g_pool_shrink_thread` — low-priority background thread
+- `pool_shrink_loop()`: sleep 5s → poll streams → shrink if quiescent → repeat
+- Thread started at server init (`init()`), joined at shutdown
 - Thread set to lowest nice value (`setpriority(PRIO_PROCESS, 0, 19)`)
-- Guard against concurrent shrink with atomic flag or mutex
-
-**`tools/server/server-context.h`:**
-- Add thread member to `server_context` class (or keep global with shutdown guard)
+- Guard against concurrent shrink with atomic flag
 
 ---
 
@@ -118,9 +150,15 @@ Dedicated low-priority thread that shrinks pools independently of the inference 
 
 ## Execution Order
 
-1. Phase 1 (decouple) — safest, no behavioral change for idle path
-2. Phase 2 (continuous main loop) — adds pool shrink during active inference
-3. Phase 3 (background thread) — adds independent shrink thread
-4. Phase 4 (config) — polish
+1. ~~Phase 1 (decouple) — DONE~~
+2. ~~Phase 2 (continuous main loop) — ABANDONED (unsafe)~~
+3. Phase 2 revised (background thread with stream polling) — pending
+4. Phase 3 (background thread) — pending (depends on Phase 2 revised)
+5. Phase 4 (config) — polish
 
-Each phase is independently buildable and testable.
+## Current State
+
+- Pool + async trim APIs split cleanly in CUDA backend
+- Idle path uses `ggml_backend_cuda_shrink_all()` (pools + async trim)
+- Pool stats API available for monitoring
+- Continuous shrink removed from main loop (documented why unsafe)
