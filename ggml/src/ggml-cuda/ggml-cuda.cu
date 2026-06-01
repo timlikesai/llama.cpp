@@ -679,8 +679,10 @@ static void ggml_cuda_async_pool_trim(int device) {
     CUDA_CHECK(cudaMemPoolTrimTo(pool, 0));
 }
 
-// Shrink all pools for a single device, including the CUDA async allocator
-static void ggml_cuda_device_shrink_all(int device) {
+// Shrink pool memory for a single device — safe during active inference.
+// Only releases freed memory (VMM tail region / legacy buffer pool).
+// Does NOT touch the CUDA async allocator (call ggml_cuda_async_pool_trim for that).
+static void ggml_cuda_device_shrink_pools(int device) {
     std::lock_guard<std::mutex> lock(g_cuda_ctx_mutex);
     for (auto * ctx : g_cuda_contexts) {
         for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
@@ -689,6 +691,28 @@ static void ggml_cuda_device_shrink_all(int device) {
             }
         }
     }
+}
+
+// Aggregate pool stats for a single device across all contexts and streams.
+// Returns total pool_size (mapped/allocated) and pool_used (actively held by tensors).
+static void ggml_cuda_device_get_pool_stats(int device, size_t * out_pool_size, size_t * out_pool_used) {
+    *out_pool_size = 0;
+    *out_pool_used = 0;
+    std::lock_guard<std::mutex> lock(g_cuda_ctx_mutex);
+    for (auto * ctx : g_cuda_contexts) {
+        for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
+            if (ctx->pools[device][i] != nullptr) {
+                *out_pool_size += ctx->pools[device][i]->get_pool_size();
+                *out_pool_used += ctx->pools[device][i]->get_pool_used();
+            }
+        }
+    }
+}
+
+// Shrink all pools for a single device, including the CUDA async allocator.
+// ONLY call this when no inference is active — async trim can cause latency spikes.
+static void ggml_cuda_device_shrink_all(int device) {
+    ggml_cuda_device_shrink_pools(device);
     // Also trim the CUDA async allocator pool to force driver cache release
     ggml_cuda_async_pool_trim(device);
 }
@@ -5818,11 +5842,37 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
     return cuda_backend;
 }
 
+// Shrink all pools across all CUDA devices (pools only, no async trim).
+// Safe to call during active inference — only releases freed memory.
 GGML_BACKEND_API void ggml_backend_cuda_pool_shrink_all() {
+    int n_devices = ggml_backend_cuda_get_device_count();
+    for (int i = 0; i < n_devices; ++i) {
+        ggml_cuda_device_shrink_pools(i);
+    }
+}
+
+// Shrink all pools AND trim the CUDA async allocator across all devices.
+// ONLY call when no inference is active — async trim can cause latency spikes.
+GGML_BACKEND_API void ggml_backend_cuda_shrink_all() {
     int n_devices = ggml_backend_cuda_get_device_count();
     for (int i = 0; i < n_devices; ++i) {
         ggml_cuda_device_shrink_all(i);
     }
+}
+
+// Trim only the CUDA async allocator pools (no pool shrink).
+// ONLY call when no inference is active.
+GGML_BACKEND_API void ggml_backend_cuda_async_trim_all() {
+    int n_devices = ggml_backend_cuda_get_device_count();
+    for (int i = 0; i < n_devices; ++i) {
+        ggml_cuda_async_pool_trim(i);
+    }
+}
+
+// Get aggregated pool stats for a single device.
+// Returns total pool_size and pool_used across all contexts and streams.
+GGML_BACKEND_API void ggml_backend_cuda_get_pool_stats(int device, size_t * out_pool_size, size_t * out_pool_used) {
+    ggml_cuda_device_get_pool_stats(device, out_pool_size, out_pool_used);
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)

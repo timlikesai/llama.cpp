@@ -47,10 +47,30 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
 /**
  * Shrink all memory pools across all CUDA backends to release unused
- * physical pages back to the driver. Useful for proactive memory management.
+ * physical pages back to the driver (pools only, no async trim).
+ * Safe to call during active inference — only releases freed memory.
  * This is a no-op if VMM is not enabled or if pools are already empty.
  */
 GGML_BACKEND_API void ggml_backend_cuda_pool_shrink_all(void);
+
+/**
+ * Shrink all pools AND trim the CUDA async allocator across all devices.
+ * ONLY call when no inference is active — async trim can cause latency spikes.
+ */
+GGML_BACKEND_API void ggml_backend_cuda_shrink_all(void);
+
+/**
+ * Trim only the CUDA async allocator pools across all devices (no pool shrink).
+ * ONLY call when no inference is active.
+ */
+GGML_BACKEND_API void ggml_backend_cuda_async_trim_all(void);
+
+/**
+ * Get aggregated pool stats for a single device.
+ * Returns total pool_size (mapped/allocated) and pool_used (actively held)
+ * across all contexts and streams.
+ */
+GGML_BACKEND_API void ggml_backend_cuda_get_pool_stats(int device, size_t * out_pool_size, size_t * out_pool_used);
 
 #ifdef  __cplusplus
 }
