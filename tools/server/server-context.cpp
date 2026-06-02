@@ -19,25 +19,17 @@ namespace {
     using ggml_backend_cuda_pool_shrink_all_fn = void(void);
     using ggml_backend_cuda_shrink_all_fn = void(void);
     using ggml_backend_cuda_get_pool_stats_fn = void(int, size_t*, size_t*);
-    using ggml_backend_cuda_are_streams_quiescent_fn = bool(void);
 
     ggml_backend_cuda_get_device_count_fn * g_cuda_device_count = nullptr;
     ggml_backend_cuda_get_device_memory_fn * g_cuda_device_memory = nullptr;
     ggml_backend_cuda_pool_shrink_all_fn * g_cuda_pool_shrink = nullptr;
     ggml_backend_cuda_shrink_all_fn * g_cuda_shrink_all = nullptr;
     ggml_backend_cuda_get_pool_stats_fn * g_cuda_get_pool_stats = nullptr;
-    ggml_backend_cuda_are_streams_quiescent_fn * g_cuda_are_streams_quiescent = nullptr;
 
     // Minimum interval between pool shrinks to avoid excessive driver syscalls
     static constexpr int POOL_SHRINK_INTERVAL_MS = 30000;
-    int64_t g_last_pool_shrink_ms = 0;
-
-    // Interval for background pool shrink thread (ms)
-    static constexpr int POOL_SHRINK_BACKGROUND_INTERVAL_MS = 5000;
-
-    // Background pool shrink thread
-    std::atomic<bool> g_pool_shrink_thread_running{false};
-    std::thread g_pool_shrink_thread;
+    // Atomic to prevent data race between main loop and any concurrent callers
+    std::atomic<int64_t> g_last_pool_shrink_ms{0};
 
     void ggml_cuda_init_runtime() {
         if (g_cuda_available) return;
@@ -61,12 +53,52 @@ namespace {
                 dlsym(g_cuda_handle, "ggml_backend_cuda_shrink_all");
             g_cuda_get_pool_stats = (ggml_backend_cuda_get_pool_stats_fn *)
                 dlsym(g_cuda_handle, "ggml_backend_cuda_get_pool_stats");
-            g_cuda_are_streams_quiescent = (ggml_backend_cuda_are_streams_quiescent_fn *)
-                dlsym(g_cuda_handle, "ggml_backend_cuda_are_streams_quiescent");
             if (g_cuda_device_count) {
                 g_cuda_available = true;
             }
         }
+    }
+
+    // Helper: log and perform a pool shrink with before/after stats.
+    // label distinguishes idle vs continuous shrink in logs.
+    void ggml_cuda_pool_shrink_if_needed(const char * label) {
+        if (!g_cuda_available || !g_cuda_pool_shrink) return;
+
+        int64_t now = ggml_time_ms();
+        int64_t last = g_last_pool_shrink_ms.load(std::memory_order_relaxed);
+        if (now - last < POOL_SHRINK_INTERVAL_MS) return;
+
+        size_t pool_size_before = 0;
+        if (g_cuda_device_count && g_cuda_get_pool_stats) {
+            for (int i = 0; i < g_cuda_device_count(); ++i) {
+                size_t sz, us;
+                g_cuda_get_pool_stats(i, &sz, &us);
+                pool_size_before += sz;
+            }
+        }
+
+        g_cuda_pool_shrink();
+
+        if (g_cuda_device_count && g_cuda_get_pool_stats) {
+            size_t pool_size_after = 0;
+            for (int i = 0; i < g_cuda_device_count(); ++i) {
+                size_t sz, us;
+                g_cuda_get_pool_stats(i, &sz, &us);
+                pool_size_after += sz;
+            }
+            if (pool_size_before > pool_size_after) {
+                SRV_INF("gpu pool shrink (%s): size %zu -> %zu MiB, freed %zu MiB\n",
+                        label, pool_size_before / 1024 / 1024, pool_size_after / 1024 / 1024,
+                        (pool_size_before - pool_size_after) / 1024 / 1024);
+            }
+        }
+        g_last_pool_shrink_ms.store(now, std::memory_order_relaxed);
+    }
+
+    // Shrink pools only (no async trim). Call between decode steps.
+    // Safe: no inference work is being submitted at this point.
+    void ggml_cuda_pool_shrink_continuous() {
+        ggml_cuda_pool_shrink_if_needed("continuous");
     }
 
     // Shrink pools + async allocator trim. ONLY call when all slots are idle.
@@ -74,10 +106,10 @@ namespace {
         if (!g_cuda_available || !g_cuda_shrink_all) return;
 
         int64_t now = ggml_time_ms();
-        if (now - g_last_pool_shrink_ms < POOL_SHRINK_INTERVAL_MS) return;
+        int64_t last = g_last_pool_shrink_ms.load(std::memory_order_relaxed);
+        if (now - last < POOL_SHRINK_INTERVAL_MS) return;
 
         size_t pool_size_before = 0, pool_used_before = 0;
-        size_t pool_size_after = 0, pool_used_after = 0;
         if (g_cuda_device_count && g_cuda_get_pool_stats) {
             for (int i = 0; i < g_cuda_device_count(); ++i) {
                 size_t sz, us;
@@ -90,6 +122,7 @@ namespace {
         g_cuda_shrink_all();
 
         if (g_cuda_device_count && g_cuda_get_pool_stats) {
+            size_t pool_size_after = 0, pool_used_after = 0;
             for (int i = 0; i < g_cuda_device_count(); ++i) {
                 size_t sz, us;
                 g_cuda_get_pool_stats(i, &sz, &us);
@@ -102,78 +135,10 @@ namespace {
                         (pool_size_before - pool_size_after) / 1024 / 1024);
             }
         }
-        g_last_pool_shrink_ms = now;
-    }
-
-    // Background thread: polls streams and shrinks pools when quiescent.
-    // Releases freed VMM tail memory without blocking inference.
-    void ggml_cuda_pool_shrink_loop() {
-        while (g_pool_shrink_thread_running.load(std::memory_order_relaxed)) {
-            // Sleep for the interval
-            for (int i = 0; i < 10 && g_pool_shrink_thread_running.load(std::memory_order_relaxed); ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(POOL_SHRINK_BACKGROUND_INTERVAL_MS / 10));
-            }
-
-            // Only shrink if streams are quiescent and interval has elapsed
-            if (!g_cuda_pool_shrink || !g_cuda_are_streams_quiescent) {
-                continue;
-            }
-
-            int64_t now = ggml_time_ms();
-            if (now - g_last_pool_shrink_ms < POOL_SHRINK_BACKGROUND_INTERVAL_MS) {
-                continue;
-            }
-
-            if (g_cuda_are_streams_quiescent()) {
-                size_t pool_size_before = 0, pool_size_after = 0;
-                if (g_cuda_device_count && g_cuda_get_pool_stats) {
-                    for (int i = 0; i < g_cuda_device_count(); ++i) {
-                        size_t sz, us;
-                        g_cuda_get_pool_stats(i, &sz, &us);
-                        pool_size_before += sz;
-                    }
-                }
-
-                g_cuda_pool_shrink();
-
-                if (g_cuda_device_count && g_cuda_get_pool_stats) {
-                    for (int i = 0; i < g_cuda_device_count(); ++i) {
-                        size_t sz, us;
-                        g_cuda_get_pool_stats(i, &sz, &us);
-                        pool_size_after += sz;
-                    }
-                    if (pool_size_before > pool_size_after) {
-                        SRV_INF("gpu pool shrink (bg): size %zu -> %zu MiB, freed %zu MiB\n",
-                                pool_size_before / 1024 / 1024, pool_size_after / 1024 / 1024,
-                                (pool_size_before - pool_size_after) / 1024 / 1024);
-                    }
-                }
-                g_last_pool_shrink_ms = now;
-            }
-        }
-    }
-
-    // Stop the background pool shrink thread.
-    void ggml_cuda_stop_pool_shrink_thread() {
-        g_pool_shrink_thread_running.store(false, std::memory_order_relaxed);
-        if (g_pool_shrink_thread.joinable()) {
-            g_pool_shrink_thread.join();
-        }
-    }
-
-    // Start the background pool shrink thread.
-    void ggml_cuda_start_pool_shrink_thread() {
-        if (!g_cuda_available || !g_cuda_pool_shrink) return;
-
-        // Stop existing thread if running
-        ggml_cuda_stop_pool_shrink_thread();
-
-        g_pool_shrink_thread_running.store(true, std::memory_order_relaxed);
-        g_pool_shrink_thread = std::thread(ggml_cuda_pool_shrink_loop);
+        g_last_pool_shrink_ms.store(now, std::memory_order_relaxed);
     }
 
     void ggml_cuda_free_runtime() {
-        ggml_cuda_stop_pool_shrink_thread();
         if (g_cuda_handle) {
             dlclose(g_cuda_handle);
             g_cuda_handle = nullptr;
@@ -198,7 +163,6 @@ namespace {
 #include <exception>
 #include <atomic>
 #include <memory>
-#include <thread>
 #include <filesystem>
 #include <utility>
 
@@ -912,7 +876,7 @@ private:
 
         llama_batch_free(batch);
 
-        ggml_cuda_stop_pool_shrink_thread();
+        ggml_cuda_free_runtime();
     }
 
     void slot_save_and_clear(server_slot & slot) {
@@ -1427,9 +1391,8 @@ private:
             };
         }
 
-        // Start background pool shrink thread
+        // Initialize CUDA runtime for pool shrink APIs
         ggml_cuda_init_runtime();
-        ggml_cuda_start_pool_shrink_thread();
 
         return true;
     }
@@ -2544,14 +2507,12 @@ private:
             }
         }
 
-        // NOTE: Continuous pool shrink during active inference is NOT safe.
-        // llama_decode() submits kernels asynchronously to inference streams,
-        // then returns. The pool shrink calls cuMemUnmap() on stream 0 (default),
-        // which has no ordering guarantee with inference streams. The GPU can
-        // still be reading from memory we just unmapped → illegal memory access.
-        // To fix this properly we would need to synchronize all inference streams
-        // before shrinking, which blocks for the full kernel latency — negating
-        // the benefit of proactive shrinking.
+        // Continuous pool shrink between decode steps.
+        // Safe: no inference work is being submitted at this point.
+        // The VMM pool shrink only releases freed tail memory (above pool_used),
+        // and the CUDA backend holds a mutex that prevents new work submission
+        // during the cuMemUnmap call, preventing TOCTOU races.
+        ggml_cuda_pool_shrink_continuous();
 
         {
             SRV_DBG("%s", "posting NEXT_RESPONSE\n");

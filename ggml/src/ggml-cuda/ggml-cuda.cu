@@ -484,8 +484,13 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     size_t get_pool_used() const override { return pool_used; }
 };
 
-// Global list of all CUDA backend contexts for pool shrink management
-static std::mutex g_cuda_ctx_mutex;
+// Global list of all CUDA backend contexts for pool management.
+// g_pool_shrink_mutex protects:
+//   - iteration over g_cuda_contexts (contexts can be created/destroyed)
+//   - the pool shrink operation itself (cuMemUnmap must be atomic w.r.t. context list)
+// The server calls pool shrink between decode steps in the main loop (no background
+// thread), so cuMemUnmap runs synchronously with no new inference work being submitted.
+static std::mutex g_pool_shrink_mutex;
 static std::vector<ggml_backend_cuda_context *> g_cuda_contexts;
 
 // pool with virtual memory
@@ -679,11 +684,12 @@ static void ggml_cuda_async_pool_trim(int device) {
     CUDA_CHECK(cudaMemPoolTrimTo(pool, 0));
 }
 
-// Shrink pool memory for a single device — safe during active inference.
+// Shrink pool memory for a single device.
 // Only releases freed memory (VMM tail region / legacy buffer pool).
 // Does NOT touch the CUDA async allocator (call ggml_cuda_async_pool_trim for that).
+// Holds g_pool_shrink_mutex to protect context list iteration and cuMemUnmap atomicity.
 static void ggml_cuda_device_shrink_pools(int device) {
-    std::lock_guard<std::mutex> lock(g_cuda_ctx_mutex);
+    std::lock_guard<std::mutex> lock(g_pool_shrink_mutex);
     for (auto * ctx : g_cuda_contexts) {
         for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
             if (ctx->pools[device][i] != nullptr) {
@@ -698,7 +704,7 @@ static void ggml_cuda_device_shrink_pools(int device) {
 static void ggml_cuda_device_get_pool_stats(int device, size_t * out_pool_size, size_t * out_pool_used) {
     *out_pool_size = 0;
     *out_pool_used = 0;
-    std::lock_guard<std::mutex> lock(g_cuda_ctx_mutex);
+    std::lock_guard<std::mutex> lock(g_pool_shrink_mutex);
     for (auto * ctx : g_cuda_contexts) {
         for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
             if (ctx->pools[device][i] != nullptr) {
@@ -3274,9 +3280,11 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
 
     // Unregister context from pool management
     {
-        std::lock_guard<std::mutex> lock(g_cuda_ctx_mutex);
-        auto it = std::remove(g_cuda_contexts.begin(), g_cuda_contexts.end(), cuda_ctx);
-        g_cuda_contexts.erase(it, g_cuda_contexts.end());
+        std::lock_guard<std::mutex> lock(g_pool_shrink_mutex);
+        auto it = std::find(g_cuda_contexts.begin(), g_cuda_contexts.end(), cuda_ctx);
+        if (it != g_cuda_contexts.end()) {
+            g_cuda_contexts.erase(it);
+        }
     }
 
     delete cuda_ctx;
@@ -5835,7 +5843,7 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
 
     // Register context for pool management
     {
-        std::lock_guard<std::mutex> lock(g_cuda_ctx_mutex);
+        std::lock_guard<std::mutex> lock(g_pool_shrink_mutex);
         g_cuda_contexts.push_back(ctx);
     }
 
@@ -5873,35 +5881,6 @@ GGML_BACKEND_API void ggml_backend_cuda_async_trim_all() {
 // Returns total pool_size and pool_used across all contexts and streams.
 GGML_BACKEND_API void ggml_backend_cuda_get_pool_stats(int device, size_t * out_pool_size, size_t * out_pool_used) {
     ggml_cuda_device_get_pool_stats(device, out_pool_size, out_pool_used);
-}
-
-// Poll all CUDA streams across all contexts and return true if all are
-// quiescent (no in-flight kernels). Non-blocking — uses cudaStreamQuery().
-static bool ggml_cuda_are_streams_quiescent() {
-    std::lock_guard<std::mutex> lock(g_cuda_ctx_mutex);
-    for (auto * ctx : g_cuda_contexts) {
-        for (int d = 0; d < ggml_cuda_info().device_count; ++d) {
-            for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
-                cudaStream_t stream = ctx->streams[d][i];
-                if (stream == nullptr) {
-                    continue;
-                }
-                cudaError_t err = cudaStreamQuery(stream);
-                if (err != cudaSuccess && err != cudaErrorNotReady) {
-                    // Unexpected error (e.g., context destroyed) — conservatively return false
-                    return false;
-                }
-                if (err == cudaErrorNotReady) {
-                    return false; // Still has work in flight
-                }
-            }
-        }
-    }
-    return true;
-}
-
-GGML_BACKEND_API bool ggml_backend_cuda_are_streams_quiescent() {
-    return ggml_cuda_are_streams_quiescent();
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)

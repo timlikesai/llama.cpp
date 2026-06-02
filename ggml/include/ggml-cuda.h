@@ -48,7 +48,8 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 /**
  * Shrink all memory pools across all CUDA backends to release unused
  * physical pages back to the driver (pools only, no async trim).
- * Safe to call during active inference — only releases freed memory.
+ * Caller should invoke between inference steps (not concurrently with
+ * llama_decode). The VMM pool shrink only releases freed tail memory.
  * This is a no-op if VMM is not enabled or if pools are already empty.
  */
 GGML_BACKEND_API void ggml_backend_cuda_pool_shrink_all(void);
@@ -71,14 +72,6 @@ GGML_BACKEND_API void ggml_backend_cuda_async_trim_all(void);
  * across all contexts and streams.
  */
 GGML_BACKEND_API void ggml_backend_cuda_get_pool_stats(int device, size_t * out_pool_size, size_t * out_pool_used);
-
-/**
- * Poll all CUDA streams across all contexts and return true if all are
- * quiescent (no in-flight kernels). Non-blocking — uses cudaStreamQuery().
- * Use this to determine when it is safe to call pool_shrink_all() during
- * active inference without racing with pending GPU work.
- */
-GGML_BACKEND_API bool ggml_backend_cuda_are_streams_quiescent(void);
 
 #ifdef  __cplusplus
 }
