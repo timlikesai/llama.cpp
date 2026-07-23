@@ -75,6 +75,13 @@ for type_k in TYPES_KV:
         with open(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu", "w") as f:
             f.write(SOURCE_FATTN_VEC.format(type_k=type_k, type_v=type_v))
 
+# MXFP4 vec: MXFP4/MXFP4, F16/MXFP4, MXFP4/F16
+for type_k, type_v in [("GGML_TYPE_MXFP4", "GGML_TYPE_MXFP4"),
+                        ("GGML_TYPE_F16", "GGML_TYPE_MXFP4"),
+                        ("GGML_TYPE_MXFP4", "GGML_TYPE_F16")]:
+    with open(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu", "w") as f:
+        f.write(SOURCE_FATTN_VEC.format(type_k=type_k, type_v=type_v))
+
 for ncols in [8, 16, 32, 64]:
     for ncols2 in [1, 2, 4, 8, 16, 32]:
         if ncols2 > ncols:

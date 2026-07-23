@@ -1450,3 +1450,6 @@ blk.33.attn_v.weight q8_0
 blk.33.ffn_down.weight q8_0
 blk.33.ffn_gate.weight q8_0
 blk.33.ffn_up.weight q8_0
+
+[MXFP4] mxfp4
+token_embd.weight q8_0

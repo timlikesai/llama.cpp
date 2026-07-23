@@ -254,7 +254,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
 #define FATTN_VEC_CASES_ALL_D(type_K, type_V) \
     FATTN_VEC_CASE( 64, type_K, type_V)       \
     FATTN_VEC_CASE(128, type_K, type_V)       \
-    FATTN_VEC_CASE(256, type_K, type_V)       \
+    FATTN_VEC_CASE(256, type_K, type_V)
 
 static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * Q = dst->src[0];
@@ -324,6 +324,10 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP4, GGML_TYPE_MXFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_MXFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_MXFP4, GGML_TYPE_F16)
+
     GGML_ABORT("fatal error");
 }
 
@@ -349,6 +353,7 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_MXFP4:
             return true;
         default:
             return false;
@@ -439,8 +444,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_NONE;
     }
 
+    if (K->type == GGML_TYPE_MXFP4 && V->type != GGML_TYPE_F16 && V->type != GGML_TYPE_F32 && V->type != GGML_TYPE_MXFP4) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+    if (V->type == GGML_TYPE_MXFP4 && K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_F32 && K->type != GGML_TYPE_MXFP4) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
 #ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type) {
+    if (K->type != V->type && K->type != GGML_TYPE_MXFP4 && V->type != GGML_TYPE_MXFP4) {
         return BEST_FATTN_KERNEL_NONE;
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS

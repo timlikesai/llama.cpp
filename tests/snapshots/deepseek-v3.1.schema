@@ -3354,3 +3354,7 @@ blk.60.attn_q_b.weight q8_0
 blk.60.ffn_down_shexp.weight q8_0
 blk.60.ffn_gate_shexp.weight q8_0
 blk.60.ffn_up_shexp.weight q8_0
+
+[MXFP4] mxfp4
+output.weight q8_0
+token_embd.weight q8_0

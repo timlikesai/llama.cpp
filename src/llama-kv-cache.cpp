@@ -309,6 +309,9 @@ llama_kv_cache::llama_kv_cache(
 
         attn_rot_k = other->attn_rot_k;
         attn_rot_v = other->attn_rot_v;
+        k_blockwise = other->k_blockwise;
+        v_blockwise = other->v_blockwise;
+        attn_rot_hadamard = other->attn_rot_hadamard;
     } else {
         const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
         const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false;
@@ -316,11 +319,17 @@ llama_kv_cache::llama_kv_cache(
             LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
         }
 
+        k_blockwise = !attn_rot_disable && type_k == GGML_TYPE_MXFP4 && n_embd_head_k_all > 0 &&
+                      hparams.n_embd_head_k() % ggml_blck_size(type_k) == 0;
+        v_blockwise = !attn_rot_disable && type_v == GGML_TYPE_MXFP4 && n_embd_head_v_all > 0 &&
+                      hparams.n_embd_head_v() % ggml_blck_size(type_v) == 0;
+
         attn_rot_k =
             !attn_rot_disable &&
             n_embd_head_k_all > 0 &&
             ggml_is_quantized(type_k) &&
-            hparams.n_embd_head_k() % 64 == 0;
+            hparams.n_embd_head_k() % 64 == 0 &&
+            !k_blockwise;
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
         if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_GLM_DSA) &&
@@ -332,31 +341,30 @@ llama_kv_cache::llama_kv_cache(
             !attn_rot_disable &&
             n_embd_head_v_all > 0 &&
             ggml_is_quantized(type_v) &&
-            hparams.n_embd_head_v() % 64 == 0;
+            hparams.n_embd_head_v() % 64 == 0 &&
+            !v_blockwise;
     }
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
-    LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
+    LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_v_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
 
-    // pre-compute the haramard matrices and keep them in host memory
+    // pre-compute the hadamard matrices and keep them in host memory
     // TODO: in the future, we can make copies in the backend buffers to avoid host -> device transfers
     if (attn_rot_k || attn_rot_v) {
         for (int64_t n = 64; n <= std::max(n_embd_head_k_all, n_embd_head_v_all); n *= 2) {
-            attn_rot_hadamard[n] = std::vector<float>(n*n);
-
-            ggml_init_params params = {
-                /* .mem_size   = */ 1*ggml_tensor_overhead(),
-                /* .mem_buffer = */ nullptr,
-                /* .no_alloc   = */ true,
-            };
-
-            ggml_context_ptr ctx { ggml_init(params) };
-
-            ggml_tensor * tmp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n, n);
-            tmp->data = attn_rot_hadamard[n].data();
-
-            ggml_gen_hadamard(tmp);
+            gen_hadamard(n);
         }
+    }
+
+    if (k_blockwise) {
+        const int64_t blk = ggml_blck_size(type_k);
+        GGML_ASSERT(ggml_is_power_of_2((int) blk) && "blockwise rotation requires power-of-2 block size");
+        gen_hadamard(blk);
+    }
+    if (v_blockwise) {
+        const int64_t blk = ggml_blck_size(type_v);
+        GGML_ASSERT(ggml_is_power_of_2((int) blk) && "blockwise rotation requires power-of-2 block size");
+        gen_hadamard(blk);
     }
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
@@ -1418,7 +1426,9 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
-    if (attn_rot_k) {
+    if (k_blockwise) {
+        res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ggml_blck_size(type_k()), ggml_blck_size(type_k()));
+    } else if (attn_rot_k) {
         int nrot = 64;
 
         // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
@@ -1429,6 +1439,9 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
         nrot /= 2;
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
+    }
+
+    if (res) {
         ggml_set_input(res);
         ggml_set_name(res, "attn_inp_k_rot");
     }
@@ -1439,7 +1452,9 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
 ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
-    if (attn_rot_v) {
+    if (v_blockwise) {
+        res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ggml_blck_size(type_v()), ggml_blck_size(type_v()));
+    } else if (attn_rot_v) {
         int nrot = 64;
         // using smaller rotation matrices for V seems beneficial
         // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4146397570
@@ -1449,6 +1464,9 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
         //nrot /= 2;
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
+    }
+
+    if (res) {
         ggml_set_input(res);
         ggml_set_name(res, "attn_inp_v_rot");
     }
@@ -1785,6 +1803,25 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
     }
 }
 
+void llama_kv_cache::gen_hadamard(int64_t n) {
+    if (attn_rot_hadamard.count(n)) return;
+
+    attn_rot_hadamard[n] = std::vector<float>(n*n);
+
+    ggml_init_params params = {
+        /* .mem_size   = */ 1*ggml_tensor_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+
+    ggml_context_ptr ctx { ggml_init(params) };
+
+    ggml_tensor * tmp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n, n);
+    tmp->data = attn_rot_hadamard[n].data();
+
+    ggml_gen_hadamard(tmp);
+}
+
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
@@ -1795,12 +1832,7 @@ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
 }
 
 void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-
-    const auto n_rot = dst->ne[0];
-    GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
-
-    memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
+    set_input_k_rot(dst);
 }
 
 size_t llama_kv_cache::total_size() const {

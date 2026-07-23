@@ -342,6 +342,9 @@ static inline int best_index_mxfp4(float x, float e) {
         if (err < best_err) {
             best_index = i;
             best_err = err;
+        } else if (err == best_err && i % 2 == 0 && best_index % 2 == 1) {
+            // RNE: on exact tie, pick the even magnitude
+            best_index = i;
         }
     }
     return best_index;
@@ -365,7 +368,17 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
             }
         }
 
-        const uint8_t e = amax > 0.0f ? (uint8_t) (floorf(log2f(amax)) - 2 + 127) : 0;
+        // e8m0 block scale, UOS boundary Qmax=7.25 (arXiv:2607.24377, Theorem 1)
+        uint8_t e = 0;
+        if (amax > 0.0f) {
+            // frexpf is exact (no libm log2 rounding): amax = (f/2) * 2^e2, f in [0.5, 1)
+            int e2;
+            const float f  = frexpf(amax, &e2) * 2.0f; // in [1, 2)
+            const int lb   = e2 - 1;                   // floor(log2(amax))
+            // Qmax=7.25: threshold at 7.25/4 = 1.8125
+            const int ei = lb - (f > 1.8125f ? 1 : 2) + 127;
+            e = (uint8_t) (ei < 0 ? 0 : (ei > 254 ? 254 : ei));
+        }
 
         const float d = GGML_E8M0_TO_FP32_HALF(e);
 

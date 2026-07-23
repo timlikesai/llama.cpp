@@ -1219,3 +1219,7 @@ blk.27.attn_v.weight q8_0
 blk.27.ffn_down.weight q8_0
 blk.27.ffn_gate.weight q8_0
 blk.27.ffn_up.weight q8_0
+
+[MXFP4] mxfp4
+output.weight q8_0
+token_embd.weight q8_0

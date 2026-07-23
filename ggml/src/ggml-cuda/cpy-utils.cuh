@@ -186,6 +186,37 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
     y->d = sumq2 > 0 ? sumqx/sumq2 : d;
 }
 
+static __device__ void quantize_f32_mxfp4_block(const float * __restrict__ x, block_mxfp4 * __restrict__ y) {
+    float amax = 0.0f;
+
+    for (int j = 0; j < QK_MXFP4/4; ++j) {
+        const float4 v = ((const float4 *) x)[j];
+        amax = fmaxf(amax, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)),
+                                 fmaxf(fabsf(v.z), fabsf(v.w))));
+    }
+
+    const auto s = ggml_cuda_mxfp4_scale(amax);
+
+    y->e = s.e;
+
+#if CUDART_VERSION >= 12080
+    for (int k = 0; k < QK_MXFP4/4; ++k) {
+        __nv_fp4x4_e2m1 q(make_float4(
+            x[2*k]*s.inv,       x[2*k+QK_MXFP4/2]*s.inv,
+            x[2*k+1]*s.inv,     x[2*k+1+QK_MXFP4/2]*s.inv));
+        uint16_t p = q.__x;
+        y->qs[2*k]   = (uint8_t) p;
+        y->qs[2*k+1] = (uint8_t)(p >> 8);
+    }
+#else
+    for (int j = 0; j < QK_MXFP4/2; ++j) {
+        const float x0 = x[j]*s.inv;
+        const float x1 = x[QK_MXFP4/2 + j]*s.inv;
+        y->qs[j] = ggml_cuda_float_to_fp4_e2m1(x0, 1.0f) | (ggml_cuda_float_to_fp4_e2m1(x1, 1.0f) << 4);
+    }
+#endif
+}
+
 // Wrapper functions for cpy.cu compatibility
 static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);
@@ -209,6 +240,10 @@ static __device__ void cpy_blck_f32_q8_0(const char * cxi, char * cdsti) {
 
 static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_mxfp4(const char * cxi, char * cdsti) {
+    quantize_f32_mxfp4_block((const float *)cxi, (block_mxfp4 *)cdsti);
 }
 
 template<typename src_t, typename dst_t>

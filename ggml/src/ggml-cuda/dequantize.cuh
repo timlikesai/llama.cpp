@@ -119,6 +119,15 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.y *= d;
 }
 
+static __device__ __forceinline__ void dequantize_mxfp4_pair(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_mxfp4 * x = (const block_mxfp4 *) vx;
+
+    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
+    const float2 f = ggml_cuda_mxfp4_to_float2(x[ib].qs[iqs]);
+    v.x = f.x * d;
+    v.y = f.y * d;
+}
+
 //================================== k-quants
 
 // Each call dequantizes one super-block of QK_K values into y using the

@@ -1,5 +1,5 @@
 # Model: gpt-oss-120b
-# n_embd=2880, n_ff=2880, n_vocab=0, n_layer=36, n_head=64, n_head_kv=8, n_expert=128
+# n_embd=2880, n_ff=2880, n_vocab=201088, n_layer=36, n_head=64, n_head_kv=8, n_expert=128
 
 [F32] f32
 
@@ -5595,3 +5595,7 @@ blk.35.attn_k.weight q8_0
 blk.35.attn_output.weight q8_0
 blk.35.attn_q.weight q8_0
 blk.35.attn_v.weight q8_0
+
+[MXFP4] mxfp4
+output.weight q8_0
+token_embd.weight q8_0

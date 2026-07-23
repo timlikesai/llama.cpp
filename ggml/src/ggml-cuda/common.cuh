@@ -837,6 +837,26 @@ static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
 #endif // CUDART_VERSION >= 12050
 }
 
+static __device__ __forceinline__ uint8_t ggml_cuda_float_to_e8m0(float x) {
+#if CUDART_VERSION >= 12080
+    return static_cast<uint8_t>(__nv_cvt_float_to_e8m0(x, __NV_SATFINITE, cudaRoundZero));
+#else
+    const int biased = (__float_as_uint(x) >> 23) & 0xFF;
+    return static_cast<uint8_t>(min(biased, 254));
+#endif // CUDART_VERSION >= 12080
+}
+
+// Compute the MXFP4 block scale using the UOS boundary Qmax=7.25 (arXiv:2607.24377, Theorem 1).
+// The normalized block max falls in (3.625, 7.25]; values above the e2m1 max saturate.
+struct ggml_cuda_mxfp4_scale_result { uint8_t e; float inv; };
+static __device__ __forceinline__ ggml_cuda_mxfp4_scale_result ggml_cuda_mxfp4_scale(float amax) {
+    const int e_floor = ggml_cuda_float_to_e8m0(amax);
+    const float f = ldexpf(amax, 127 - e_floor); // amax / 2^floor(log2(amax)), in [1, 2)
+    // Qmax=7.25: threshold at 7.25/4 = 1.8125
+    const int e = max(0, min(254, e_floor - (f > 1.8125f ? 1 : 2)));
+    return { static_cast<uint8_t>(e), ldexpf(1.0f, 127 - e) };
+}
+
 static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
 #if defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
     // ROCm does not support fp8 in software on devices with fp8 hardware,
@@ -891,13 +911,25 @@ __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e)
 #pragma unroll
     for (int i = 1; i < 8; ++i) {
         const float err = fabsf(ax - pos_lut[i]);
-        if (err < best_err) {
+        if (err < best_err || (err == best_err && i % 2 == 0)) {
             best_err = err;
             best_i   = i;
         }
     }
 
     return static_cast<uint8_t>(best_i | sign_bit);
+}
+
+static __device__ __forceinline__ half2 ggml_cuda_mxfp4_to_half2(uint8_t q) {
+#if CUDART_VERSION >= 12080
+    return half2(__nv_cvt_fp4x2_to_halfraw2(q, __NV_E2M1));
+#else
+    return __floats2half2_rn(0.5f*kvalues_mxfp4[q & 0x0F], 0.5f*kvalues_mxfp4[q >> 4]);
+#endif // CUDART_VERSION >= 12080
+}
+
+static __device__ __forceinline__ float2 ggml_cuda_mxfp4_to_float2(uint8_t q) {
+    return __half22float2(ggml_cuda_mxfp4_to_half2(q));
 }
 
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.

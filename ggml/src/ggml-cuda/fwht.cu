@@ -83,6 +83,9 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
     const float scale = 1 / sqrtf(n);
 
     switch (n) {
+        case 32:
+            ggml_cuda_kernel_launch(fwht_cuda<32>, launch_params, src_d, dst_d, rows, scale);
+            return true;
         case 64:
             ggml_cuda_kernel_launch(fwht_cuda<64>, launch_params, src_d, dst_d, rows, scale);
             return true;

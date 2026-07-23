@@ -143,6 +143,36 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     }
 }
 
+// rounding edge values for f32->mxfp4, near e2m1 code point boundaries
+static void init_tensor_mxfp4_ties(ggml_tensor * tensor) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+    const int64_t n = ggml_nelements(tensor);
+    constexpr int qk = 32; // QK_MXFP4
+    GGML_ASSERT(n % qk == 0);
+
+    std::vector<float> data(n, 0.0f);
+    const float ties[] = {0.1875f, 0.4375f, 0.875f, -0.1875f, -0.4375f, -0.875f};
+
+    auto fill = [&](int64_t i, float amax, float scale) {
+        data[i] = amax;
+        for (int j = 1; j < qk; ++j) {
+            data[i + j] = ties[(j - 1) % 6] * scale;
+        }
+    };
+
+    for (int64_t i = 0, block = 0; i < n; i += qk, ++block) {
+        // Order matters: first matching condition wins. %8==7 implies %4==3,
+        // so the large-amax case must come before the all-zero case.
+        if (block % 16 == 7)       fill(i, 0.001f, 0.0005f);    // small amax
+        else if (block % 32 == 15) fill(i, 1.5f, 0.75f);        // amax in (1,2)
+        else if (block % 64 == 31) fill(i, 0.999f, 0.4995f);    // exp boundary near 1
+        else if (block % 8 == 7)   fill(i, 1000.0f, 500.0f);    // large amax
+        else if (block % 4 == 3)  { /* all-zero, already zeroed */ }
+        else                       fill(i, 2.0f, 1.0f);         // default ties
+    }
+    ggml_backend_tensor_set(tensor, data.data(), 0, n * sizeof(float));
+}
+
 // generate an F16 mask where certain blocks are randomly masked with -INF value
 static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
@@ -433,6 +463,7 @@ static std::string var_to_str(ggml_scale_mode mode) {
 #define VARS_TO_STR14(a, b, c, d, e, f, g, h, i, j, k, l, m, n) VAR_TO_STR(a) + "," + VARS_TO_STR13(b, c, d, e, f, g, h, i, j, k, l, m, n)
 #define VARS_TO_STR15(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) VAR_TO_STR(a) + "," + VARS_TO_STR14(b, c, d, e, f, g, h, i, j, k, l, m, n, o)
 #define VARS_TO_STR16(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) VAR_TO_STR(a) + "," + VARS_TO_STR15(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p)
+#define VARS_TO_STR17(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q) VAR_TO_STR(a) + "," + VARS_TO_STR16(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
 
 #ifdef GGML_USE_SYCL
 static bool inline _isinf(float f) {
@@ -2441,7 +2472,8 @@ struct test_set_rows : public test_case {
     double max_nmse_err() override {
         if (type_dst == GGML_TYPE_Q2_0 || type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 ||
             type_dst == GGML_TYPE_IQ4_NL ||
-            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
+            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0 ||
+            type_dst == GGML_TYPE_MXFP4) {
             // estimate what the max nmse error would be if one quantized value is
             // off by one. The test values are distributed in [-1,1], so it'll be
             // roughly (2.0 / 2^bits)^2, divided by the mean square value of the reference,
@@ -2949,15 +2981,16 @@ struct test_cpy : public test_case {
     bool _src_transpose;
     bool _use_dst_shape;
     bool _use_dst_alloc;
+    const bool mxfp4_ties;
 
     std::string vars() override {
         if (_use_dst_alloc) {
-            return VARS_TO_STR8(type_src, type_dst, ne_src, ne_dst, permute_src, permute_dst, _src_transpose, dst_alloc);
+            return VARS_TO_STR9(type_src, type_dst, ne_src, ne_dst, permute_src, permute_dst, _src_transpose, dst_alloc, mxfp4_ties);
         }
         if (_use_dst_shape) {
-            return VARS_TO_STR7(type_src, type_dst, ne_src, ne_dst, permute_src, permute_dst, _src_transpose);
+            return VARS_TO_STR8(type_src, type_dst, ne_src, ne_dst, permute_src, permute_dst, _src_transpose, mxfp4_ties);
         }
-        return VARS_TO_STR6(type_src, type_dst, ne_src, permute_src, permute_dst, _src_transpose);
+        return VARS_TO_STR7(type_src, type_dst, ne_src, permute_src, permute_dst, _src_transpose, mxfp4_ties);
     }
 
     int64_t total_elements() const {
@@ -2969,7 +3002,8 @@ struct test_cpy : public test_case {
             return 0.0;
         }
         if (type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 || type_dst == GGML_TYPE_IQ4_NL ||
-            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
+            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0 ||
+            type_dst == GGML_TYPE_MXFP4) {
             // estimate what the max nmse error would be if one quantized value is
             // off by one. The test values are distributed in [-150,150], so it'll be
             // roughly (150*2.0 / 2^bits)^2, divided by the mean square value of the reference,
@@ -3002,14 +3036,16 @@ struct test_cpy : public test_case {
             std::array<int64_t, 4> permute_src = {0, 0, 0, 0},
             std::array<int64_t, 4> permute_dst = {0, 0, 0, 0},
             bool transpose_src = false,
-            std::array<int64_t, 4> dst_alloc = {0, 0, 0, 0})
+            std::array<int64_t, 4> dst_alloc = {0, 0, 0, 0},
+            bool mxfp4_ties = false)
         : type_src(type_src), type_dst(type_dst), ne_src(ne_src), ne_dst(ne_dst), permute_src(permute_src), permute_dst(permute_dst),
           dst_alloc(dst_alloc),
           _src_use_permute(permute_src[0] + permute_src[1] + permute_src[2] + permute_src[3] > 0),
           _dst_use_permute(permute_dst[0] + permute_dst[1] + permute_dst[2] + permute_dst[3] > 0),
           _src_transpose(transpose_src),
           _use_dst_shape(ne_dst[0] >= 0 && ne_dst[1] >= 0 && ne_dst[2] >= 0 && ne_dst[3] >= 0),
-          _use_dst_alloc(dst_alloc[0] > 0){}
+          _use_dst_alloc(dst_alloc[0] > 0),
+          mxfp4_ties(mxfp4_ties){}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * src = ggml_new_tensor(ctx, type_src, 4, ne_src.data());
@@ -3054,8 +3090,13 @@ struct test_cpy : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            // test extended range of values to check if casting between f32 and i32 is consistent
-            init_tensor_uniform(t, -150.f, 150.f);
+            if (mxfp4_ties && t->type == GGML_TYPE_F32 && strcmp(t->name, "src") == 0) {
+                // exact e2m1 midpoints: backends must tie-break identically (RNE)
+                init_tensor_mxfp4_ties(t);
+            } else {
+                // test extended range of values to check if casting between f32 and i32 is consistent
+                init_tensor_uniform(t, -150.f, 150.f);
+            }
         }
     }
 };
@@ -7084,13 +7125,18 @@ struct test_flash_attn_ext : public test_case {
     const ggml_type type_K;
     const ggml_type type_V;
     std::array<int32_t, 4> permute;
+    const bool quant_in_graph; // build K/V as F32 and quantize in-graph (exercises the backend's f32->mxfp4 path)
+    const bool v_is_k_view;   // MLA: V is a sub-view of the K cache
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
 
     std::string vars() override {
-        return VARS_TO_STR15(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, quant_in_graph, v_is_k_view, kv_view);
     }
 
     double max_nmse_err() override {
+        if (quant_in_graph && (type_K == GGML_TYPE_MXFP4 || type_V == GGML_TYPE_MXFP4)) {
+            return 4e-3; // CPU/CUDA f32->mxfp4 quantizer disagreement + F16 accum rounding
+        }
         return 5e-4;
     }
 
@@ -7104,9 +7150,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true)
+                        bool quant_in_graph = false, bool v_is_k_view = false, bool kv_view = true)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view) {}
+          type_K(type_K), type_V(type_V), permute(permute), quant_in_graph(quant_in_graph), v_is_k_view(v_is_k_view), kv_view(kv_view) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7134,23 +7180,40 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * q = create_permuted(GGML_TYPE_F32, hsk_padded, nb, nh*nr23[0], nr23[1], false);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = create_permuted(type_K,        hsk_padded, kv, nh,         nr23[1], kv_view); // the K tensor is usually a view of the K cache
-        ggml_set_name(k, "k");
-
+        ggml_tensor * k = nullptr;
         ggml_tensor * v = nullptr;
-        if (type_K == type_V && hsk_padded == 576 && hsv_padded == 512) {
-            // TODO: this branch should become a separate test case parameter instead of hardcoding this for these head shapes
+        if (quant_in_graph) {
+            // in-graph quant needs identity layout, no v-is-k-view
+            const bool id_permute = permute == std::array<int32_t, 4>{0, 1, 2, 3};
+            GGML_ASSERT(id_permute);
+            GGML_ASSERT(!v_is_k_view);
 
-            // in this branch, the V cache is sub-view of the K cache. this is used by some MLA-based models
-            // for more info:
-            //   - https://github.com/ggml-org/llama.cpp/pull/13435
-            //   - https://github.com/ggml-org/llama.cpp/pull/18953#issuecomment-3774948392
-            //   - https://github.com/ggml-org/llama.cpp/pull/18986
-            v = ggml_view_4d(ctx, k, hsv_padded, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
+            // K/V start as F32 and are cast in-graph, so the backend f32->mxfp4 quant runs in the graph
+            ggml_tensor * k_src = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk_padded, kv, nh, nr23[1]);
+            ggml_set_name(k_src, "k_src");
+            ggml_tensor * k_dst = ggml_new_tensor_4d(ctx, type_K,        hsk_padded, kv, nh, nr23[1]);
+            k = ggml_cpy(ctx, k_src, k_dst);
+            ggml_set_name(k, "k");
+
+            ggml_tensor * v_src = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsv_padded, kv, nh, nr23[1]);
+            ggml_set_name(v_src, "v_src");
+            ggml_tensor * v_dst = ggml_new_tensor_4d(ctx, type_V,        hsv_padded, kv, nh, nr23[1]);
+            v = ggml_cpy(ctx, v_src, v_dst);
+            ggml_set_name(v, "v");
         } else {
-            v = create_permuted(type_V,        hsv_padded, kv, nh,         nr23[1], kv_view); // the V tensor is usually a view of the V cache
+            k = create_permuted(type_K,        hsk_padded, kv, nh,         nr23[1], kv_view); // the K tensor is usually a view of the K cache
+            ggml_set_name(k, "k");
+
+            if (v_is_k_view) {
+                // MLA: V cache is a sub-view of the K cache
+                GGML_ASSERT(type_K == type_V);
+                GGML_ASSERT(hsv_padded <= hsk_padded);
+                v = ggml_view_4d(ctx, k, hsv_padded, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
+            } else {
+                v = create_permuted(type_V,        hsv_padded, kv, nh,         nr23[1], kv_view); // the V tensor is usually a view of the V cache
+            }
+            ggml_set_name(v, "v");
         }
-        ggml_set_name(v, "v");
 
         ggml_tensor * m = nullptr;
         if (mask) {
@@ -7179,6 +7242,8 @@ struct test_flash_attn_ext : public test_case {
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
+            } else if (quant_in_graph && (type_K == GGML_TYPE_MXFP4 || type_V == GGML_TYPE_MXFP4) && (strcmp(t->name, "k_src") == 0 || strcmp(t->name, "v_src") == 0)) {
+                init_tensor_mxfp4_ties(t);
             } else {
                 init_tensor_uniform(t);
             }
@@ -8862,6 +8927,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // quant block count not a multiple of the kernel block size
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q4_0, {96, 1, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32, {96, 1, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_MXFP4, {96, 1, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_MXFP4, GGML_TYPE_F32, {96, 1, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_MXFP4, {96, 1, 1, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {0, 0, 0, 0}, true)); // e2m1 tie values
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}));
@@ -9135,7 +9203,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 32, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 4, 128, {2, 3}));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 512, 256)); // many rows
-    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 32, 32));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 1, 1024)); // too big (N>512)
 
 #if 0
@@ -9867,12 +9936,60 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    auto add_fa_mxfp4 = [&](int64_t hsk, int64_t hsv, int64_t nh = 4, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 512, int64_t nb = 1,
+                            bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f,
+                            std::array<int32_t, 4> permute = {0, 1, 2, 3}, bool quant_in_graph = false, bool v_is_k_view = false) {
+        test_cases.emplace_back(new test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap,
+                                                        GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, permute, quant_in_graph, v_is_k_view));
+    };
+
+    for (int hs : { 64, 96, 128, 256 }) {
+        for (int64_t nb : { 1, 2 }) {
+            add_fa_mxfp4(hs, hs, 4, {1, 1}, 512, nb);
+        }
+    }
+    add_fa_mxfp4(128, 128, 4, {1, 1}, 512, 1, true, true);              // sinks
+    add_fa_mxfp4( 64,  64, 4, {1, 1}, 512, 1, true, true);              // sinks
+    add_fa_mxfp4(128, 128, 4, {1, 1}, 512, 1, true, false, 0.0f, 1.0f); // logit softcap
+    add_fa_mxfp4(256, 256, 4, {1, 1}, 512, 1, true, false, 0.0f, 1.0f); // logit softcap
+    add_fa_mxfp4(128, 128, 4, {1, 1}, 512, 1, true, false, 0.5f);       // ALiBi
+    add_fa_mxfp4(128, 128, 4, {2, 1}, 512, 1);
+    add_fa_mxfp4(128, 128, 4, {2, 2}, 512, 1);
+    add_fa_mxfp4(128, 128, 4, {4, 1}, 512, 1);
+    add_fa_mxfp4(128, 128, 4, {4, 1}, 512, 2);
+    add_fa_mxfp4(128, 128, 4, {8, 1}, 512, 1);
+    add_fa_mxfp4(128, 128, 4, {1, 1}, 512, 1, true, false, 0.0f, 0.0f, {0, 2, 1, 3}); // permuted K/V views
+    add_fa_mxfp4(128, 128, 4, {1, 1}, 512, 1, false);                 // no mask
+    add_fa_mxfp4(128, 128, 4, {1, 1},  64, 1);                        // short cache
+    add_fa_mxfp4(128, 128, 4, {1, 1},  31, 1);                        // odd kv (QK_MXFP4=32 boundary)
+    add_fa_mxfp4(128, 128, 4, {1, 1}, 512, 4);
+    add_fa_mxfp4(192, 128, 4, {8, 1}, 512, 2);
+    add_fa_mxfp4(512, 512, 4, {4, 1}, 512, 2);
+    add_fa_mxfp4( 80,  80, 4, {1, 1}, 512, 2);
+    add_fa_mxfp4(576, 512, 1, {20, 1}, 512, 2, true, false, 0.0f, 0.0f, {0, 1, 2, 3}, false, true); // MLA: V is a sub-view of K
+
+    // quant_in_graph=true: exercise f32->mxfp4 quantization accuracy through attention
+    // (cases above initialize K/V directly as MXFP4, skipping the in-graph quant step)
+    for (int64_t nb : { 1, 2 }) {
+        add_fa_mxfp4(128, 128, 4, {1, 1}, 512, nb, true, false, 0.0f, 0.0f, {0, 1, 2, 3}, true);
+    }
+    add_fa_mxfp4( 64,  64, 4, {1, 1}, 512, 1, true, false, 0.0f, 0.0f, {0, 1, 2, 3}, true);
+    add_fa_mxfp4(256, 256, 4, {1, 1}, 512, 1, true, false, 0.0f, 0.0f, {0, 1, 2, 3}, true);
+    add_fa_mxfp4(128, 128, 4, {2, 1}, 512, 1, true, false, 0.0f, 0.0f, {0, 1, 2, 3}, true);
+    add_fa_mxfp4(128, 128, 4, {1, 1}, 512, 1, true, false, 0.0f, 1.0f, {0, 1, 2, 3}, true);
+    add_fa_mxfp4(128, 128, 4, {1, 1},  31, 1, true, false, 0.0f, 0.0f, {0, 1, 2, 3}, true); // odd kv + in-graph quant
+    add_fa_mxfp4(128, 128, 4, {1, 1}, 512, 1, true, true, 0.0f, 0.0f, {0, 1, 2, 3}, true);   // sinks + in-graph quant
+    add_fa_mxfp4( 64,  64, 8, {8, 1}, 7680, 1);
+    add_fa_mxfp4(128, 128, 8, {8, 1}, 7680, 1);
+    add_fa_mxfp4(256, 256, 8, {8, 1}, 7680, 1);
+
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
             if (hsk == 192 && (hsv != 128 && hsv != 192)) continue;
             if (hsk == 576 && hsv != 512) continue; // DeepSeek MLA
             if (hsk == 320 && hsv != 256) continue; // Mistral4 MLA
+            const bool v_is_k_view = (hsk == 576 && hsv == 512); // DeepSeek MLA: V is a sub-view of K
 
             for (bool mask : { true, false } ) {
                 for (bool sinks : { true, false } ) {
@@ -9899,11 +10016,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                     for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
                                                         if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72) continue;
                                                         test_cases.emplace_back(new test_flash_attn_ext(
-                                                                    hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV));
+                                                                    hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV, {0, 1, 2, 3}, false, v_is_k_view));
                                                         // run fewer test cases permuted
                                                         if (mask == true && max_bias == 0.0f && logit_softcap == 0 && kv == 512) {
                                                             test_cases.emplace_back(new test_flash_attn_ext(
-                                                                        hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV, {0, 2, 1, 3}));
+                                                                        hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV, {0, 2, 1, 3}, false, v_is_k_view));
                                                         }
                                                     }
                                                 }
@@ -9933,6 +10050,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_MXFP4));
 
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
@@ -9943,10 +10062,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
     // MLA shape (V is a view of K) with quantized KV
-    // (the test harness builds V as a view of K for this shape; see build_graph)
-    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
-    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
-    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 1024,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 1024,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false, true));
 
     // large-KV F16 cases (Qwen3.6-27B geometry and a llama-class control): the upstream matrix
     // stops at kv=1024, blind to long-context FA bugs (e.g. the oneDNN SDPA ordering race on BMG).
@@ -9958,10 +10076,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // dense-allocated (non-view) quant K/V at batch >= 64, in cache and native layouts
-    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
-    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
-    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
-    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false, false, false));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false, false, false));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false, false, false));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false, false, false));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
@@ -10260,6 +10378,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 1, 256));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 32, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 64, 2048, 64));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 2048, 32));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 2048, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 2048, 256));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 512, 2048, 512));
@@ -10338,6 +10457,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16)); // f16 baselines for the mxfp4 cases below
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    for (int hs : { 64, 96, 128, 256 }) {
+        for (int64_t nb : { 1, 4, 512 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {8, 1}, 7680, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+        }
+    }
 
     // q8_0 KV cases with long context (decode and prompt)
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   128, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));

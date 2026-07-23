@@ -250,13 +250,19 @@ private:
     bool attn_rot_k = false;
     bool attn_rot_v = false;
 
+    // Use blockwise rotation
+    bool k_blockwise = false;
+    bool v_blockwise = false;
+
     // if all layers participating in the cache have constant head size, the value is stored here
     // otherwise the value is -1
     int32_t n_embd_head_k_all = 0;
     int32_t n_embd_head_v_all = 0;
 
-    // pre-computed hadamard martrices
+    // pre-computed hadamard matrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
+
+    void gen_hadamard(int64_t n);
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
