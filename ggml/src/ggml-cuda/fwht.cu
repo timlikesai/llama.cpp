@@ -5,40 +5,42 @@ template <int N>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
 __global__ void fwht_cuda(const float * src, float * dst, const int64_t n_rows, const float scale) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    // for N < warp_size (e.g. 32 on 64-wide waves) one warp does warp_size/N rows using N-wide shuffles
+    constexpr int lanes_per_row = N < warp_size ? N : warp_size;
+    constexpr int rows_per_warp = warp_size / lanes_per_row;
 
-    const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
+    const int lane = threadIdx.x % lanes_per_row;
 
-    if (r >= n_rows) {
-        return;
-    }
+    const int64_t r0 = ((int64_t) blockIdx.x * blockDim.y + threadIdx.y) * rows_per_warp + threadIdx.x / lanes_per_row;
+    // clamp instead of early return so all lanes reach the shuffles
+    const int64_t r = r0 < n_rows ? r0 : n_rows - 1;
 
     src += r * N;
     dst += r * N;
 
-    static constexpr int el_w = N / warp_size;
+    static constexpr int el_w = N / lanes_per_row;
     float     reg[el_w];
-    const int lane = threadIdx.x;
 
     ggml_cuda_pdl_sync();
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
-        reg[i] = src[i * warp_size + lane] * scale;
+        reg[i] = src[i * lanes_per_row + lane] * scale;
     }
 
 #pragma unroll
-    for (int h = 1; h < warp_size; h *= 2) {
+    for (int h = 1; h < lanes_per_row; h *= 2) {
 #pragma unroll
         for (int j = 0; j < el_w; j++) {
             const float val  = reg[j];
-            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
+            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, lanes_per_row);
 
             reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
         }
     }
 
 #pragma unroll
-    for (int h = warp_size; h < N; h *= 2) {
-        const int step = h / warp_size;
+    for (int h = lanes_per_row; h < N; h *= 2) {
+        const int step = h / lanes_per_row;
 #pragma unroll
         for (int j = 0; j < el_w; j += 2 * step) {
 #pragma unroll
@@ -52,9 +54,11 @@ __global__ void fwht_cuda(const float * src, float * dst, const int64_t n_rows, 
         }
     }
 
+    if (r0 < n_rows) {
 #pragma unroll
-    for (int i = 0; i < el_w; ++i) {
-        dst[i * warp_size + lane] = reg[i];
+        for (int i = 0; i < el_w; ++i) {
+            dst[i * lanes_per_row + lane] = reg[i];
+        }
     }
 }
 
@@ -71,8 +75,9 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
 
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int rows_per_block = 4;
+    const int rows_per_warp  = n < warp_size ? warp_size / n : 1;
 
-    const int64_t num_blocks = (rows + rows_per_block - 1) / rows_per_block;
+    const int64_t num_blocks = (rows + rows_per_block * rows_per_warp - 1) / (rows_per_block * rows_per_warp);
 
     cudaStream_t                         stream = ctx.stream();
     dim3                                 grid_dims(num_blocks, 1, 1);

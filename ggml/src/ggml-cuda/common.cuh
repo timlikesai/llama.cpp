@@ -929,7 +929,11 @@ static __device__ __forceinline__ half2 ggml_cuda_mxfp4_to_half2(uint8_t q) {
 }
 
 static __device__ __forceinline__ float2 ggml_cuda_mxfp4_to_float2(uint8_t q) {
+#if CUDART_VERSION >= 12080
     return __half22float2(ggml_cuda_mxfp4_to_half2(q));
+#else
+    return make_float2(0.5f*kvalues_mxfp4[q & 0x0F], 0.5f*kvalues_mxfp4[q >> 4]);
+#endif // CUDART_VERSION >= 12080
 }
 
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.

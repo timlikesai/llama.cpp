@@ -638,8 +638,8 @@ static __device__ __forceinline__ void dequantize_V_mxfp4(const void * __restric
 #pragma unroll
     for (int j = 0; j < ne/2; ++j) {
         const float2 v = ggml_cuda_mxfp4_to_float2(x[ib].qs[b0 + j]);
-        own[j] = d * (low ? v.x : v.y);
-        xch[j] = d * (low ? v.y : v.x);
+        own[j] = (low ? v.x : v.y) * d;
+        xch[j] = (low ? v.y : v.x) * d;
     }
 
     constexpr int shfl_dist = QK_MXFP4 / (2 * ne);
