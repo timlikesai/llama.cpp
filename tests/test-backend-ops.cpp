@@ -3047,6 +3047,9 @@ struct test_cpy : public test_case {
           _use_dst_alloc(dst_alloc[0] > 0),
           mxfp4_ties(mxfp4_ties){}
 
+    test_cpy(ggml_type type_src, ggml_type type_dst, std::array<int64_t, 4> ne_src, bool mxfp4_ties)
+        : test_cpy(type_src, type_dst, ne_src, {-1, -1, -1, -1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {0, 0, 0, 0}, mxfp4_ties) {}
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * src = ggml_new_tensor(ctx, type_src, 4, ne_src.data());
         ggml_set_param(src);
@@ -7242,7 +7245,7 @@ struct test_flash_attn_ext : public test_case {
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
-            } else if (quant_in_graph && (type_K == GGML_TYPE_MXFP4 || type_V == GGML_TYPE_MXFP4) && (strcmp(t->name, "k_src") == 0 || strcmp(t->name, "v_src") == 0)) {
+            } else if (quant_in_graph && ((strcmp(t->name, "k_src") == 0 && type_K == GGML_TYPE_MXFP4) || (strcmp(t->name, "v_src") == 0 && type_V == GGML_TYPE_MXFP4))) {
                 init_tensor_mxfp4_ties(t);
             } else {
                 init_tensor_uniform(t);
@@ -8929,7 +8932,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32, {96, 1, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_MXFP4, {96, 1, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_MXFP4, GGML_TYPE_F32, {96, 1, 1, 1}));
-    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_MXFP4, {96, 1, 1, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {0, 0, 0, 0}, true)); // e2m1 tie values
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_MXFP4, {96, 1, 1, 1}, true)); // e2m1 tie values
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}));
@@ -9950,10 +9953,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             add_fa_mxfp4(hs, hs, 4, {1, 1}, 512, nb);
         }
     }
-    add_fa_mxfp4(128, 128, 4, {1, 1}, 512, 1, true, true);              // sinks
-    add_fa_mxfp4( 64,  64, 4, {1, 1}, 512, 1, true, true);              // sinks
-    add_fa_mxfp4(128, 128, 4, {1, 1}, 512, 1, true, false, 0.0f, 1.0f); // logit softcap
-    add_fa_mxfp4(256, 256, 4, {1, 1}, 512, 1, true, false, 0.0f, 1.0f); // logit softcap
+    for (int hs : {  64, 128 }) {
+        add_fa_mxfp4(hs, hs, 4, {1, 1}, 512, 1, true, true); // sinks
+    }
+    for (int hs : { 128, 256 }) {
+        add_fa_mxfp4(hs, hs, 4, {1, 1}, 512, 1, true, false, 0.0f, 1.0f); // logit softcap
+    }
     add_fa_mxfp4(128, 128, 4, {1, 1}, 512, 1, true, false, 0.5f);       // ALiBi
     add_fa_mxfp4(128, 128, 4, {2, 1}, 512, 1);
     add_fa_mxfp4(128, 128, 4, {2, 2}, 512, 1);
@@ -9972,18 +9977,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // quant_in_graph=true: exercise f32->mxfp4 quantization accuracy through attention
     // (cases above initialize K/V directly as MXFP4, skipping the in-graph quant step)
-    for (int64_t nb : { 1, 2 }) {
-        add_fa_mxfp4(128, 128, 4, {1, 1}, 512, nb, true, false, 0.0f, 0.0f, {0, 1, 2, 3}, true);
+    auto add_fa_mxfp4_qig = [&](int64_t hs, int64_t kv = 512, std::array<int64_t, 2> nr23 = {1, 1}, int64_t nb = 1,
+                                bool sinks = false, float logit_softcap = 0.0f) {
+        add_fa_mxfp4(hs, hs, 4, nr23, kv, nb, true, sinks, 0.0f, logit_softcap, {0, 1, 2, 3}, true);
+    };
+
+    for (int64_t hs : { 64, 128, 256 }) {
+        add_fa_mxfp4_qig(hs);
     }
-    add_fa_mxfp4( 64,  64, 4, {1, 1}, 512, 1, true, false, 0.0f, 0.0f, {0, 1, 2, 3}, true);
-    add_fa_mxfp4(256, 256, 4, {1, 1}, 512, 1, true, false, 0.0f, 0.0f, {0, 1, 2, 3}, true);
-    add_fa_mxfp4(128, 128, 4, {2, 1}, 512, 1, true, false, 0.0f, 0.0f, {0, 1, 2, 3}, true);
-    add_fa_mxfp4(128, 128, 4, {1, 1}, 512, 1, true, false, 0.0f, 1.0f, {0, 1, 2, 3}, true);
-    add_fa_mxfp4(128, 128, 4, {1, 1},  31, 1, true, false, 0.0f, 0.0f, {0, 1, 2, 3}, true); // odd kv + in-graph quant
-    add_fa_mxfp4(128, 128, 4, {1, 1}, 512, 1, true, true, 0.0f, 0.0f, {0, 1, 2, 3}, true);   // sinks + in-graph quant
-    add_fa_mxfp4( 64,  64, 8, {8, 1}, 7680, 1);
-    add_fa_mxfp4(128, 128, 8, {8, 1}, 7680, 1);
-    add_fa_mxfp4(256, 256, 8, {8, 1}, 7680, 1);
+    add_fa_mxfp4_qig(128, 512, {1, 1}, 2);
+    add_fa_mxfp4_qig(128, 512, {2, 1});
+    add_fa_mxfp4_qig(128, 512, {1, 1}, 1, false, 1.0f); // logit softcap
+    add_fa_mxfp4_qig(128, 31);                           // odd kv
+    add_fa_mxfp4_qig(128, 512, {1, 1}, 1, true);        // sinks
+    for (int hs : { 64, 128, 256 }) {
+        add_fa_mxfp4(hs, hs, 8, {8, 1}, 7680, 1);
+    }
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {

@@ -8555,9 +8555,6 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
     ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
 
-    // mxfp4 K has no lossless vec_dot (Q would be quantized to q8_0): dequantize K rows to f32 instead
-    const bool        k_is_mxfp4 = (k->type == GGML_TYPE_MXFP4);
-    ggml_to_float_t const k_to_float = k_is_mxfp4 ? ggml_get_type_traits(k->type)->to_float : nullptr;
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
 
@@ -8597,7 +8594,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const int iv2 = iq2 / rv2;
 
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
-        if (!k_is_mxfp4) {
+        if (k->type != GGML_TYPE_MXFP4) {
             q_to_vec_dot(pq, Q_q, DK);
         }
 
@@ -8614,9 +8611,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float s; // KQ value
 
             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-            if (k_is_mxfp4) {
+            // mxfp4 K has no lossless vec_dot (Q would be quantized to q8_0): dequantize K rows to f32 instead
+            if (k->type == GGML_TYPE_MXFP4) {
                 float * K32 = (float *) Q_q;
-                k_to_float(k_data, K32, DK);
+                ggml_get_type_traits(GGML_TYPE_MXFP4)->to_float(k_data, K32, DK);
                 ggml_vec_dot_f32(DK, &s, 0, pq, 0, K32, 0, 1);
             } else {
                 kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
