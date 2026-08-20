@@ -4,6 +4,7 @@
 #include "ggml-cpu-impl.h"
 #include "simd-mappings.h"
 #include "ggml-quants.h"
+#include "ggml-mxfp.h"
 #include "quants.h"
 
 #include "arch-fallback.h"
@@ -60,6 +61,14 @@ void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
 
 void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_nvfp4_ref(x, y, k);
+}
+
+void quantize_row_mxfp8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp8_ref(x, y, k);
+}
+
+void quantize_row_mxfp6(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp6_ref(x, y, k);
 }
 
 //
@@ -324,6 +333,62 @@ void ggml_vec_dot_mxfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
         sumf += d * (sumi1 + sumi2);
     }
     *s = sumf;
+}
+
+// mxfp6/mxfp8: codes decode to float (no integer LUT applies), so the dot uses
+// the ggml-mxfp.h reference decode; per-block partial sums keep the mxfp4 accumulation
+static void ggml_vec_dot_mxfp_q8_0_generic_impl(int n, float * GGML_RESTRICT s,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy,
+        float (*decode)(const void * block, int j), int qk, size_t block_size) {
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    const int nb = n / qk;
+
+    int ib = 0;
+    float sumf = 0;
+
+    for (; ib < nb; ++ib) {
+        const char * block = (const char *) vx + ib*block_size;
+        const float d = GGML_CPU_FP16_TO_FP32(y[ib].d)*GGML_E8M0_TO_FP32((uint8_t) block[0]);
+
+        float sumi = 0;
+        for (int j = 0; j < qk; ++j) {
+            sumi += decode(block, j) * y[ib].qs[j];
+        }
+        sumf += d * sumi;
+    }
+    *s = sumf;
+}
+
+static float ggml_cpu_mxfp6_value(const void * block, int j) {
+    const block_mxfp6 * b = (const block_mxfp6 *) block;
+    return ggml_mxfp_e2m3_to_f32(ggml_mxfp6_code_get(b->qs, j));
+}
+
+static float ggml_cpu_mxfp8_value(const void * block, int j) {
+    const block_mxfp8 * b = (const block_mxfp8 *) block;
+    return ggml_mxfp_e4m3_to_f32(b->qs[j]);
+}
+
+void ggml_vec_dot_mxfp6_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_MXFP6 == 0);
+    static_assert(QK_MXFP6 == QK8_0, "QK_MXFP6 and QK8_0 must be the same");
+    ggml_vec_dot_mxfp_q8_0_generic_impl(n, s, vx, vy, ggml_cpu_mxfp6_value, QK_MXFP6, sizeof(block_mxfp6));
+}
+
+void ggml_vec_dot_mxfp8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_MXFP8 == 0);
+    static_assert(QK_MXFP8 == QK8_0, "QK_MXFP8 and QK8_0 must be the same");
+    ggml_vec_dot_mxfp_q8_0_generic_impl(n, s, vx, vy, ggml_cpu_mxfp8_value, QK_MXFP8, sizeof(block_mxfp8));
 }
 
 // NVFP4: super-block of 64 elements = 4 sub-blocks of 16 = 2 q8_0 blocks

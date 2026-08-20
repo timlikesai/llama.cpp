@@ -109,6 +109,12 @@ typedef sycl::half2 ggml_half2;
 #define QI_MXFP4 (QK_MXFP4 / (4 * QR_MXFP4))
 #define QR_MXFP4 2
 
+#define QI_MXFP8 (QK_MXFP8 / (4 * QR_MXFP8))
+#define QR_MXFP8 2
+
+#define QI_MXFP6 (QK_MXFP6 / (4 * QR_MXFP6))
+#define QR_MXFP6 2
+
 #define QI_NVFP4 (QK_NVFP4 / (4 * QR_NVFP4))
 #define QR_NVFP4 2
 
@@ -218,6 +224,19 @@ typedef struct {
 } block_mxfp4;
 static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
 
+#define QK_MXFP6 32
+typedef struct {
+    uint8_t e; // E8M0
+    uint8_t qs[QK_MXFP6*3/4]; // 6-bit e2m3 codes, packed as a little-endian bitstream
+} block_mxfp6;
+static_assert(sizeof(block_mxfp6) == sizeof(uint8_t) + QK_MXFP6*3/4, "wrong mxfp6 block size/padding");
+
+#define QK_MXFP8 32
+typedef struct {
+    uint8_t e; // E8M0
+    uint8_t qs[QK_MXFP8]; // e4m3 codes
+} block_mxfp8;
+static_assert(sizeof(block_mxfp8) == sizeof(uint8_t) + QK_MXFP8, "wrong mxfp8 block size/padding");
 #define QK_NVFP4 64
 #define QK_NVFP4_SUB 16  // sub-block size for per-group scales
 typedef struct {

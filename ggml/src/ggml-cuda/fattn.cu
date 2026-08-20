@@ -444,15 +444,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_NONE;
     }
 
-    if (K->type == GGML_TYPE_MXFP4 && V->type != GGML_TYPE_F16 && V->type != GGML_TYPE_F32 && V->type != GGML_TYPE_MXFP4) {
+    if (K->type == GGML_TYPE_MXFP4 && V->type != GGML_TYPE_F16 && V->type != GGML_TYPE_MXFP4) {
         return BEST_FATTN_KERNEL_NONE;
     }
-    if (V->type == GGML_TYPE_MXFP4 && K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_F32 && K->type != GGML_TYPE_MXFP4) {
+    if (V->type == GGML_TYPE_MXFP4 && K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_MXFP4) {
         return BEST_FATTN_KERNEL_NONE;
     }
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type && K->type != GGML_TYPE_MXFP4 && V->type != GGML_TYPE_MXFP4) {
+    if (K->type != V->type) {
         return BEST_FATTN_KERNEL_NONE;
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS

@@ -73,6 +73,12 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_MXFP4:
             mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, args, stream);
             break;
+        case GGML_TYPE_MXFP6:
+            mul_mat_q_case<GGML_TYPE_MXFP6>(ctx, args, stream);
+            break;
+        case GGML_TYPE_MXFP8:
+            mul_mat_q_case<GGML_TYPE_MXFP8>(ctx, args, stream);
+            break;
         case GGML_TYPE_NVFP4:
             mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
             break;
@@ -128,16 +134,16 @@ void ggml_cuda_mul_mat_q(
 
     const bool fallback = ne01 % 128 != 0;
 
-    const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
-    const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
-    const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
+    const bool use_mxfp_mma = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_MXFP6 || src0->type == GGML_TYPE_MXFP8 || src0->type == GGML_TYPE_NVFP4);
+    const size_t y_block_size       = use_mxfp_mma ? (src0->type == GGML_TYPE_NVFP4 ? sizeof(block_fp4_mmq) : sizeof(block_mxfp_mmq)) : sizeof(block_q8_1_mmq);
+    const size_t y_values_per_block = use_mxfp_mma ? (src0->type == GGML_TYPE_NVFP4 ? QK_FP4_MMQ : QK_FP8_MMQ) : QK8_1_MMQ;
 
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
             ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
-        if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
+        if (src0->type == GGML_TYPE_NVFP4 && use_mxfp_mma) {
             src1_scale.alloc(ne13*ne12*ne11);
         }
 
@@ -145,7 +151,11 @@ void ggml_cuda_mul_mat_q(
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
-            if (use_native_fp4) {
+            if (use_mxfp_mma) {
+                // the mixed mxfp path loads activations as float4
+                if (src0->type != GGML_TYPE_NVFP4) {
+                    GGML_ASSERT(ggml_cuda_is_aligned(src1, 16));
+                }
                 static constexpr size_t align_float8 = 32;
                 const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
@@ -160,14 +170,12 @@ void ggml_cuda_mul_mat_q(
         }
 
         // Stride depends on quantization format
-        const int64_t s12 = use_native_fp4 ?
-                                ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
-                                ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+        const int64_t s12 = ne11 * ne10_padded * y_block_size / (y_values_per_block * sizeof(int));
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
-            src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
+            src0->type == GGML_TYPE_NVFP4 && use_mxfp_mma ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
@@ -206,7 +214,7 @@ void ggml_cuda_mul_mat_q(
         ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
-    if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
+    if (src0->type == GGML_TYPE_NVFP4 && use_mxfp_mma) {
         src1_scale.alloc(ne12*n_expert_used);
     }
 
@@ -219,7 +227,11 @@ void ggml_cuda_mul_mat_q(
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
 
-        if (use_native_fp4) {
+        if (use_mxfp_mma) {
+            // the mixed mxfp path loads activations as float4
+            if (src0->type != GGML_TYPE_NVFP4) {
+                GGML_ASSERT(ggml_cuda_is_aligned(src1, 16));
+            }
             static constexpr size_t align_float8 = 32;
             const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
             if (dedup_bcast) {
@@ -240,8 +252,7 @@ void ggml_cuda_mul_mat_q(
     }
 
     static_assert(QK_FP4_MMQ == 8 * QK_MXFP4, "QK_FP4_MMQ needs to be 8 * QK_MXFP4");
-    const int64_t s12 = use_native_fp4 ? ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
-                                         ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+    const int64_t s12 = ne11 * ne10_padded * y_block_size / (y_values_per_block * sizeof(int));
     const int64_t s13 = ne12*s12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
@@ -288,6 +299,8 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_IQ4_NL:
 // -------------------------------------------------
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP6:
+        case GGML_TYPE_MXFP8:
         case GGML_TYPE_NVFP4:
             mmq_supported = true;
             break;

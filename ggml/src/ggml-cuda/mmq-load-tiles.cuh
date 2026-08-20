@@ -1620,45 +1620,73 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
-template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_mxfp4_fp4(
+// x tile loaders for the mixed mxfp (mxfp4/mxfp6/mxfp8) mma. Every mxfp block has a 1-byte
+// ue8m0 scale and 32 values; each format adapter turns the encoded values into one-byte
+// containers (e2m1/e2m3/e4m3 code) in natural k order, all sharing the same strided layout.
+static __device__ __forceinline__ void ggml_cuda_mmq_mxfp4_to_containers(const block_mxfp4 * bxi, uint8_t * o) {
+    // qs byte p: low nibble = element p, high nibble = element p+16
+    const uint32_t q0 = get_int_b1(bxi->qs, 0);
+    const uint32_t q1 = get_int_b1(bxi->qs, 1);
+    const uint32_t q2 = get_int_b1(bxi->qs, 2);
+    const uint32_t q3 = get_int_b1(bxi->qs, 3);
+    uint4 * o4 = (uint4 *) o;
+    o4[0] = make_uint4((q0 << 2) & 0x3C3C3C3C, (q1 << 2) & 0x3C3C3C3C,
+                              (q2 << 2) & 0x3C3C3C3C, (q3 << 2) & 0x3C3C3C3C);
+    o4[1] = make_uint4((q0 >> 2) & 0x3C3C3C3C, (q1 >> 2) & 0x3C3C3C3C,
+                              (q2 >> 2) & 0x3C3C3C3C, (q3 >> 2) & 0x3C3C3C3C);
+}
+
+static __device__ __forceinline__ void ggml_cuda_mmq_mxfp6_to_containers(const block_mxfp6 * bxi, uint8_t * o) {
+    // upper 2 bits of each container byte are ignored by the HW
+    #pragma unroll
+    for (int j = 0; j < QK_MXFP6; ++j) {
+        o[j] = ggml_mxfp6_code_get(bxi->qs, j);
+    }
+}
+
+static __device__ __forceinline__ void ggml_cuda_mmq_mxfp8_to_containers(const block_mxfp8 * bxi, uint8_t * o) {
+    // raw e4m3 bytes
+    memcpy(o, bxi->qs, QK_MXFP8);
+}
+
+// x tile loader for the mixed mxfp mma: 1-byte ue8m0 scale + 32 values per block;
+// the per-format adapter writes the values into one-byte containers in natural k order.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_mxfp(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
     constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
-
+    constexpr int iter_k      = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     int *      x_qs = (int *) x_tile;
-    uint32_t * x_sc = (uint32_t *) (x_qs + 2 * MMQ_TILE_NE_K);
-
+    uint32_t * x_sc = (uint32_t *) (x_qs + iter_k / 4);
     const int txi = threadIdx.x;
-
-    constexpr int iter_k = ggml_cuda_mmq_get_K_vram(type, J, fallback);
-
-    constexpr int threads_per_row = iter_k / QK_MXFP4;  // each thread processes 1 block
+    constexpr int threads_per_row = iter_k / 32; // 32 values per block, common to all mxfp
     constexpr int rows_per_warp   = warp_size / threads_per_row;
     const int     kbx             = txi % threads_per_row;
     const int     row_in_warp     = txi / threads_per_row;
-
-#pragma unroll
+    #pragma unroll
     for (int i0 = 0; i0 < I; i0 += rows_per_warp * nwarps) {
         int i = i0 + threadIdx.y * rows_per_warp + row_in_warp;
-
         if constexpr (fallback) {
             i = min(i, i_max);
         }
-
-        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i * stride + kbx;
-
-        // quantize_mxfp4_mmq permutes nibbles to match the quantized format
-        const int k0 = kbx * 4;
-        memcpy(x_qs + i*sram_stride + k0, bxi->qs, 16);
-
-        // Load E8M0 scales: pack 2 consecutive scales into one uint32
-        if (kbx % 2 == 0) {
-            uint32_t e = bxi->e;
-            e |= ((bxi + 1)->e << 8);
-            x_sc[i*sram_stride + kbx / 2] = e;
+        uint8_t * o = (uint8_t *) (x_qs + i*sram_stride + kbx*8);
+        uint8_t e;
+        if constexpr (type == GGML_TYPE_MXFP4) {
+            const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i * stride + kbx;
+            ggml_cuda_mmq_mxfp4_to_containers(bxi, o);
+            e = bxi->e;
+        } else if constexpr (type == GGML_TYPE_MXFP6) {
+            const block_mxfp6 * bxi = (const block_mxfp6 *) x + kbx0 + i * stride + kbx;
+            ggml_cuda_mmq_mxfp6_to_containers(bxi, o);
+            e = bxi->e;
+        } else {
+            const block_mxfp8 * bxi = (const block_mxfp8 *) x + kbx0 + i * stride + kbx;
+            ggml_cuda_mmq_mxfp8_to_containers(bxi, o);
+            e = bxi->e;
         }
+        x_sc[i*sram_stride + kbx] = e;
     }
 }
 

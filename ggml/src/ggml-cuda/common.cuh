@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-impl.h"
+#include "ggml-mxfp.h"
 #include "ggml-cuda.h"
 
 #include <cstdint>
@@ -846,15 +847,11 @@ static __device__ __forceinline__ uint8_t ggml_cuda_float_to_e8m0(float x) {
 #endif // CUDART_VERSION >= 12080
 }
 
-// Compute the MXFP4 block scale using the UOS boundary Qmax=7.25 (arXiv:2607.24377, Theorem 1).
-// The normalized block max falls in (3.625, 7.25]; values above the e2m1 max saturate.
-struct ggml_cuda_mxfp4_scale_result { uint8_t e; float inv; };
-static __device__ __forceinline__ ggml_cuda_mxfp4_scale_result ggml_cuda_mxfp4_scale(float amax) {
-    const int e_floor = ggml_cuda_float_to_e8m0(amax);
-    const float f = ldexpf(amax, 127 - e_floor); // amax / 2^floor(log2(amax)), in [1, 2)
-    // Qmax=7.25: threshold at 7.25/4 = 1.8125
-    const int e = max(0, min(254, e_floor - (f > 1.8125f ? 1 : 2)));
-    return { static_cast<uint8_t>(e), ldexpf(1.0f, 127 - e) };
+// UOS block scale, see ggml_mxfp_uos_exponent in ggml-mxfp.h
+struct ggml_cuda_mxfp_scale_result { uint8_t e; float inv; };
+static __device__ __forceinline__ ggml_cuda_mxfp_scale_result ggml_cuda_mxfp_scale(float amax, float qmax) {
+    const uint8_t e = ggml_mxfp_uos_exponent(amax, qmax);
+    return { e, ggml_mxfp_e8m0_inv_scale(e) };
 }
 
 static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
@@ -933,6 +930,43 @@ static __device__ __forceinline__ float2 ggml_cuda_mxfp4_to_float2(uint8_t q) {
     return __half22float2(ggml_cuda_mxfp4_to_half2(q));
 #else
     return make_float2(0.5f*kvalues_mxfp4[q & 0x0F], 0.5f*kvalues_mxfp4[q >> 4]);
+#endif // CUDART_VERSION >= 12080
+}
+
+// mxfp8 (e4m3): two values packed in a uint16_t (little-endian: value 0 in the low byte, value 1 in the high byte).
+// 0x7F/0xFF are the e4m3 NaN codes; zero them out to match the CPU (which decodes them as 0).
+static __device__ __forceinline__ half2 ggml_cuda_mxfp8_to_half2(uint16_t q) {
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+    const uint16_t lo = (q & 0x00FF) * ((q & 0x00FF) != 0x7F && (q & 0x00FF) != 0xFF);
+    const uint16_t hi = (q & 0xFF00) * ((q & 0xFF00) != 0x7F00 && (q & 0xFF00) != 0xFF00);
+    return half2(__nv_cvt_fp8x2_to_halfraw2(lo | hi, __NV_E4M3));
+#else
+    return __floats2half2_rn(ggml_mxfp_e4m3_to_f32(q & 0xFF), ggml_mxfp_e4m3_to_f32(q >> 8));
+#endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+}
+
+static __device__ __forceinline__ float2 ggml_cuda_mxfp8_to_float2(uint16_t q) {
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+    return __half22float2(ggml_cuda_mxfp8_to_half2(q));
+#else
+    return make_float2(ggml_mxfp_e4m3_to_f32(q & 0xFF), ggml_mxfp_e4m3_to_f32(q >> 8));
+#endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+}
+
+// mxfp6 (e2m3): two values packed in a uint16_t (value 0 in bits [0,6), value 1 in bits [8,14))
+static __device__ __forceinline__ half2 ggml_cuda_mxfp6_to_half2(uint16_t q) {
+#if CUDART_VERSION >= 12080
+    return half2(__nv_cvt_fp6x2_to_halfraw2(q, __NV_E2M3));
+#else
+    return __floats2half2_rn(ggml_mxfp_e2m3_to_f32(q & 0x3F), ggml_mxfp_e2m3_to_f32((q >> 8) & 0x3F));
+#endif // CUDART_VERSION >= 12080
+}
+
+static __device__ __forceinline__ float2 ggml_cuda_mxfp6_to_float2(uint16_t q) {
+#if CUDART_VERSION >= 12080
+    return __half22float2(ggml_cuda_mxfp6_to_half2(q));
+#else
+    return make_float2(ggml_mxfp_e2m3_to_f32(q & 0x3F), ggml_mxfp_e2m3_to_f32((q >> 8) & 0x3F));
 #endif // CUDART_VERSION >= 12080
 }
 
@@ -1061,6 +1095,20 @@ struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qk = QK_MXFP4;
     static constexpr int qr = QR_MXFP4;
     static constexpr int qi = QI_MXFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP6> {
+    static constexpr int qk = QK_MXFP6;
+    static constexpr int qr = QR_MXFP6;
+    static constexpr int qi = QI_MXFP6;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP8> {
+    static constexpr int qk = QK_MXFP8;
+    static constexpr int qr = QR_MXFP8;
+    static constexpr int qi = QI_MXFP8;
 };
 
 template<>
