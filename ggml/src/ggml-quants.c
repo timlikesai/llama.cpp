@@ -347,6 +347,36 @@ static inline int best_index_mxfp4(float x, float e) {
     return best_index;
 }
 
+// same result as best_index_mxfp4, but requires e to be a power of two (e8m0 scale):
+// the grid kvalues*e = {0,1,2,3,4,6,8,12}*e is exact, so nearest + RNE tie to even value
+static inline int best_index_mxfp4_e8m0(float x, float e) {
+    const float u = fabsf(x) / e;
+
+    int q = 0;
+    if (u > 0.5f) {
+        if      (u <  1.5f)  q = 1;
+        else if (u <= 2.5f)  q = 2;
+        else if (u <  3.5f)  q = 3;
+        else if (u <= 5.0f)  q = 4;
+        else if (u <  7.0f)  q = 5; // grid value 6
+        else if (u <= 10.0f) q = 6; // grid value 8
+        else                 q = 7; // grid value 12
+    }
+    return q != 0 && x < 0.0f ? q + 8 : q;
+}
+
+// encode one 32-element block with a fixed e8m0 exponent; layout: byte j = elems j, j+16
+static inline void quantize_row_mxfp4_blk(const float * GGML_RESTRICT xb, block_mxfp4 * yb, uint8_t e) {
+    const float d = GGML_E8M0_TO_FP32_HALF(e);
+
+    yb->e = e;
+
+    for (int j = 0; j < QK_MXFP4/2; ++j) {
+        yb->qs[j]  = best_index_mxfp4_e8m0(xb[j], d);
+        yb->qs[j] |= best_index_mxfp4_e8m0(xb[QK_MXFP4/2 + j], d) << 4;
+    }
+}
+
 void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_MXFP4;
 
@@ -365,19 +395,9 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
             }
         }
 
-        const uint8_t e = amax > 0.0f ? (uint8_t) (floorf(log2f(amax)) - 2 + 127) : 0;
+        const uint8_t e = ggml_mxfp_scale(amax, GGML_MXFP_QMAX_E2M1);
 
-        const float d = GGML_E8M0_TO_FP32_HALF(e);
-
-        y[i].e = e;
-
-        for (int j = 0; j < qk/2; ++j) {
-            const uint8_t x0 = best_index_mxfp4(x[i*qk + 0    + j], d);
-            const uint8_t x1 = best_index_mxfp4(x[i*qk + qk/2 + j], d);
-
-            y[i].qs[j]  = x0;
-            y[i].qs[j] |= x1 << 4;
-        }
+        quantize_row_mxfp4_blk(x + i*qk, &y[i], e);
     }
 }
 
@@ -2299,10 +2319,62 @@ size_t quantize_q8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     return nrow * row_size;
 }
 
+static void quantize_row_mxfp4_impl(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t n_per_row, const float * GGML_RESTRICT quant_weights) {
+    assert(n_per_row % QK_MXFP4 == 0);
+
+    const int64_t nb = n_per_row / QK_MXFP4;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float * xb = x + i*QK_MXFP4;
+        const float * wb = quant_weights + i*QK_MXFP4;
+
+        float amax = 0.0f; // absolute max
+        for (int j = 0; j < QK_MXFP4; j++) {
+            if (amax < fabsf(xb[j])) {
+                amax = fabsf(xb[j]);
+            }
+        }
+
+        const uint8_t e_def = ggml_mxfp_scale(amax, GGML_MXFP_QMAX_E2M1);
+
+        // search e in [e_def-1, e_def+1]: a lower exponent trades clamping of the largest
+        // values for finer resolution of the rest, a higher one reduces clamping when the
+        // saturated values carry most of the weighted error. e8m0 max exponent is 254.
+        // ties keep the lowest exponent
+        uint8_t best_e = e_def;
+        float best_err = -1.0f;
+        const int e_lo = e_def > 0   ? (int) e_def - 1 : 0;
+        const int e_hi = e_def < 254 ? (int) e_def + 1 : 254;
+        for (int e = e_lo; e <= e_hi; e++) {
+            const float d = GGML_E8M0_TO_FP32_HALF((uint8_t) e);
+            float err = 0.0f;
+            for (int j = 0; j < QK_MXFP4; j++) {
+                const float t = xb[j] - kvalues_mxfp4[best_index_mxfp4_e8m0(xb[j], d)]*d;
+                err += wb[j]*t*t;
+            }
+            if (best_err < 0.0f || err < best_err) {
+                best_err = err;
+                best_e = (uint8_t) e;
+            }
+        }
+
+        quantize_row_mxfp4_blk(xb, &y[i], best_e);
+    }
+}
+
 size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    GGML_UNUSED(quant_weights);
-    quantize_row_mxfp4_ref(src, dst, (int64_t)nrow*n_per_row);
-    return nrow * ggml_row_size(GGML_TYPE_MXFP4, n_per_row);
+    if (!quant_weights) {
+        quantize_row_mxfp4_ref(src, dst, (int64_t)nrow*n_per_row);
+        return nrow * ggml_row_size(GGML_TYPE_MXFP4, n_per_row);
+    }
+    size_t row_size = ggml_row_size(GGML_TYPE_MXFP4, n_per_row);
+    char * qrow = (char *)dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_mxfp4_impl(src, (block_mxfp4*)qrow, n_per_row, quant_weights);
+        src += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
 }
 
 size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {

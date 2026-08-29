@@ -1122,6 +1122,11 @@ namespace ggml_cuda_mma {
 #endif // AMD_MFMA_AVAILABLE
     }
 
+    // Block-scaled mma. Both quantizations encode values as e2m1 (FP4):
+    // - MXFP4 x MXFP8 (e4m3 activations): one ue8m0 scale per 32 k values (scale_vec::1X), m16n8k32.
+    //   Fragment layout follows the m16n8k32 u4/s4 pattern (PTX ISA 9.7.15.5.10):
+    //   A: row = g + 8*(r%2), k = 8*t + 4*(r/2) + byte; B: col = g, k = 8*t + 4*r + byte  (t = l%4, g = l/4, r = reg)
+    // - NVFP4 x NVFP4: ue4m3 scales, scale_vec::4X, m16n8k64.
     template <ggml_type type>
     static __device__ __forceinline__ void mma_block_scaled_fp4(tile<16, 8, float> &     D,
                                                                 const tile<16, 8, int> & A,
@@ -1135,7 +1140,7 @@ namespace ggml_cuda_mma {
 
         if constexpr (type == GGML_TYPE_MXFP4) {
             asm volatile(
-                "mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 "
+                "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e2m1.e4m3.f32.ue8m0 "
                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
                 "%10, {0, 0}, %11, {0, 0};"
                 : "+f"(Dxi[0]), "+f"(Dxi[1]), "+f"(Dxi[2]), "+f"(Dxi[3])

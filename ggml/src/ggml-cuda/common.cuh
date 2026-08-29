@@ -446,6 +446,19 @@ struct ggml_cuda_unroll<1> {
     }
 };
 
+// device version of ggml_mxfp_scale (ggml-impl.h)
+typedef struct { uint8_t e; float inv; } ggml_cuda_mxfp_scale_result;
+static __device__ __forceinline__ ggml_cuda_mxfp_scale_result ggml_cuda_mxfp_scale(float amax, float qmax) {
+    if (!(amax > 0.0f)) {
+        return { 0, ldexpf(1.0f, 127) };
+    }
+    int A, Q;
+    const float r_a = frexpf(amax, &A);
+    const float m   = frexpf(qmax, &Q);
+    const float e = fminf(254.0f, fmaxf(0.0f, 127.0f + A - Q + (r_a > m) - (r_a <= 0.5f * m)));
+    return { static_cast<uint8_t>(e), ldexpf(1.0f, 127 - e) };
+}
+
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_sum(int x) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
@@ -898,13 +911,26 @@ __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e)
 #pragma unroll
     for (int i = 1; i < 8; ++i) {
         const float err = fabsf(ax - pos_lut[i]);
-        if (err < best_err) {
+        // RNE: on exact tie, pick the even grid index
+        if (err < best_err || (err == best_err && (i & 1) == 0 && (best_i & 1) == 1)) {
             best_err = err;
             best_i   = i;
         }
     }
 
     return static_cast<uint8_t>(best_i | sign_bit);
+}
+
+static __device__ __forceinline__ half2 ggml_cuda_mxfp4_to_half2(uint8_t q) {
+#if CUDART_VERSION >= 12080
+    return half2(__nv_cvt_fp4x2_to_halfraw2(q, __NV_E2M1));
+#else
+    return __floats2half2_rn(0.5f*kvalues_mxfp4[q & 0x0F], 0.5f*kvalues_mxfp4[q >> 4]);
+#endif // CUDART_VERSION >= 12080
+}
+
+static __device__ __forceinline__ float2 ggml_cuda_mxfp4_to_float2(uint8_t q) {
+    return __half22float2(ggml_cuda_mxfp4_to_half2(q));
 }
 
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
