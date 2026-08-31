@@ -58,6 +58,13 @@ void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_mxfp4_ref(x, y, k);
 }
 
+void quantize_row_mxfp6(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp6_ref(x, y, k);
+}
+
+void quantize_row_mxfp8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp8_ref(x, y, k);
+}
 void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_nvfp4_ref(x, y, k);
 }
@@ -325,6 +332,94 @@ void ggml_vec_dot_mxfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
     }
     *s = sumf;
 }
+// floating point mxfp x mxfp8 dot (mxfp family, mxfp4/mxfp6/mxfp8):
+// both operands are floating point block formats, so decode the codes to float and
+// accumulate in float, matching the CUDA paths which quantize the activations to e4m3
+void ggml_vec_dot_mxfp_mxfp8(enum ggml_type type, int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_mxfp8 * GGML_RESTRICT y = (const block_mxfp8 *) vy;
+
+    float sumf = 0.0f;
+
+    switch (type) {
+        case GGML_TYPE_MXFP4: {
+            assert(n % QK_MXFP4 == 0);
+            static_assert(QK_MXFP4 == QK_MXFP8, "QK_MXFP4 and QK_MXFP8 must be the same");
+
+            const block_mxfp4 * GGML_RESTRICT x = (const block_mxfp4 *) vx;
+
+            const int nb = n / QK_MXFP4;
+
+            for (int ib = 0; ib < nb; ++ib) {
+                const float d = GGML_E8M0_TO_FP32(x[ib].e)*GGML_E8M0_TO_FP32(y[ib].e);
+
+                float sumi = 0.0f;
+                for (int j = 0; j < QK_MXFP4/2; ++j) {
+                    sumi += (kvalues_mxfp4[x[ib].qs[j] & 0xf] * 0.5f) * ggml_e4m3_to_fp32((uint8_t) y[ib].qs[j +          0])
+                           + (kvalues_mxfp4[x[ib].qs[j] >>  4] * 0.5f) * ggml_e4m3_to_fp32((uint8_t) y[ib].qs[j + QK_MXFP4/2]);
+                }
+                sumf += d * sumi;
+            }
+        } break;
+        case GGML_TYPE_MXFP6: {
+            assert(n % QK_MXFP6 == 0);
+            static_assert(QK_MXFP6 == QK_MXFP8, "QK_MXFP6 and QK_MXFP8 must be the same");
+
+            const block_mxfp6 * GGML_RESTRICT x = (const block_mxfp6 *) vx;
+
+            const int nb = n / QK_MXFP6;
+
+            for (int ib = 0; ib < nb; ++ib) {
+                const float d = GGML_E8M0_TO_FP32(x[ib].e)*GGML_E8M0_TO_FP32(y[ib].e);
+
+                float sumi = 0.0f;
+                for (int j = 0; j < QK_MXFP6; ++j) {
+                    sumi += ggml_e2m3_to_fp32(ggml_mxfp6_get_code(x[ib].qs, j)) * ggml_e4m3_to_fp32((uint8_t) y[ib].qs[j]);
+                }
+                sumf += d * sumi;
+            }
+        } break;
+        case GGML_TYPE_MXFP8: {
+            assert(n % QK_MXFP8 == 0);
+
+            const block_mxfp8 * GGML_RESTRICT x = (const block_mxfp8 *) vx;
+
+            const int nb = n / QK_MXFP8;
+
+            for (int ib = 0; ib < nb; ++ib) {
+                const float d = GGML_E8M0_TO_FP32(x[ib].e)*GGML_E8M0_TO_FP32(y[ib].e);
+
+                float sumi = 0.0f;
+                for (int j = 0; j < QK_MXFP8; ++j) {
+                    sumi += ggml_e4m3_to_fp32((uint8_t) x[ib].qs[j]) * ggml_e4m3_to_fp32((uint8_t) y[ib].qs[j]);
+                }
+                sumf += d * sumi;
+            }
+        } break;
+        default:
+            GGML_ABORT("unsupported type %s", ggml_type_name(type));
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_mxfp4_mxfp8(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    ggml_vec_dot_mxfp_mxfp8(GGML_TYPE_MXFP4, n, s, bs, vx, bx, vy, by, nrc);
+}
+
+void ggml_vec_dot_mxfp6_mxfp8(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    ggml_vec_dot_mxfp_mxfp8(GGML_TYPE_MXFP6, n, s, bs, vx, bx, vy, by, nrc);
+}
+
+void ggml_vec_dot_mxfp8_mxfp8(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    ggml_vec_dot_mxfp_mxfp8(GGML_TYPE_MXFP8, n, s, bs, vx, bx, vy, by, nrc);
+}
+
 
 // NVFP4: super-block of 64 elements = 4 sub-blocks of 16 = 2 q8_0 blocks
 void ggml_vec_dot_nvfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {

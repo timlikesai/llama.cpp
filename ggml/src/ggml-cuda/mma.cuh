@@ -1122,13 +1122,13 @@ namespace ggml_cuda_mma {
 #endif // AMD_MFMA_AVAILABLE
     }
 
-    // Block-scaled mma. Both quantizations encode values as e2m1 (FP4):
-    // - MXFP4 x MXFP8 (e4m3 activations): one ue8m0 scale per 32 k values (scale_vec::1X), m16n8k32.
+    // Block-scaled mma for mxfp weights (e2m1/e2m3/e4m3) x e4m3 (mxfp8) activations:
+    // one ue8m0 scale per 32 k values (scale_vec::1X), m16n8k32.
     //   Fragment layout follows the m16n8k32 u4/s4 pattern (PTX ISA 9.7.15.5.10):
     //   A: row = g + 8*(r%2), k = 8*t + 4*(r/2) + byte; B: col = g, k = 8*t + 4*r + byte  (t = l%4, g = l/4, r = reg)
-    // - NVFP4 x NVFP4: ue4m3 scales, scale_vec::4X, m16n8k64.
+    // NVFP4 x NVFP4: ue4m3 scales, scale_vec::4X, m16n8k64.
     template <ggml_type type>
-    static __device__ __forceinline__ void mma_block_scaled_fp4(tile<16, 8, float> &     D,
+    static __device__ __forceinline__ void mma_block_scaled(tile<16, 8, float> &     D,
                                                                 const tile<16, 8, int> & A,
                                                                 const tile<8, 8, int> &  B,
                                                                 uint32_t                 a_scale,
@@ -1138,13 +1138,19 @@ namespace ggml_cuda_mma {
         const int * Bxi = (const int *) B.x;
         float *     Dxi = (float *) D.x;
 
+        // mxf8f6f4: the mxfp4/6/8 variants differ only in the A dtype token, share the rest via a macro
+#define MXFP_MMA(a_dt, D, A, B, as, bs) \
+    asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32." a_dt ".e4m3.f32.ue8m0 " \
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, " \
+                "%10, {0, 0}, %11, {0, 0};" \
+                : "+f"(D[0]), "+f"(D[1]), "+f"(D[2]), "+f"(D[3]) \
+                : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]), "r"(as), "r"(bs))
         if constexpr (type == GGML_TYPE_MXFP4) {
-            asm volatile(
-                "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e2m1.e4m3.f32.ue8m0 "
-                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
-                "%10, {0, 0}, %11, {0, 0};"
-                : "+f"(Dxi[0]), "+f"(Dxi[1]), "+f"(Dxi[2]), "+f"(Dxi[3])
-                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[1]), "r"(a_scale), "r"(b_scale));
+            MXFP_MMA("e2m1", Dxi, Axi, Bxi, a_scale, b_scale);
+        } else if constexpr (type == GGML_TYPE_MXFP6) {
+            MXFP_MMA("e2m3", Dxi, Axi, Bxi, a_scale, b_scale);
+        } else if constexpr (type == GGML_TYPE_MXFP8) {
+            MXFP_MMA("e4m3", Dxi, Axi, Bxi, a_scale, b_scale);
         } else {
             asm volatile(
                 "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
@@ -1153,6 +1159,7 @@ namespace ggml_cuda_mma {
                 : "+f"(Dxi[0]), "+f"(Dxi[1]), "+f"(Dxi[2]), "+f"(Dxi[3])
                 : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[1]), "r"(a_scale), "r"(b_scale));
         }
+#undef MXFP_MMA
 #else
         GGML_UNUSED_VARS(D, A, B, a_scale, b_scale);
 #endif // BLACKWELL_MMA_AVAILABLE

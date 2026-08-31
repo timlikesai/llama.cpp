@@ -81,6 +81,8 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_Q8_0:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP6:
+        case GGML_TYPE_MXFP8:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_NVFP4:
             return MMQ_Q8_1_DS_LAYOUT_D4;
@@ -697,10 +699,12 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
 #ifdef BLACKWELL_MMA_AVAILABLE
     switch (type) {
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP6:
+        case GGML_TYPE_MXFP8:
             return ggml_cuda_mmq_util_funcs(
                 -1,
-                ggml_cuda_mmq_load_tiles_mxfp4_mxfp8<type, J, fallback>,
-                ggml_cuda_mmq_vec_dot_mxfp4_mxfp8_mma<type, J, fallback>,
+                ggml_cuda_mmq_load_tiles_mxfp<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_mxfp_mma<type, J, fallback>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         case GGML_TYPE_NVFP4:
             return ggml_cuda_mmq_util_funcs(

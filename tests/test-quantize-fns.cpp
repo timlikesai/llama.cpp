@@ -199,6 +199,60 @@ static int test_vec_dot_q(bool verbose) {
 
     return num_failed;
 }
+// floating point mxfp x mxfp8 dot kernels against the float reference
+static int test_vec_dot_mxfp(bool verbose) {
+    const int n = 32 * 128; // multiple of the mxfp block size
+    const ggml_type types[] = { GGML_TYPE_MXFP4, GGML_TYPE_MXFP6, GGML_TYPE_MXFP8 };
+
+    int num_failed = 0;
+
+    for (ggml_type type : types) {
+        std::vector<float> test_data(n);
+        std::vector<float> test_data2(n);
+
+        generate_data(0.0, n, test_data.data());
+        generate_data(1.0, n, test_data2.data());
+
+        const auto * qfns = ggml_get_type_traits_cpu(type);
+        const auto * qfns_mxfp8 = ggml_get_type_traits_cpu(GGML_TYPE_MXFP8);
+
+        std::vector<uint8_t> tmp_q1(2 * n);
+        std::vector<uint8_t> tmp_q2(2 * n);
+
+        qfns->from_float(test_data.data(),  tmp_q1.data(), n);
+        qfns_mxfp8->from_float(test_data2.data(), tmp_q2.data(), n);
+
+        // float reference from the dequantized rows
+        std::vector<float> tmp_out1(n);
+        std::vector<float> tmp_out2(n);
+
+        const auto * tfns = ggml_get_type_traits(type);
+        const auto * tfns_mxfp8 = ggml_get_type_traits(GGML_TYPE_MXFP8);
+
+        tfns->to_float(tmp_q1.data(), tmp_out1.data(), n);
+        tfns_mxfp8->to_float(tmp_q2.data(), tmp_out2.data(), n);
+
+        double ref = 0.0;
+        for (int i = 0; i < n; ++i) {
+            ref += (double) tmp_out1[i] * tmp_out2[i];
+        }
+
+        const float ref_f32 = (float) ref;
+
+        // floating point mxfp x mxfp8 kernel
+        float result = 0.0f;
+        qfns->vec_dot(n, &result, 0, tmp_q1.data(), 0, tmp_q2.data(), 0, 1);
+        const float error = fabsf(result - ref_f32) / n;
+        const bool failed = !(error < 1e-3f);
+        num_failed += failed;
+        if (failed || verbose) {
+            printf("%5s mxfp f32 vec_dot error:          %s (%f)\n", ggml_type_name(type), RESULT_STR[failed], error);
+        }
+
+    }
+
+    return num_failed;
+}
 
 int main(int argc, char * argv[]) {
     bool verbose = false;
@@ -221,6 +275,7 @@ int main(int argc, char * argv[]) {
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
+    num_failed += test_vec_dot_mxfp(verbose);
 
     if (num_failed || verbose) {
         printf("%d tests failed\n", num_failed);

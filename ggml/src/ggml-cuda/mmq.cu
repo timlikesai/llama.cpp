@@ -73,6 +73,12 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_MXFP4:
             mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, args, stream);
             break;
+        case GGML_TYPE_MXFP6:
+            mul_mat_q_case<GGML_TYPE_MXFP6>(ctx, args, stream);
+            break;
+        case GGML_TYPE_MXFP8:
+            mul_mat_q_case<GGML_TYPE_MXFP8>(ctx, args, stream);
+            break;
         case GGML_TYPE_NVFP4:
             mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
             break;
@@ -129,7 +135,8 @@ void ggml_cuda_mul_mat_q(
     const bool fallback = ne01 % 128 != 0;
 
     const bool is_nvfp4 = src0->type == GGML_TYPE_NVFP4;
-    const bool use_block_scaled_mma = blackwell_mma_available(cc) && (is_nvfp4 || src0->type == GGML_TYPE_MXFP4);
+    const bool is_mxfp  = ggml_cuda_is_mxfp(src0->type);
+    const bool use_block_scaled_mma = blackwell_mma_available(cc) && (is_nvfp4 || is_mxfp);
     // mxfp8 activation blocks (e4m3 codes + ue8m0 scale) have the same size and value count as q8_1
     const size_t y_block_size       = use_block_scaled_mma && is_nvfp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_block_scaled_mma && is_nvfp4 ? QK_FP4_MMQ : QK8_1_MMQ;
@@ -287,6 +294,8 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_IQ4_NL:
 // -------------------------------------------------
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP6:
+        case GGML_TYPE_MXFP8:
         case GGML_TYPE_NVFP4:
             mmq_supported = true;
             break;
@@ -299,6 +308,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         return false;
     }
 
+    // mxfp6/mxfp8 MMQ needs the Blackwell block-scaled mma; other arches use the cuBLAS dequant fallback
+    if ((type == GGML_TYPE_MXFP6 || type == GGML_TYPE_MXFP8) && !blackwell_mma_available(cc)) {
+        return false;
+    }
     // MMQ tiles require at least 48 KiB per-block shared memory; fall back to BLAS otherwise.
     {
         const int    id    = ggml_cuda_get_device();

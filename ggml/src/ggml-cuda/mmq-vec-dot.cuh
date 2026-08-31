@@ -1226,7 +1226,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #pragma unroll
             for (int frag = 0; frag < nfrags; ++frag) {
                 tile_C C = {};
-                mma_block_scaled_fp4<type>(C, A[n][frag], B[frag], scaleA[n][frag], scaleB[frag]);
+                mma_block_scaled<type>(C, A[n][frag], B[frag], scaleA[n][frag], scaleB[frag]);
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
                     sum[(j0 / tile_C::J + n) * tile_C::ne + l] += C.x[l];
@@ -1236,10 +1236,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
-// MXFP4 weights x E4M3 (mxfp8) activations block-scaled MMA path for Blackwell (m16n8k32, scale_vec::1X ue8m0).
-// x rows: iter_k e2m1 values in 8-bit containers (unpacked in ggml_cuda_mmq_load_tiles_mxfp4_mxfp8), then one ue8m0 scale byte per 32 values;
+// mxfp weights (e2m1/e2m3/e4m3) x e4m3 (mxfp8) activations block-scaled MMA path for Blackwell (m16n8k32, scale_vec::1X ue8m0).
+// x rows: iter_k weight codes in 8-bit containers (packed in ggml_cuda_mmq_load_tiles_mxfp), then one ue8m0 scale byte per 32 values;
 // y rows: 4 scale bytes (one per 32 values), then e4m3 values.
-template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_mxfp4_mxfp8_mma(
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_mxfp_mma(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
     typedef tile<16, 8, int>   tile_A;
     typedef tile<8,  8, int>   tile_B;
@@ -1278,7 +1278,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             const int kx = k0 + 2*t;
             const int2 a0 = *(const int2 *) (x_qs + (i0 + n*tile_A::I + g    )*sram_stride + kx);
             const int2 a1 = *(const int2 *) (x_qs + (i0 + n*tile_A::I + g + 8)*sram_stride + kx);
-            // register layout per mma_block_scaled_fp4: x[0],x[1] are rows g/g+8 k 8t..8t+3, x[2],x[3] are k 8t+4..8t+7
+            // register layout per mma_block_scaled: x[0],x[1] are rows g/g+8 k 8t..8t+3, x[2],x[3] are k 8t+4..8t+7
             A[n][frag].x[0] = a0.x;
             A[n][frag].x[2] = a0.y;
             A[n][frag].x[1] = a1.x;
@@ -1306,7 +1306,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #pragma unroll
             for (int frag = 0; frag < nfrags; ++frag) {
                 tile_C C = {};
-                mma_block_scaled_fp4<type>(C, A[n][frag], B[frag], scaleA[n][frag], scaleB[frag]);
+                mma_block_scaled<type>(C, A[n][frag], B[frag], scaleA[n][frag], scaleB[frag]);
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
                     sum[(j0 / tile_C::J + n) * tile_C::ne + l] += C.x[l];

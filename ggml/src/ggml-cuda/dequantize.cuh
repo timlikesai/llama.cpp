@@ -127,6 +127,31 @@ static __device__ __forceinline__ void dequantize_mxfp4_pair(const void * vx, co
     v.x = f.x * d;
     v.y = f.y * d;
 }
+// mxfp6 (e2m3): 24 bytes of 6-bit packed codes, mxfp8 (e4m3): 32 one-byte codes;
+// pair convention: v.x = value iqs, v.y = value iqs + 16
+static __device__ __forceinline__ void dequantize_mxfp6_pair(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_mxfp6 * x = (const block_mxfp6 *) vx;
+    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
+    const uint16_t q2 = (uint16_t) ggml_mxfp6_get_code(x[ib].qs, iqs)
+                   | ((uint16_t) ggml_mxfp6_get_code(x[ib].qs, iqs + 16) << 8);
+    const float2 f = ggml_cuda_mxfp6_to_float2(q2);
+    v.x = f.x * d;
+    v.y = f.y * d;
+}
+
+static __device__ __forceinline__ void dequantize_mxfp8_pair(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_mxfp8 * x = (const block_mxfp8 *) vx;
+    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
+    // the scale byte makes qs unaligned, so load the code bytes separately
+    const uint8_t * qs = (const uint8_t *) x[ib].qs;
+    const uint16_t q0 = (uint16_t) qs[iqs]      | ((uint16_t) qs[iqs + 1] << 8);
+    const uint16_t q1 = (uint16_t) qs[iqs + 16] | ((uint16_t) qs[iqs + 17] << 8);
+    const float2 f0 = ggml_cuda_mxfp8_to_float2(q0);
+    const float2 f1 = ggml_cuda_mxfp8_to_float2(q1);
+    v.x = f0.x * d;
+    v.y = f1.x * d;
+}
+
 
 //================================== k-quants
 
@@ -444,19 +469,69 @@ static __device__ __forceinline__ void dequantize_iq4_xs(const void * vx, const 
     }
 }
 
-template<typename dst_t>
-static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
-
-    const block_mxfp4 * x = (const block_mxfp4 *) vx + ibs*(QK_K/QK_MXFP4);
-
+template<typename dst_t, ggml_type type>
+static __device__ __forceinline__ void dequantize_mxfp(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
     const int64_t il = tid/8; // 0...3
     const int64_t ib = tid%8; // 0...7
-    dst_t * y = yy + 32*ib + 4*il;
-    const uint8_t  * q4 = x[ib].qs + 4*il;
-    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
-    for (int j = 0; j < 4; ++j) {
-        const float2 v = ggml_cuda_mxfp4_to_float2(q4[j]);
-        y[j+ 0] = ggml_cuda_cast<dst_t>(v.x * d);
-        y[j+16] = ggml_cuda_cast<dst_t>(v.y * d);
+    const int64_t ib0 = ibs*(QK_K/QK_MXFP4) + ib;  // sub-block index, 32 values per scale for all mxfp types
+
+    if constexpr (type == GGML_TYPE_MXFP4) {
+        // byte j holds the codes of values {j, j+16} in its low/high nibble
+        const block_mxfp4 * x = (const block_mxfp4 *) vx + ib0;
+        const float d = ggml_cuda_e8m0_to_fp32(x->e);
+        dst_t * y = yy + 32*ib + 4*il;
+        const uint8_t * q4 = x->qs + 4*il;
+        for (int j = 0; j < 4; ++j) {
+            const float2 v = ggml_cuda_mxfp4_to_float2(q4[j]);
+            y[j+ 0] = ggml_cuda_cast<dst_t>(v.x * d);
+            y[j+16] = ggml_cuda_cast<dst_t>(v.y * d);
+        }
+    } else {
+        // mxfp6/mxfp8: one e8m0 scale byte + codes per 32-value sub-block, the scale byte makes qs unaligned
+        const int64_t blk = type == GGML_TYPE_MXFP6 ? sizeof(block_mxfp6) : sizeof(block_mxfp8);
+        const float d = ggml_cuda_e8m0_to_fp32(((const uint8_t *) vx)[ib0*blk]);
+        dst_t * y = yy + 32*ib + 8*il;
+        const uint8_t * qs6 = ((const block_mxfp6 *) vx)[ib0].qs;
+        const uint8_t * qs8 = (const uint8_t *) ((const block_mxfp8 *) vx)[ib0].qs;
+        if constexpr (type == GGML_TYPE_MXFP6) {
+            // 6-bit packed bitstream: the 8 codes (8*il .. 8*il+7) are 6 consecutive bytes (byte-aligned);
+            // unpack 4 codes per 3-byte word into the byte container the x2 dequant intrinsic expects
+            const uint8_t * q6 = qs6 + 6*il;
+            const uint32_t w0 = (uint32_t) q6[0] | ((uint32_t) q6[1] << 8) | ((uint32_t) q6[2] << 16);
+            const uint32_t w1 = (uint32_t) q6[3] | ((uint32_t) q6[4] << 8) | ((uint32_t) q6[5] << 16);
+            const uint16_t q[4] = {
+                (uint16_t)  (w0 & 0x3F)  | ((uint16_t) ((w0 >> 6)  & 0x3F) << 8),
+                (uint16_t) ((w0 >> 12) & 0x3F) | ((uint16_t) ((w0 >> 18) & 0x3F) << 8),
+                (uint16_t)  (w1 & 0x3F)  | ((uint16_t) ((w1 >> 6)  & 0x3F) << 8),
+                (uint16_t) ((w1 >> 12) & 0x3F) | ((uint16_t) ((w1 >> 18) & 0x3F) << 8),
+            };
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 v = ggml_cuda_mxfp6_to_float2(q[j]);
+                y[2*j + 0] = ggml_cuda_cast<dst_t>(v.x * d);
+                y[2*j + 1] = ggml_cuda_cast<dst_t>(v.y * d);
+            }
+        } else {
+            // byte-wise
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int j0 = 8*il + 2*j;
+                const uint16_t q2 = (uint16_t) qs8[j0] | ((uint16_t) qs8[j0 + 1] << 8);
+                const float2 v = ggml_cuda_mxfp8_to_float2(q2);
+                y[2*j + 0] = ggml_cuda_cast<dst_t>(v.x * d);
+                y[2*j + 1] = ggml_cuda_cast<dst_t>(v.y * d);
+            }
+        }
     }
 }
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_mxfp6(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+    dequantize_mxfp<dst_t, GGML_TYPE_MXFP6>(vx, ibs, yy, tid);
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_mxfp8(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+    dequantize_mxfp<dst_t, GGML_TYPE_MXFP8>(vx, ibs, yy, tid);
+}
+

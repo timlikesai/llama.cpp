@@ -1628,7 +1628,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
-template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_mxfp4_mxfp8(
+// mxfp weight tiles for the block-scaled mma: one thread per 32-element block, one 8-bit container
+// byte per value, then one e8m0 scale byte per 32 values.
+// mxf8f6f4 container packing (PTX ISA): e2m1 in bits [2..5], e2m3 in bits [0..5], e4m3 in bits [0..7].
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_mxfp(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
@@ -1651,23 +1654,47 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
-        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i * stride + kbx;
-        const uint32_t packed[4] = { (uint32_t) get_int_b1(bxi->qs, 0),
-                                     (uint32_t) get_int_b1(bxi->qs, 1),
-                                     (uint32_t) get_int_b1(bxi->qs, 2),
-                                     (uint32_t) get_int_b1(bxi->qs, 3) };
-
-        // qs byte j holds elements {j, j+16} in its low/high nibble; mxf8f6f4 wants e2m1 codes
-        // in K order, one per byte, in bits [2..5] (nibble << 2): bytes[j] = lo, bytes[j+16] = hi
-        uint8_t * bytes = (uint8_t *) (x_qs + i*sram_stride + kbx*8);
-        for (int w = 0; w < 4; ++w) {
-            const uint32_t p = packed[w];
-            *(uint32_t *) (bytes + 4*w)      = (p & 0x0F0F0F0F) << 2;
-            *(uint32_t *) (bytes + 4*w + 16) = (p >> 2) & 0x3C3C3C3C;
+        if constexpr (type == GGML_TYPE_MXFP4) {
+            const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i * stride + kbx;
+            // qs byte j holds elements {j, j+16} in its low/high nibble: bytes[j] = lo, bytes[j+16] = hi
+            uint8_t * out = (uint8_t *) (x_qs + i*sram_stride + kbx*8);
+#pragma unroll
+            for (int j = 0; j < QK_MXFP4/2; ++j) {
+                out[j]      = (bxi->qs[j] & 0x0F) << 2;
+                out[j + 16] = (bxi->qs[j] >> 2) & 0x3C;
+            }
+            x_sc[i*sram_stride + kbx] = bxi->e;
+        } else if constexpr (type == GGML_TYPE_MXFP8) {
+            // e4m3 codes are one per byte in K order; the scale byte makes qs unaligned,
+            // so load bytes and assemble the 4-byte words in registers
+            const block_mxfp8 * bxi = (const block_mxfp8 *) x + kbx0 + i * stride + kbx;
+            const uint8_t * qsb = (const uint8_t *) bxi->qs;
+            uint32_t * out = (uint32_t *) (x_qs + i*sram_stride + kbx*8);
+#pragma unroll
+            for (int w = 0; w < QK_MXFP8/4; ++w) {
+                const int w0 = 4*w;
+                out[w] = (uint32_t) qsb[w0] | ((uint32_t) qsb[w0+1] << 8) | ((uint32_t) qsb[w0+2] << 16) | ((uint32_t) qsb[w0+3] << 24);
+            }
+            x_sc[i*sram_stride + kbx] = bxi->e;
+        } else {
+            // e2m3 (mxfp6): 6-bit packed bitstream, every 4 codes fill exactly 3 bytes (code 4*k is byte-aligned),
+            // unpack 4 at a time into the one-byte-per-code container
+            const block_mxfp6 * bxi = (const block_mxfp6 *) x + kbx0 + i * stride + kbx;
+            const uint8_t * qsb = (const uint8_t *) bxi->qs;
+            uint8_t * out = (uint8_t *) (x_qs + i*sram_stride + kbx*8);
+#pragma unroll
+            for (int k = 0; k < QK_MXFP6/4; ++k) {
+                const uint32_t w = (uint32_t) qsb[3*k] | ((uint32_t) qsb[3*k+1] << 8) | ((uint32_t) qsb[3*k+2] << 16);
+                out[4*k + 0] = (uint8_t)  (w & 0x3F);
+                out[4*k + 1] = (uint8_t) ((w >> 6) & 0x3F);
+                out[4*k + 2] = (uint8_t) ((w >> 12) & 0x3F);
+                out[4*k + 3] = (uint8_t) ((w >> 18) & 0x3F);
+            }
+            x_sc[i*sram_stride + kbx] = bxi->e;
         }
-        x_sc[i*sram_stride + kbx] = bxi->e;
     }
 }
+
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_nvfp4(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kb0, const int i_max, const int stride) {

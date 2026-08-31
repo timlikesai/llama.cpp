@@ -186,12 +186,17 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
     y->d = sumq2 > 0 ? sumqx/sumq2 : d;
 }
 
-static __device__ void quantize_f32_mxfp4_block(const float * __restrict__ x, block_mxfp4 * __restrict__ y) {
+// absolute max of a 32-element block, then the data-free e8m0 scale for the grid
+static __device__ __forceinline__ ggml_mxfp_scale_result ggml_cuda_mxfp_blk_scale(const float * x, float qmax) {
     float amax = 0.0f;
     for (int j = 0; j < QK_MXFP4; ++j) {
         amax = fmaxf(amax, fabsf(x[j]));
     }
-    const auto s = ggml_cuda_mxfp_scale(amax, GGML_MXFP_QMAX_E2M1);
+    return ggml_mxfp_scale(amax, qmax);
+}
+
+static __device__ void quantize_f32_mxfp4_block(const float * __restrict__ x, block_mxfp4 * __restrict__ y) {
+    const auto s = ggml_cuda_mxfp_blk_scale(x, GGML_MXFP_QMAX_E2M1);
     y->e = s.e;
 #if CUDART_VERSION >= 12080
     for (int k = 0; k < QK_MXFP4/4; ++k) {
@@ -207,6 +212,43 @@ static __device__ void quantize_f32_mxfp4_block(const float * __restrict__ x, bl
         y->qs[j] = ggml_cuda_float_to_fp4_e2m1(x[j]*s.inv, 1.0f) | (ggml_cuda_float_to_fp4_e2m1(x[QK_MXFP4/2+j]*s.inv, 1.0f) << 4);
     }
 #endif // CUDART_VERSION >= 12080
+}
+
+static __device__ void quantize_f32_mxfp6_block(const float * __restrict__ x, block_mxfp6 * __restrict__ y) {
+    const auto s = ggml_cuda_mxfp_blk_scale(x, GGML_MXFP_QMAX_E2M3);
+    y->e = s.e;
+#if CUDART_VERSION >= 12080
+    for (int k = 0; k < QK_MXFP6/4; ++k) {
+        const uint32_t p = __nv_fp6x4_e2m3(make_float4(
+            x[4*k+0]*s.inv, x[4*k+1]*s.inv, x[4*k+2]*s.inv, x[4*k+3]*s.inv)).__x;
+        // one code per byte in K order, pack into the 6-bit bitstream
+        for (int j = 0; j < 4; ++j) {
+            ggml_mxfp6_set_code(y->qs, 4*k+j, (uint8_t) (p >> (8*j)));
+        }
+    }
+#else
+    for (int j = 0; j < QK_MXFP6; ++j) {
+        ggml_mxfp6_set_code(y->qs, j, ggml_fp32_to_e2m3(x[j]*s.inv));
+    }
+#endif // CUDART_VERSION >= 12080
+}
+
+static __device__ void quantize_f32_mxfp8_block(const float * __restrict__ x, block_mxfp8 * __restrict__ y) {
+    const auto s = ggml_cuda_mxfp_blk_scale(x, GGML_MXFP_QMAX_E4M3);
+    y->e = s.e;
+#if defined(FP8_AVAILABLE)
+    for (int k = 0; k < QK_MXFP8/4; ++k) {
+        const uint32_t p = __nv_fp8x4_e4m3(make_float4(
+            x[4*k+0]*s.inv, x[4*k+1]*s.inv, x[4*k+2]*s.inv, x[4*k+3]*s.inv)).__x;
+        for (int j = 0; j < 4; ++j) {
+            y->qs[4*k+j] = (int8_t) (p >> (8*j));
+        }
+    }
+#else
+    for (int j = 0; j < QK_MXFP8; ++j) {
+        y->qs[j] = (int8_t) ggml_fp32_to_e4m3(x[j]*s.inv);
+    }
+#endif // defined(FP8_AVAILABLE)
 }
 
 // Wrapper functions for cpy.cu compatibility
@@ -236,6 +278,14 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
 
 static __device__ void cpy_blck_f32_mxfp4(const char * cxi, char * cdsti) {
     quantize_f32_mxfp4_block((const float *)cxi, (block_mxfp4 *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_mxfp6(const char * cxi, char * cdsti) {
+    quantize_f32_mxfp6_block((const float *)cxi, (block_mxfp6 *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_mxfp8(const char * cxi, char * cdsti) {
+    quantize_f32_mxfp8_block((const float *)cxi, (block_mxfp8 *)cdsti);
 }
 
 template<typename src_t, typename dst_t>

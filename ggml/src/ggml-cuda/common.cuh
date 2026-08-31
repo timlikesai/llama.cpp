@@ -446,17 +446,8 @@ struct ggml_cuda_unroll<1> {
     }
 };
 
-// device version of ggml_mxfp_scale (ggml-impl.h)
-typedef struct { uint8_t e; float inv; } ggml_cuda_mxfp_scale_result;
-static __device__ __forceinline__ ggml_cuda_mxfp_scale_result ggml_cuda_mxfp_scale(float amax, float qmax) {
-    if (!(amax > 0.0f)) {
-        return { 0, ldexpf(1.0f, 127) };
-    }
-    int A, Q;
-    const float r_a = frexpf(amax, &A);
-    const float m   = frexpf(qmax, &Q);
-    const float e = fminf(254.0f, fmaxf(0.0f, 127.0f + A - Q + (r_a > m) - (r_a <= 0.5f * m)));
-    return { static_cast<uint8_t>(e), ldexpf(1.0f, 127 - e) };
+static inline constexpr __host__ __device__ bool ggml_cuda_is_mxfp(ggml_type type) {
+    return type == GGML_TYPE_MXFP4 || type == GGML_TYPE_MXFP6 || type == GGML_TYPE_MXFP8;
 }
 
 template<int width = WARP_SIZE>
@@ -932,6 +923,30 @@ static __device__ __forceinline__ half2 ggml_cuda_mxfp4_to_half2(uint8_t q) {
 static __device__ __forceinline__ float2 ggml_cuda_mxfp4_to_float2(uint8_t q) {
     return __half22float2(ggml_cuda_mxfp4_to_half2(q));
 }
+// 2 codes per 2 bytes, byte j holds value 2j (no unpack needed)
+static __device__ __forceinline__ half2 ggml_cuda_mxfp6_to_half2(uint16_t q) {
+#if CUDART_VERSION >= 12080
+    return half2(__nv_cvt_fp6x2_to_halfraw2(q, __NV_E2M3));
+#else
+    return __floats2half2_rn(ggml_e2m3_to_fp32(q & 0xFF), ggml_e2m3_to_fp32((q >> 8) & 0xFF));
+#endif // CUDART_VERSION >= 12080
+}
+
+static __device__ __forceinline__ float2 ggml_cuda_mxfp6_to_float2(uint16_t q) {
+    return __half22float2(ggml_cuda_mxfp6_to_half2(q));
+}
+
+static __device__ __forceinline__ half2 ggml_cuda_mxfp8_to_half2(uint16_t q) {
+#if defined(FP8_AVAILABLE)
+    return half2(__nv_cvt_fp8x2_to_halfraw2(q, __NV_E4M3));
+#else
+    return __floats2half2_rn(ggml_e4m3_to_fp32(q & 0xFF), ggml_e4m3_to_fp32((q >> 8) & 0xFF));
+#endif // defined(FP8_AVAILABLE)
+}
+
+static __device__ __forceinline__ float2 ggml_cuda_mxfp8_to_float2(uint16_t q) {
+    return __half22float2(ggml_cuda_mxfp8_to_half2(q));
+}
 
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
 // Precompute mp (m' in the paper) and L such that division
@@ -1058,6 +1073,19 @@ struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qk = QK_MXFP4;
     static constexpr int qr = QR_MXFP4;
     static constexpr int qi = QI_MXFP4;
+};
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP6> {
+    static constexpr int qk = QK_MXFP6;
+    static constexpr int qr = 1;
+    static constexpr int qi = QK_MXFP6*6/8/4;  // 24 packed bytes = 6 ints
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP8> {
+    static constexpr int qk = QK_MXFP8;
+    static constexpr int qr = 1;
+    static constexpr int qi = QK_MXFP8/4;  // 32 packed bytes = 8 ints
 };
 
 template<>

@@ -311,7 +311,7 @@ static __global__ void quantize_mmq_nvfp4(
 // activation quantization for the mxfp4 x e4m3 block-scaled mma:
 // e4m3 codes + one ue8m0 scale per 32 values, blocks of 128 values
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <bool scatter>
+template <bool scatter, bool use_aligned_float8>
 static __global__ void quantize_mmq_fp8(const float * __restrict__ x,
                                           const int32_t * __restrict__ ids,
                                           void * __restrict__ vy,
@@ -354,10 +354,9 @@ static __global__ void quantize_mmq_fp8(const float * __restrict__ x,
 
     const int64_t i0 = warp_start_offset + grp * 32 + pos * 4;
 
-    // launcher asserts ne0 % QK_FP8_MMQ == 0; out-of-range tail values are zero-padded
-    float4 v4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 v4;
     if (i0 + 3 < ne00) {
-        if ((reinterpret_cast<uintptr_t>(x + base_pos + i0) % 16) == 0) {
+        if constexpr (use_aligned_float8) {
             v4 = *(const float4 *) (x + base_pos + i0);
         } else {
             v4.x = x[base_pos + i0 + 0];
@@ -366,7 +365,7 @@ static __global__ void quantize_mmq_fp8(const float * __restrict__ x,
             v4.w = x[base_pos + i0 + 3];
         }
     } else {
-        // chunk straddles the end of the row: load only the in-range values
+        // k tail beyond ne00: zero-pad so the MMA path sees zeroed k
         v4.x = i0 + 0 < ne00 ? x[base_pos + i0 + 0] : 0.0f;
         v4.y = i0 + 1 < ne00 ? x[base_pos + i0 + 1] : 0.0f;
         v4.z = i0 + 2 < ne00 ? x[base_pos + i0 + 2] : 0.0f;
@@ -379,7 +378,7 @@ static __global__ void quantize_mmq_fp8(const float * __restrict__ x,
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, 8));
     }
 
-    const auto s = ggml_cuda_mxfp_scale(amax, GGML_MXFP_QMAX_E4M3);
+    const auto s = ggml_mxfp_scale(amax, GGML_MXFP_QMAX_E4M3);
 
     const float4 sv = make_float4(v4.x * s.inv, v4.y * s.inv, v4.z * s.inv, v4.w * s.inv);
     const uint32_t packed = __nv_fp8x4_e4m3(sv).__x;
@@ -529,6 +528,67 @@ void quantize_row_q8_1_cuda(
     GGML_UNUSED(type_src0);
 }
 
+__launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
+static __global__ void quantize_mxfp8(
+        const float * x_ptr, void * vy_ptr,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
+    ggml_cuda_pdl_lc();
+    const float * GGML_CUDA_RESTRICT x  = x_ptr;
+    void        * GGML_CUDA_RESTRICT vy = vy_ptr;
+    const int64_t i0 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i0 >= ne0) {
+        return;
+    }
+
+    const int64_t i3 = fastdiv(blockIdx.z, ne2);
+    const int64_t i2 = blockIdx.z - i3*ne2.z;
+    const int64_t i1 = blockIdx.y;
+
+    const int64_t & i00 = i0;
+    const int64_t & i01 = i1;
+    const int64_t & i02 = i2;
+    const int64_t & i03 = i3;
+
+    const int64_t i_cont = ((i3*ne2.z + i2) * ne1 + i1) * ne0 + i0;
+
+    block_mxfp8 * y = (block_mxfp8 *) vy;
+
+    const int64_t ib  = i_cont / QK_MXFP8; // block index
+    const int64_t iqs = i_cont % QK_MXFP8; // quant index
+
+    ggml_cuda_pdl_sync();
+    const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
+    const float amax = warp_reduce_max<QK_MXFP8>(fabsf(xi));
+
+    const auto s = ggml_mxfp_scale(amax, GGML_MXFP_QMAX_E4M3);
+
+    y[ib].qs[iqs] = (int8_t) ggml_fp32_to_e4m3(xi*s.inv);
+
+    if (iqs > 0) {
+        return;
+    }
+
+    y[ib].e = s.e;
+}
+
+void quantize_row_mxfp8_cuda(
+        const float * x, const int32_t * ids, void * vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(!ids);
+    GGML_ASSERT(ne0 % QK_MXFP8 == 0);
+
+    const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
+
+    const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+    const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
+    ggml_cuda_kernel_launch(quantize_mxfp8, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+}
+
 void quantize_mmq_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
@@ -608,15 +668,20 @@ void quantize_scatter_mmq_block_scaled_cuda(
                 x, ids_src1_inv, vy, scale, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/nrows_dst, /*ne2=*/1, n_expert_used);
         }
     } else {
-        GGML_ASSERT(type_src0 == GGML_TYPE_MXFP4);
+        GGML_ASSERT(ggml_cuda_is_mxfp(type_src0));
         GGML_ASSERT(ne0 % QK_FP8_MMQ == 0);
         constexpr int nwarps = 8;
         constexpr int vals_per_block = nwarps * QK_FP8_MMQ;
         const int64_t block_num_y = (ne0 + vals_per_block - 1) / vals_per_block;
         const dim3 block_size(WARP_SIZE, nwarps, 1);
         const dim3 num_blocks(n_tokens, block_num_y, 1);
-        quantize_mmq_fp8<true><<<num_blocks, block_size, 0, stream>>>(
-            x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
+        if (use_aligned_float8) {
+            quantize_mmq_fp8<true, true><<<num_blocks, block_size, 0, stream>>>(
+                x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
+        } else {
+            quantize_mmq_fp8<true, false><<<num_blocks, block_size, 0, stream>>>(
+                x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
+        }
     }
 }
 
@@ -624,7 +689,7 @@ void quantize_mmq_block_scaled_cuda(
         const float * x, const int32_t * ids, void * vy, float * scale, const ggml_type type_src0, const bool use_aligned_float8,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
-    GGML_ASSERT(type_src0 == GGML_TYPE_MXFP4 || type_src0 == GGML_TYPE_NVFP4);
+    GGML_ASSERT(ggml_cuda_is_mxfp(type_src0) || type_src0 == GGML_TYPE_NVFP4);
     GGML_ASSERT(ne0 > 0);
 
     if (type_src0 == GGML_TYPE_NVFP4) {
@@ -647,6 +712,10 @@ void quantize_mmq_block_scaled_cuda(
         const dim3    num_blocks(ne1, block_num_y, ne2 * ne3);
         const dim3    block_size(WARP_SIZE, nwarps, 1);
 
-        quantize_mmq_fp8<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+        if (use_aligned_float8) {
+            quantize_mmq_fp8<false, true><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+        } else {
+            quantize_mmq_fp8<false, false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+        }
     }
 }

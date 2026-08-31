@@ -17,7 +17,6 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
         case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
         case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
-        case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
@@ -37,6 +36,16 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
     }
 }
 
+static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_mxfp_cuda(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_MXFP4: return vec_dot_mxfp4_mxfp8;
+        case GGML_TYPE_MXFP6: return vec_dot_mxfp6_mxfp8;
+        case GGML_TYPE_MXFP8: return vec_dot_mxfp8_mxfp8;
+        default:              return nullptr;
+    }
+}
+
+
 static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
@@ -46,7 +55,9 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
         case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
         case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
-        case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
+        case GGML_TYPE_MXFP4:   return VDR_MXFP4_MMVQ;
+        case GGML_TYPE_MXFP6:   return VDR_MXFP6_MMVQ;
+        case GGML_TYPE_MXFP8:   return VDR_MXFP8_MMVQ;
         case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
         case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
@@ -130,6 +141,8 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(gg
         case GGML_TYPE_IQ4_NL:  return 6;
         case GGML_TYPE_IQ4_XS:  return 5;
         case GGML_TYPE_MXFP4:   return 4;
+        case GGML_TYPE_MXFP6:   return 4;
+        case GGML_TYPE_MXFP8:   return 4;
         case GGML_TYPE_NVFP4:   return 4;
         case GGML_TYPE_Q2_K:    return 4;
         case GGML_TYPE_Q3_K:    return 4;
@@ -151,6 +164,8 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_turing_plus(ggm
         case GGML_TYPE_IQ3_S:   return 6;
         case GGML_TYPE_IQ3_XXS: return 7;
         case GGML_TYPE_MXFP4:   return 7;
+        case GGML_TYPE_MXFP6:   return 7;
+        case GGML_TYPE_MXFP8:   return 7;
         case GGML_TYPE_NVFP4:   return 8;
         case GGML_TYPE_Q2_K:    return 7;
         case GGML_TYPE_Q3_K:    return 5;
@@ -238,6 +253,8 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
         case GGML_TYPE_IQ4_NL:  return 7;
         case GGML_TYPE_IQ4_XS:  return 5;
         case GGML_TYPE_MXFP4:   return 5;
+        case GGML_TYPE_MXFP6:   return 5;
+        case GGML_TYPE_MXFP8:   return 5;
         case GGML_TYPE_NVFP4:   return 5;
         case GGML_TYPE_Q3_K:    return 4;
         case GGML_TYPE_Q4_0:    return 7;
@@ -575,7 +592,8 @@ static __global__ void mul_mat_vec_q(
     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr bool is_mxfp = ggml_cuda_is_mxfp(type);
+    constexpr vec_dot_q_cuda_t vec_dot = is_mxfp ? get_vec_dot_mxfp_cuda(type) : get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
@@ -666,7 +684,8 @@ static __global__ void mul_mat_vec_q(
     float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
-    const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
+    // base offset of the activation row in blocks (q8_1 for the int types, mxfp8 for the mxfp family)
+    const uint32_t y_base_blk = sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
@@ -677,14 +696,14 @@ static __global__ void mul_mat_vec_q(
 
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
+            // y block: mxfp8 for the mxfp family, q8_1 for the int types
+            const block_q8_1 * y = (const block_q8_1 *) ((const char *) vy + (y_base_blk + j*stride_col_y + kby)*(is_mxfp ? sizeof(block_mxfp8) : sizeof(block_q8_1)));
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                tmp[j][i] += vec_dot(vx, y, kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        tmp_gate[j][i] += vec_dot(vgate, y, kbx_offset + i*stride_row_x + kbx, kqs);
                     }
                 }
             }
@@ -804,7 +823,8 @@ static __global__ void mul_mat_vec_q_moe(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr bool is_mxfp = ggml_cuda_is_mxfp(type);
+    constexpr vec_dot_q_cuda_t vec_dot = is_mxfp ? get_vec_dot_mxfp_cuda(type) : get_vec_dot_q_cuda(type);
 
     // fuse gate, bias, scales, and glu_op into the up projection
     bool use_gate = false;
@@ -844,7 +864,7 @@ static __global__ void mul_mat_vec_q_moe(
     const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
-    const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
+    const uint32_t y_base_blk = channel_y*stride_channel_y + token_idx*stride_col_y;
     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
 
     // partial sum for each thread
@@ -855,12 +875,14 @@ static __global__ void mul_mat_vec_q_moe(
         const int kby = kbx * (qk/QK8_1);
         const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
+        // y block: mxfp8 for the mxfp family, q8_1 for the int types
+        const block_q8_1 * y = (const block_q8_1 *) ((const char *) vy + (y_base_blk + kby)*(is_mxfp ? sizeof(block_mxfp8) : sizeof(block_q8_1)));
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            tmp[i] += vec_dot(vx, y, kbx_offset + i*stride_row_x + kbx, kqs);
             if constexpr (has_fusion) {
                 if (use_gate) {
-                    tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    tmp_gate[i] += vec_dot(vgate, y, kbx_offset + i*stride_row_x + kbx, kqs);
                 }
             }
         }
@@ -1259,6 +1281,18 @@ static void mul_mat_vec_q_switch_type(
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
             break;
+        case GGML_TYPE_MXFP6:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_MXFP6>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_MXFP8:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_MXFP8>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
         case GGML_TYPE_NVFP4:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_NVFP4>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
@@ -1435,12 +1469,19 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    const bool is_mxfp = ggml_cuda_is_mxfp(src0->type);
+    const size_t src1_block_size  = is_mxfp ? sizeof(block_mxfp8) : sizeof(block_q8_1);
+    const size_t src1_vals_block  = is_mxfp ? QK_MXFP8 : QK8_1;
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * src1_block_size/src1_vals_block);
     {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        if (is_mxfp) {
+            quantize_row_mxfp8_cuda(src1_d, nullptr, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        } else {
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

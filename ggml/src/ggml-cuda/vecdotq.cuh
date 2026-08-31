@@ -304,28 +304,104 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q8_0_16_q8_1_
     return d8_1*sumf;
 }
 
-#define VDR_MXFP4_Q8_1_MMVQ 2
+#define VDR_MXFP4_MMVQ 2
 #define VDR_MXFP4_Q8_1_MMQ  4
 
-static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+// mxfp family vec dots with e4m3 (mxfp8) activations: floating point decode and FMA, matching the
+// CUDA MMA path (block-scaled mma with e4m3 activations) and the CPU reference
 
+static __device__ __forceinline__ float vec_dot_mxfp4_mxfp8(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ by, const int & kbx, const int & iqs) {
+
+    // the mxfp y block is a block_mxfp8, typed as block_q8_1 to share the mmvq vec_dot signature
+    const block_mxfp8 * bm8 = (const block_mxfp8 *) by;
     const block_mxfp4 * bq4 = (const block_mxfp4 *) vbq + kbx;
 
-    const int * q8 = (const int *) bq8_1->qs + iqs;
+    // both qs arrays start 1 byte into their blocks: assemble the pairs in registers
+    const uint8_t * x = (const uint8_t *) (bq4->qs + 4*iqs);
+    const uint8_t * y = (const uint8_t *) (bm8->qs + 4*iqs);
 
-    int sumi = 0;
+    half2 acc = __floats2half2_rn(0.0f, 0.0f);
 #pragma unroll
-    for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
-        const int aux_q4 = get_int_b1(bq4->qs, iqs + l);
-        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+    for (int l = 0; l < VDR_MXFP4_MMVQ; ++l) {
+        const half2 a0 = ggml_cuda_mxfp8_to_half2((uint16_t) y[4*l + 0]  | ((uint16_t) y[4*l + 1]  << 8));
+        const half2 a1 = ggml_cuda_mxfp8_to_half2((uint16_t) y[4*l + 2]  | ((uint16_t) y[4*l + 3]  << 8));
+        const half2 a2 = ggml_cuda_mxfp8_to_half2((uint16_t) y[4*l + 16] | ((uint16_t) y[4*l + 17] << 8));
+        const half2 a3 = ggml_cuda_mxfp8_to_half2((uint16_t) y[4*l + 18] | ((uint16_t) y[4*l + 19] << 8));
 
-        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
-        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+        // byte j: low nibble = value 4*l+j, high nibble = value 4*l+16+j
+        const half2 w0 = ggml_cuda_mxfp4_to_half2(x[4*l + 0]);
+        const half2 w1 = ggml_cuda_mxfp4_to_half2(x[4*l + 1]);
+        const half2 w2 = ggml_cuda_mxfp4_to_half2(x[4*l + 2]);
+        const half2 w3 = ggml_cuda_mxfp4_to_half2(x[4*l + 3]);
+
+        acc = __hfma2(w0, half2(a0.x, a2.x), acc);
+        acc = __hfma2(w1, half2(a0.y, a2.y), acc);
+        acc = __hfma2(w2, half2(a1.x, a3.x), acc);
+        acc = __hfma2(w3, half2(a1.y, a3.y), acc);
     }
 
-    const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds);
-    return d * sumi;
+    const float2 s = __half22float2(acc);
+    const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * ggml_cuda_e8m0_to_fp32(bm8->e);
+    return d * (s.x + s.y);
+}
+
+#define VDR_MXFP6_MMVQ 6
+#define VDR_MXFP8_MMVQ 2
+
+// mxfp6: threads per block (qi/vdr) each do vdr/3 byte-aligned 16-value halves starting at half iqs/vdr;
+// only values 0 and 16 of a block are byte-aligned in the packed bitstream
+static __device__ __forceinline__ float vec_dot_mxfp6_mxfp8(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ by, const int & kbx, const int & iqs) {
+    // the mxfp y block is a block_mxfp8, typed as block_q8_1 to share the mmvq vec_dot signature
+    const block_mxfp8 * bm8 = (const block_mxfp8 *) by;
+    const block_mxfp6 * bq = (const block_mxfp6 *) vbq + kbx;
+    const uint8_t *     e4m3 = (const uint8_t *) bm8->qs;
+    const int h = iqs / VDR_MXFP6_MMVQ;
+    // two accumulators break the single FMA dependency chain (this dot is latency-bound)
+    half2 acc0 = __floats2half2_rn(0.0f, 0.0f);
+    half2 acc1 = __floats2half2_rn(0.0f, 0.0f);
+#pragma unroll
+    for (int h2 = 0; h2 < VDR_MXFP6_MMVQ / 3; ++h2) {
+        const uint8_t * q16 = bq->qs + 12*(h + h2);
+        const uint8_t * y16 = e4m3 + 16*(h + h2);
+#pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            // 4 codes per 3 bytes (code 4*g is byte-aligned): unpack into the byte container
+            // the x2 dequant intrinsic expects, 2 codes per uint16
+            const uint32_t w  = (uint32_t) q16[3*g] | ((uint32_t) q16[3*g+1] << 8) | ((uint32_t) q16[3*g+2] << 16);
+            const uint16_t q0 = (uint16_t)  (w & 0x3F)  | ((uint16_t) ((w >> 6)  & 0x3F) << 8);
+            const uint16_t q1 = (uint16_t) ((w >> 12) & 0x3F) | ((uint16_t) ((w >> 18) & 0x3F) << 8);
+            const uint16_t y0 = (uint16_t) y16[4*g + 0] | ((uint16_t) y16[4*g + 1] << 8);
+            const uint16_t y1 = (uint16_t) y16[4*g + 2] | ((uint16_t) y16[4*g + 3] << 8);
+            acc0 = __hfma2(ggml_cuda_mxfp6_to_half2(q0), ggml_cuda_mxfp8_to_half2(y0), acc0);
+            acc1 = __hfma2(ggml_cuda_mxfp6_to_half2(q1), ggml_cuda_mxfp8_to_half2(y1), acc1);
+        }
+    }
+    const float2 s = __half22float2(__hadd2(acc0, acc1));
+    const float d = ggml_cuda_e8m0_to_fp32(bq->e) * ggml_cuda_e8m0_to_fp32(bm8->e);
+    return d * (s.x + s.y);
+}
+
+// mxfp8: threads per block (qi/vdr), each does 4*VDR contiguous values
+static __device__ __forceinline__ float vec_dot_mxfp8_mxfp8(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ by, const int & kbx, const int & iqs) {
+    // the mxfp y block is a block_mxfp8, typed as block_q8_1 to share the mmvq vec_dot signature
+    const block_mxfp8 * bm8 = (const block_mxfp8 *) by;
+    const block_mxfp8 * bq = (const block_mxfp8 *) vbq + kbx;
+    const uint8_t *     x = (const uint8_t *) bq->qs + 4*iqs;
+    const uint8_t *     y = (const uint8_t *) bm8->qs + 4*iqs;
+    const float d = ggml_cuda_e8m0_to_fp32(bq->e) * ggml_cuda_e8m0_to_fp32(bm8->e);
+    float sum = 0.0f;
+#pragma unroll
+    for (int l = 0; l < 2 * VDR_MXFP8_MMVQ; ++l) {
+        const uint16_t x2 = (uint16_t) x[2*l] | ((uint16_t) x[2*l + 1] << 8);
+        const uint16_t y2 = (uint16_t) y[2*l] | ((uint16_t) y[2*l + 1] << 8);
+        const float2 v = ggml_cuda_mxfp8_to_float2(x2);
+        const float2 w = ggml_cuda_mxfp8_to_float2(y2);
+        sum += v.x * w.x + v.y * w.y;
+    }
+    return d * sum;
 }
 
 #define VDR_NVFP4_Q8_1_MMVQ 4

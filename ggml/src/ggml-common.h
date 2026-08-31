@@ -218,6 +218,20 @@ typedef struct {
 } block_mxfp4;
 static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
 
+#define QK_MXFP6 32
+typedef struct {
+    uint8_t e; // E8M0
+    uint8_t qs[QK_MXFP6*6/8]; // E2M3, 6-bit packed codes, value j at bit 6*j (little-endian bit order)
+} block_mxfp6;
+static_assert(sizeof(block_mxfp6) == sizeof(uint8_t) + QK_MXFP6*6/8, "wrong mxfp6 block size/padding");
+
+#define QK_MXFP8 32
+typedef struct {
+    uint8_t e; // E8M0
+    uint8_t qs[QK_MXFP8]; // E4M3
+} block_mxfp8;
+static_assert(sizeof(block_mxfp8) == sizeof(uint8_t) + QK_MXFP8, "wrong mxfp8 block size/padding");
+
 #define QK_NVFP4 64
 #define QK_NVFP4_SUB 16  // sub-block size for per-group scales
 typedef struct {

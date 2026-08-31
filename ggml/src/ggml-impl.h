@@ -499,20 +499,57 @@ static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
 
 // Data-free optimal e8m0 block scale per grid (ref. https://arxiv.org/abs/2607.24377):
 #define GGML_MXFP_QMAX_E2M1 7.25f  // E2M1 (maxnorm 6):   q* = 29/4 = 7.25
+#define GGML_MXFP_QMAX_E2M3 7.875f // E2M3 (maxnorm 7.5): q* = 63/8 = 7.875
 #define GGML_MXFP_QMAX_E4M3 464.0f // E4M3 (maxnorm 448): q* ~= 464
+
+// host+device qualifier: the mxfp helpers below are shared between the reference code and the CUDA kernels
+#ifndef GGML_HOST_DEVICE
+#if defined(__device__) && defined(__host__)
+#define GGML_HOST_DEVICE __host__ __device__
+#else
+#define GGML_HOST_DEVICE
+#endif
+#endif // GGML_HOST_DEVICE
+
+// mxfp6 (e2m3) 6-bit packed bitstream of a block_mxfp6: value j at bit 6*j (little-endian bit order)
+static inline GGML_HOST_DEVICE uint8_t ggml_mxfp6_get_code(const uint8_t * qs, int j) {
+    const int b = 6*j / 8;
+    const int o = 6*j % 8;
+    if (o + 6 <= 8) {
+        return (uint8_t) ((qs[b] >> o) & 0x3F);
+    }
+    return (uint8_t) (((qs[b] >> o) | (qs[b+1] << (8-o))) & 0x3F);
+}
+
+static inline GGML_HOST_DEVICE void ggml_mxfp6_set_code(uint8_t * qs, int j, uint8_t code) {
+    const int b = 6*j / 8;
+    const int o = 6*j % 8;
+    if (o + 6 <= 8) {
+        qs[b] = (uint8_t) ((qs[b] & ~(uint8_t) (0x3Fu << o)) | (uint8_t) (code << o));
+    } else {
+        qs[b]   = (uint8_t) ((qs[b] & (uint8_t) ~(0x3Fu << o)) | (uint8_t) (code << o));
+        qs[b+1] = (uint8_t) ((qs[b+1] & (uint8_t) ~(0x3Fu >> (8-o))) | (uint8_t) (code >> (8-o)));
+    }
+}
 
 // Data-free e8m0 block scale: the exponent e such that amax*2^(127-e) falls in (qmax/2, qmax].
 // A tie (amax/qmax exactly a power of two) lands exactly on qmax, which is in range (lower exponent).
-static inline uint8_t ggml_mxfp_scale(float amax, float qmax) {
+typedef struct { uint8_t e; float inv; } ggml_mxfp_scale_result;
+static inline GGML_HOST_DEVICE ggml_mxfp_scale_result ggml_mxfp_scale(float amax, float qmax) {
+    ggml_mxfp_scale_result r;
     if (!(amax > 0.0f)) {
-        return 0;
+        r.e   = 0;
+        r.inv = ldexpf(1.0f, 127);
+        return r;
     }
 
     int A, Q;
     const float r_a = frexpf(amax, &A);
     const float m   = frexpf(qmax, &Q);
-    const int e = A - Q + (r_a > m) - (r_a <= 0.5f * m);
-    return (uint8_t) MAX(0, MIN(254, 127 + e));
+    const int e = MAX(0, MIN(254, 127 + A - Q + (r_a > m) - (r_a <= 0.5f * m)));
+    r.e   = (uint8_t) e;
+    r.inv = ldexpf(1.0f, 127 - e);
+    return r;
 }
 
 // UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits
@@ -568,6 +605,131 @@ static inline uint8_t ggml_fp32_to_ue4m3(float x) {
         }
     }
     return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
+}
+
+// E2M3: signed, 2 exp bits (bias=1), 3 mantissa bits; no NaN/Inf codes, max value 7.5
+static inline GGML_HOST_DEVICE float ggml_e2m3_to_fp32(uint8_t x) {
+    if (x == 0) {
+        return 0.0f;
+    }
+    const int exp = (x >> 3) & 0x3;
+    const int man = x & 0x7;
+    const float raw = exp == 0
+        ? ldexpf((float) man, -3)
+        : ldexpf(1.0f + (float) man * 0.125f, exp - 1);
+    return (x & 0x20) ? -raw : raw;
+}
+
+// RNE, saturates at the max value 7.5 (0x1F); 0x3F is -7.5 (sign bit is set)
+static inline GGML_HOST_DEVICE uint8_t ggml_fp32_to_e2m3(float x) {
+    const uint8_t sign = x < 0.0f || (x == 0.0f && signbit(x)) ? 0x20 : 0x00;
+    if (x != x) {
+        return (uint8_t) (0x1F | sign); // saturate, e2m3 has no NaN
+    }
+    const float a = fabsf(x);
+    if (a > 7.5f) {
+        return (uint8_t) (0x1F | sign);
+    }
+    if (a == 0.0f) {
+        return sign;
+    }
+
+    uint32_t bits;
+    memcpy(&bits, &a, 4);
+    int exp = ((bits >> 23) & 0xFF) - 127;
+    int man = (bits >> 20) & 0x7;
+
+    // subnormal output: value = man * 2^-3 (grid is contiguous to the min normal 1)
+    if (exp <= -1) {
+        const float t = a * 8.0f; // exact
+        int m = (int) t;
+        const float rem = t - (float) m;
+        if (rem > 0.5f || (rem == 0.5f && (m & 1))) {
+            ++m;
+        }
+        if (m < 1) {
+            return sign;
+        }
+        if (m > 7) {
+            return (uint8_t) (sign | 0x08); // 1.0 = exp 1, man 0
+        }
+        return (uint8_t) (sign | m);
+    }
+
+    // RNE on the 20 dropped mantissa bits (tie to even)
+    const uint32_t rem = bits & 0xFFFFF;
+    if (rem > 0x80000 || (rem == 0x80000 && (man & 1))) {
+        if (++man > 7) {
+            man = 0;
+            ++exp;
+            if (exp > 2) {
+                return (uint8_t) (0x1F | sign);
+            }
+        }
+    }
+
+    return (uint8_t) (sign | ((exp + 1) << 3) | man);
+}
+
+// E4M3: signed, 4 exp bits (bias=7), 3 mantissa bits; 0x7F/0xFF is the NaN code
+static inline GGML_HOST_DEVICE float ggml_e4m3_to_fp32(uint8_t x) {
+    if (x == 0 || x == 0x7F || x == 0xFF) {
+        return x & 0x80 ? -0.0f : 0.0f;
+    }
+    const int exp = (x >> 3) & 0xF;
+    const int man = x & 0x7;
+    const float raw = exp == 0
+        ? ldexpf((float) man, -9)
+        : ldexpf(1.0f + (float) man * 0.125f, exp - 7);
+    return (x & 0x80) ? -raw : raw;
+}
+
+// RNE, saturates at the max finite value 448 (0x7E)
+static inline GGML_HOST_DEVICE uint8_t ggml_fp32_to_e4m3(float x) {
+    const uint8_t sign = x < 0.0f || (x == 0.0f && signbit(x)) ? 0x80 : 0x00;
+    if (x != x) {
+        return (uint8_t) (0x7F | sign);
+    }
+    const float a = fabsf(x);
+    if (a > 448.0f) {
+        return (uint8_t) (0x7E | sign);
+    }
+    if (a == 0.0f) {
+        return sign;
+    }
+
+    uint32_t bits;
+    memcpy(&bits, &a, 4);
+    int exp = ((bits >> 23) & 0xFF) - 127;
+    int man = (bits >> 20) & 0x7;
+
+    // subnormal output: value = man * 2^-9
+    if (exp <= -7) {
+        const float t = a * 512.0f; // exact
+        int m = (int) t;
+        const float rem = t - (float) m;
+        if (rem > 0.5f || (rem == 0.5f && (m & 1))) {
+            ++m;
+        }
+        if (m >= 8) {
+            return (uint8_t) (sign | 0x08); // 2^-6 = min normal, tie at 7.5 * 2^-9
+        }
+        return (uint8_t) (sign | m);
+    }
+
+    // RNE on the 20 dropped mantissa bits (tie to even)
+    const uint32_t rem = bits & 0xFFFFF;
+    if (rem > 0x80000 || (rem == 0x80000 && (man & 1))) {
+        if (++man > 7) {
+            man = 0;
+            ++exp;
+            if (exp > 8) {
+                return (uint8_t) (0x7E | sign);
+            }
+        }
+    }
+
+    return (uint8_t) (sign | ((exp + 7) << 3) | man);
 }
 
 /**
