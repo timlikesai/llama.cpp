@@ -308,23 +308,38 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q8_0_16_q8_1_
 #define VDR_MXFP4_Q8_1_MMQ  4
 
 static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs, const int & nb) {
 
-    const block_mxfp4 * bq4 = (const block_mxfp4 *) vbq + kbx;
+    const ggml_cuda_mxfp4_block b = ggml_cuda_mxfp4_block_of((const uint8_t *) vbq, nb, kbx);
 
     const int * q8 = (const int *) bq8_1->qs + iqs;
 
+    // hoist the scale load: it comes from a different cache line (e plane) than the data,
+    // so issuing it first lets its latency overlap the data loads and the dp4a work
+    const float d = ggml_cuda_e8m0_to_fp32(*b.e) * 0.5f * __low2float(bq8_1->ds);
+
+    // the two ints read by this thread are consecutive; a single 8B load suffices when the data plane is 8B aligned.
+    // iqs is even (mmvq passes kqs = 2*(tid % (qi/vdr)) with vdr = 2), so 4*iqs stays 8B aligned
+    assert((iqs & 1) == 0);
+    static_assert(VDR_MXFP4_Q8_1_MMVQ == 2, "vec_dot_mxfp4_q8_1 assumes 2 consecutive ints");
+    int aux_q4[2];
+    const bool aligned8 = (reinterpret_cast<uintptr_t>(b.qs) & 7) == 0;
+    if (aligned8) {
+        const uint2 q2 = *(const uint2 *) (b.qs + 4*iqs);
+        aux_q4[0] = q2.x;
+        aux_q4[1] = q2.y;
+    } else {
+        aux_q4[0] = get_int_b1(b.qs, iqs);
+        aux_q4[1] = get_int_b1(b.qs, iqs + 1);
+    }
     int sumi = 0;
 #pragma unroll
     for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
-        const int aux_q4 = get_int_b1(bq4->qs, iqs + l);
-        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+        const int2 v = get_int_from_table_16(aux_q4[l], kvalues_mxfp4);
 
         sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
         sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
     }
-
-    const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds);
     return d * sumi;
 }
 

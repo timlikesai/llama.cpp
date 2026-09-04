@@ -237,10 +237,10 @@ static __global__ void dequantize_block_iq4_xs(const void * __restrict__ vx, dst
 }
 
 template<typename dst_t>
-static __global__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+static __global__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nb) {
     const int64_t i = blockIdx.x;
 
-    dequantize_mxfp4(vx, i, yy + i*QK_K, threadIdx.x);
+    dequantize_mxfp4(vx, i, yy + i*QK_K, threadIdx.x, nb);
 }
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
@@ -370,8 +370,8 @@ static void dequantize_row_iq4_xs_cuda(const void * vx, dst_t * y, const int64_t
 
 template<typename dst_t>
 static void dequantize_row_mxfp4_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
-    const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_mxfp4<<<nb, 32, 0, stream>>>(vx, y);
+    const int64_t nsb = (k + QK_K - 1) / QK_K; // super-blocks per row
+    dequantize_block_mxfp4<<<nsb, 32, 0, stream>>>(vx, y, k / QK_MXFP4);
 }
 
 template <typename dst_t>

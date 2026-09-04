@@ -1583,6 +1583,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int kbx  = txi / QI_MXFP4;
     const int kqsx = txi % QI_MXFP4;
 
+    const uint8_t * xb = (const uint8_t *) x;
+    const int kbt = kbx0 + kbx; // absolute block index of this thread (row*stride + block)
+
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
         int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
@@ -1591,9 +1594,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
-        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbx;
-
-        const int aux_q4 = get_int_b1(bxi->qs, kqsx);
+        const ggml_cuda_mxfp4_block b = ggml_cuda_mxfp4_block_of(xb, stride, kbt + i*stride);
+        const int aux_q4 = get_int_b1(b.qs, kqsx);
         const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
         const int k0 = kbx * (2 * QI_MXFP4) + kqsx;
 
@@ -1613,17 +1615,14 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
         int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
-
         if (fallback) {
             i = min(i, i_max);
         }
-
-        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbxd;
-
+        const ggml_cuda_mxfp4_block b = ggml_cuda_mxfp4_block_of(xb, stride, kbx0 + kbxd + i*stride);
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_df[i*sram_stride                           + kbxd] = ggml_cuda_e8m0_to_fp32(bxi->e)*0.5f;
+        x_df[i*sram_stride                           + kbxd] = ggml_cuda_e8m0_to_fp32(*b.e)*0.5f;
 #else
-        x_df[i*(MMQ_TILE_NE_K/QI_MXFP4) + i/QI_MXFP4 + kbxd] = ggml_cuda_e8m0_to_fp32(bxi->e)*0.5f;
+        x_df[i*(MMQ_TILE_NE_K/QI_MXFP4) + i/QI_MXFP4 + kbxd] = ggml_cuda_e8m0_to_fp32(*b.e)*0.5f;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }
@@ -1642,30 +1641,33 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     constexpr int iter_k = ggml_cuda_mmq_get_K_vram(type, J, fallback);
 
-    constexpr int threads_per_row = iter_k / QK_MXFP4;  // each thread processes 1 block
+    // each thread processes 1 block (16B data, 1 scale byte)
+    constexpr int threads_per_row = iter_k / QK_MXFP4;
     constexpr int rows_per_warp   = warp_size / threads_per_row;
-    const int     kbx             = txi % threads_per_row;
+    const int     kbx = txi % threads_per_row;
     const int     row_in_warp     = txi / threads_per_row;
 
-#pragma unroll
+    const uint8_t * xb = (const uint8_t *) x;
+    const int kbt = kbx0 + kbx; // absolute block index of this thread (row*stride + block)
+    const int k0 = kbx * 4;
+    // 128-bit loads when the data plane is 16B aligned
+    const bool aligned16 = (reinterpret_cast<uintptr_t>(xb) % 16) == 0 && stride % 16 == 0;
+    #pragma unroll
     for (int i0 = 0; i0 < I; i0 += rows_per_warp * nwarps) {
         int i = i0 + threadIdx.y * rows_per_warp + row_in_warp;
-
         if constexpr (fallback) {
             i = min(i, i_max);
         }
-
-        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i * stride + kbx;
-
-        // quantize_mxfp4_mmq permutes nibbles to match the quantized format
-        const int k0 = kbx * 4;
-        memcpy(x_qs + i*sram_stride + k0, bxi->qs, 16);
-
-        // Load E8M0 scales: pack 2 consecutive scales into one uint32
+        const ggml_cuda_mxfp4_block b = ggml_cuda_mxfp4_block_of(xb, stride, kbt + i*stride);
+        if (aligned16) {
+            *(uint4 *) (x_qs + i*sram_stride + k0) = *(const uint4 *) b.qs;
+        } else {
+            memcpy(x_qs + i*sram_stride + k0, b.qs, 16);
+        }
         if (kbx % 2 == 0) {
-            uint32_t e = bxi->e;
-            e |= ((bxi + 1)->e << 8);
-            x_sc[i*sram_stride + kbx / 2] = e;
+            // scale byte pair (kb and kb+1); kb+1 may be the first block of the next row
+            const ggml_cuda_mxfp4_block b1 = ggml_cuda_mxfp4_block_of(xb, stride, kbt + i*stride + 1);
+            x_sc[i*sram_stride + kbx / 2] = (uint32_t) *b.e | ((uint32_t) *b1.e << 8);
         }
     }
 }

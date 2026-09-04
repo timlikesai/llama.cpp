@@ -837,6 +837,14 @@ static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
 #endif // CUDART_VERSION >= 12050
 }
 
+// tiled mxfp4 row: [e x nb][qs[16] x nb], nb = ne00/32; block kb = row*nb + block in row: scale byte e, 16B data qs
+struct ggml_cuda_mxfp4_block { const uint8_t * e; const uint8_t * qs; };
+static __device__ __forceinline__ ggml_cuda_mxfp4_block ggml_cuda_mxfp4_block_of(const uint8_t * x, const int64_t nb, const int64_t kb) {
+    const uint8_t * r = x + (kb / nb) * (size_t) nb * sizeof(block_mxfp4);
+    const int64_t k = kb % nb;
+    return { r + k, r + nb + 16*k };
+}
+
 static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
 #if defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
     // ROCm does not support fp8 in software on devices with fp8 hardware,

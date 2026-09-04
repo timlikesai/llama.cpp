@@ -1658,7 +1658,8 @@ bool llama_model_loader::load_all_data(
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
+                // mxfp4 is uploaded whole: the backend retiles rows in set_tensor, the chunked path cannot do that
+                if (upload_backend && cur->type != GGML_TYPE_MXFP4) {
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);

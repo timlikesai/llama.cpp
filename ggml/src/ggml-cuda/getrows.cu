@@ -40,7 +40,7 @@ static __global__ void k_get_rows(
     }
 }
 
-template<typename dst_t, dequantize_kq_t<dst_t> dequantize_kq>
+template<typename dst_t, dequantize_kq_t<dst_t> dequantize_kq = nullptr, bool mxfp4 = false>
 static __global__ void k_get_rows_kq(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
         const int64_t ne00, /*const int64_t ne01, const int64_t ne02, const int64_t ne03,*/
@@ -64,10 +64,16 @@ static __global__ void k_get_rows_kq(
         const void * src0_row = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
 
         for (int64_t ib = blockIdx.y; ib < nsb; ib += gridDim.y) {
-            dequantize_kq(src0_row, ib, dst_row + ib*QK_K, threadIdx.x);
+            if constexpr (mxfp4) {
+                // mxfp4 rows are tiled per row ([e x nb][qs[16] x nb]); nb is derivable from ne00
+                dequantize_mxfp4<dst_t>(src0_row, ib, dst_row + ib*QK_K, threadIdx.x, ne00/QK_MXFP4);
+            } else {
+                dequantize_kq(src0_row, ib, dst_row + ib*QK_K, threadIdx.x);
+            }
         }
     }
 }
+
 
 template<typename src0_t, typename dst_t>
 static __global__ void k_get_rows_float(
@@ -193,7 +199,7 @@ static void get_rows_cuda_q(
         s10, s11, s12/*, s13*/);
 }
 
-template<int block_dim, typename dst_t, dequantize_kq_t<dst_t> dequantize_kq>
+template<int block_dim, typename dst_t, dequantize_kq_t<dst_t> dequantize_kq = nullptr, bool mxfp4 = false>
 static void get_rows_cuda_kq(
         const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
         const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
@@ -221,7 +227,7 @@ static void get_rows_cuda_kq(
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
 
-    k_get_rows_kq<dst_t, dequantize_kq><<<block_nums, block_dims, 0, stream>>>(
+    k_get_rows_kq<dst_t, dequantize_kq, mxfp4><<<block_nums, block_dims, 0, stream>>>(
         src0_d, src1_d, dst_d,
         ne00, /*ne01, ne02, ne03,*/
         /*ne10,*/ ne11, ne12_fdv, /*ne13,*/
@@ -401,7 +407,7 @@ static void ggml_cuda_get_rows_switch_src0_type(
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_MXFP4:
-            get_rows_cuda_kq<32, dst_t, dequantize_mxfp4<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<32, dst_t, nullptr, /* mxfp4 = */ true>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         default:
@@ -451,6 +457,11 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(ne13 == 1);
 
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
+    // mxfp4 rows are stored tiled per row; the kernel reads whole rows, so all row strides must be whole rows
+    if (src0->type == GGML_TYPE_MXFP4) {
+        const size_t row = ggml_row_size(GGML_TYPE_MXFP4, ne00);
+        GGML_ASSERT(nb01 % row == 0 && nb02 % row == 0 && nb03 % row == 0);
+    }
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
 

@@ -17,7 +17,6 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
         case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
         case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
-        case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
@@ -541,6 +540,17 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+// dot product of row i of vx with the y block; mxfp4 rows are stored tiled per row ([e x nb][qs[16] x nb])
+template<ggml_type type>
+static __device__ __forceinline__ float vec_dot_x_row(const void * vx, const block_q8_1 * bq,
+        const int kbx_offset, const int i, const int kbx, const int kqs, const int stride_row_x, const int blocks_per_row_x) {
+    if constexpr (type == GGML_TYPE_MXFP4) {
+        const int64_t row_stride = sizeof(block_mxfp4) * blocks_per_row_x;
+        return vec_dot_mxfp4_q8_1((const uint8_t *) vx + (kbx_offset / blocks_per_row_x + i) * row_stride, bq, kbx, kqs, blocks_per_row_x);
+    }
+    return get_vec_dot_q_cuda(type)(vx, bq, kbx_offset + i*stride_row_x + kbx, kqs);
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -657,6 +667,8 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
+
+#pragma unroll
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
@@ -667,12 +679,10 @@ static __global__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                tmp[j][i] += vec_dot_x_row<type>(vx, &y[j*stride_col_y + kby], kbx_offset, i, kbx, kqs, stride_row_x, blocks_per_row_x);
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        tmp_gate[j][i] += vec_dot_x_row<type>(vgate, &y[j*stride_col_y + kby], kbx_offset, i, kbx, kqs, stride_row_x, blocks_per_row_x);
                     }
                 }
             }
@@ -845,10 +855,10 @@ static __global__ void mul_mat_vec_q_moe(
 
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            tmp[i] += vec_dot_x_row<type>(vx, &y[kby], kbx_offset, i, kbx, kqs, stride_row_x, blocks_per_row_x);
             if constexpr (has_fusion) {
                 if (use_gate) {
-                    tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    tmp_gate[i] += vec_dot_x_row<type>(vgate, &y[kby], kbx_offset, i, kbx, kqs, stride_row_x, blocks_per_row_x);
                 }
             }
         }
@@ -1364,6 +1374,8 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+    // mxfp4 rows are stored tiled per row; the kernels assume packed rows (row stride == row size)
+    GGML_ASSERT(src0->type != GGML_TYPE_MXFP4 || nb01 == ggml_row_size(GGML_TYPE_MXFP4, ne00));
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;

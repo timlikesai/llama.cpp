@@ -724,6 +724,83 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 }
 
 
+// mxfp4 rows are stored tiled in the CUDA buffer: [e x nb][qs[16] x nb] per row (nb = ne00/32),
+// vs the file layout {e, qs[16]} x nb; converted on copy (set/get_tensor)
+
+// (de)tile n rows between the file layout {e, qs[16]} x nb and the tiled layout [e x nb][qs[16] x nb];
+// src and dst are the same size, not in-place
+static void mxfp4_reorder_rows(const uint8_t * src, uint8_t * dst, int64_t n, int64_t ne00, bool src_tiled) {
+    const int64_t nb = ne00 / QK_MXFP4;
+    const size_t bs = sizeof(block_mxfp4); // 1 scale byte + 16 data bytes
+    const size_t row = (size_t) nb * bs;
+
+    const uint8_t * s = src;
+    uint8_t * d = dst;
+    for (int64_t r = 0; r < n; r++) {
+        for (int64_t i = 0; i < nb; i++) {
+            if (!src_tiled) {
+                d[i] = s[i * bs];
+                memcpy(d + nb + i * (bs - 1), s + i * bs + 1, bs - 1);
+            } else {
+                d[i * bs] = s[i];
+                memcpy(d + i * bs + 1, s + nb + i * (bs - 1), bs - 1);
+            }
+        }
+        s += row;
+        d += row;
+    }
+}
+
+// copy whole rows (file layout) between a host buffer and the tiled buffer; a view row is a
+// whole parent row addressed by the view's own strides
+static void mxfp4_transfer_rows(const ggml_tensor * t, const void * data, bool h2d) {
+    const size_t row = ggml_row_size(GGML_TYPE_MXFP4, t->ne[0]);
+    GGML_ASSERT(t->nb[1] % row == 0 && t->nb[2] % row == 0 && t->nb[3] % row == 0); // whole rows only
+    if (t->view_src) {
+        const ggml_tensor * root = t;
+        while (root->view_src) {
+            root = root->view_src;
+        }
+        GGML_ASSERT(root->ne[0] == t->ne[0]); // no k-slices
+        GGML_ASSERT(((const char *) t->data - (const char *) root->data) % row == 0);
+    }
+
+    const int64_t nrows = ggml_nelements(t) / t->ne[0];
+    const int64_t n_scratch = std::max<int64_t>(1, std::min<int64_t>(nrows, (int64_t) ((4 * 1024 * 1024) / row)));
+    std::vector<uint8_t> scratch((size_t) n_scratch * row);
+
+    if (ggml_is_contiguous(t)) {
+        for (int64_t r0 = 0; r0 < nrows; r0 += n_scratch) {
+            const int64_t n = std::min(n_scratch, nrows - r0);
+            if (h2d) {
+                mxfp4_reorder_rows((const uint8_t *) data + r0 * row, scratch.data(), n, t->ne[0], /* src_tiled = */ false);
+                CUDA_CHECK(cudaMemcpyAsync((uint8_t *) t->data + r0 * row, scratch.data(), (size_t) n * row, cudaMemcpyHostToDevice, cudaStreamPerThread));
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(scratch.data(), (const uint8_t *) t->data + r0 * row, (size_t) n * row, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+                mxfp4_reorder_rows(scratch.data(), (uint8_t *) data + r0 * row, n, t->ne[0], /* src_tiled = */ true);
+            }
+        }
+    } else {
+        // view: one row at a time into its parent slot
+        for (int64_t w = 0; w < t->ne[3]; w++) {
+            for (int64_t z = 0; z < t->ne[2]; z++) {
+                for (int64_t i = 0; i < t->ne[1]; i++) {
+                    const int64_t r = i + t->ne[1] * (z + t->ne[2] * w);
+                    uint8_t * dev = (uint8_t *) t->data + i * t->nb[1] + z * t->nb[2] + w * t->nb[3];
+                    if (h2d) {
+                        mxfp4_reorder_rows((const uint8_t *) data + r * row, scratch.data(), 1, t->ne[0], /* src_tiled = */ false);
+                        CUDA_CHECK(cudaMemcpyAsync(dev, scratch.data(), row, cudaMemcpyHostToDevice, cudaStreamPerThread));
+                    } else {
+                        CUDA_CHECK(cudaMemcpyAsync(scratch.data(), dev, row, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+                        mxfp4_reorder_rows(scratch.data(), (uint8_t *) data + r * row, 1, t->ne[0], /* src_tiled = */ true);
+                    }
+                }
+            }
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+}
+
 // cuda buffer
 
 struct ggml_backend_cuda_buffer_context {
@@ -784,18 +861,35 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// the 2d and async copy hooks read raw rows and cannot (de)tile; mxfp4 must go through the set/get_tensor hooks
+static void mxfp4_assert_plain(const ggml_tensor * tensor) {
+    GGML_ASSERT(tensor->type != GGML_TYPE_MXFP4 && "mxfp4 is stored in the tiled layout; use the buffer set/get_tensor hooks");
+}
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
-
     ggml_cuda_set_device(ctx->device);
+
+    if (tensor->type == GGML_TYPE_MXFP4) {
+        GGML_ASSERT(offset == 0 && size == ggml_row_size(GGML_TYPE_MXFP4, tensor->ne[0]) * (ggml_nelements(tensor) / tensor->ne[0])); // whole tensor only
+        mxfp4_transfer_rows(tensor, data, /* h2d = */ true);
+        return;
+    }
+
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
-
     ggml_cuda_set_device(ctx->device);
+
+    if (tensor->type == GGML_TYPE_MXFP4) {
+        GGML_ASSERT(offset == 0 && size == ggml_row_size(GGML_TYPE_MXFP4, tensor->ne[0]) * (ggml_nelements(tensor) / tensor->ne[0])); // whole tensor only
+        mxfp4_transfer_rows(tensor, data, /* h2d = */ false);
+        return;
+    }
+
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -803,6 +897,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    mxfp4_assert_plain(tensor);
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
@@ -813,6 +908,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
 static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    mxfp4_assert_plain(tensor);
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
@@ -1276,6 +1372,7 @@ static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buff
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
+// returns nullptr when pinned memory is unavailable (GGML_CUDA_NO_PINNED, or alloc failure)
 static void * ggml_cuda_host_malloc(size_t size) {
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
         return nullptr;
@@ -1815,6 +1912,67 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+// each view row is a whole parent row; copy it to its dst row using the view's strides, 16B
+// chunks when the row is 16B aligned, else byte-wise; one block per row
+static __global__ void k_mxfp4_view_gather(char * __restrict__ dst, const char * __restrict__ src,
+        const int nrows, const int row, const int nb1, const int nb2, const int nb3, const int n01, const int n02) {
+    const int r = blockIdx.x;
+    const int i = r % n01;
+    const int z = (r / n01) % n02;
+    const int w = r / (n01 * n02);
+    const char * s = src + (int64_t) (i*nb1 + z*nb2 + w*nb3);
+    char * d = dst + (int64_t) r * row;
+
+    if (row % 16 == 0) { // 16B chunks
+        const int n16 = row / 16;
+        for (int o = threadIdx.x; o < n16; o += blockDim.x) {
+            ((uint4 *) d)[o] = ((const uint4 *) s)[o];
+        }
+    } else {
+        for (int o = threadIdx.x; o < row; o += blockDim.x) {
+            d[o] = s[o];
+        }
+    }
+}
+
+// mxfp4 view rows are packed parent rows; gather them into a contiguous pool temp in view order
+// so the regular contiguous kernels can be used as-is. *src0_v and *src0_temp must outlive the op;
+// returns the tensor to use, or src0 if no materialization was needed
+static const ggml_tensor * mxfp4_view_to_temp(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+        ggml_tensor * src0_v, ggml_cuda_pool_alloc<char> * src0_temp) {
+    if (src0->type != GGML_TYPE_MXFP4 || src0->view_src == nullptr ||
+        src0->nb[1] == ggml_row_size(GGML_TYPE_MXFP4, src0->ne[0])) { // packed rows, incl. contiguous views: read as-is
+        return src0;
+    }
+
+    const size_t row = ggml_row_size(GGML_TYPE_MXFP4, src0->ne[0]);
+    GGML_ASSERT(src0->nb[1] % row == 0 && src0->nb[2] % row == 0 && src0->nb[3] % row == 0); // whole parent rows only
+
+    const int nrows = (int) (src0->ne[1] * src0->ne[2] * src0->ne[3]);
+
+    *src0_v = *src0;
+    src0_v->view_src = nullptr;
+    src0_v->nb[1] = row;
+    src0_v->nb[2] = row * src0->ne[1];
+    src0_v->nb[3] = row * src0->ne[1] * src0->ne[2];
+    // the temp keeps the parent's buffer; its padding is zeroed below
+
+    // include the padding the buft would reserve for this shape, so the mmq entry padding clear stays in bounds
+    const size_t temp_size = ggml_backend_buffer_get_alloc_size(src0->buffer, src0_v);
+    src0_temp->alloc(temp_size);
+    src0_v->data = src0_temp->get();
+    const size_t nbytes = ggml_nbytes(src0_v);
+    if (temp_size > nbytes) {
+        CUDA_CHECK(cudaMemsetAsync((char *) src0_v->data + nbytes, 0, temp_size - nbytes, ctx.stream()));
+    }
+
+    k_mxfp4_view_gather<<<nrows, 256, 0, ctx.stream()>>>(
+            (char *) src0_v->data, (const char *) src0->data, nrows, (int) row,
+            (int) src0->nb[1], (int) src0->nb[2], (int) src0->nb[3], (int) src0->ne[1], (int) src0->ne[2]);
+
+    return src0_v;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1822,6 +1980,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
     }
+
+    // An mxfp4 view reads from the parent's packed tiled rows, which its own strides do not describe;
+    // materialize it into a contiguous temp and run the op on that
+    ggml_tensor src0_v{};
+    ggml_cuda_pool_alloc<char> src0_temp(ctx.pool());
+    src0 = mxfp4_view_to_temp(ctx, src0, &src0_v, &src0_temp);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
@@ -1913,6 +2077,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    // mxfp4 views are materialized the same way as in mul_mat (see mxfp4_view_to_temp)
+    ggml_tensor src0_v{};
+    ggml_cuda_pool_alloc<char> src0_temp(ctx.pool());
+    src0 = mxfp4_view_to_temp(ctx, src0, &src0_v, &src0_temp);
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -2015,8 +2184,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         src0_slice.ne[2]    = 1;
         src0_slice.nb[3]    = src0_slice.nb[2];
         src0_slice.op       = GGML_OP_VIEW;
-        src0_slice.view_src = dst->src[0]; // non-const pointer to src0
-        src0_slice.data     = (char *) src0->data + i02*nb02;
+        // src0 may be the materialized temp for mxfp4 views: the slice then lives in the temp, not in the original tensor
+        src0_slice.view_src = (src0 == dst->src[0]) ? (ggml_tensor *) dst->src[0] : nullptr;
+        src0_slice.data     = (char *) src0->data + i02*src0->nb[2];
 
         ggml_tensor src1_slice;
         memset(&src1_slice, 0, sizeof(src1_slice));
@@ -2442,6 +2612,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    mxfp4_assert_plain(tensor);
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -2451,6 +2622,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    mxfp4_assert_plain(tensor);
 
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
@@ -2461,6 +2633,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    mxfp4_assert_plain(tensor);
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
@@ -2472,6 +2645,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    mxfp4_assert_plain(tensor);
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));

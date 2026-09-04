@@ -436,15 +436,15 @@ static __device__ __forceinline__ void dequantize_iq4_xs(const void * vx, const 
 }
 
 template<typename dst_t>
-static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
-
-    const block_mxfp4 * x = (const block_mxfp4 *) vx + ibs*(QK_K/QK_MXFP4);
-
+static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid, const int64_t nb) {
     const int64_t il = tid/8; // 0...3
     const int64_t ib = tid%8; // 0...7
+    const int bi = ibs*(QK_K/QK_MXFP4) + ib; // block in the row
+
+    const ggml_cuda_mxfp4_block b = ggml_cuda_mxfp4_block_of((const uint8_t *) vx, nb, bi);
     dst_t * y = yy + 32*ib + 4*il;
-    const uint8_t  * q4 = x[ib].qs + 4*il;
-    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
+    const uint8_t * q4 = b.qs + 4*il;
+    const float d = ggml_cuda_e8m0_to_fp32(*b.e);
     for (int j = 0; j < 4; ++j) {
         y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] & 0xf]*0.5f);
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
