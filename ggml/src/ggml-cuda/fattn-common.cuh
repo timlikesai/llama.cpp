@@ -617,6 +617,105 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_mxfp4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_mxfp4 * x = (const block_mxfp4 *) vx;
+
+    static_assert(ne % 2 == 0, "bad ne");
+    static_assert(QK_MXFP4/2 % ne == 0, "bad ne");
+
+    const int64_t ib  = i0 / QK_MXFP4;
+    const int     r   = i0 % QK_MXFP4;
+    const bool    low = r < QK_MXFP4/2;
+    const int     b0  = low ? r : r - QK_MXFP4/2 + ne/2;
+
+    static_assert(std::is_same_v<T, half> || std::is_same_v<T, float>, "bad type");
+
+    // a byte holds one code from each half of the 32-element block (low nibble = elem j,
+    // high nibble = elem j+16): each thread reads its own half directly and takes the other
+    // half from the partner thread covering the other half of the same block
+    constexpr int shfl_dist = QK_MXFP4 / (2 * ne);
+
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 scale = __half2half2(ggml_cuda_cast<half>(ggml_cuda_e8m0_to_fp32(x[ib].e)));
+#pragma unroll
+        for (int j = 0; j < ne/2; ++j) {
+            const half2 p = ggml_cuda_mxfp4_to_half2(x[ib].qs[b0 + j]) * scale;
+            const half2 q = __shfl_xor_sync(0xFFFFFFFF, p, shfl_dist, WARP_SIZE);
+            ((half *) dst)[j]        = low ? __low2half(p)  : __high2half(q);
+            ((half *) dst)[j + ne/2] = low ? __low2half(q)  : __high2half(p);
+        }
+    } else {
+        const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
+#pragma unroll
+        for (int j = 0; j < ne/2; ++j) {
+            const float2 v = ggml_cuda_mxfp4_to_float2(x[ib].qs[b0 + j]);
+            const float ox = __shfl_xor_sync(0xFFFFFFFF, v.x, shfl_dist, WARP_SIZE);
+            const float oy = __shfl_xor_sync(0xFFFFFFFF, v.y, shfl_dist, WARP_SIZE);
+            ((float *) dst)[j]        = (low ? v.x : oy) * d;
+            ((float *) dst)[j + ne/2] = (low ? ox : v.y) * d;
+        }
+    }
+}
+
+// Shared between vec_dot_fattn_vec_KQ_mxfp4 and the mxfp4 Q_reg construction in fattn-vec.cuh:
+// a K byte holds the codes of elements 2k and 2k+16 (low/high nibble), so the Q side is interleaved:
+// Q_reg[m] = (Q[2k], Q[2k+16]) and Q_reg[nbpt+m] = (Q[2k+1], Q[2k+17]) within the thread's 32-elem block
+template <int D, int nthreads>
+struct fattn_vec_mxfp4_map {
+    static constexpr int nblocks = D/QK_MXFP4;
+    static constexpr int tpblock = nthreads/nblocks;
+    static constexpr int nbpt    = (QK_MXFP4/4)/tpblock;
+    static_assert(nthreads % nblocks == 0, "bad nthreads for mxfp4");
+
+    int ib, s0;
+
+    __device__ __forceinline__ fattn_vec_mxfp4_map() {
+        const int t = nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads;
+        ib = t / tpblock;
+        s0 = (t % tpblock) * nbpt;
+    }
+};
+
+static __device__ __forceinline__ float2 fattn_vec_q_load(const void * __restrict__ Q_v, int i) {
+#ifdef V_DOT2_F32_F16_AVAILABLE
+    return __half22float2(((const half2 *) Q_v)[i]);
+#else
+    return ((const float2 *) Q_v)[i];
+#endif // V_DOT2_F32_F16_AVAILABLE
+}
+
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_mxfp4 * K_mxfp4 = (const block_mxfp4 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    using map_t = fattn_vec_mxfp4_map<D, nthreads>;
+    constexpr int nbpt = map_t::nbpt;
+    static_assert(nbpt * 2 == (D / 2) / nthreads, "nbpt must match Q_reg size");
+    const map_t map;
+
+    const float d = ggml_cuda_e8m0_to_fp32(K_mxfp4[map.ib].e);
+    const uint8_t * qs = K_mxfp4[map.ib].qs;
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int m = 0; m < nbpt; ++m) {
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        ggml_cuda_mad(sum, ggml_cuda_mxfp4_to_half2(qs[2*(map.s0 + m) + 0]), ((const half2 *) Q_v)[m]);
+        ggml_cuda_mad(sum, ggml_cuda_mxfp4_to_half2(qs[2*(map.s0 + m) + 1]), ((const half2 *) Q_v)[nbpt + m]);
+#else
+        ggml_cuda_mad(sum, ggml_cuda_mxfp4_to_float2(qs[2*(map.s0 + m) + 0]), fattn_vec_q_load(Q_v, m));
+        ggml_cuda_mad(sum, ggml_cuda_mxfp4_to_float2(qs[2*(map.s0 + m) + 1]), fattn_vec_q_load(Q_v, nbpt + m));
+#endif // V_DOT2_F32_F16_AVAILABLE
+    }
+
+    return sum * d;
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -633,6 +732,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_MXFP4) {
+        return vec_dot_fattn_vec_KQ_mxfp4<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -655,6 +756,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+    } else if constexpr (type_V == GGML_TYPE_MXFP4) {
+        return dequantize_V_mxfp4<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

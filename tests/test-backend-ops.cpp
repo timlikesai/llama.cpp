@@ -143,6 +143,34 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     }
 }
 
+// rounding edge values for f32->mxfp4, near e2m1 code point boundaries
+static void init_tensor_mxfp4_ties(ggml_tensor * tensor, float amax_lo = 0.001f, float amax_hi = 1000.0f) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+    const int64_t n = ggml_nelements(tensor);
+    constexpr int qk = 32; // QK_MXFP4
+    GGML_ASSERT(n % qk == 0);
+
+    std::vector<float> data(n, 0.0f);
+    const float ties[] = {0.1875f, 0.4375f, 0.875f, -0.1875f, -0.4375f, -0.875f};
+
+    auto fill = [&](int64_t i, float amax, float scale) {
+        data[i] = amax;
+        for (int j = 1; j < qk; ++j) {
+            data[i + j] = ties[(j - 1) % 6] * scale;
+        }
+    };
+
+    for (int64_t i = 0, block = 0; i < n; i += qk, ++block) {
+        if (block % 16 == 7)       fill(i, amax_lo, 0.5f*amax_lo);  // small amax
+        else if (block % 32 == 15) fill(i, 1.5f, 0.75f);            // amax in (1,2)
+        else if (block % 64 == 31) fill(i, 0.999f, 0.4995f);        // exp boundary near 1
+        else if (block % 8 == 7)   fill(i, amax_hi, 0.5f*amax_hi);  // large amax
+        else if (block % 4 == 3)  { /* all-zero, already zeroed */ }
+        else                       fill(i, 2.0f, 1.0f);             // default ties
+    }
+    ggml_backend_tensor_set(tensor, data.data(), 0, n * sizeof(float));
+}
+
 // generate an F16 mask where certain blocks are randomly masked with -INF value
 static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
@@ -2526,7 +2554,8 @@ struct test_set_rows : public test_case {
     double max_nmse_err() override {
         if (type_dst == GGML_TYPE_Q2_0 || type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 ||
             type_dst == GGML_TYPE_IQ4_NL ||
-            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
+            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0 ||
+            type_dst == GGML_TYPE_MXFP4) {
             // estimate what the max nmse error would be if one quantized value is
             // off by one. The test values are distributed in [-1,1], so it'll be
             // roughly (2.0 / 2^bits)^2, divided by the mean square value of the reference,
@@ -3059,7 +3088,8 @@ struct test_cpy : public test_case {
             return 0.0;
         }
         if (type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 || type_dst == GGML_TYPE_IQ4_NL ||
-            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
+            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0 ||
+            type_dst == GGML_TYPE_MXFP4) {
             // estimate what the max nmse error would be if one quantized value is
             // off by one. The test values are distributed in [-150,150], so it'll be
             // roughly (150*2.0 / 2^bits)^2, divided by the mean square value of the reference,
@@ -3144,8 +3174,14 @@ struct test_cpy : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            // test extended range of values to check if casting between f32 and i32 is consistent
-            init_tensor_uniform(t, -150.f, 150.f);
+            if (type_src == GGML_TYPE_F32 && type_dst == GGML_TYPE_MXFP4 && strcmp(t->name, "src") == 0) {
+                // values near e2m1 code boundaries (exact midpoints when amax = 1.5);
+                // backends must tie-break identically (RNE)
+                init_tensor_mxfp4_ties(t);
+            } else {
+                // test extended range of values to check if casting between f32 and i32 is consistent
+                init_tensor_uniform(t, -150.f, 150.f);
+            }
         }
     }
 };
@@ -4635,9 +4671,15 @@ struct test_mul_mat : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
-        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
-            return 2e-2;
+        // the CPU reference quantizes activations to q8_0, the Blackwell MMQ path to e4m3
+        // (mxfp4) or e2m1 (nvfp4), which needs extra tolerance vs the q8_0-vs-q8_0 case
+        if (backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            if (type_a == GGML_TYPE_MXFP4) {
+                return 1e-3;
+            }
+            if (type_a == GGML_TYPE_NVFP4) {
+                return 2e-2;
+            }
         }
         return max_nmse_err();
     }
@@ -4919,9 +4961,15 @@ struct test_mul_mat_id : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
-        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
-            return 2e-2;
+        // the CPU reference quantizes activations to q8_0, the Blackwell MMQ path to e4m3
+        // (mxfp4) or e2m1 (nvfp4), which needs extra tolerance vs the q8_0-vs-q8_0 case
+        if (backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            if (type_a == GGML_TYPE_MXFP4) {
+                return 1e-3;
+            }
+            if (type_a == GGML_TYPE_NVFP4) {
+                return 2e-2;
+            }
         }
         return max_nmse_err();
     }
@@ -9263,6 +9311,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // quant block count not a multiple of the kernel block size
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q4_0, {96, 1, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32, {96, 1, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_MXFP4, {96, 1, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_MXFP4, GGML_TYPE_F32, {96, 1, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}));
@@ -10362,6 +10412,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // mxfp4 KV cases: head sizes, no mask, short/odd cache, GQA batch, and MLA V-view
+    test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {1, 1},  512, 1, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  512, 2, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1},  512, 1, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},   64, 1, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},   31, 1, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},   31, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {8, 1}, 7680, 1, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 128, 4, {1, 1},  512, 2, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, {0, 1, 2, 3}, true, true));
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;

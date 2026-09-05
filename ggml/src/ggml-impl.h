@@ -497,6 +497,24 @@ static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
 #define GGML_E8M0_TO_FP32(x) ggml_e8m0_to_fp32(x)
 #define GGML_E8M0_TO_FP32_HALF(x) ggml_e8m0_to_fp32_half(x)
 
+// Data-free optimal e8m0 block scale per grid (ref. https://arxiv.org/abs/2607.24377):
+#define GGML_MXFP_QMAX_E2M1 7.25f  // E2M1 (maxnorm 6):   q* = 29/4 = 7.25
+#define GGML_MXFP_QMAX_E4M3 464.0f // E4M3 (maxnorm 448): q* ~= 464
+
+// Data-free e8m0 block scale: the exponent e such that amax*2^(127-e) falls in (qmax/2, qmax].
+// A tie (amax/qmax exactly a power of two) lands exactly on qmax, which is in range (lower exponent).
+static inline uint8_t ggml_mxfp_scale(float amax, float qmax) {
+    if (!(amax > 0.0f)) {
+        return 0;
+    }
+
+    int A, Q;
+    const float r_a = frexpf(amax, &A);
+    const float m   = frexpf(qmax, &Q);
+    const int e = A - Q + (r_a > m) - (r_a <= 0.5f * m);
+    return (uint8_t) MAX(0, MIN(254, 127 + e));
+}
+
 // UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits
 // Returns value * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 * E2M1_float)
 static inline float ggml_ue4m3_to_fp32(uint8_t x) {
