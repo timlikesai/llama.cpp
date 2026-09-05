@@ -347,6 +347,36 @@ static inline int best_index_mxfp4(float x, float e) {
     return best_index;
 }
 
+// same result as best_index_mxfp4, but requires e to be a power of two (e8m0 scale):
+// the grid kvalues*e = {0,1,2,3,4,6,8,12}*e is exact, so nearest + RNE tie to even value
+static inline int best_index_mxfp4_e8m0(float x, float e) {
+    const float u = fabsf(x) / e;
+
+    int q = 0;
+    if (u > 0.5f) {
+        if      (u <  1.5f)  q = 1;
+        else if (u <= 2.5f)  q = 2;
+        else if (u <  3.5f)  q = 3;
+        else if (u <= 5.0f)  q = 4;
+        else if (u <  7.0f)  q = 5; // grid value 6
+        else if (u <= 10.0f) q = 6; // grid value 8
+        else                 q = 7; // grid value 12
+    }
+    return q != 0 && x < 0.0f ? q + 8 : q;
+}
+
+// encode one 32-element block with a fixed e8m0 exponent; layout: byte j = elems j, j+16
+static inline void quantize_row_mxfp4_blk(const float * GGML_RESTRICT xb, block_mxfp4 * yb, uint8_t e) {
+    const float d = GGML_E8M0_TO_FP32_HALF(e);
+
+    yb->e = e;
+
+    for (int j = 0; j < QK_MXFP4/2; ++j) {
+        yb->qs[j]  = best_index_mxfp4_e8m0(xb[j], d);
+        yb->qs[j] |= best_index_mxfp4_e8m0(xb[QK_MXFP4/2 + j], d) << 4;
+    }
+}
+
 void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_MXFP4;
 
@@ -365,19 +395,9 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
             }
         }
 
-        const uint8_t e = amax > 0.0f ? (uint8_t) (floorf(log2f(amax)) - 2 + 127) : 0;
+        const uint8_t e = ggml_mxfp_scale(amax, GGML_MXFP_QMAX_E2M1);
 
-        const float d = GGML_E8M0_TO_FP32_HALF(e);
-
-        y[i].e = e;
-
-        for (int j = 0; j < qk/2; ++j) {
-            const uint8_t x0 = best_index_mxfp4(x[i*qk + 0    + j], d);
-            const uint8_t x1 = best_index_mxfp4(x[i*qk + qk/2 + j], d);
-
-            y[i].qs[j]  = x0;
-            y[i].qs[j] |= x1 << 4;
-        }
+        quantize_row_mxfp4_blk(x + i*qk, &y[i], e);
     }
 }
 

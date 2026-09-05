@@ -75,6 +75,12 @@ for type_k in TYPES_KV:
         with open(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu", "w") as f:
             f.write(SOURCE_FATTN_VEC.format(type_k=type_k, type_v=type_v))
 
+# type pairs to generate beyond the full TYPES_KV cross product
+TYPES_KV_EXTRA = [("GGML_TYPE_MXFP4", "GGML_TYPE_MXFP4")]
+for type_k, type_v in TYPES_KV_EXTRA:
+    with open(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu", "w") as f:
+        f.write(SOURCE_FATTN_VEC.format(type_k=type_k, type_v=type_v))
+
 for ncols in [8, 16, 32, 64]:
     for ncols2 in [1, 2, 4, 8, 16, 32]:
         if ncols2 > ncols:
