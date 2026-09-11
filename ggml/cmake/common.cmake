@@ -51,7 +51,9 @@ endfunction()
 
 # Determines which FlashAttention vector kernel template instances to compile, returns them in OUT_SRCS.
 function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
-    set(FA_TYPES q4_0 q4_1 q5_0 q5_1 q8_0 bf16 f16)
+    set(FA_TYPES q4_0 q4_1 q5_0 q5_1 q8_0 bf16 f16 mxfp4)
+    # mxfp4 only has a self-mixed instance, keep it out of the "all" cross product
+    set(FA_X_TYPES q4_0 q4_1 q5_0 q5_1 q8_0 bf16 f16)
 
     string(TOLOWER "${GGML_CUDA_FA_QUANTS}" FA_QUANTS)
     string(STRIP   "${FA_QUANTS}" FA_QUANTS)
@@ -65,11 +67,12 @@ function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
 
     if (FA_QUANTS STREQUAL "all")
         set(FA_COMBINATIONS "")
-        foreach (TYPE_V IN LISTS FA_TYPES)
-            foreach (TYPE_K IN LISTS FA_TYPES)
+        foreach (TYPE_V IN LISTS FA_X_TYPES)
+            foreach (TYPE_K IN LISTS FA_X_TYPES)
                 list(APPEND FA_COMBINATIONS ${TYPE_K}-${TYPE_V})
             endforeach()
         endforeach()
+        list(APPEND FA_COMBINATIONS mxfp4-mxfp4)
     else()
         set(FA_COMBINATIONS f16-f16)
 

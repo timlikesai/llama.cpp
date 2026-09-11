@@ -129,8 +129,9 @@ void ggml_cuda_mul_mat_q(
     const bool fallback = ne01 % 128 != 0;
 
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
-    const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
-    const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
+    // mxfp8 activation blocks (e4m3 codes + ue8m0 scale) have the same size and value count as q8_1
+    const size_t y_block_size       = use_native_fp4 && src0->type == GGML_TYPE_NVFP4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
+    const size_t y_values_per_block = use_native_fp4 && src0->type == GGML_TYPE_NVFP4 ? QK_FP4_MMQ : QK8_1_MMQ;
 
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
@@ -160,9 +161,7 @@ void ggml_cuda_mul_mat_q(
         }
 
         // Stride depends on quantization format
-        const int64_t s12 = use_native_fp4 ?
-                                ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
-                                ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+        const int64_t s12 = ne11 * ne10_padded * y_block_size / (y_values_per_block * sizeof(int));
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
@@ -240,8 +239,7 @@ void ggml_cuda_mul_mat_q(
     }
 
     static_assert(QK_FP4_MMQ == 8 * QK_MXFP4, "QK_FP4_MMQ needs to be 8 * QK_MXFP4");
-    const int64_t s12 = use_native_fp4 ? ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
-                                         ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+    const int64_t s12 = ne11 * ne10_padded * y_block_size / (y_values_per_block * sizeof(int));
     const int64_t s13 = ne12*s12;
 
     // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
