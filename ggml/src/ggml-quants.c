@@ -334,12 +334,13 @@ void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_REST
     }
 }
 
+// tie picks the even code (RNE, as in cvt.rn.satfinite.e2m1x2)
 static inline int best_index_mxfp4(float x, float e) {
     int best_index = 0;
     float best_err = fabsf(kvalues_mxfp4[0]*e - x);
     for (int i = 1; i < 16; i++) {
         float err = fabsf(kvalues_mxfp4[i]*e - x);
-        if (err < best_err) {
+        if (err < best_err || (err == best_err && (i & 1) == 0 && (best_index & 1) != 0)) {
             best_index = i;
             best_err = err;
         }
@@ -365,7 +366,7 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
             }
         }
 
-        const uint8_t e = amax > 0.0f ? (uint8_t) (floorf(log2f(amax)) - 2 + 127) : 0;
+        const uint8_t e = ggml_mxfp_scale(amax, GGML_MXFP_QMAX_E2M1);
 
         const float d = GGML_E8M0_TO_FP32_HALF(e);
 
