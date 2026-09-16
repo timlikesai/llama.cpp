@@ -100,29 +100,6 @@ static __global__ void quantize_q8_1(
     y[ib].ds = make_half2(d, sum);
 }
 
-__device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
-    if (!(amax > 0.0f)) {
-        return 0;
-    }
-
-    // FP4 E2M1: max exponent (unbiased) is 2.
-    constexpr int FP4_E2M1_EMAX = 2;
-
-    const float e = log2f(amax);
-
-    // "even" -> round-to-nearest integer, ties-to-even
-    const int e_int = __float2int_rn(e);
-
-    const int shared_exp = e_int - FP4_E2M1_EMAX;
-
-    int biased = shared_exp + 127;
-
-    biased = max(biased, 0);
-    biased = min(biased, 254);
-
-    return static_cast<uint8_t>(biased);
-}
-
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
 template <bool scatter, bool use_aligned_float8>
 static __global__ void quantize_mmq_nvfp4(
@@ -331,8 +308,6 @@ static __global__ void quantize_mmq_nvfp4(
 
 }
 
-// quantize values in the format mxfp4 is stored which is interleaved nibbles
-// i.e. a block a0-a31 is represented as a0a16,a1a17 ...a15a31
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
 template <bool scatter>
 static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
@@ -393,7 +368,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
             amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, WARP_SIZE));
         }
 
-        const uint8_t e = compute_e8m0_scale(amax);
+        const uint8_t e = compute_e8m0_scale(amax, 4.0f);
         scales[b] = e;
         const float inv_s = (amax == 0.0f) ? 0.0f : __frcp_rn(ggml_cuda_e8m0_to_fp32(e));
 
@@ -451,6 +426,109 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
         }
     }
     GGML_UNUSED(n_expert_used);
+}
+
+// quantize values in the format mxfp8 is stored: e4m3 codes, one ue8m0 scale per 32 values
+// scatter: grid over tokens, quantize once, write to all the token's compact rows
+template <bool scatter>
+static __global__ void quantize_mmq_mxfp8(const float * __restrict__ x,
+                                          const int32_t * __restrict__ ids,
+                                          void * __restrict__ vy,
+                                          const int64_t ne00,
+                                          const int64_t s01,
+                                          const int64_t s02,
+                                          const int64_t s03,
+                                          const int64_t ne0,
+                                          const int     ne1,
+                                          const int     ne2,
+                                          const int     n_expert_used) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    constexpr int vals_per_scale = 32;
+    constexpr int vals_per_warp  = 4 * vals_per_scale;
+
+    const int warp_id = threadIdx.y;
+    const int lane_id_32 = threadIdx.x;
+
+    const int nwarps = blockDim.y;
+
+    const int64_t warp_start_offset = (blockIdx.y * nwarps + warp_id) * vals_per_warp;
+
+    if (warp_start_offset >= ne0) {
+        return;
+    }
+
+    const int64_t k_block = warp_start_offset / QK_FP8_MMQ;
+
+    ggml_cuda_pdl_sync();
+    int64_t base_pos;
+    if constexpr (scatter) {
+        base_pos = (int64_t) blockIdx.x * s02; // one physical row per token
+    } else {
+        const int64_t i2  = blockIdx.z % ne2;
+        const int64_t i3  = blockIdx.z / ne2;
+        const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
+        base_pos = i3 * s03 + i2 * s02 + i01 * s01;
+    }
+
+    // each lane processes 4 consecutive values: 8 lanes per scale group of 32
+    const int grp = lane_id_32 / 8;
+    const int pos = lane_id_32 % 8;
+    const int64_t i0 = warp_start_offset + grp * vals_per_scale + pos * 4;
+
+    // the launcher asserts ne0 % QK_FP8_MMQ == 0; out-of-range tail values are zero-padded
+    float4 v4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (i0 + 3 < ne00) {
+        if ((reinterpret_cast<uintptr_t>(x + base_pos + i0) % 16) == 0) {
+            v4 = *(const float4 *) (x + base_pos + i0);
+        } else {
+            v4.x = x[base_pos + i0 + 0];
+            v4.y = x[base_pos + i0 + 1];
+            v4.z = x[base_pos + i0 + 2];
+            v4.w = x[base_pos + i0 + 3];
+        }
+    } else {
+        v4.x = i0 + 0 < ne00 ? x[base_pos + i0 + 0] : 0.0f;
+        v4.y = i0 + 1 < ne00 ? x[base_pos + i0 + 1] : 0.0f;
+        v4.z = i0 + 2 < ne00 ? x[base_pos + i0 + 2] : 0.0f;
+        v4.w = i0 + 3 < ne00 ? x[base_pos + i0 + 3] : 0.0f;
+    }
+
+    float amax = fmaxf(fmaxf(fabsf(v4.x), fabsf(v4.y)), fmaxf(fabsf(v4.z), fabsf(v4.w)));
+#pragma unroll
+    for (int mask = 4; mask > 0; mask >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, 8));
+    }
+
+
+    const uint8_t e = compute_e8m0_scale(amax, 256.0f);
+    const float inv_s = (amax == 0.0f) ? 0.0f : __frcp_rn(ggml_cuda_e8m0_to_fp32(e));
+    const float4 sv = make_float4(v4.x * inv_s, v4.y * inv_s, v4.z * inv_s, v4.w * inv_s);
+    const uint32_t packed = __nv_fp8x4_e4m3(sv).__x;
+
+    block_fp8_mmq * y = (block_fp8_mmq *) vy;
+    if constexpr (scatter) {
+#pragma unroll
+        for (int slot = 0; slot < n_expert_used; ++slot) {
+            const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            block_fp8_mmq * yb = y + (k_block * ne1 + i);
+            memcpy(&yb->qs[grp * vals_per_scale + pos * 4], &packed, sizeof(packed));
+            if (pos == 0) {
+                yb->d4[grp] = e;
+            }
+        }
+    } else {
+        const int64_t ib0 = blockIdx.z * ((int64_t) ne1 * (ne0 / QK_FP8_MMQ));
+        block_fp8_mmq * yb = y + (ib0 + k_block * ne1 + blockIdx.x);
+        memcpy(&yb->qs[grp * vals_per_scale + pos * 4], &packed, sizeof(packed));
+        if (pos == 0) {
+            yb->d4[grp] = e;
+        }
+    }
+    GGML_UNUSED(n_expert_used);
+#else
+    GGML_UNUSED_VARS(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, n_expert_used);
+    NO_DEVICE_CODE;
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
@@ -652,6 +730,8 @@ void quantize_scatter_mmq_fp4_cuda(
         }
     } else {
         GGML_ASSERT(type_src0 == GGML_TYPE_MXFP4);
+        GGML_ASSERT(ne0 % (2 * QK_MXFP4) == 0);
+
         constexpr int nwarps = 8;
         constexpr int vals_per_block = nwarps * 2 * QK_MXFP4;
         const int64_t block_num_y = (ne0 + vals_per_block - 1) / vals_per_block;
@@ -694,4 +774,37 @@ void quantize_mmq_fp4_cuda(
 
         quantize_mmq_mxfp4<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
     }
+}
+
+void quantize_mmq_mxfp8_cuda(
+        const float * x, const int32_t * ids, void * vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(ne0 % QK_FP8_MMQ == 0);
+
+    constexpr int nwarps = 8;
+    constexpr int vals_per_block = nwarps * QK_FP8_MMQ;
+
+    const int64_t block_num_y = (ne0 + vals_per_block - 1) / vals_per_block;
+    const dim3    num_blocks(ne1, block_num_y, ne2 * ne3);
+    const dim3    block_size(WARP_SIZE, nwarps, 1);
+
+    quantize_mmq_mxfp8<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+}
+
+void quantize_scatter_mmq_mxfp8_cuda(
+        const float * x, const int32_t * ids_src1_inv, void * vy,
+        const int64_t ne00, const int64_t stride_token, const int64_t ne0,
+        const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream) {
+    GGML_ASSERT(ne0 % QK_FP8_MMQ == 0);
+
+    constexpr int nwarps = 8;
+    constexpr int vals_per_block = nwarps * QK_FP8_MMQ;
+
+    const int64_t block_num_y = (ne0 + vals_per_block - 1) / vals_per_block;
+    const dim3 num_blocks(n_tokens, block_num_y, 1);
+    const dim3 block_size(WARP_SIZE, nwarps, 1);
+
+    quantize_mmq_mxfp8<true><<<num_blocks, block_size, 0, stream>>>(
+        x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
 }

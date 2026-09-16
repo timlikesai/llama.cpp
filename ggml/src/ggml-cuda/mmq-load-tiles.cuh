@@ -1670,6 +1670,47 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_mxfp4_mxfp8(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback, prec_src1);
+
+    int *      x_qs = (int *) x_tile;
+    uint32_t * x_sc = (uint32_t *) (x_qs + MMQ_ITER_K_FP4 / 4);
+
+    constexpr int threads_per_row = MMQ_ITER_K_FP4 / QK_MXFP4;  // one thread per block
+    constexpr int rows_per_warp = warp_size / threads_per_row;
+    const int kbx = threadIdx.x % threads_per_row;
+    const int row_in_warp = threadIdx.x / threads_per_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += rows_per_warp * nwarps) {
+        int i = i0 + threadIdx.y * rows_per_warp + row_in_warp;
+
+        if constexpr (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i * stride + kbx;
+        const uint32_t packed[4] = { (uint32_t) get_int_b1(bxi->qs, 0),
+                                     (uint32_t) get_int_b1(bxi->qs, 1),
+                                     (uint32_t) get_int_b1(bxi->qs, 2),
+                                     (uint32_t) get_int_b1(bxi->qs, 3) };
+
+        // qs byte j holds elements {j, j+16} in its low/high nibble; mxf8f6f4 wants e2m1 codes
+        // in K order, one per byte, in bits [2..5] (nibble << 2): bytes[j] = lo, bytes[j+16] = hi
+        uint8_t * bytes = (uint8_t *) (x_qs + i*sram_stride + kbx*8);
+        for (int w = 0; w < 4; ++w) {
+            const uint32_t p = packed[w];
+            *(uint32_t *) (bytes + 4*w)      = (p & 0x0F0F0F0F) << 2;
+            *(uint32_t *) (bytes + 4*w + 16) = (p >> 2) & 0x3C3C3C3C;
+        }
+        x_sc[i*sram_stride + kbx] = bxi->e;
+    }
+}
+
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_nvfp4(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kb0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
