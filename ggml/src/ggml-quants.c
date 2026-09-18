@@ -346,8 +346,17 @@ static inline int best_index_mxfp4(float x, float e) {
     }
     return best_index;
 }
+// mxfp4 block scale (e8m0) from the block max. OCP e_base (max at ~4.0) is used
+// for weight quantization; UOS (arxiv 2607.24377, E2M1 boundary Qmax=7.25) for
+// the online KV cache.
+static uint8_t mxfp4_scale_e(float amax, bool uos) {
+    if (uos) {
+        return (uint8_t) (ceilf(log2f(amax) - log2f(7.25f)) + 127);
+    }
+    return (uint8_t) (lrintf(log2f(amax) - log2f(4.0f)) + 127);
+}
 
-void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k) {
+static void quantize_row_mxfp4_scale(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k, bool uos) {
     static const int qk = QK_MXFP4;
 
     assert(k % qk == 0);
@@ -365,8 +374,7 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
             }
         }
 
-        const uint8_t e = amax > 0.0f ? (uint8_t) (lrintf(log2f(amax) - log2f(4.0f)) + 127) : 0;
-
+        const uint8_t e = amax == 0.0f ? 0 : mxfp4_scale_e(amax, uos);
         const float d = GGML_E8M0_TO_FP32_HALF(e);
 
         y[i].e = e;
@@ -380,6 +388,15 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
         }
     }
 }
+
+void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp4_scale(x, y, k, false);
+}
+
+void quantize_row_mxfp4_ref_uos(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp4_scale(x, y, k, true);
+}
+
 
 static inline float mxfp4_block_err2(const float * x, const float * im, int qk, int e) {
     const float d  = GGML_E8M0_TO_FP32_HALF(e);

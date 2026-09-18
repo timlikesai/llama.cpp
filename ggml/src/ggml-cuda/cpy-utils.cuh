@@ -191,7 +191,8 @@ static __device__ void quantize_f32_mxfp4_block(const float * __restrict__ x, bl
     for (int j = 0; j < QK_MXFP4; ++j) {
         amax = fmaxf(amax, fabsf(x[j]));
     }
-    const uint8_t e = compute_e8m0_scale(amax, 4.0f);
+    // UOS (arxiv 2607.24377): optimal online activation quantization for mxfp4
+    const uint8_t e = compute_e8m0_scale(amax, 7.25f, true);
     const float inv_s = (amax == 0.0f) ? 0.0f : __frcp_rn(ggml_cuda_e8m0_to_fp32(e));
     y->e = e;
 #if CUDART_VERSION >= 12080
