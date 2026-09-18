@@ -755,7 +755,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = sizeof(block_mxfp4),
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_mxfp4,
-        .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp4_ref,
+        .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp4_ref_uos, // online quantization (KV cache)
     },
     [GGML_TYPE_NVFP4] = {
         .type_name                = "nvfp4",

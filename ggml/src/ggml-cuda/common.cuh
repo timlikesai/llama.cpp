@@ -455,6 +455,16 @@ struct ggml_cuda_unroll<1> {
     }
 };
 
+__device__ __forceinline__ uint8_t compute_e8m0_scale(float amax, float fmax, bool round_up = false) {
+    if (!(amax > 0.0f)) {
+        return 0;
+    }
+
+    const float t = log2f(amax) - log2f(fmax);
+    const int e = round_up ? (int) ceilf(t) : __float2int_rn(t);
+    return static_cast<uint8_t>(min(max(e + 127, 0), 254));
+}
+
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_sum(int x) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
@@ -907,13 +917,26 @@ __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e)
 #pragma unroll
     for (int i = 1; i < 8; ++i) {
         const float err = fabsf(ax - pos_lut[i]);
-        if (err < best_err) {
+        // RNE: on exact tie, pick the even grid index
+        if (err < best_err || (err == best_err && (i & 1) == 0 && (best_i & 1) == 1)) {
             best_err = err;
             best_i   = i;
         }
     }
 
     return static_cast<uint8_t>(best_i | sign_bit);
+}
+
+static __device__ __forceinline__ half2 ggml_cuda_mxfp4_to_half2(uint8_t q) {
+#if CUDART_VERSION >= 12080
+    return half2(__nv_cvt_fp4x2_to_halfraw2(q, __NV_E2M1));
+#else
+    return __floats2half2_rn(0.5f*kvalues_mxfp4[q & 0x0F], 0.5f*kvalues_mxfp4[q >> 4]);
+#endif // CUDART_VERSION >= 12080
+}
+
+static __device__ __forceinline__ float2 ggml_cuda_mxfp4_to_float2(uint8_t q) {
+    return __half22float2(ggml_cuda_mxfp4_to_half2(q));
 }
 
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
