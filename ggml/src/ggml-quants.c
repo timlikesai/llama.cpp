@@ -350,10 +350,10 @@ static inline int best_index_mxfp4(float x, float e) {
 // mxfp4 block scale from block amax. OCP e_base (max at ~4.0) is used for
 // weights; UOS (arxiv 2607.24377, E2M1 boundary Qmax=7.25) for KV cache
 static uint8_t mxfp4_scale_e(float amax, bool uos) {
-    if (uos) {
-        return (uint8_t) (ceilf(log2f(amax) - log2f(7.25f)) + 127);
-    }
-    return (uint8_t) (lrintf(log2f(amax) - log2f(4.0f)) + 127);
+    // clamp to the valid e8m0 range, same as the CUDA compute_e8m0_scale
+    const float t = log2f(amax) - log2f(uos ? 7.25f : 4.0f);
+    const int e = (uos ? (int) ceilf(t) : (int) lrintf(t)) + 127;
+    return (uint8_t) (e < 0 ? 0 : e > 254 ? 254 : e);
 }
 
 static void quantize_row_mxfp4_scale(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k, bool uos) {
@@ -399,7 +399,6 @@ void quantize_row_mxfp4_ref_uos(const float * GGML_RESTRICT x, block_mxfp4 * GGM
 
 static inline float mxfp4_block_err2(const float * x, const float * im, int qk, int e) {
     const float d  = GGML_E8M0_TO_FP32_HALF(e);
-    const float is = d == 0.0f ? 0.0f : 1.0f / d;
     float s = 0.0f;
     for (int j = 0; j < qk; j += 2) {
         for (int h = 0; h < 2; h++) {

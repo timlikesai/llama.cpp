@@ -106,6 +106,12 @@ function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
             add_compile_definitions(${COMBINATION_DEF}=${COMPILED})
         endforeach()
     endforeach()
+    # mxfp4-mxfp4 is not part of the FA_TYPES cross product, define it explicitly
+    if ("mxfp4-mxfp4" IN_LIST FA_COMBINATIONS)
+        add_compile_definitions(GGML_CUDA_FA_MXFP4_MXFP4=1)
+    else()
+        add_compile_definitions(GGML_CUDA_FA_MXFP4_MXFP4=0)
+    endif()
 
     message(STATUS "FlashAttention K-V type combinations: ${FA_COMBINATIONS}")
 
@@ -116,9 +122,6 @@ function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
             message(FATAL_ERROR "FlashAttention template instance \"${SRC}\" does not exist")
         endif()
         list(APPEND SRCS "${SRC}")
-        string(REPLACE "-" "_" COMBINATION_DEF "${COMBINATION}")
-        string(TOUPPER "${COMBINATION_DEF}" COMBINATION_DEF)
-        add_compile_definitions(GGML_CUDA_FA_${COMBINATION_DEF}=1)
     endforeach()
 
     set(${OUT_SRCS} ${SRCS} PARENT_SCOPE)

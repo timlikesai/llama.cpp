@@ -499,7 +499,6 @@ static __global__ void quantize_mmq_mxfp8(const float * __restrict__ x,
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, 8));
     }
 
-
     const uint8_t e = compute_e8m0_scale(amax, 256.0f);
     const float inv_s = (amax == 0.0f) ? 0.0f : __frcp_rn(ggml_cuda_e8m0_to_fp32(e));
     const float4 sv = make_float4(v4.x * inv_s, v4.y * inv_s, v4.z * inv_s, v4.w * inv_s);
