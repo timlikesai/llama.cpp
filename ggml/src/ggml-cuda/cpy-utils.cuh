@@ -191,13 +191,15 @@ static __device__ void quantize_f32_mxfp4_block(const float * __restrict__ x, bl
     for (int j = 0; j < QK_MXFP4; ++j) {
         amax = fmaxf(amax, fabsf(x[j]));
     }
-    const uint8_t e = compute_e8m0_scale(amax, 4.0f);
+
+    // UOS (arxiv 2607.24377): optimal online quantization for mxfp4
+    const uint8_t e = compute_e8m0_scale(amax, 7.25f, true);
     const float inv_s = (amax == 0.0f) ? 0.0f : __frcp_rn(ggml_cuda_e8m0_to_fp32(e));
     y->e = e;
 #if CUDART_VERSION >= 12080
     for (int k = 0; k < QK_MXFP4/4; ++k) {
         __nv_fp4x4_e2m1 q(make_float4(
-            x[2*k]*inv_s, x[2*k+QK_MXFP4/2]*inv_s,
+            x[2*k  ]*inv_s, x[2*k  +QK_MXFP4/2]*inv_s,
             x[2*k+1]*inv_s, x[2*k+1+QK_MXFP4/2]*inv_s));
         uint16_t p = q.__x;
         y->qs[2*k]   = (uint8_t) p;

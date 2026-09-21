@@ -1240,9 +1240,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #endif // BLACKWELL_MMA_AVAILABLE
 }
 
-// MXFP4 weights x E4M3 (mxfp8) activations block-scaled MMA path for Blackwell (m16n8k32, scale_vec::1X ue8m0).
-// x rows: iter_k e2m1 values in 8-bit containers (unpacked in ggml_cuda_mmq_load_tiles_mxfp4_mxfp8), then one ue8m0 scale byte per 32 values;
-// y rows: 4 scale bytes (one per 32 values), then e4m3 values.
+// MXFP4 weights x MXFP8 activations block-scaled MMA path for Blackwell (m16n8k32, scale_vec::1X ue8m0).
+// x rows: e2m1 values in 8-bit containers, then one ue8m0 scale byte per 32 values;
+// y rows: 4 scale bytes, then e4m3 values.
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_mxfp4_mxfp8_mma(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(BLACKWELL_MMA_AVAILABLE)

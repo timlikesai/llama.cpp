@@ -451,12 +451,13 @@ struct ggml_cuda_unroll<1> {
     }
 };
 
-__device__ __forceinline__ uint8_t compute_e8m0_scale(float amax, float fmax) {
+__device__ __forceinline__ uint8_t compute_e8m0_scale(float amax, float fmax, bool round_up = false) {
     if (!(amax > 0.0f)) {
         return 0;
     }
 
-    const int e = __float2int_rn(log2f(amax) - log2f(fmax));
+    const float t = log2f(amax) - log2f(fmax);
+    const int e = round_up ? (int) ceilf(t) : __float2int_rn(t);
     return static_cast<uint8_t>(min(max(e + 127, 0), 254));
 }
 
