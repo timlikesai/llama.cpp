@@ -58,7 +58,7 @@ void quantize_scatter_mmq_fp4_cuda(const float *   x,
                                    cudaStream_t    stream);
 
 void quantize_mmq_mxfp8_cuda(
-        const float *   x,
+                             const float *   x,
                              const int32_t * ids,
                              void *          vy,
                              int64_t         ne00,
@@ -72,16 +72,16 @@ void quantize_mmq_mxfp8_cuda(
                              cudaStream_t    stream);
 
 void quantize_scatter_mmq_mxfp8_cuda(
-                                   const float *   x,
-                                   const int32_t * ids_src1_inv,
-                                   void *          vy,
-                                   int64_t         ne00,
-                                   int64_t         stride_token,
-                                   int64_t         ne0,
-                                   int64_t         n_tokens,
-                                   int64_t         nrows_dst,
-                                   int             n_expert_used,
-                                   cudaStream_t    stream);
+                                     const float *   x,
+                                     const int32_t * ids_src1_inv,
+                                     void *          vy,
+                                     int64_t         ne00,
+                                     int64_t         stride_token,
+                                     int64_t         ne0,
+                                     int64_t         n_tokens,
+                                     int64_t         nrows_dst,
+                                     int             n_expert_used,
+                                     cudaStream_t    stream);
 
 void quantize_scatter_mmq_q8_1_cuda(const float *   x,
                                     const int32_t * ids_src1_inv,

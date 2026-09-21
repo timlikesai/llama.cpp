@@ -308,9 +308,76 @@ static __global__ void quantize_mmq_nvfp4(
 
 }
 
+// quantize activations for the Blackwell mxfp block-scaled MMA paths:
+//  - prec Q4 (W4A4): interleaved e2m1 nibbles (mxfp4 block layout), UOS e8m0 scales
+//  - prec MXFP8 (W4A8): e4m3 codes (mxfp8 block layout), RNE e8m0 scales
+
+// pack 4 codes from the lane's scale group: W4A4 gathers the interleaved e2m1 pairs of the mxfp4
+// block layout, W4A8 gathers 4 consecutive e4m3 values; valid on lanes with lane_id % 4 == 0
+template <ggml_prec prec>
+static __device__ __forceinline__ uint32_t quantize_mmq_mxfp_pack4(const float xi, const float inv_s, const int base, const int lane_id_32) {
+    const float scaled_val = xi * inv_s;
+    if constexpr (prec == GGML_PREC_Q4) {
+#if CUDART_VERSION >= 12080
+        const float val0 = __shfl_sync(0xFFFFFFFF, scaled_val, base,      WARP_SIZE);
+        const float val1 = __shfl_sync(0xFFFFFFFF, scaled_val, base + 16, WARP_SIZE);
+        const float val2 = __shfl_sync(0xFFFFFFFF, scaled_val, base + 1,  WARP_SIZE);
+        const float val3 = __shfl_sync(0xFFFFFFFF, scaled_val, base + 17, WARP_SIZE);
+
+        const __nv_fp4x4_e2m1 fp4_packed(make_float4(val0, val1, val2, val3));
+        return *(const uint16_t *) &fp4_packed;
+#else
+        // Fallback: manual FP4 conversion using LUT
+        const uint8_t q_val = ggml_cuda_float_to_fp4_e2m1(xi, inv_s);
+
+        const uint8_t q_lo_0 = __shfl_sync(0xFFFFFFFF, q_val, base,      WARP_SIZE);
+        const uint8_t q_lo_1 = __shfl_sync(0xFFFFFFFF, q_val, base + 1,  WARP_SIZE);
+        const uint8_t q_hi_0 = __shfl_sync(0xFFFFFFFF, q_val, base + 16, WARP_SIZE);
+        const uint8_t q_hi_1 = __shfl_sync(0xFFFFFFFF, q_val, base + 17, WARP_SIZE);
+
+        return (q_hi_1 << 12) | (q_lo_1 << 8) | (q_hi_0 << 4) | q_lo_0;
+#endif // CUDART_VERSION >= 12080
+    } else {
+        const float val1 = __shfl_sync(0xFFFFFFFF, scaled_val, lane_id_32 + 1, WARP_SIZE);
+        const float val2 = __shfl_sync(0xFFFFFFFF, scaled_val, lane_id_32 + 2, WARP_SIZE);
+        const float val3 = __shfl_sync(0xFFFFFFFF, scaled_val, lane_id_32 + 3, WARP_SIZE);
+
+        return __nv_fp8x4_e4m3(make_float4(scaled_val, val1, val2, val3)).__x;
+    }
+}
+
+// store one warp's 2 sub-blocks (64 codes + 2 e8m0 scales) to output block yb_idx
+template <ggml_prec prec>
+static __device__ __forceinline__ void quantize_mmq_mxfp_store(
+        void * vy, const int64_t yb_idx, const int quad_idx_in_block, const int group_id, const int lane_id_32,
+        const uint8_t scales[2], const uint32_t packed[2]) {
+    if constexpr (prec == GGML_PREC_Q4) {
+        block_fp4_mmq * yb = (block_fp4_mmq *) vy + yb_idx;
+        char2 * yqs2 = (char2 *) yb->qs;
+        if (lane_id_32 % 4 == 0) {
+            yqs2[quad_idx_in_block * 16 + 0 * 8 + group_id] = *(const char2 *) &packed[0];
+            yqs2[quad_idx_in_block * 16 + 1 * 8 + group_id] = *(const char2 *) &packed[1];
+        }
+        if (lane_id_32 == 0) {
+            yb->d4[quad_idx_in_block] = (scales[1] << 8) | scales[0];
+        }
+    } else {
+        block_fp8_mmq * yb = (block_fp8_mmq *) vy + yb_idx;
+        uint32_t * yqs4 = (uint32_t *) yb->qs;
+        if (lane_id_32 % 4 == 0) {
+            yqs4[quad_idx_in_block * 16 + 0 * 8 + group_id] = packed[0];
+            yqs4[quad_idx_in_block * 16 + 1 * 8 + group_id] = packed[1];
+        }
+        if (lane_id_32 == 0) {
+            yb->d4[quad_idx_in_block * 2 + 0] = scales[0];
+            yb->d4[quad_idx_in_block * 2 + 1] = scales[1];
+        }
+    }
+}
+
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <bool scatter>
-static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
+template <bool scatter, ggml_prec prec>
+static __global__ void quantize_mmq_mxfp(const float * __restrict__ x,
                                           const int32_t * __restrict__ ids,
                                           void * __restrict__ vy,
                                           const int64_t ne00,
@@ -321,8 +388,11 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
                                           const int     ne1,
                                           const int     ne2,
                                           const int     n_expert_used) {
+    static_assert(prec == GGML_PREC_Q4 || prec == GGML_PREC_MXFP8, "bad prec");
+
     constexpr int vals_per_scale = 32;
     constexpr int vals_per_warp  = 2 * vals_per_scale;  // Each warp processes 2 blocks of 32 = 64 values
+    constexpr int vals_per_block = prec == GGML_PREC_Q4 ? QK_FP4_MMQ : QK_FP8_MMQ;
 
     const int warp_id = threadIdx.y;
     const int lane_id_32 = threadIdx.x;
@@ -335,12 +405,10 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
         return;
     }
 
-    const int64_t block_fp4_mmq_size = QK_FP4_MMQ;
-    const int64_t k_block            = warp_start_offset / block_fp4_mmq_size;
-    const int64_t quad_idx_in_block  = (warp_start_offset % block_fp4_mmq_size) / vals_per_warp;
+    const int64_t k_block            = warp_start_offset / vals_per_block;
+    const int64_t quad_idx_in_block  = (warp_start_offset % vals_per_block) / vals_per_warp;
 
     const int group_id = lane_id_32 / 4;
-    const int lane_in_group = lane_id_32 % 4;
     const int base = group_id * 2;
 
     ggml_cuda_pdl_sync();
@@ -354,8 +422,8 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
         base_pos = i3 * s03 + i2 * s02 + i01 * s01;
     }
 
-    uint8_t scales[2];
-    char2   packed[2];
+    uint8_t  scales[2];
+    uint32_t packed[2];
 
 #pragma unroll
     for (int b = 0; b < 2; ++b) {
@@ -368,167 +436,26 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
             amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, WARP_SIZE));
         }
 
-        const uint8_t e = compute_e8m0_scale(amax, 4.0f);
+        // W4A4: UOS (arxiv 2607.24377); W4A8: RNE to the e4m3 grid
+        const uint8_t e = prec == GGML_PREC_Q4 ?
+            ggml_e8m0_scale(amax, GGML_MXFP4_FMAX_UOS, true) : ggml_e8m0_scale(amax, GGML_MXFP4_FMAX_W4A8, false);
         scales[b] = e;
         const float inv_s = (amax == 0.0f) ? 0.0f : __frcp_rn(ggml_cuda_e8m0_to_fp32(e));
 
-#if CUDART_VERSION >= 12080
-        const float scaled_val = xi * inv_s;
-
-        const float val0 = __shfl_sync(0xFFFFFFFF, scaled_val, base, WARP_SIZE);
-        const float val1 = __shfl_sync(0xFFFFFFFF, scaled_val, base + 16, WARP_SIZE);
-        const float val2 = __shfl_sync(0xFFFFFFFF, scaled_val, base + 1, WARP_SIZE);
-        const float val3 = __shfl_sync(0xFFFFFFFF, scaled_val, base + 17, WARP_SIZE);
-
-        __nv_fp4x4_e2m1 fp4_packed(make_float4(val0, val1, val2, val3));
-        packed[b] = *(char2 *) &fp4_packed;
-#else
-        // Fallback: manual FP4 conversion using LUT
-        const uint8_t q_val = ggml_cuda_float_to_fp4_e2m1(xi, inv_s);
-
-        const uint8_t q_lo_0 = __shfl_sync(0xFFFFFFFF, q_val, base,      WARP_SIZE);
-        const uint8_t q_lo_1 = __shfl_sync(0xFFFFFFFF, q_val, base + 1,  WARP_SIZE);
-        const uint8_t q_hi_0 = __shfl_sync(0xFFFFFFFF, q_val, base + 16, WARP_SIZE);
-        const uint8_t q_hi_1 = __shfl_sync(0xFFFFFFFF, q_val, base + 17, WARP_SIZE);
-
-        char2 q;
-        q.x = (q_hi_0 << 4) | q_lo_0;
-        q.y = (q_hi_1 << 4) | q_lo_1;
-        packed[b] = q;
-#endif // CUDART_VERSION >= 12080
+        packed[b] = quantize_mmq_mxfp_pack4<prec>(xi, inv_s, base, lane_id_32);
     }
 
-    block_fp4_mmq * y = (block_fp4_mmq *) vy;
     if constexpr (scatter) {
 #pragma unroll
         for (int slot = 0; slot < n_expert_used; ++slot) {
             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
-            block_fp4_mmq * yb = y + (k_block * ne1 + i);
-            char2 * yqs2 = (char2 *) yb->qs;
-            if (lane_in_group == 0) {
-                yqs2[quad_idx_in_block * 16 + 0 * 8 + group_id] = packed[0];
-                yqs2[quad_idx_in_block * 16 + 1 * 8 + group_id] = packed[1];
-            }
-            if (lane_id_32 == 0) {
-                yb->d4[quad_idx_in_block] = (scales[1] << 8) | scales[0];
-            }
+            quantize_mmq_mxfp_store<prec>(vy, k_block * ne1 + i, quad_idx_in_block, group_id, lane_id_32, scales, packed);
         }
     } else {
-        const int64_t ib0 = blockIdx.z * ((int64_t) ne1 * (ne0 / block_fp4_mmq_size));
-        block_fp4_mmq * yb = y + (ib0 + k_block * ne1 + blockIdx.x);
-        char2 * yqs2 = (char2 *) yb->qs;
-        if (lane_in_group == 0) {
-            yqs2[quad_idx_in_block * 16 + 0 * 8 + group_id] = packed[0];
-            yqs2[quad_idx_in_block * 16 + 1 * 8 + group_id] = packed[1];
-        }
-        if (lane_id_32 == 0) {
-            yb->d4[quad_idx_in_block] = (scales[1] << 8) | scales[0];
-        }
+        const int64_t ib0 = blockIdx.z * ((int64_t) ne1 * (ne0 / vals_per_block));
+        quantize_mmq_mxfp_store<prec>(vy, ib0 + k_block * ne1 + blockIdx.x, quad_idx_in_block, group_id, lane_id_32, scales, packed);
     }
     GGML_UNUSED(n_expert_used);
-}
-
-// quantize values in the format mxfp8 is stored: e4m3 codes, one ue8m0 scale per 32 values
-// scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <bool scatter>
-static __global__ void quantize_mmq_mxfp8(const float * __restrict__ x,
-                                          const int32_t * __restrict__ ids,
-                                          void * __restrict__ vy,
-                                          const int64_t ne00,
-                                          const int64_t s01,
-                                          const int64_t s02,
-                                          const int64_t s03,
-                                          const int64_t ne0,
-                                          const int     ne1,
-                                          const int     ne2,
-                                          const int     n_expert_used) {
-#if defined(BLACKWELL_MMA_AVAILABLE)
-    constexpr int vals_per_scale = 32;
-    constexpr int vals_per_warp  = 4 * vals_per_scale;
-
-    const int warp_id = threadIdx.y;
-    const int lane_id_32 = threadIdx.x;
-
-    const int nwarps = blockDim.y;
-
-    const int64_t warp_start_offset = (blockIdx.y * nwarps + warp_id) * vals_per_warp;
-
-    if (warp_start_offset >= ne0) {
-        return;
-    }
-
-    const int64_t k_block = warp_start_offset / QK_FP8_MMQ;
-
-    ggml_cuda_pdl_sync();
-    int64_t base_pos;
-    if constexpr (scatter) {
-        base_pos = (int64_t) blockIdx.x * s02; // one physical row per token
-    } else {
-        const int64_t i2  = blockIdx.z % ne2;
-        const int64_t i3  = blockIdx.z / ne2;
-        const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
-        base_pos = i3 * s03 + i2 * s02 + i01 * s01;
-    }
-
-    // each lane processes 4 consecutive values: 8 lanes per scale group of 32
-    const int grp = lane_id_32 / 8;
-    const int pos = lane_id_32 % 8;
-    const int64_t i0 = warp_start_offset + grp * vals_per_scale + pos * 4;
-
-    // the launcher asserts ne0 % QK_FP8_MMQ == 0; out-of-range tail values are zero-padded
-    float4 v4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    if (i0 + 3 < ne00) {
-        if ((reinterpret_cast<uintptr_t>(x + base_pos + i0) % 16) == 0) {
-            v4 = *(const float4 *) (x + base_pos + i0);
-        } else {
-            v4.x = x[base_pos + i0 + 0];
-            v4.y = x[base_pos + i0 + 1];
-            v4.z = x[base_pos + i0 + 2];
-            v4.w = x[base_pos + i0 + 3];
-        }
-    } else {
-        v4.x = i0 + 0 < ne00 ? x[base_pos + i0 + 0] : 0.0f;
-        v4.y = i0 + 1 < ne00 ? x[base_pos + i0 + 1] : 0.0f;
-        v4.z = i0 + 2 < ne00 ? x[base_pos + i0 + 2] : 0.0f;
-        v4.w = i0 + 3 < ne00 ? x[base_pos + i0 + 3] : 0.0f;
-    }
-
-    float amax = fmaxf(fmaxf(fabsf(v4.x), fabsf(v4.y)), fmaxf(fabsf(v4.z), fabsf(v4.w)));
-#pragma unroll
-    for (int mask = 4; mask > 0; mask >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, 8));
-    }
-
-
-    const uint8_t e = compute_e8m0_scale(amax, 256.0f);
-    const float inv_s = (amax == 0.0f) ? 0.0f : __frcp_rn(ggml_cuda_e8m0_to_fp32(e));
-    const float4 sv = make_float4(v4.x * inv_s, v4.y * inv_s, v4.z * inv_s, v4.w * inv_s);
-    const uint32_t packed = __nv_fp8x4_e4m3(sv).__x;
-
-    block_fp8_mmq * y = (block_fp8_mmq *) vy;
-    if constexpr (scatter) {
-#pragma unroll
-        for (int slot = 0; slot < n_expert_used; ++slot) {
-            const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
-            block_fp8_mmq * yb = y + (k_block * ne1 + i);
-            memcpy(&yb->qs[grp * vals_per_scale + pos * 4], &packed, sizeof(packed));
-            if (pos == 0) {
-                yb->d4[grp] = e;
-            }
-        }
-    } else {
-        const int64_t ib0 = blockIdx.z * ((int64_t) ne1 * (ne0 / QK_FP8_MMQ));
-        block_fp8_mmq * yb = y + (ib0 + k_block * ne1 + blockIdx.x);
-        memcpy(&yb->qs[grp * vals_per_scale + pos * 4], &packed, sizeof(packed));
-        if (pos == 0) {
-            yb->d4[grp] = e;
-        }
-    }
-    GGML_UNUSED(n_expert_used);
-#else
-    GGML_UNUSED_VARS(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, n_expert_used);
-    NO_DEVICE_CODE;
-#endif // defined(BLACKWELL_MMA_AVAILABLE)
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
@@ -730,14 +657,12 @@ void quantize_scatter_mmq_fp4_cuda(
         }
     } else {
         GGML_ASSERT(type_src0 == GGML_TYPE_MXFP4);
-        GGML_ASSERT(ne0 % (2 * QK_MXFP4) == 0);
-
         constexpr int nwarps = 8;
         constexpr int vals_per_block = nwarps * 2 * QK_MXFP4;
         const int64_t block_num_y = (ne0 + vals_per_block - 1) / vals_per_block;
         const dim3 block_size(WARP_SIZE, nwarps, 1);
         const dim3 num_blocks(n_tokens, block_num_y, 1);
-        quantize_mmq_mxfp4<true><<<num_blocks, block_size, 0, stream>>>(
+        quantize_mmq_mxfp<true, GGML_PREC_Q4><<<num_blocks, block_size, 0, stream>>>(
             x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
     }
 }
@@ -772,7 +697,7 @@ void quantize_mmq_fp4_cuda(
         const dim3    num_blocks(ne1, block_num_y, ne2 * ne3);
         const dim3    block_size(WARP_SIZE, nwarps, 1);
 
-        quantize_mmq_mxfp4<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+        quantize_mmq_mxfp<false, GGML_PREC_Q4><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
     }
 }
 
@@ -783,13 +708,13 @@ void quantize_mmq_mxfp8_cuda(
     GGML_ASSERT(ne0 % QK_FP8_MMQ == 0);
 
     constexpr int nwarps = 8;
-    constexpr int vals_per_block = nwarps * QK_FP8_MMQ;
+    constexpr int vals_per_block = nwarps * 2 * QK_MXFP4;
 
     const int64_t block_num_y = (ne0 + vals_per_block - 1) / vals_per_block;
     const dim3    num_blocks(ne1, block_num_y, ne2 * ne3);
     const dim3    block_size(WARP_SIZE, nwarps, 1);
 
-    quantize_mmq_mxfp8<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+    quantize_mmq_mxfp<false, GGML_PREC_MXFP8><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
 }
 
 void quantize_scatter_mmq_mxfp8_cuda(
@@ -799,12 +724,12 @@ void quantize_scatter_mmq_mxfp8_cuda(
     GGML_ASSERT(ne0 % QK_FP8_MMQ == 0);
 
     constexpr int nwarps = 8;
-    constexpr int vals_per_block = nwarps * QK_FP8_MMQ;
+    constexpr int vals_per_block = nwarps * 2 * QK_MXFP4;
 
     const int64_t block_num_y = (ne0 + vals_per_block - 1) / vals_per_block;
     const dim3 num_blocks(n_tokens, block_num_y, 1);
     const dim3 block_size(WARP_SIZE, nwarps, 1);
 
-    quantize_mmq_mxfp8<true><<<num_blocks, block_size, 0, stream>>>(
+    quantize_mmq_mxfp<true, GGML_PREC_MXFP8><<<num_blocks, block_size, 0, stream>>>(
         x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
 }

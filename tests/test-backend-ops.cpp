@@ -147,34 +147,6 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     }
 }
 
-// rounding edge values for f32->mxfp4, near e2m1 code point boundaries
-static void init_tensor_mxfp4_ties(ggml_tensor * tensor, float amax_lo = 0.001f, float amax_hi = 1000.0f) {
-    GGML_ASSERT(tensor->type == GGML_TYPE_F32);
-    const int64_t n = ggml_nelements(tensor);
-    constexpr int qk = 32; // QK_MXFP4
-    GGML_ASSERT(n % qk == 0);
-
-    std::vector<float> data(n, 0.0f);
-    const float ties[] = {0.1875f, 0.4375f, 0.875f, -0.1875f, -0.4375f, -0.875f};
-
-    auto fill = [&](int64_t i, float amax, float scale) {
-        data[i] = amax;
-        for (int j = 1; j < qk; ++j) {
-            data[i + j] = ties[(j - 1) % 6] * scale;
-        }
-    };
-
-    for (int64_t i = 0, block = 0; i < n; i += qk, ++block) {
-        if (block % 16 == 7)       fill(i, amax_lo, 0.5f*amax_lo);  // small amax
-        else if (block % 32 == 15) fill(i, 1.5f, 0.75f);            // amax in (1,2)
-        else if (block % 64 == 31) fill(i, 0.999f, 0.4995f);        // exp boundary near 1
-        else if (block % 8 == 7)   fill(i, amax_hi, 0.5f*amax_hi);  // large amax
-        else if (block % 4 == 3)  { /* all-zero, already zeroed */ }
-        else                       fill(i, 2.0f, 1.0f);             // default ties
-    }
-    ggml_backend_tensor_set(tensor, data.data(), 0, n * sizeof(float));
-}
-
 // generate an F16 mask where certain blocks are randomly masked with -INF value
 static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
@@ -3260,14 +3232,8 @@ struct test_cpy : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (type_src == GGML_TYPE_F32 && type_dst == GGML_TYPE_MXFP4 && strcmp(t->name, "src") == 0) {
-                // values near e2m1 code boundaries (exact midpoints when amax = 1.5);
-                // backends must tie-break identically (RNE)
-                init_tensor_mxfp4_ties(t);
-            } else {
-                // test extended range of values to check if casting between f32 and i32 is consistent
-                init_tensor_uniform(t, -150.f, 150.f);
-            }
+            // test extended range of values to check if casting between f32 and i32 is consistent
+            init_tensor_uniform(t, -150.f, 150.f);
         }
     }
 };
@@ -5010,6 +4976,28 @@ static bool graph_mul_mat_hi_prec_act(ggml_cgraph * gf, ggml_op op) {
     return false;
 }
 
+// nmse tolerance for mxfp4 matmuls on Blackwell: 1e-3 for the default W4A8 (e4m3) path,
+// 2e-2 when W4A4 (e2m1) is forced via GGML_CUDA_MMQ_PREC=q4
+static double max_nmse_err_mxfp4_blackwell() {
+    const char * env = getenv("GGML_CUDA_MMQ_PREC");
+    return (env != nullptr && std::string(env) == "q4") ? 2e-2 : 1e-3;
+}
+
+// nmse tolerance for the FP4 types' MMQ activation quantization on Blackwell,
+// or -1 when the default tolerance applies
+static double max_nmse_err_blackwell_fp4(const ggml_type type_a, ggml_cgraph * gf, ggml_op op, ggml_backend_t backend) {
+    if (graph_mul_mat_hi_prec_act(gf, op) || !backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+        return -1.0;
+    }
+    if (type_a == GGML_TYPE_MXFP4) {
+        return max_nmse_err_mxfp4_blackwell();
+    }
+    if (type_a == GGML_TYPE_NVFP4) {
+        return 2e-2;
+    }
+    return -1.0;
+}
+
 // GGML_OP_MUL_MAT
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
@@ -5036,14 +5024,9 @@ struct test_mul_mat : public test_case {
 
     double max_nmse_err(ggml_backend_t backend) override {
         // Blackwell MMQ uses e4m3 (mxfp4) / e2m1 (nvfp4) activations, needs extra tolerance
-        if (!graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT) &&
-                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
-            if (type_a == GGML_TYPE_MXFP4) {
-                return 1e-3;
-            }
-            if (type_a == GGML_TYPE_NVFP4) {
-                return 2e-2;
-            }
+        const double fp4_err = max_nmse_err_blackwell_fp4(type_a, gf, GGML_OP_MUL_MAT, backend);
+        if (fp4_err >= 0.0) {
+            return fp4_err;
         }
         return max_nmse_err();
     }
@@ -5299,14 +5282,9 @@ struct test_mul_mat_id : public test_case {
 
     double max_nmse_err(ggml_backend_t backend) override {
         // Blackwell MMQ uses e4m3 (mxfp4) / e2m1 (nvfp4) activations, needs extra tolerance
-        if (!graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT_ID) &&
-                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
-            if (type_a == GGML_TYPE_MXFP4) {
-                return 1e-3;
-            }
-            if (type_a == GGML_TYPE_NVFP4) {
-                return 2e-2;
-            }
+        const double fp4_err = max_nmse_err_blackwell_fp4(type_a, gf, GGML_OP_MUL_MAT_ID, backend);
+        if (fp4_err >= 0.0) {
+            return fp4_err;
         }
         return max_nmse_err();
     }

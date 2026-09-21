@@ -192,8 +192,8 @@ static __device__ void quantize_f32_mxfp4_block(const float * __restrict__ x, bl
         amax = fmaxf(amax, fabsf(x[j]));
     }
 
-    // UOS (arxiv 2607.24377): optimal online quantization for mxfp4
-    const uint8_t e = compute_e8m0_scale(amax, 7.25f, true);
+    // UOS (arxiv 2607.24377) for the KV cache
+    const uint8_t e = ggml_e8m0_scale(amax, GGML_MXFP4_FMAX_UOS, true);
     const float inv_s = (amax == 0.0f) ? 0.0f : __frcp_rn(ggml_cuda_e8m0_to_fp32(e));
     y->e = e;
 #if CUDART_VERSION >= 12080
@@ -207,7 +207,7 @@ static __device__ void quantize_f32_mxfp4_block(const float * __restrict__ x, bl
     }
 #else
     for (int j = 0; j < QK_MXFP4/2; ++j) {
-        y->qs[j] = ggml_cuda_float_to_fp4_e2m1(x[j]*inv_s, 1.0f) | (ggml_cuda_float_to_fp4_e2m1(x[QK_MXFP4/2+j]*inv_s, 1.0f) << 4);
+        y->qs[j] = ggml_float_to_fp4_e2m1_index(x[j]*inv_s, 0.5f) | (ggml_float_to_fp4_e2m1_index(x[QK_MXFP4/2+j]*inv_s, 0.5f) << 4);
     }
 #endif // CUDART_VERSION >= 12080
 }
