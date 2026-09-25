@@ -508,6 +508,46 @@ static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
 
 #define GGML_E8M0_TO_FP32(x) ggml_e8m0_to_fp32(x)
 #define GGML_E8M0_TO_FP32_HALF(x) ggml_e8m0_to_fp32_half(x)
+// e8m0 block scale from block amax: 2^round(log2(amax / fmax))
+// round_up: ceil (UOS) instead of round-to-nearest-even
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define GGML_HOST_DEVICE __host__ __device__
+#else
+#define GGML_HOST_DEVICE
+#endif // __CUDACC__ || __HIPCC__
+GGML_HOST_DEVICE static inline uint8_t ggml_e8m0_scale(float amax, float fmax, bool round_up) {
+    if (!(amax > 0.0f)) {
+        return 0;
+    }
+
+    const float t = log2f(amax) - log2f(fmax);
+    const int e = (round_up ? (int) ceilf(t) : (int) rintf(t)) + 127;
+
+    return (uint8_t) (e < 0 ? 0 : e > 254 ? 254 : e);
+}
+
+// fmax values for ggml_e8m0_scale (amax / scale), per quantization target
+#define GGML_MXFP4_FMAX_WEIGHTS 4.0f    // weights (RNE): amax maps to 4.0 on the e2m1 grid
+#define GGML_MXFP4_FMAX_UOS 7.25f       // activations (W4A4) and KV cache (UOS): amax maps to at most 7.25, values above 6.0 clamp
+#define GGML_MXFP4_FMAX_W4A8 256.0f     // activations (W4A8, RNE): amax maps to 256 on the e4m3 grid
+
+// e2m1 quantization index: index into the 2x grid that minimizes |grid[i]*d - x|
+// d = scale * 0.5 to match the 2x grid convention (kvalues_fp4 in ggml-common.h)
+// RNE: on an exact tie, pick the even grid index
+GGML_HOST_DEVICE static inline int ggml_float_to_fp4_e2m1_index(float x, float d) {
+    static const int grid[16] = { 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12 };
+
+    int best_index = 0;
+    float best_err = fabsf(grid[0]*d - x);
+    for (int i = 1; i < 16; i++) {
+        const float err = fabsf(grid[i]*d - x);
+        if (err < best_err || (err == best_err && (i & 1) == 0 && (best_index & 1) != 0)) {
+            best_index = i;
+            best_err = err;
+        }
+    }
+    return best_index;
+}
 
 // UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits
 // Returns value * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 * E2M1_float)

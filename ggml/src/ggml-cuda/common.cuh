@@ -451,16 +451,6 @@ struct ggml_cuda_unroll<1> {
     }
 };
 
-__device__ __forceinline__ uint8_t compute_e8m0_scale(float amax, float fmax, bool round_up = false) {
-    if (!(amax > 0.0f)) {
-        return 0;
-    }
-
-    const float t = log2f(amax) - log2f(fmax);
-    const int e = round_up ? (int) ceilf(t) : __float2int_rn(t);
-    return static_cast<uint8_t>(min(max(e + 127, 0), 254));
-}
-
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_sum(int x) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
@@ -893,29 +883,6 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
 #else
      NO_DEVICE_CODE; // Used only for NVFP4 Scales for Activations, only for Blackwell
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
-}
-
-__device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e) {
-    const uint8_t sign_bit = (x < 0.0f) << 3;
-    float         ax       = fabsf(x) * e;
-
-    // Positive LUT
-    static constexpr float pos_lut[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
-
-    int   best_i   = 0;
-    float best_err = fabsf(ax - pos_lut[0]);
-
-#pragma unroll
-    for (int i = 1; i < 8; ++i) {
-        const float err = fabsf(ax - pos_lut[i]);
-        // RNE: on exact tie, pick the even grid index
-        if (err < best_err || (err == best_err && (i & 1) == 0 && (best_i & 1) == 1)) {
-            best_err = err;
-            best_i   = i;
-        }
-    }
-
-    return static_cast<uint8_t>(best_i | sign_bit);
 }
 
 static __device__ __forceinline__ half2 ggml_cuda_mxfp4_to_half2(uint8_t q) {

@@ -1311,7 +1311,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #pragma unroll
             for (int frag = 0; frag < nfrags; ++frag) {
                 tile_C C = {};
-                mma_block_scaled_fp4<type>(C, A[n][frag], B[frag], scaleA[n][frag], scaleB[frag]);
+                mma_block_scaled_fp4<type, GGML_PREC_MXFP8>(C, A[n][frag], B[frag], scaleA[n][frag], scaleB[frag]);
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
                     sum[(j0 / tile_C::J + n) * tile_C::ne + l] += C.x[l];

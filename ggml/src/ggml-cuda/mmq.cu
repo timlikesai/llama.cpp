@@ -71,12 +71,13 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             break;
 // -----------------------------------------------------------------------
         case GGML_TYPE_MXFP4:
-            // src1 at Q4 uses the native FP4 instructions, which are Blackwell-only
             if (prec_src1 == GGML_PREC_Q4) {
+                // mxf8f6f4 (W4A4) path: e2m1 (mxfp4) activations
                 mul_mat_q_case<GGML_TYPE_MXFP4, GGML_PREC_Q4>(ctx, args, stream);
-                break;
+            } else {
+                // mxf8f6f4 (W4A8) path: e4m3 (mxfp8) activations
+                mul_mat_q_case<GGML_TYPE_MXFP4, GGML_PREC_MXFP8>(ctx, args, stream);
             }
-            mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, args, stream);
             break;
         case GGML_TYPE_NVFP4:
             if (prec_src1 == GGML_PREC_Q4) {
@@ -113,9 +114,8 @@ static ggml_prec ggml_cuda_mmq_get_prec_env() {
     return GGML_PREC_UNDEFINED;
 }
 
-// src1 is quantized to Q8_1 unless the FP4 types can use 4-bit activations, in which case they
-// default to the native W4A4 instructions on Blackwell. MXFP4 defaults to the higher-accuracy
-// W4A8 (e4m3) path instead; the policy or the env var can force either.
+// src1 is quantized to Q8_1 unless NVFP4 can use the native W4A4 instructions on Blackwell.
+// MXFP4 always uses the higher-accuracy W4A8 (e4m3) activations on Blackwell.
 static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggml_tensor * dst, const int cc) {
     static const ggml_prec prec_env = ggml_cuda_mmq_get_prec_env();
 
@@ -123,15 +123,14 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     if (prec == GGML_PREC_UNDEFINED) {
         prec = (ggml_prec) ggml_get_op_params_i32(dst, 3);
     }
-
-    // MXFP4 defaults to the higher-accuracy W4A8 (e4m3) path
-    if (prec == GGML_PREC_UNDEFINED && src0->type == GGML_TYPE_MXFP4) {
-        prec = GGML_PREC_Q8;
+    // MXFP4 uses the mxf8f6f4 (W4A8) path by default; W4A4 requires an explicit Q4 request
+    if (src0->type == GGML_TYPE_MXFP4 && blackwell_mma_available(cc)) {
+        return prec == GGML_PREC_Q4 ? GGML_PREC_Q4 : GGML_PREC_MXFP8;
     }
 
-    // Q4 only for the FP4 types on Blackwell
+    // Q4 only for NVFP4 on Blackwell
     GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8 || prec == GGML_PREC_Q4);
-    const bool can_use_q4 = (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) && blackwell_mma_available(cc);
+    const bool can_use_q4 = src0->type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc);
     if (prec == GGML_PREC_Q8 || !can_use_q4) {
         return GGML_PREC_Q8;
     }

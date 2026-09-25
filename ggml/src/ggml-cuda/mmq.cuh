@@ -260,8 +260,9 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
         return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
     }
     if (blackwell_mma_available(cc)) {
-        // only NVFP4 at higher precision keeps src1 at Q8_1
-        if (prec_src1 != GGML_PREC_Q4 && type == GGML_TYPE_NVFP4) {
+        // only NVFP4 at higher precision, or MXFP4 with Q8_1 activations, keeps src1 at Q8_1
+        if ((type == GGML_TYPE_NVFP4 && prec_src1 != GGML_PREC_Q4) ||
+            (type == GGML_TYPE_MXFP4 && prec_src1 == GGML_PREC_Q8)) {
             return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
         }
         return ggml_cuda_mmq_get_config_blackwell(type, J, fallback, prec_src1);
@@ -292,8 +293,9 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
 #endif // CDNA
 #else
 #ifdef BLACKWELL_MMA_AVAILABLE
-    // only NVFP4 at higher precision keeps src1 at Q8_1
-    if (prec_src1 != GGML_PREC_Q4 && type == GGML_TYPE_NVFP4) {
+    // only NVFP4 at higher precision, or MXFP4 with Q8_1 activations, keeps src1 at Q8_1
+    if ((type == GGML_TYPE_NVFP4 && prec_src1 != GGML_PREC_Q4) ||
+        (type == GGML_TYPE_MXFP4 && prec_src1 == GGML_PREC_Q8)) {
         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
     }
     return ggml_cuda_mmq_get_config_blackwell(type, J, fallback, prec_src1);
@@ -712,7 +714,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             }
             return ggml_cuda_mmq_util_funcs(
                 -1,
-                ggml_cuda_mmq_load_tiles_mxfp4_mxfp8<type, J, fallback, prec_src1>,
+                ggml_cuda_mmq_load_tiles_mxfp4_mxfp8<type, J, fallback, GGML_PREC_MXFP8>,
                 ggml_cuda_mmq_vec_dot_mxfp4_mxfp8_mma<type, J, fallback>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         case GGML_TYPE_NVFP4:
@@ -1585,6 +1587,10 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
 #define DECL_MMQ_CASE_W4A4(type)                                                   \
     template void mul_mat_q_case<type, GGML_PREC_Q4>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 
+// mxf8f6f4 mixed variant: e4m3 (mxfp8) activation; the weight type selects W4/W6/W8.
+#define DECL_MMQ_CASE_MXA8(type)                                                   \
+    template void mul_mat_q_case<type, GGML_PREC_MXFP8>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
+
 extern DECL_MMQ_CASE(GGML_TYPE_Q1_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q4_0);
@@ -1608,9 +1614,8 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ3_S);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ4_NL);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 // -----------------------------------------
-extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
+extern DECL_MMQ_CASE_MXA8(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
-extern DECL_MMQ_CASE_W4A4(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
 
 // -------------------------------------------------------------------------------------------------------------------------
