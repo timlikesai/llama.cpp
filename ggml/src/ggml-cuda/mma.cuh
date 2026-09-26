@@ -1182,7 +1182,7 @@ namespace ggml_cuda_mma {
 #endif // AMD_MFMA_AVAILABLE
     }
 
-    template <ggml_type type>
+    template <ggml_type type, ggml_prec prec_src1 = GGML_PREC_Q4>
     static __device__ __forceinline__ void mma_block_scaled_fp4(tile<16, 8, float> &     D,
                                                                 const tile<16, 8, int> & A,
                                                                 const tile<8, 8, int> &  B,
@@ -1193,16 +1193,23 @@ namespace ggml_cuda_mma {
         const int * Bxi = (const int *) B.x;
         float *     Dxi = (float *) D.x;
 
-        if constexpr (type == GGML_TYPE_MXFP4) {
+        if constexpr (type == GGML_TYPE_NVFP4) {
             asm volatile(
-                "mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 "
+                "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
+                "%10, {0, 0}, %11, {0, 0};"
+                : "+f"(Dxi[0]), "+f"(Dxi[1]), "+f"(Dxi[2]), "+f"(Dxi[3])
+                : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[1]), "r"(a_scale), "r"(b_scale));
+        } else if (prec_src1 == GGML_PREC_Q4) {
+            asm volatile(
+                "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e2m1.e2m1.f32.ue8m0 "
                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
                 "%10, {0, 0}, %11, {0, 0};"
                 : "+f"(Dxi[0]), "+f"(Dxi[1]), "+f"(Dxi[2]), "+f"(Dxi[3])
                 : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[1]), "r"(a_scale), "r"(b_scale));
         } else {
             asm volatile(
-                "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e2m1.e4m3.f32.ue8m0 "
                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
                 "%10, {0, 0}, %11, {0, 0};"
                 : "+f"(Dxi[0]), "+f"(Dxi[1]), "+f"(Dxi[2]), "+f"(Dxi[3])
@@ -1210,6 +1217,7 @@ namespace ggml_cuda_mma {
         }
 #else
         GGML_UNUSED_VARS(D, A, B, a_scale, b_scale);
+        NO_DEVICE_CODE;
 #endif // BLACKWELL_MMA_AVAILABLE
     }
 
