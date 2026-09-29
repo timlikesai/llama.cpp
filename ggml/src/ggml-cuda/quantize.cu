@@ -338,11 +338,17 @@ static __device__ __forceinline__ uint32_t quantize_mmq_mxfp_pack4(const float x
         return (q_hi_1 << 12) | (q_lo_1 << 8) | (q_hi_0 << 4) | q_lo_0;
 #endif // CUDART_VERSION >= 12080
     } else {
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
         const float val1 = __shfl_sync(0xFFFFFFFF, scaled_val, lane_id_32 + 1, WARP_SIZE);
         const float val2 = __shfl_sync(0xFFFFFFFF, scaled_val, lane_id_32 + 2, WARP_SIZE);
         const float val3 = __shfl_sync(0xFFFFFFFF, scaled_val, lane_id_32 + 3, WARP_SIZE);
 
         return __nv_fp8x4_e4m3(make_float4(scaled_val, val1, val2, val3)).__x;
+#else
+        // unreachable: this path serves the Blackwell block-scaled mma only
+        GGML_UNUSED(scaled_val);
+        return 0;
+#endif // FP8_AVAILABLE && !GGML_USE_HIP
     }
 }
 

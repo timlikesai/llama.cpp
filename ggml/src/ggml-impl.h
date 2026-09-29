@@ -509,11 +509,11 @@ static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
 #define GGML_E8M0_TO_FP32(x) ggml_e8m0_to_fp32(x)
 #define GGML_E8M0_TO_FP32_HALF(x) ggml_e8m0_to_fp32_half(x)
 
-#if defined(__CUDACC__) || defined(__HIPCC__)
+#if defined(__CUDACC__) || defined(__HIPCC__) || defined(__MUSACC__)
 #define GGML_HOST_DEVICE __host__ __device__
 #else
 #define GGML_HOST_DEVICE
-#endif // __CUDACC__ || __HIPCC__
+#endif // __CUDACC__ || __HIPCC__ || __MUSACC__
 
 // e8m0 block scale from block amax: 2^round(log2(amax / fmax))
 // round_up: ceil (UOS) instead of round-to-nearest-even
