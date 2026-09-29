@@ -522,7 +522,7 @@ GGML_HOST_DEVICE static inline uint8_t ggml_e8m0_scale(float amax, float fmax, b
         return 0;
     }
 
-    const float t = log2f(amax) - log2f(fmax);
+    const float t = log2f(amax / fmax);
     const int e = (round_up ? (int) ceilf(t) : (int) rintf(t)) + 127;
 
     return (uint8_t) (e < 0 ? 0 : e > 254 ? 254 : e);
