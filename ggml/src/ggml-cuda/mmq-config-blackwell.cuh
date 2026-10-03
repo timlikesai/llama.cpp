@@ -1,20 +1,24 @@
-static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_blackwell(ggml_type type, int J, bool fallback) {
-    CASE(GGML_TYPE_MXFP4, 256, 1, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, true);
-    CASE(GGML_TYPE_MXFP4, 256, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, true);
-    CASE(GGML_TYPE_MXFP4, 256, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, true);
-    CASE(GGML_TYPE_MXFP4, 256, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, true);
-    CASE(GGML_TYPE_MXFP4, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, true);
-    CASE(GGML_TYPE_MXFP4, 256, 1, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
-    CASE(GGML_TYPE_MXFP4, 256, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
-    CASE(GGML_TYPE_MXFP4, 256, 1, 128,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
-    CASE(GGML_TYPE_MXFP4, 256, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
-    CASE(GGML_TYPE_MXFP4, 256, 1, 128,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
-    CASE(GGML_TYPE_MXFP4, 256, 1, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
-    CASE(GGML_TYPE_MXFP4, 256, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
-    CASE(GGML_TYPE_MXFP4, 256, 1, 128,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
-    CASE(GGML_TYPE_MXFP4, 256, 1, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
-    CASE(GGML_TYPE_MXFP4, 256, 1, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
-    CASE(GGML_TYPE_MXFP4, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
+static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_blackwell(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
+    if (type == GGML_TYPE_MXFP4) {
+        // W4A8 (e4m3 activations) uses the FP8 SRAM layout, W4A4 the FP4 one
+        const ggml_cuda_mmq_sram_layout L = prec_src1 == GGML_PREC_MXFP8 ? GGML_CUDA_MMQ_SRAM_LAYOUT_FP8 : GGML_CUDA_MMQ_SRAM_LAYOUT_FP4;
+        CASE(GGML_TYPE_MXFP4, 256, 1, 128,   8, L, MMQ_ITER_K_FP4, true, true);
+        CASE(GGML_TYPE_MXFP4, 256, 1, 128,  16, L, MMQ_ITER_K_FP4, true, true);
+        CASE(GGML_TYPE_MXFP4, 256, 1, 128,  32, L, MMQ_ITER_K_FP4, true, true);
+        CASE(GGML_TYPE_MXFP4, 256, 1, 128,  64, L, MMQ_ITER_K_FP4, true, true);
+        CASE(GGML_TYPE_MXFP4, 256, 1, 128, 128, L, MMQ_ITER_K_FP4, true, true);
+        CASE(GGML_TYPE_MXFP4, 256, 1, 128,   8, L, MMQ_ITER_K_FP4, true, false);
+        CASE(GGML_TYPE_MXFP4, 256, 1, 128,  16, L, MMQ_ITER_K_FP4, true, false);
+        CASE(GGML_TYPE_MXFP4, 256, 1, 128,  24, L, MMQ_ITER_K_FP4, true, false);
+        CASE(GGML_TYPE_MXFP4, 256, 1, 128,  32, L, MMQ_ITER_K_FP4, true, false);
+        CASE(GGML_TYPE_MXFP4, 256, 1, 128,  40, L, MMQ_ITER_K_FP4, true, false);
+        CASE(GGML_TYPE_MXFP4, 256, 1, 128,  48, L, MMQ_ITER_K_FP4, true, false);
+        CASE(GGML_TYPE_MXFP4, 256, 1, 128,  64, L, MMQ_ITER_K_FP4, true, false);
+        CASE(GGML_TYPE_MXFP4, 256, 1, 128,  80, L, MMQ_ITER_K_FP4, true, false);
+        CASE(GGML_TYPE_MXFP4, 256, 1, 128,  96, L, MMQ_ITER_K_FP4, true, false);
+        CASE(GGML_TYPE_MXFP4, 256, 1, 128, 112, L, MMQ_ITER_K_FP4, true, false);
+        CASE(GGML_TYPE_MXFP4, 256, 1, 128, 128, L, MMQ_ITER_K_FP4, true, false);
+    }
 
     CASE(GGML_TYPE_NVFP4, 256, 1, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, true);
     CASE(GGML_TYPE_NVFP4, 256, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, true);

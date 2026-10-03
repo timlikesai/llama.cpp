@@ -448,6 +448,7 @@ extern "C" {
         GGML_PREC_F16       = 20,
         GGML_PREC_Q8        = 30,
         GGML_PREC_Q4        = 40,
+        GGML_PREC_MXFP8     = 50, // e4m3 (mxfp8) activation, mxf8f6f4 mixed MMA (W4A8/W6A8/W8A8)
     };
 
     // op hint
@@ -1448,6 +1449,7 @@ extern "C" {
     //  - GGML_PREC_F16  - can accumulate the results in F16, F32
     //  - GGML_PREC_Q8   - not allowed
     //  - GGML_PREC_Q4   - not allowed
+    //  - GGML_PREC_MXFP8  - not allowed
     //
     // return false on faliure
     GGML_API bool ggml_prec_set_acc(
@@ -1462,6 +1464,7 @@ extern "C" {
     //  - GGML_PREC_F16  - GGML_TYPE_F16,
     //  - GGML_PREC_Q8   - GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, GGML_TYPE_Q8_K, etc.
     //  - GGML_PREC_Q4   - GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_NVFP4, GGML_TYPE_MXFP4, etc.
+    //  - GGML_PREC_MXFP8  - e4m3 (mxfp8) activation codes
     //
     // for example:
     //   - ggml_prec_set_src(a, GGML_PREC_Q8, 1):
