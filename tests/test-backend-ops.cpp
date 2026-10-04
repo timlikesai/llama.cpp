@@ -2582,7 +2582,8 @@ struct test_set_rows : public test_case {
     double max_nmse_err() override {
         if (type_dst == GGML_TYPE_Q2_0 || type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 ||
             type_dst == GGML_TYPE_IQ4_NL ||
-            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
+            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0 ||
+            type_dst == GGML_TYPE_MXFP4) {
             // estimate what the max nmse error would be if one quantized value is
             // off by one. The test values are distributed in [-1,1], so it'll be
             // roughly (2.0 / 2^bits)^2, divided by the mean square value of the reference,
@@ -3145,7 +3146,8 @@ struct test_cpy : public test_case {
             return 0.0;
         }
         if (type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 || type_dst == GGML_TYPE_IQ4_NL ||
-            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
+            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0 ||
+            type_dst == GGML_TYPE_MXFP4) {
             // estimate what the max nmse error would be if one quantized value is
             // off by one. The test values are distributed in [-150,150], so it'll be
             // roughly (150*2.0 / 2^bits)^2, divided by the mean square value of the reference,
@@ -4974,6 +4976,28 @@ static bool graph_mul_mat_hi_prec_act(ggml_cgraph * gf, ggml_op op) {
     return false;
 }
 
+// nmse tolerance for mxfp4 matmuls on Blackwell: 1e-3 for the default W4A8 (e4m3) path,
+// 2e-2 when W4A4 (e2m1) is forced via GGML_CUDA_MMQ_PREC=q4
+static double max_nmse_err_mxfp4_blackwell() {
+    const char * env = getenv("GGML_CUDA_MMQ_PREC");
+    return (env != nullptr && std::string(env) == "q4") ? 2e-2 : 1e-3;
+}
+
+// nmse tolerance for the FP4 types' MMQ activation quantization on Blackwell,
+// or -1 when the default tolerance applies
+static double max_nmse_err_blackwell_fp4(const ggml_type type_a, ggml_cgraph * gf, ggml_op op, ggml_backend_t backend) {
+    if (graph_mul_mat_hi_prec_act(gf, op) || !backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+        return -1.0;
+    }
+    if (type_a == GGML_TYPE_MXFP4) {
+        return max_nmse_err_mxfp4_blackwell();
+    }
+    if (type_a == GGML_TYPE_NVFP4) {
+        return 2e-2;
+    }
+    return -1.0;
+}
+
 // GGML_OP_MUL_MAT
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
@@ -4999,11 +5023,10 @@ struct test_mul_mat : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
-        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
-                !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT) &&
-                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
-            return 2e-2;
+        // Blackwell MMQ uses e4m3 (mxfp4) / e2m1 (nvfp4) activations, needs extra tolerance
+        const double fp4_err = max_nmse_err_blackwell_fp4(type_a, gf, GGML_OP_MUL_MAT, backend);
+        if (fp4_err >= 0.0) {
+            return fp4_err;
         }
         return max_nmse_err();
     }
@@ -5258,11 +5281,10 @@ struct test_mul_mat_id : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
-        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
-                !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT_ID) &&
-                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
-            return 2e-2;
+        // Blackwell MMQ uses e4m3 (mxfp4) / e2m1 (nvfp4) activations, needs extra tolerance
+        const double fp4_err = max_nmse_err_blackwell_fp4(type_a, gf, GGML_OP_MUL_MAT_ID, backend);
+        if (fp4_err >= 0.0) {
+            return fp4_err;
         }
         return max_nmse_err();
     }
@@ -9859,6 +9881,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // quant block count not a multiple of the kernel block size
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q4_0, {96, 1, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32, {96, 1, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_MXFP4, {96, 1, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_MXFP4, GGML_TYPE_F32, {96, 1, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}));
@@ -11102,6 +11126,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // mxfp4 KV cases: head sizes, no mask, short/odd cache, GQA batch, and MLA V-view
+    test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {1, 1},  512, 1, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  512, 2, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1},  512, 1, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},   64, 1, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},   31, 1, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},   31, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {8, 1}, 7680, 1, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 128, 4, {1, 1},  512, 2, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, {0, 1, 2, 3}, true, true));
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;

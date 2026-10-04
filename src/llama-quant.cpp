@@ -494,7 +494,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             const int64_t nx = tensor->ne[0];
             const int64_t qk_k = ggml_blck_size(new_type);
 
-            if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE) {
+            if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE || ftype == LLAMA_FTYPE_MOSTLY_MXFP4) {
                 new_type = GGML_TYPE_Q8_0;
             }
             else if (arch == LLM_ARCH_FALCON || nx % qk_k != 0) {
@@ -522,6 +522,9 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         } else {
             new_type = GGML_TYPE_Q8_0;
         }
+    } else if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4) {
+        // token embeddings stay at Q8_0 until MXFP8 support is available
+        new_type = category == tensor_category::TOKEN_EMBD ? GGML_TYPE_Q8_0 : GGML_TYPE_MXFP4;
     } else if (category == tensor_category::TOKEN_EMBD) {
         if (qs.params->token_embedding_type < GGML_TYPE_COUNT) {
             new_type = qs.params->token_embedding_type;
@@ -891,6 +894,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q1_0: return GGML_TYPE_Q1_0;
         case LLAMA_FTYPE_MOSTLY_Q2_0: return GGML_TYPE_Q2_0;
 
+        case LLAMA_FTYPE_MOSTLY_MXFP4:     return GGML_TYPE_MXFP4;
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
 
         // K-quants
