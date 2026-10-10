@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <cctype>
 #include <cfloat>
 #include <cinttypes>
 #include <cstdarg>
@@ -5166,6 +5167,32 @@ static bool graph_mul_mat_hi_prec_act(ggml_cgraph * gf, ggml_op op) {
     return false;
 }
 
+// nmse tolerance for mxfp4 matmuls on Blackwell: 2e-3 for the default W4A8 (e4m3) path,
+// 2e-2 when W4A4 (e2m1) is forced via GGML_CUDA_MMQ_PREC=q4
+static double max_nmse_err_mxfp4_blackwell() {
+    const char * env = getenv("GGML_CUDA_MMQ_PREC");
+    std::string env_cpp = env != nullptr ? env : "";
+    for (char & c : env_cpp) {
+        c = std::tolower(c);
+    }
+    return env_cpp == "q4" ? 2e-2 : 2e-3;
+}
+
+// nmse tolerance for the FP4 types' MMQ activation quantization on Blackwell,
+// or -1 when the default tolerance applies
+static double max_nmse_err_blackwell_fp4(const ggml_type type_a, ggml_cgraph * gf, ggml_op op, ggml_backend_t backend) {
+    if (graph_mul_mat_hi_prec_act(gf, op) || !backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+        return -1.0;
+    }
+    if (type_a == GGML_TYPE_MXFP4) {
+        return max_nmse_err_mxfp4_blackwell();
+    }
+    if (type_a == GGML_TYPE_NVFP4) {
+        return 2e-2;
+    }
+    return -1.0;
+}
+
 // GGML_OP_MUL_MAT
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
@@ -5191,11 +5218,10 @@ struct test_mul_mat : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
-        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
-                !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT) &&
-                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
-            return 2e-2;
+        // for blackwell we quantize activations of the FP4 types instead of q8_1 so we add higher tolerance
+        const double fp4_err = max_nmse_err_blackwell_fp4(type_a, gf, GGML_OP_MUL_MAT, backend);
+        if (fp4_err >= 0.0) {
+            return fp4_err;
         }
         return max_nmse_err();
     }
@@ -5450,11 +5476,10 @@ struct test_mul_mat_id : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
-        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
-                !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT_ID) &&
-                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
-            return 2e-2;
+        // for blackwell we quantize activations of the FP4 types instead of q8_1 so we add higher tolerance
+        const double fp4_err = max_nmse_err_blackwell_fp4(type_a, gf, GGML_OP_MUL_MAT_ID, backend);
+        if (fp4_err >= 0.0) {
+            return fp4_err;
         }
         return max_nmse_err();
     }

@@ -1229,9 +1229,107 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             tile_C & C = *reinterpret_cast<tile_C *>(sum + (j0 / tile_C::J + n) * tile_C::ne);
 #pragma unroll
             for (int frag = 0; frag < nfrags; ++frag) {
-                mma_block_scaled_fp4<type>(C, A[n][frag], B[frag], scaleA[n][frag], scaleB[frag]);
+                mma_block_scaled_fp4<type, GGML_PREC_Q4>(C, A[n][frag], B[frag], scaleA[n][frag], scaleB[frag]);
             }
         }
     }
 }
 
+// MXFP4 weights x MXFP8 activations block-scaled MMA path for Blackwell (m16n8k32, scale_vec::1X ue8m0).
+// x rows: e2m1 values packed two per byte, then one ue8m0 scale per 32 values;
+// y rows: 4 ue8m0 scales, then e4m3 values.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_mxfp4_mxfp8_mma(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    typedef tile<16, 8, int>   tile_A;
+    typedef tile<8,  8, int>   tile_B;
+    typedef tile<16, 8, float> tile_C;
+
+#ifdef BLACKWELL_MMA_AVAILABLE
+    constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback, GGML_PREC_MXFP8);
+    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback, GGML_PREC_MXFP8);
+    constexpr int ntx           = rows_per_warp / tile_C::I;
+    constexpr int nfrags        = MMQ_TILE_NE_K / tile_A::J;
+    constexpr int iter_k        = ggml_cuda_mmq_get_K_vram(type, J, fallback, GGML_PREC_MXFP8);
+
+    y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+
+    const int *      x_qs = (const int *) x;
+    const uint32_t * x_sc = (const uint32_t *) (x_qs + iter_k / 8);
+    const int *      y_qs = (const int *) y + 4;
+    const uint32_t * y_sc = (const uint32_t *) y;
+
+    const int g = threadIdx.x / 4;
+    const int t = threadIdx.x % 4;
+
+    // the block_scale MMA reads the scale registers from 2 threads per quad, the values in the
+    // other lanes are not selected, see https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-block-scaling
+    const int tidx_A = g + (t % 2) * 8;
+    const int i0     = (threadIdx.y / ntx) * rows_per_warp;
+
+    tile_A   A[ntx][nfrags];
+    uint32_t scaleA[ntx][nfrags];
+
+    static_assert(nfrags == 4, "the scale vector load covers all fragments");
+
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+        // one vector load covers the 4 fragment scales of this row and k chunk
+        const uint4 sa = *(const uint4 *) (x_sc + (i0 + n * tile_A::I + tidx_A) * sram_stride + k00 / tile_A::J);
+        scaleA[n][0] = sa.x;
+        scaleA[n][1] = sa.y;
+        scaleA[n][2] = sa.z;
+        scaleA[n][3] = sa.w;
+#pragma unroll
+        for (int frag = 0; frag < nfrags; ++frag) {
+            const int k0 = k00 + frag * tile_A::J;
+            // e2m1 is packed 2/byte in x_qs; thread t unpacks its 8 values of the 32-value block
+            // into the mxf8f6f4 fragment layout (one code per byte, bits [2..5])
+            const int b  = k0 / 8;
+            const int pi = 4*b + 2*(t & 1);
+            const uint32_t p00 = *(const uint32_t *) (x_qs + (i0 + n*tile_A::I + g    )*sram_stride + pi);
+            const uint32_t p01 = *(const uint32_t *) (x_qs + (i0 + n*tile_A::I + g    )*sram_stride + pi + 1);
+            const uint32_t p10 = *(const uint32_t *) (x_qs + (i0 + n*tile_A::I + g + 8)*sram_stride + pi);
+            const uint32_t p11 = *(const uint32_t *) (x_qs + (i0 + n*tile_A::I + g + 8)*sram_stride + pi + 1);
+            const uint32_t lo_mask = 0x0F0F0F0F;
+            // register layout per mma_block_scaled_fp4: x[0],x[1] are rows g/g+8 k 8t..8t+3, x[2],x[3] are k 8t+4..8t+7
+            A[n][frag].x[0] = t < 2 ? (p00 & lo_mask) << 2 : (p00 >> 2) & 0x3C3C3C3C;
+            A[n][frag].x[2] = t < 2 ? (p01 & lo_mask) << 2 : (p01 >> 2) & 0x3C3C3C3C;
+            A[n][frag].x[1] = t < 2 ? (p10 & lo_mask) << 2 : (p10 >> 2) & 0x3C3C3C3C;
+            A[n][frag].x[3] = t < 2 ? (p11 & lo_mask) << 2 : (p11 >> 2) & 0x3C3C3C3C;
+        }
+    }
+
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += ntx * tile_C::J) {
+        tile_B   B[nfrags];
+        uint32_t scaleB[nfrags];
+
+#pragma unroll
+        for (int frag = 0; frag < nfrags; ++frag) {
+            const int k0 = frag * tile_B::J;
+            const int2 b0 = *(const int2 *) (y_qs + (j0 + g)*MMQ_TILE_Y_K + k0 + 2*t);
+            B[frag].x[0] = b0.x;
+            B[frag].x[1] = b0.y;
+        }
+        // one vector load covers the 4 fragment scales of this y row
+        const uint4 sb = *(const uint4 *) (y_sc + (j0 + g) * MMQ_TILE_Y_K);
+        scaleB[0] = sb.x;
+        scaleB[1] = sb.y;
+        scaleB[2] = sb.z;
+        scaleB[3] = sb.w;
+
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            // accumulate in place into the output sum array
+            tile_C & C = *reinterpret_cast<tile_C *> (sum + (j0 / tile_C::J + n) * tile_C::ne);
+#pragma unroll
+            for (int frag = 0; frag < nfrags; ++frag) {
+                mma_block_scaled_fp4<type, GGML_PREC_MXFP8>(C, A[n][frag], B[frag], scaleA[n][frag], scaleB[frag]);
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(x, y, sum, k00);
+    NO_DEVICE_CODE;
+#endif // BLACKWELL_MMA_AVAILABLE
+}

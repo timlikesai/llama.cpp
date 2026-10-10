@@ -100,27 +100,26 @@ static __global__ void quantize_q8_1(
     y[ib].ds = make_half2(d, sum);
 }
 
-__device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
+// fmax values for ggml_e8m0_scale on the mxfp4 activation paths:
+// amax maps to fmax on the target grid, scaled values stay inside the grid range
+constexpr float GGML_MXFP4_FMAX_W4A4 =   4.0f; // e2m1 activations, grid max 6.0
+constexpr float GGML_MXFP4_FMAX_W4A8 = 256.0f; // e4m3 activations, grid max 448.0
+
+// e8m0 block scale from the block amax: 2^rint(log2(amax / fmax)), clamped to [0, 254]
+static __device__ __forceinline__ uint8_t ggml_e8m0_scale(float amax, float fmax) {
     if (!(amax > 0.0f)) {
         return 0;
     }
 
-    // FP4 E2M1: max exponent (unbiased) is 2.
-    constexpr int FP4_E2M1_EMAX = 2;
+    const float t = log2f(amax / fmax);
+    const int e = (int) rintf(t) + 127;
 
-    const float e = log2f(amax);
+    return (uint8_t) (e < 0 ? 0 : e > 254 ? 254 : e);
+}
 
-    // "even" -> round-to-nearest integer, ties-to-even
-    const int e_int = __float2int_rn(e);
-
-    const int shared_exp = e_int - FP4_E2M1_EMAX;
-
-    int biased = shared_exp + 127;
-
-    biased = max(biased, 0);
-    biased = min(biased, 254);
-
-    return static_cast<uint8_t>(biased);
+// inverse of the e8m0 scale byte: 2^(127-e), the scale is a power of two so the inverse is exact
+static __device__ __forceinline__ float ggml_e8m0_inv_scale(uint8_t e) {
+    return __uint_as_float((uint32_t) (254 - e) << 23);
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
@@ -392,9 +391,9 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
             amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, WARP_SIZE));
         }
 
-        const uint8_t e = compute_e8m0_scale(amax);
+        const uint8_t e = ggml_e8m0_scale(amax, GGML_MXFP4_FMAX_W4A4);
         scales[b] = e;
-        const float inv_s = (amax == 0.0f) ? 0.0f : __frcp_rn(ggml_cuda_e8m0_to_fp32(e));
+        const float inv_s = (amax == 0.0f) ? 0.0f : ggml_e8m0_inv_scale(e);
 
 #if CUDART_VERSION >= 12080
         const float scaled_val = xi * inv_s;
@@ -447,6 +446,95 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
         }
         if (lane_id_32 == 0) {
             yb->d4[quad_idx_in_block] = (scales[1] << 8) | scales[0];
+        }
+    }
+    GGML_UNUSED(n_expert_used);
+}
+
+// quantize values as e4m3 (mxfp8) codes for the W4A8 Blackwell mma path:
+// one warp per output block, lane l holds values 4l..4l+3 of scale group l/8
+// scatter: grid over tokens, quantize once, write to all the token's compact rows
+template <bool scatter>
+static __global__ void quantize_mmq_mxfp8(const float * __restrict__ x,
+                                          const int32_t * __restrict__ ids,
+                                          void * __restrict__ vy,
+                                          const int64_t ne00,
+                                          const int64_t s01,
+                                          const int64_t s02,
+                                          const int64_t s03,
+                                          const int64_t ne0,
+                                          const int     ne1,
+                                          const int     ne2,
+                                          const int     n_expert_used) {
+    constexpr int vals_per_warp = QK_FP8_MMQ;
+
+    const int warp_id = threadIdx.y;
+    const int lane_id_32 = threadIdx.x;
+
+    const int nwarps = blockDim.y;
+
+    const int64_t warp_start_offset = (blockIdx.y * nwarps + warp_id) * vals_per_warp;
+
+    if (warp_start_offset >= ne0) {
+        return;
+    }
+
+    const int64_t block_fp8_mmq_size = QK_FP8_MMQ;
+    const int64_t k_block            = warp_start_offset / block_fp8_mmq_size;
+
+    ggml_cuda_pdl_sync();
+    int64_t base_pos;
+    if constexpr (scatter) {
+        base_pos = (int64_t) blockIdx.x * s02; // one physical row per token
+    } else {
+        const int64_t i2  = blockIdx.z % ne2;
+        const int64_t i3  = blockIdx.z / ne2;
+        const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
+        base_pos = i3 * s03 + i2 * s02 + i01 * s01;
+    }
+
+    float vals[4];
+    float amax = 0.0f;
+#pragma unroll
+    for (int v = 0; v < 4; ++v) {
+        const int64_t i0 = warp_start_offset + 4 * lane_id_32 + v;
+        vals[v] = (i0 < ne00) ? x[base_pos + i0] : 0.0f;
+        amax = fmaxf(amax, fabsf(vals[v]));
+    }
+    // reduce amax over the 8 lanes of the scale group
+#pragma unroll
+    for (int mask = 4; mask > 0; mask >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, WARP_SIZE));
+    }
+
+    const uint8_t e = ggml_e8m0_scale(amax, GGML_MXFP4_FMAX_W4A8);
+    const float inv_s = (amax == 0.0f) ? 0.0f : ggml_e8m0_inv_scale(e);
+
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+    const uint32_t packed = __nv_fp8x4_e4m3(make_float4(vals[0] * inv_s, vals[1] * inv_s, vals[2] * inv_s, vals[3] * inv_s)).__x;
+#else
+    // unreachable: this path serves the Blackwell block-scaled mma only
+    GGML_UNUSED(inv_s);
+    const uint32_t packed = 0;
+#endif // FP8_AVAILABLE && !GGML_USE_HIP
+
+    block_fp8_mmq * y = (block_fp8_mmq *) vy;
+    if constexpr (scatter) {
+#pragma unroll
+        for (int slot = 0; slot < n_expert_used; ++slot) {
+            const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            block_fp8_mmq * yb = y + (k_block * ne1 + i);
+            ((uint32_t *) yb->qs)[lane_id_32] = packed;
+            if (lane_id_32 % 8 == 0) {
+                yb->d4[lane_id_32 / 8] = e;
+            }
+        }
+    } else {
+        const int64_t ib0 = blockIdx.z * ((int64_t) ne1 * (ne0 / block_fp8_mmq_size));
+        block_fp8_mmq * yb = y + (ib0 + k_block * ne1 + blockIdx.x);
+        ((uint32_t *) yb->qs)[lane_id_32] = packed;
+        if (lane_id_32 % 8 == 0) {
+            yb->d4[lane_id_32 / 8] = e;
         }
     }
     GGML_UNUSED(n_expert_used);
@@ -693,4 +781,37 @@ void quantize_mmq_fp4_cuda(
 
         quantize_mmq_mxfp4<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
     }
+}
+
+void quantize_mmq_mxfp8_cuda(
+        const float * x, const int32_t * ids, void * vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(ne0 % QK_FP8_MMQ == 0);
+
+    constexpr int nwarps = 8;
+    constexpr int vals_per_cta = nwarps * QK_FP8_MMQ;
+
+    const int64_t block_num_y = (ne0 + vals_per_cta - 1) / vals_per_cta;
+    const dim3    num_blocks(ne1, block_num_y, ne2 * ne3);
+    const dim3    block_size(WARP_SIZE, nwarps, 1);
+
+    quantize_mmq_mxfp8<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+}
+
+void quantize_scatter_mmq_mxfp8_cuda(
+        const float * x, const int32_t * ids_src1_inv, void * vy,
+        const int64_t ne00, const int64_t stride_token, const int64_t ne0,
+        const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream) {
+    GGML_ASSERT(ne0 % QK_FP8_MMQ == 0);
+
+    constexpr int nwarps = 8;
+    constexpr int vals_per_cta = nwarps * QK_FP8_MMQ;
+
+    const int64_t block_num_y = (ne0 + vals_per_cta - 1) / vals_per_cta;
+    const dim3 num_blocks(n_tokens, block_num_y, 1);
+    const dim3 block_size(WARP_SIZE, nwarps, 1);
+
+    quantize_mmq_mxfp8<true><<<num_blocks, block_size, 0, stream>>>(
+        x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
 }
