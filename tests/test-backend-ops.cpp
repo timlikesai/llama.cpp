@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <cctype>
 #include <cfloat>
 #include <cinttypes>
 #include <cstdarg>
@@ -5176,20 +5177,63 @@ static int32_t test_get_op_params_i32(const ggml_tensor * tensor, uint32_t i) {
     return tensor->op_params[i];
 }
 
-// true if any node of the given op requests 8-bit src1 (GGML_PREC_Q8)
-static bool graph_mul_mat_hi_prec_act(ggml_cgraph * gf, ggml_op op) {
+// the src1 precision (op_params[3]) requested by a MUL_MAT/MUL_MAT_ID node, or GGML_PREC_UNDEFINED when the node leaves it to the backend default
+static int graph_mul_mat_prec(ggml_cgraph * gf, ggml_op op) {
     if (gf == nullptr) {
-        return false;
+        return GGML_PREC_UNDEFINED;
     }
 
     ggml_tensor ** nodes = ggml_graph_nodes(gf);
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-        if (nodes[i]->op == op && test_get_op_params_i32(nodes[i], 3) == GGML_PREC_Q8) {
-            return true;
+        if (nodes[i]->op == op && test_get_op_params_i32(nodes[i], 3) != GGML_PREC_UNDEFINED) {
+            return test_get_op_params_i32(nodes[i], 3);
         }
     }
 
-    return false;
+    return GGML_PREC_UNDEFINED;
+}
+
+// the src1 precision the Blackwell MMQ will actually use for this graph, mirroring ggml_cuda_mmq_get_prec_src1.
+// the GGML_CUDA_MMQ_PREC env override wins over the requested precision.
+static int blackwell_mmq_effective_prec(ggml_cgraph * gf, ggml_op op) {
+    const char * env = getenv("GGML_CUDA_MMQ_PREC");
+    std::string env_cpp = env != nullptr ? env : "";
+    for (char & c : env_cpp) {
+        c = std::tolower((unsigned char) c);
+    }
+    if (env_cpp == "q4") {
+        return GGML_PREC_Q4;
+    }
+    if (env_cpp == "q8") {
+        return GGML_PREC_Q8;
+    }
+    return graph_mul_mat_prec(gf, op); // "auto"/unset -> the precision the test requested on src1
+}
+
+// nmse tolerance for FP4 MMQ activation quantization on Blackwell, or -1 for the default.
+// follows the effective precision: Q8_1 -> default, W4A4 (e2m1) -> 2e-2, W4A8 (e4m3) -> 2e-3.
+static double max_nmse_err_blackwell_fp4(const ggml_type type_a, ggml_cgraph * gf, ggml_op op, ggml_backend_t backend) {
+    if (!backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+        return -1.0;
+    }
+
+    const int prec = blackwell_mmq_effective_prec(gf, op);
+    if (prec == GGML_PREC_Q8) {
+        return -1.0; // Q8_1 activations - default tolerance
+    }
+
+    if (type_a == GGML_TYPE_MXFP4) {
+        if (prec == GGML_PREC_Q4) {
+            return 2e-2; // W4A4 (e2m1 activations)
+        }
+        return 2e-3; // W4A8 (e4m3 activations): the MXFP4 default, or explicitly requested
+    }
+
+    if (type_a == GGML_TYPE_NVFP4) {
+        return 2e-2;
+    }
+
+    return -1.0;
 }
 
 // GGML_OP_MUL_MAT
@@ -5217,11 +5261,10 @@ struct test_mul_mat : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
-        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
-                !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT) &&
-                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
-            return 2e-2;
+        // for blackwell we quantize activations of the FP4 types instead of q8_1 so we add higher tolerance
+        const double fp4_err = max_nmse_err_blackwell_fp4(type_a, gf, GGML_OP_MUL_MAT, backend);
+        if (fp4_err >= 0.0) {
+            return fp4_err;
         }
         return max_nmse_err();
     }
@@ -5387,7 +5430,7 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
-// FP4 W4A8 path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
+// FP4 W4A8 path with Q8_1 activations (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_w4a8 : public test_mul_mat {
     test_mul_mat_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
             int64_t m = 32, int64_t n = 32, int64_t k = 256,
@@ -5409,13 +5452,44 @@ struct test_mul_mat_w4a8 : public test_mul_mat {
     }
 };
 
-// FP4 native W4A4 path (default precision)
+// FP4 W4A8 path with native e4m3 activations (GGML_PREC_MXFP8) - the Blackwell MXFP4 default
+struct test_mul_mat_w4a8_mxfp8 : public test_mul_mat {
+    test_mul_mat_w4a8_mxfp8(ggml_type type_a = GGML_TYPE_MXFP4, ggml_type type_b = GGML_TYPE_F32,
+            int64_t m = 32, int64_t n = 32, int64_t k = 256,
+            std::array<int64_t, 2> bs = {1, 1},
+            std::array<int64_t, 2> nr = {1, 1})
+        : test_mul_mat(type_a, type_b, m, n, k, bs, nr) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat::build_graph(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_MUL_MAT) {
+                ggml_prec_set_src(t, GGML_PREC_MXFP8, 1);
+            }
+        }
+        return out;
+    }
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_W4A8_MXFP8";
+    }
+};
+
+// FP4 native W4A4 path (GGML_PREC_Q4 on src1 selects 4-bit e2m1 activations)
 struct test_mul_mat_w4a4 : public test_mul_mat {
     test_mul_mat_w4a4(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
             int64_t m = 32, int64_t n = 32, int64_t k = 256,
             std::array<int64_t, 2> bs = {1, 1},
             std::array<int64_t, 2> nr = {1, 1})
         : test_mul_mat(type_a, type_b, m, n, k, bs, nr) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat::build_graph(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_MUL_MAT) {
+                ggml_prec_set_src(t, GGML_PREC_Q4, 1);
+            }
+        }
+        return out;
+    }
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_W4A4";
@@ -5477,11 +5551,10 @@ struct test_mul_mat_id : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
-        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
-                !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT_ID) &&
-                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
-            return 2e-2;
+        // for blackwell we quantize activations of the FP4 types instead of q8_1 so we add higher tolerance
+        const double fp4_err = max_nmse_err_blackwell_fp4(type_a, gf, GGML_OP_MUL_MAT_ID, backend);
+        if (fp4_err >= 0.0) {
+            return fp4_err;
         }
         return max_nmse_err();
     }
@@ -5586,12 +5659,42 @@ struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
     }
 };
 
-// FP4 native W4A4 path on the MoE path (default precision)
+// FP4 W4A8 path with native e4m3 activations on the MoE path (GGML_PREC_MXFP8)
+struct test_mul_mat_id_w4a8_mxfp8 : public test_mul_mat_id {
+    test_mul_mat_id_w4a8_mxfp8(ggml_type type_a = GGML_TYPE_MXFP4, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 8, int n_used = 2, bool b = false,
+            int64_t m = 32, int64_t n = 32, int64_t k = 256)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_MUL_MAT_ID) {
+                ggml_prec_set_src(t, GGML_PREC_MXFP8, 1);
+            }
+        }
+        return out;
+    }
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_W4A8_MXFP8";
+    }
+};
+
+// FP4 native W4A4 path on the MoE path (GGML_PREC_Q4 on src1 selects 4-bit e2m1 activations)
 struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
     test_mul_mat_id_w4a4(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
             int64_t m = 32, int64_t n = 32, int64_t k = 256)
         : test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_MUL_MAT_ID) {
+                ggml_prec_set_src(t, GGML_PREC_Q4, 1);
+            }
+        }
+        return out;
+    }
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_W4A4";
@@ -10691,7 +10794,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 8192, 1, 8192));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 1024, 7, 1024));  // many rows
 
-    // FP4 activation precision (default = native W4A4, src1 GGML_PREC_Q8 = W4A8)
+    // FP4 activation precision: NVFP4 defaults to W4A4, MXFP4 to W4A8 (e4m3); src1 Q4=W4A4, Q8=Q8_1, MXFP8=e4m3
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 32,  1, 256));
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 64, 16, 512));
@@ -10704,8 +10807,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 64, 16, 512));
     test_cases.emplace_back(new test_mul_mat_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
+    test_cases.emplace_back(new test_mul_mat_w4a8_mxfp8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
+    test_cases.emplace_back(new test_mul_mat_w4a8_mxfp8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 64, 16, 512));
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
+    test_cases.emplace_back(new test_mul_mat_id_w4a8_mxfp8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
 
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
