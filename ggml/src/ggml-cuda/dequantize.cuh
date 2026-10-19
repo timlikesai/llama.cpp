@@ -119,6 +119,15 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.y *= d;
 }
 
+static __device__ __forceinline__ void dequantize_mxfp4_pair(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_mxfp4 * x = (const block_mxfp4 *) vx;
+
+    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
+    const float2 f = ggml_cuda_mxfp4_to_float2(x[ib].qs[iqs]);
+    v.x = f.x * d;
+    v.y = f.y * d;
+}
+
 //================================== k-quants
 
 // Each call dequantizes one super-block of QK_K values into y using the
@@ -446,7 +455,8 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
     const uint8_t  * q4 = x[ib].qs + 4*il;
     const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
     for (int j = 0; j < 4; ++j) {
-        y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] & 0xf]*0.5f);
-        y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
+        const float2 v = ggml_cuda_mxfp4_to_float2(q4[j]);
+        y[j+ 0] = ggml_cuda_cast<dst_t>(v.x * d);
+        y[j+16] = ggml_cuda_cast<dst_t>(v.y * d);
     }
 }
