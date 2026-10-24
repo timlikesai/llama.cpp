@@ -440,6 +440,7 @@ extern "C" {
     //  - source tensor data representation type
     //  - etc.
     // the precision parameters are stored as ggml_tensor.op_params to the respective ops
+    // the values are ranked by decreasing precision, a smaller value asks for a more precise representation
     enum ggml_prec {
         GGML_PREC_UNDEFINED = 0,
         GGML_PREC_DEFAULT   = 0,  // note: deprecated, use GGML_PREC_UNDEFINED
@@ -447,6 +448,7 @@ extern "C" {
         GGML_PREC_BF16      = 15,
         GGML_PREC_F16       = 20,
         GGML_PREC_Q8        = 30,
+        GGML_PREC_MXFP8     = 35,
         GGML_PREC_Q4        = 40,
     };
 
@@ -1444,11 +1446,12 @@ extern "C" {
     // [TAG_GGML_PREC]
     // set the minimum required accumulator type for the implementation to use during the compute
     // for example:
-    //  - GGML_PREC_F32  - requires accumulation of the results in F32
-    //  - GGML_PREC_BF16 - can accumulate the results in BF16, F32
-    //  - GGML_PREC_F16  - can accumulate the results in F16, F32
-    //  - GGML_PREC_Q8   - not allowed
-    //  - GGML_PREC_Q4   - not allowed
+    //  - GGML_PREC_F32   - requires accumulation of the results in F32
+    //  - GGML_PREC_BF16  - can accumulate the results in BF16, F32
+    //  - GGML_PREC_F16   - can accumulate the results in F16, F32
+    //  - GGML_PREC_Q8    - not allowed
+    //  - GGML_PREC_MXFP8 - not allowed
+    //  - GGML_PREC_Q4    - not allowed
     //
     // return false on faliure
     GGML_API bool ggml_prec_set_acc(
@@ -1458,11 +1461,12 @@ extern "C" {
     // [TAG_GGML_PREC]
     // set the smallest rank that the implementation can use to internally convert the src[idx] data to
     // ranks in decreasing order:
-    //  - GGML_PREC_F32  - GGML_TYPE_F32
-    //  - GGML_PREC_BF16 - GGML_TYPE_BF16
-    //  - GGML_PREC_F16  - GGML_TYPE_F16,
-    //  - GGML_PREC_Q8   - GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, GGML_TYPE_Q8_K, etc.
-    //  - GGML_PREC_Q4   - GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_NVFP4, GGML_TYPE_MXFP4, etc.
+    //  - GGML_PREC_F32   - GGML_TYPE_F32
+    //  - GGML_PREC_BF16  - GGML_TYPE_BF16
+    //  - GGML_PREC_F16   - GGML_TYPE_F16,
+    //  - GGML_PREC_Q8    - GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, GGML_TYPE_Q8_K, etc.
+    //  - GGML_PREC_MXFP8 - e4m3 values with ue8m0 block scales (mxfp8), there is no GGML_TYPE for it
+    //  - GGML_PREC_Q4    - GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_NVFP4, GGML_TYPE_MXFP4, etc.
     //
     // for example:
     //   - ggml_prec_set_src(a, GGML_PREC_Q8, 1):

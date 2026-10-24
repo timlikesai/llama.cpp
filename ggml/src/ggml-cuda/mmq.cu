@@ -71,12 +71,13 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             break;
 // -----------------------------------------------------------------------
         case GGML_TYPE_MXFP4:
-            // src1 at Q4 uses the native FP4 instructions, which are Blackwell-only
             if (prec_src1 == GGML_PREC_Q4) {
                 mul_mat_q_case<GGML_TYPE_MXFP4, GGML_PREC_Q4>(ctx, args, stream);
-                break;
+            } else if (prec_src1 == GGML_PREC_MXFP8) {
+                mul_mat_q_case<GGML_TYPE_MXFP4, GGML_PREC_MXFP8>(ctx, args, stream);
+            } else {
+                mul_mat_q_case<GGML_TYPE_MXFP4, GGML_PREC_Q8>(ctx, args, stream);
             }
-            mul_mat_q_case<GGML_TYPE_MXFP4, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_NVFP4:
             if (prec_src1 == GGML_PREC_Q4) {
@@ -106,14 +107,17 @@ static ggml_prec ggml_cuda_mmq_get_prec_env() {
     if (env_cpp == "q8") {
         return GGML_PREC_Q8;
     }
+    if (env_cpp == "mxfp8") {
+        return GGML_PREC_MXFP8;
+    }
     if (env_cpp != "auto") {
-        GGML_LOG_WARN("%s: Unknown value for GGML_CUDA_MMQ_PREC: '%s'. Available: 'q4', 'q8', 'auto'.\n", __func__, env_cpp.c_str());
+        GGML_LOG_WARN("%s: Unknown value for GGML_CUDA_MMQ_PREC: '%s'. Available: 'q4', 'q8', 'mxfp8', 'auto'.\n", __func__, env_cpp.c_str());
     }
     return GGML_PREC_UNDEFINED;
 }
 
-// src1 is quantized to Q8_1 unless the FP4 types can use 4-bit activations, in which case they
-// default to the native W4A4 instructions on Blackwell.
+// src1 is quantized to Q8_1 unless NVFP4 can use the native W4A4 instructions on Blackwell.
+// MXFP4 defaults to the higher-accuracy mxfp8 (e4m3) activations on Blackwell.
 static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggml_tensor * dst, const int cc) {
     static const ggml_prec prec_env = ggml_cuda_mmq_get_prec_env();
 
@@ -122,13 +126,25 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
         prec = (ggml_prec) ggml_get_op_params_i32(dst, 3);
     }
 
-    // Q4 only for the FP4 types on Blackwell
-    GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8 || prec == GGML_PREC_Q4);
-    const bool can_use_q4 = (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) && blackwell_mma_available(cc);
-    if (prec == GGML_PREC_Q8 || !can_use_q4) {
+    GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q4 || prec == GGML_PREC_MXFP8 ||
+                prec == GGML_PREC_Q8);
+
+    if (src0->type == GGML_TYPE_MXFP4 && blackwell_mma_available(cc)) {
+        if (prec == GGML_PREC_Q4) {
+            return GGML_PREC_Q4;
+        }
+        if (prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_MXFP8) {
+            return GGML_PREC_MXFP8;
+        }
         return GGML_PREC_Q8;
     }
-    return GGML_PREC_Q4;
+
+    // NVFP4 on Blackwell keeps native Q4 activations unless a higher precision is requested; all else uses Q8_1
+    const bool can_use_q4 = src0->type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc);
+    if (can_use_q4 && (prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q4)) {
+        return GGML_PREC_Q4;
+    }
+    return GGML_PREC_Q8;
 }
 
 void ggml_cuda_mul_mat_q(
@@ -249,6 +265,9 @@ void ggml_cuda_mul_mat_q(
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
+            } else if (prec_src1 == GGML_PREC_MXFP8) {
+                quantize_mmq_mxfp8_cuda(src1_d, nullptr, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded,
+                                        ne11, ne12, ne13, stream);
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
@@ -257,9 +276,7 @@ void ggml_cuda_mul_mat_q(
         }
 
         // Stride depends on quantization format
-        const int64_t s12 = use_native_fp4 ?
-                                ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
-                                ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+        const int64_t s12 = ne11 * ne10_padded * y_block_size / (y_values_per_block * sizeof(int));
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
@@ -325,6 +342,14 @@ void ggml_cuda_mul_mat_q(
                 quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
             }
+        } else if (prec_src1 == GGML_PREC_MXFP8) {
+            if (dedup_bcast) {
+                quantize_scatter_mmq_mxfp8_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), ne10,
+                                    /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
+            } else {
+                quantize_mmq_mxfp8_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), ne10, s11, s12, s13,
+                                       ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+            }
         } else if (dedup_bcast) {
             quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
@@ -336,8 +361,7 @@ void ggml_cuda_mul_mat_q(
     }
 
     static_assert(QK_FP4_MMQ == 8 * QK_MXFP4, "QK_FP4_MMQ needs to be 8 * QK_MXFP4");
-    const int64_t s12 = use_native_fp4 ? ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
-                                         ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+    const int64_t s12 = ne11 * ne10_padded * y_block_size / (y_values_per_block * sizeof(int));
     const int64_t s13 = ne12*s12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
