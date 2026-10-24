@@ -308,10 +308,14 @@ Legal values: `auto`, `f16`, `fp16`, `bf16`, `f32`, `fp32`.
 
 #### GGML_CUDA_MMQ_PREC
 
-Override the activation precision that the model requests for NVFP4 and MXFP4 matrix multiplications.
-Currently supported values: `auto`, `q8`, `q4`.
+Override the activation precision that the model requests for NVFP4 and MXFP4 matrix multiplications on Blackwell.
+Legal values: `auto`, `q8`, `mxfp8`, `q4`.
 
-NVFP4 and MXFP4 layers marked as W4A16 request 8-bit activations, so on Blackwell those layers run through the W4A8 path instead of the native W4A4 path. Set `q4` to keep the native W4A4 path for faster prompt processing at the cost of accuracy, or `q8` to use the W4A8 path for every layer, `auto` uses per-tensor prec metadata (this is the same behavior as when the environment variable is not set).
+`auto` keeps what the graph asks for. On Blackwell that means `mxfp8` for MXFP4 layers, which runs e4m3 activations on the block-scaled `mxf8f6f4` MMA at close to Q8_1 accuracy and nearly the speed of the native W4A4 path, and `q4` for NVFP4 layers, which runs native e2m1 activations. MXFP4 layers marked as W4A16 ask for 8-bit activations, so those keep using `q8` (Q8_1) instead of `mxfp8`.
+
+Set `q4` for the native W4A4 path on every FP4 layer, `q8` for Q8_1 activations on every FP4 layer, or `mxfp8` for e4m3 activations, where NVFP4 falls back to `q8`. The value overrides the per-layer request instead of acting as a floor, so it also applies to the layers that asked for a different precision.
+
+Other architectures and weight types ignore this variable, they always use Q8_1 activations.
 
 ### Unified Memory
 
