@@ -165,6 +165,14 @@ def parse_args() -> argparse.Namespace:
         "--fp8-as-q8", action="store_true",
         help="Store tensors dequantized from FP8 as Q8_0 instead of BF16/F16.",
     )
+    parser.add_argument(
+        "--native-experts", action="store_true",
+        help=(
+            "Keep the expert weights the checkpoint already stores as a ggml block type (currently "
+            "Inkling2 MXFP8 experts) as those same bytes, instead of dequantizing them. "
+            "Default is off, so conversion output is unchanged without this flag."
+        ),
+    )
 
     parser.add_argument(
         "--fuse-qkv", action="store_true",
@@ -298,6 +306,12 @@ def main() -> None:
             else:
                 from conversion.deepseek import DeepseekV4DSparkModel
                 model_class = DeepseekV4DSparkModel
+
+        if args.native_experts:
+            if not getattr(model_class, "supports_native_experts", False):
+                logger.error("--native-experts is not supported for %s", model_architecture)
+                sys.exit(1)
+            model_class.native_experts = True
 
         if args.mtp or args.no_mtp:
             if not model_class.supports_mtp_export:
