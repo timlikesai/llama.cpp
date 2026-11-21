@@ -112,9 +112,9 @@ typedef sycl::half2 ggml_half2;
 #define QI_NVFP4 (QK_NVFP4 / (4 * QR_NVFP4))
 #define QR_NVFP4 2
 
-// MXFP8: one E4M3 byte per element, so 4 elements per 32-bit word
+// MXFP8: one E4M3 byte per element, so the payload is 8 32-bit words per block like Q8_0
 #define QI_MXFP8 (QK_MXFP8 / (4 * QR_MXFP8))
-#define QR_MXFP8 4
+#define QR_MXFP8 1
 
 #define QI5_0 (QK5_0 / (4 * QR5_0))
 #define QR5_0 2
