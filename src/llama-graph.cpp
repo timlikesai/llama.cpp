@@ -1442,12 +1442,13 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_base()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
     }
 
-    if (inp_attn->self_attn_mask.raw && inp_attn->self_attn_mask.raw->buffer) {
+    // the dense mask is only needed when the distances do not already encode causality
+    if (!fold_rel_mask && inp_attn->self_attn_mask.raw && inp_attn->self_attn_mask.raw->buffer) {
         attn_ctx->get_base()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
     }
 
     if (self_rel_pos->buffer) {
-        attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
+        attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent, fold_rel_mask);
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -4435,6 +4436,10 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa_rel>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);
 
+    // for a single sequence with causal attention, the mask is a pure function of the distance to each cell, so it
+    // can live in the bias table as an extra -INF bucket and the gathered bias becomes the complete mask
+    inp->fold_rel_mask = cparams.flash_attn && cparams.n_seq_max == 1 && cparams.causal_attn;
+
     inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
     ggml_set_input(inp->self_rel_pos);
     ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
@@ -4469,13 +4474,18 @@ ggml_tensor * llm_graph_context::build_attn(
     GGML_ASSERT(attn_mask.rows == nullptr);
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
+    // when the distances carry the -INF bucket, the gathered bias already is that mask for the dense layers
     ggml_tensor * kq_mask = attn_mask.raw;
-    if (kq_mask->type != GGML_TYPE_F32) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
-    }
-    kq_mask = ggml_add(ctx0, kq_b, kq_mask);
-    if (cparams.flash_attn) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+    if (inp->fold_rel_mask && !is_swa) {
+        kq_mask = kq_b;
+    } else {
+        if (kq_mask->type != GGML_TYPE_F32) {
+            kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        }
+        kq_mask = ggml_add(ctx0, kq_b, kq_mask);
+        if (cparams.flash_attn && kq_mask->type != GGML_TYPE_F16) {
+            kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+        }
     }
     cb(kq_mask, "kq_mask_rel_pos", il);
 

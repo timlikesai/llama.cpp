@@ -361,7 +361,23 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
         table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
 
+        // the folded path appends a -INF bucket to the table - which is only (extent + 1) rows wide, so the fill and
+        // the concat are negligible. the gathered bias then *is* the mask flash attention consumes, which removes the
+        // broadcast add with the dense mask, the F32 widening of that mask and the narrowing cast at the end - three
+        // of the n_kv x n_head wide buffers this layer used to allocate
+        const bool fold_mask = inp->fold_rel_mask && !is_swa;
+        if (fold_mask) {
+            ggml_tensor * far = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_head, 1, n_tokens), -INFINITY);
+
+            table = ggml_concat(ctx0, table, far, 1);
+        }
+
         ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
+        if (fold_mask) {
+            // ggml_get_rows always returns F32 for float sources (see its TODO), so narrow right after the gather:
+            // the permute-copy below is then the only buffer left at full width, and it is half the size
+            kq_b = ggml_cast(ctx0, kq_b, GGML_TYPE_F16);
+        }
         kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
         kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
         cb(kq_b, "kq_b", il);
