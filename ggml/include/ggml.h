@@ -260,7 +260,8 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_F8_E4M3 = 43,
-        GGML_TYPE_COUNT   = 44,
+        GGML_TYPE_MXFP8   = 44, // MXFP8 (1 block of 32, E8M0 scale, E4M3 values)
+        GGML_TYPE_COUNT   = 45,
     };
 
     // [TAG_GGML_PREC]
@@ -317,6 +318,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_F8_E4M3 = 29, // except 1d tensors
+        GGML_FTYPE_MOSTLY_MXFP8   = 30, // except 1d tensors
     };
 
     // available tensor operations:
