@@ -508,15 +508,21 @@ static void common_params_fit_impl(
                             sum_projected_used_min_ctx += dmds_min_ctx[id].mb.total();
                         }
                     }
-                    if (sum_used_target > sum_projected_used_min_ctx) {
+                    // the interpolation below divides by the difference between the max. and the min. context probe.
+                    // when the model's device memory does not scale with the context, or the max. context could not be
+                    // probed at all, that difference is <= 0 and reducing the context cannot free what we need: keep
+                    // the min. context (assigned above) and let the next step reduce the number of layers instead
+                    const int64_t ctx_memory_delta = sum_projected_used - sum_projected_used_min_ctx;
+
+                    if (ctx_memory_delta > 0 && sum_used_target > sum_projected_used_min_ctx) {
                         // linear interpolation between minimum and maximum context size:
                         cparams->n_ctx += (n_ctx_max - n_ctx_min_total) * (sum_used_target - sum_projected_used_min_ctx)
-                            / (sum_projected_used - sum_projected_used_min_ctx);
+                            / ctx_memory_delta;
                         // round down context for CUDA backend, keep it divisible by the number of streams:
                         const uint32_t align = 256 * n_streams;
                         cparams->n_ctx = std::max(cparams->n_ctx - cparams->n_ctx % align, n_ctx_min_total);
 
-                        const int64_t bytes_per_ctx = (sum_projected_used - sum_projected_used_min_ctx) / (n_ctx_max - n_ctx_min_total);
+                        const int64_t bytes_per_ctx = ctx_memory_delta / (n_ctx_max - n_ctx_min_total);
                         const int64_t memory_reduction = (n_ctx_max - cparams->n_ctx) * bytes_per_ctx;
                         LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
                             __func__, n_ctx_max, cparams->n_ctx, memory_reduction/MiB);
@@ -526,7 +532,7 @@ static void common_params_fit_impl(
                         }
                         LOG_TRC("%s: entire model should be fit across devices by reducing context\n", __func__);
                     } else {
-                        const int64_t memory_reduction = sum_projected_used - sum_projected_used_min_ctx;
+                        const int64_t memory_reduction = ctx_memory_delta;
                         LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
                             __func__, n_ctx_max, cparams->n_ctx, memory_reduction/MiB);
                     }
@@ -792,7 +798,10 @@ static void common_params_fit_impl(
                 uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
                 LOG_TRC("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", __func__, id, delta);
                 while (delta > 1) {
-                    uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                    // if adding layers to this device does not increase its memory use (the excess overflows to the
+                    // next device or to system memory) this interpolation is undefined, so bisect instead of dividing
+                    const int64_t mem_span = mem_high[id] - mem[id];
+                    uint32_t step_size = mem_span > 0 ? uint32_t(int64_t(delta) * (targets[id] - mem[id]) / mem_span) : delta / 2;
                     step_size = std::max(step_size, uint32_t(1));
                     step_size = std::min(step_size, delta - 1);
 
@@ -864,7 +873,9 @@ static void common_params_fit_impl(
             assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
             uint32_t delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
             while (delta > 1) {
-                uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                // see the comment at the other filling loop: the memory span can be 0 when the excess overflows
+                const int64_t mem_span = mem_high[id] - mem[id];
+                uint32_t step_size = mem_span > 0 ? uint32_t(int64_t(delta) * (targets[id] - mem[id]) / mem_span) : delta / 2;
                 step_size = std::max(step_size, uint32_t(1));
                 step_size = std::min(step_size, delta - 1);
 
