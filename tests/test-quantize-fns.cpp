@@ -302,6 +302,154 @@ static int test_f8_e4m3(bool verbose) {
     return num_failed;
 }
 
+// GGML_TYPE_MXFP8 is a pass-through format: checkpoints already contain the E4M3 payloads and
+//     the UE8M0 block scales, and we repack those bytes without touching their values. So the
+//     round trip must be exact, not merely close: quantize -> dequantize -> quantize has to
+//     reproduce the same bytes, and decoding must match the OCP FP8 table bit for bit.
+static int test_mxfp8(bool verbose) {
+    const auto * traits     = ggml_get_type_traits(GGML_TYPE_MXFP8);
+    const auto * traits_cpu = ggml_get_type_traits_cpu(GGML_TYPE_MXFP8);
+
+    static const int qk = 32; // QK_MXFP8
+    static const int bs = 33; // sizeof(block_mxfp8) = 1 scale byte + 32 payload bytes
+
+    int num_failed = 0;
+
+    const bool traits_failed = traits->blck_size != qk || traits->type_size != bs || !traits->is_quantized
+        || ggml_row_size(GGML_TYPE_MXFP8, qk) != bs
+        || traits_cpu->vec_dot_type != GGML_TYPE_Q8_0;
+    num_failed += traits_failed;
+    if (verbose || traits_failed) {
+        printf("mxfp8 type traits:                      %s\n", RESULT_STR[traits_failed]);
+    }
+
+    // every payload code at scale 2^0 must decode to the OCP FP8 value for that code
+    {
+        std::vector<uint8_t> block(bs);
+        std::vector<float>   values(qk);
+        block[0] = 127; // 2^(127-127) = 1.0
+        int decode_failed = 0;
+        for (int c = 0; c < 256; ++c) {
+            block[1 + c % qk] = (uint8_t) c;
+            if ((c % qk) != qk - 1 && c != 255) {
+                continue;
+            }
+            traits->to_float(block.data(), values.data(), qk);
+            for (int j = 0; j < qk; ++j) {
+                const int code = (j == qk - 1) ? c : ((c / qk) * qk + j);
+                if (code > 255 || (code & 0x7F) == 0x7F) {
+                    continue;
+                }
+                const float expected = std::copysign(F8_E4M3_VALUES[code & 0x7F], code & 0x80 ? -1.0f : 1.0f);
+                if (values[j] != expected) {
+                    ++decode_failed;
+                }
+            }
+        }
+        num_failed += decode_failed;
+        if (verbose || decode_failed) {
+            printf("mxfp8 payload table at scale 1.0:       %s (%d mismatches)\n", RESULT_STR[decode_failed != 0], decode_failed);
+        }
+    }
+
+    // the UE8M0 scale is a plain power of two, 2^(e-127), applied to the whole block
+    {
+        int scale_failed = 0;
+        for (int e : {0, 1, 100, 126, 127, 128, 200, 254}) {
+            std::vector<uint8_t> block(bs, 0);
+            std::vector<float>   values(qk);
+            block[0] = (uint8_t) e;
+            std::fill(block.begin() + 1, block.end(), 0x38); // E4M3 +1.0
+            traits->to_float(block.data(), values.data(), qk);
+            const float expected = std::ldexp(1.0f, e - 127);
+            for (int j = 0; j < qk; ++j) {
+                if (values[j] != expected) {
+                    ++scale_failed;
+                }
+            }
+        }
+        num_failed += scale_failed;
+        if (verbose || scale_failed) {
+            printf("mxfp8 e8m0 scale = 2^(e-127):           %s (%d mismatches)\n", RESULT_STR[scale_failed != 0], scale_failed);
+        }
+    }
+
+    // e = 255 is NaN in the OCP spec. ggml_e8m0_to_fp32() does not special-case it, so it decodes
+    //     to +inf and the block becomes non-finite - a file containing it is corrupt, and the
+    //     loader has to reject that rather than quietly produce inf weights.
+    {
+        std::vector<uint8_t> block(bs, 0);
+        std::vector<float>   values(qk);
+        block[0] = 255;
+        std::fill(block.begin() + 1, block.end(), 0x38);
+        traits->to_float(block.data(), values.data(), qk);
+        bool finite = false;
+        for (float v : values) {
+            finite = finite || std::isfinite(v);
+        }
+        num_failed += finite;
+        if (verbose || finite) {
+            printf("mxfp8 scale byte 255 is not finite:     %s\n", RESULT_STR[finite]);
+        }
+    }
+
+    // quantize -> dequantize -> quantize must be a fixed point, byte for byte
+    {
+        const int64_t n = qk * 256;
+        std::vector<uint8_t> b1((size_t) n / qk * bs), b2(b1.size());
+        std::vector<float>   src(n), d1(n), d2(n);
+        int                  idempotent_failed = 0;
+
+        for (int pass = 0; pass < 4; ++pass) {
+            const float amplitude = pass == 0 ? 1.0f : pass == 1 ? 1e6f : pass == 2 ? 1e-6f : 448.0f;
+            for (int64_t i = 0; i < n; ++i) {
+                src[i] = amplitude * std::sin(0.017f * (float) i) * (1.0f + 0.25f * (float)(i % 7)) *
+                         ((i % 3) ? 1.0f : -1.0f);
+            }
+
+            traits_cpu->from_float(src.data(), b1.data(), n);
+            traits->to_float(b1.data(), d1.data(), n);
+            traits_cpu->from_float(d1.data(), b2.data(), n);
+            traits->to_float(b2.data(), d2.data(), n);
+
+            const bool same_bytes = std::equal(b1.begin(), b1.end(), b2.begin());
+            const bool same_vals  = std::equal(d1.begin(), d1.end(), d2.begin());
+            idempotent_failed += !same_bytes;
+            idempotent_failed += !same_vals;
+            if (verbose) {
+                printf("  mxfp8 pass %d (amplitude %g): bytes %s, values %s\n", pass, amplitude,
+                        same_bytes ? "identical" : "DIFFER", same_vals ? "identical" : "DIFFER");
+            }
+        }
+
+        num_failed += idempotent_failed;
+        if (verbose || idempotent_failed) {
+            printf("mxfp8 requantization is a fixed point:  %s\n", RESULT_STR[idempotent_failed != 0]);
+        }
+    }
+
+    // an all-zero block must not produce NaN/inf and must carry a valid (non-255) scale
+    {
+        const int64_t n = qk;
+        std::vector<uint8_t> block(bs, 0xFF);
+        std::vector<float>   values(qk, 1.0f);
+        std::vector<float>   zeros(n, 0.0f);
+        traits_cpu->from_float(zeros.data(), block.data(), n);
+        traits->to_float(block.data(), values.data(), n);
+        const bool zero_failed = block[0] == 255 || !std::all_of(values.begin(), values.end(),
+                        [](float v) { return v == 0.0f; });
+        num_failed += zero_failed;
+        if (verbose || zero_failed) {
+            printf("mxfp8 all-zero block:                   %s\n", RESULT_STR[zero_failed]);
+        }
+    }
+
+    if (!num_failed && verbose) {
+        printf("mxfp8: all checks passed\n");
+    }
+    return num_failed;
+}
+
 static int test_vec_dot_q(bool verbose) {
     int num_failed = 0;
 
@@ -447,6 +595,7 @@ int main(int argc, char * argv[]) {
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_f8_e4m3(verbose);
+    num_failed += test_mxfp8(verbose);
     num_failed += test_vec_dot_q(verbose);
     num_failed += test_quantize_imatrix_degenerate(verbose);
 
