@@ -29,6 +29,8 @@ _E4M3 = _e4m3_table()
 _E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], dtype=np.float32)
 _EXPERT_CHUNK_ROWS = 128
 _QK_MXFP8 = 32  # ggml/src/ggml-common.h: QK_MXFP8, one ue8m0 scale per 32 e4m3 codes
+_QK_NVFP4 = 64  # ggml/src/ggml-common.h: QK_NVFP4, one e4m3 scale per 16 elements, 4 per 64-element block
+_QK_NVFP4_SUB = 16
 
 
 def _dequant_expert_chunk(weight: Callable[[], Tensor], scale: Callable[[], Tensor], amax: Callable[[], Tensor] | None, denominator: Callable[[], Tensor] | None, name: str, expert: int, rows: slice) -> np.ndarray:
@@ -78,6 +80,29 @@ def _expert_row_slices(experts: int, rows: int, w13: bool) -> Iterable[tuple[int
                 yield expert, (slice(2 * start + half, 2 * stop + half, 2) if w13 else slice(start, stop))
 
 
+def _pack_nvfp4_chunk(weight: Callable[[], Tensor], scale: Callable[[], Tensor], name: str, expert: int, rows: slice) -> np.ndarray:
+    # Lossless apart from the nibble order: the checkpoint pairs element 2i with 2i+1 in one byte, ggml
+    # pairs j with j + 8 inside each 16-element sub-block (conversion/base.py:1320-1325), and a super-block
+    # is the 4 sub-block scales followed by their 32 payload bytes.
+    packed = LazyTorchTensor.to_eager(weight().view(torch.uint8)[expert, rows]).numpy()
+    scales = LazyTorchTensor.to_eager(scale().view(torch.uint8)[expert, rows]).numpy()
+    # ggml stores the sub-block scales as UE4M3, so a negative scale cannot be kept without requantizing
+    if np.any(scales & 0x80):
+        raise ValueError(f"Inkling2: {name}_scale expert {expert}: NVFP4 scale sign bit set, cannot keep as UE4M3")
+    if np.isnan(_E4M3[scales]).any():
+        raise ValueError(f"Inkling2: {name}_scale expert {expert}: E4M3FN NaN")
+    if packed.shape[-1] * 2 != scales.shape[-1] * _QK_NVFP4_SUB:
+        raise ValueError(f"Inkling2: {name} expert {expert}: payload {packed.shape} and scale {scales.shape} disagree")
+    n_sub = _QK_NVFP4 // _QK_NVFP4_SUB
+    if scales.shape[-1] % n_sub:
+        raise ValueError(f"Inkling2: {name} expert {expert}: {scales.shape[-1]} sub-blocks is not a multiple of {n_sub}")
+    codes = np.stack((packed & 15, packed >> 4), axis=-1).reshape(packed.shape[0], -1, n_sub, _QK_NVFP4_SUB)
+    raw = np.empty((packed.shape[0], codes.shape[1], _QK_NVFP4 // 2 + n_sub), dtype=np.uint8)
+    raw[:, :, :n_sub] = scales.reshape(packed.shape[0], codes.shape[1], n_sub)
+    raw[:, :, n_sub:] = (codes[:, :, :, : _QK_NVFP4_SUB // 2] | (codes[:, :, :, _QK_NVFP4_SUB // 2:] << 4)).reshape(packed.shape[0], codes.shape[1], _QK_NVFP4 // 2)
+    return raw.reshape(packed.shape[0], -1)
+
+
 def _pack_mxfp8_chunk(weight: Callable[[], Tensor], scale: Callable[[], Tensor], name: str, expert: int, rows: slice) -> np.ndarray:
     # Lossless: the e4m3 codes and the ue8m0 scale bytes are copied verbatim into the
     # ggml block_mxfp8 order, one scale byte per 32 code bytes. Only bytes move, no value is recomputed.
@@ -114,9 +139,9 @@ def _load_inkling2_hparams(dir_model: Path):
 class Inkling2Model(TextModel):
     model_arch = gguf.MODEL_ARCH.INKLING2
 
-    # The checkpoint's mxfp8_nearest experts are already ggml MXFP8 values, so they can be
-    # repacked bit-exactly instead of dequantized. Opt-in: convert_hf_to_gguf.py sets
-    # native_experts from --native-experts. The nvfp4_nearest experts always dequantize.
+    # The checkpoint's mxfp8_nearest and nvfp4_nearest experts are already ggml block values, so they
+    # can be repacked bit-exactly instead of dequantized. Opt-in: convert_hf_to_gguf.py sets
+    # native_experts from --native-experts.
     supports_native_experts = True
     native_experts = False
 
@@ -138,7 +163,7 @@ class Inkling2Model(TextModel):
         super().__init__(dir_model, *args, **kwargs)
         logger.warning("Inkling2: converting the text backbone only; vision and MTP tensors are skipped")
         if self.native_experts:
-            logger.warning("Inkling2: --native-experts keeps the MXFP8 expert layers as native bytes, the NVFP4 layers are still dequantized")
+            logger.warning("Inkling2: --native-experts keeps the MXFP8 and NVFP4 expert layers as native bytes")
         hp = self.hparams
         for name, default in (("q_bias", False), ("o_bias", False), ("n_shared_experts", 0), ("use_value_norm_no_gamma", True), ("attn_res_normalize_values", True), ("scoring_func", "sigmoid")):
             if hp.get(name, default) != default:
@@ -203,8 +228,14 @@ class Inkling2Model(TextModel):
                     t = gen()
                     if t.dtype != torch.float32 or tuple(t.shape) != expected:
                         raise ValueError(f"Inkling2: {companion}: expected F32 {expected}, got {t.dtype} {tuple(t.shape)}")
-            if self.native_experts and not nvfp4:
-                self.add_native_mxfp8_experts(name, weight, scale, shape, w13)
+            native = self.native_experts and (not nvfp4 or cols % _QK_NVFP4 == 0)
+            if self.native_experts and not native:
+                logger.warning("Inkling2: %s: %d columns is not a multiple of %d, dequantizing instead of keeping NVFP4", name, cols, _QK_NVFP4)
+            if native:
+                if nvfp4:
+                    self.add_native_nvfp4_experts(name, weight, scale, amax, denominator, shape, w13)
+                else:
+                    self.add_native_mxfp8_experts(name, weight, scale, shape, w13)
                 del self.model_tensors[name]
                 for companion in required:
                     del self.model_tensors[companion]
@@ -235,6 +266,37 @@ class Inkling2Model(TextModel):
         new_name = self.map_tensor_name(target, try_suffixes=()) + ".weight"
         logger.info("Inkling2: %s: %s, kept as MXFP8, shape = %s", new_name, name, tuple(reversed(shape)))
         self.gguf_writer.add_tensor(new_name, gguf.LazyChunkedTensor(chunks, byte_shape, np.uint8), raw_dtype=gguf.GGMLQuantizationType.MXFP8)
+
+    def add_native_nvfp4_experts(self, name: str, weight: Callable[[], Tensor], scale: Callable[[], Tensor], amax: Callable[[], Tensor], denominator: Callable[[], Tensor], shape: tuple[int, int, int], w13: bool) -> None:
+        # Same streaming as the MXFP8 export, plus the per-expert global factor that ggml NVFP4 has no
+        # room for: it goes to the .scale sidecar the runtime multiplies the expert output by.
+        experts, rows, cols = shape
+        block = _QK_NVFP4 // 2 + _QK_NVFP4 // _QK_NVFP4_SUB
+        byte_shape = (experts, rows, cols // _QK_NVFP4 * block)
+        chunks: list[Callable[[], np.ndarray]] = [
+            partial(_pack_nvfp4_chunk, weight, scale, name, expert, row_slice)
+            for expert, row_slice in _expert_row_slices(experts, rows, w13)
+        ]
+        target = name.replace(".w13_weight", ".gate_up_proj").replace(".w2_weight", ".down_proj")
+        new_name = self.map_tensor_name(target, try_suffixes=()) + ".weight"
+        logger.info("Inkling2: %s: %s, kept as NVFP4, shape = %s", new_name, name, tuple(reversed(shape)))
+        self.gguf_writer.add_tensor(new_name, gguf.LazyChunkedTensor(chunks, byte_shape, np.uint8), raw_dtype=gguf.GGMLQuantizationType.NVFP4)
+        self.add_nvfp4_expert_scale(new_name, amax, denominator, experts, name)
+
+    def add_nvfp4_expert_scale(self, new_name: str, amax: Callable[[], Tensor], denominator: Callable[[], Tensor], experts: int, name: str) -> None:
+        # amax / outer_scale_denominator is not a power of two in this checkpoint, so it cannot be folded
+        # into the ue4m3 block scales; divide in float32 exactly like the dequant path does per expert.
+        a = LazyTorchTensor.to_eager(amax()).numpy()
+        d = LazyTorchTensor.to_eager(denominator()).numpy()
+        if a.size != experts or d.size != 1:
+            raise ValueError(f"Inkling2: {name}: expected amax ({experts},) and outer_scale_denominator (1,), got {a.size} and {d.size}")
+        if not np.isfinite(a).all() or (a < 0).any():
+            raise ValueError(f"Inkling2: {name}_amax: expected finite nonnegative values")
+        if not np.isfinite(d).all() or (d <= 0).any():
+            raise ValueError(f"Inkling2: {name}_outer_scale_denominator: expected finite positive value")
+        factor = a / d.reshape(())
+        logger.info("Inkling2: %s: per-expert scale, shape = [%d]", new_name.replace(".weight", ".scale"), experts)
+        self.gguf_writer.add_tensor(new_name.replace(".weight", ".scale"), factor)
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
