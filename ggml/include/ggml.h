@@ -1562,6 +1562,14 @@ extern "C" {
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
 
+    // same as ggml_get_rows, but the destination keeps the type of the source instead of always being F32.
+    // only for F16/BF16/F32 sources, and only where a backend implements a same-type destination: others must
+    // decline the op in supports_op so that the scheduler falls back to CPU
+    GGML_API struct ggml_tensor * ggml_get_rows_same_type(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // data
+            struct ggml_tensor  * b); // row indices
+
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // gradients of ggml_get_rows result

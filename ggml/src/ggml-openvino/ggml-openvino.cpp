@@ -1784,6 +1784,10 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
     }
     case GGML_OP_GET_ROWS:
     case GGML_OP_SET_ROWS: {
+        // a destination that keeps the source type is implemented by CPU and CUDA only, see ggml_get_rows_same_type
+        if (op->op == GGML_OP_GET_ROWS && op->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_I32) {
+            return {false, "GET_ROWS with a destination that is neither F32 nor an I32 pass-through is not supported"};
+        }
         if (GgmlOvDecoder::is_conv_state_snapshot_writeback(op) && ggml_openvino_is_static()) {
             return {false, "convolution snapshots require dynamic execution"};
         }

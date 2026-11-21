@@ -16853,6 +16853,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_GET_ROWS:
             {
+                // the get_rows pipelines are compiled per source type with an F32 destination, so a destination that
+                // keeps the source type (ggml_get_rows_same_type, implemented by CPU and CUDA) must be declined here
+                if (op->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_I32) {
+                    return false;
+                }
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:

@@ -12197,6 +12197,11 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_NONE:
             return true;
         case GGML_OP_GET_ROWS:
+            // a destination that keeps the source type is implemented by CPU and CUDA only, see
+            // ggml_get_rows_same_type - declining it falls back to CPU instead of mis-typing the buffer
+            if (op->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_I32) {
+                return false;
+            }
             switch (op->src[0]->type) {
                 case GGML_TYPE_I32:
                     return op->type == GGML_TYPE_I32;

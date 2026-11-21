@@ -2521,13 +2521,16 @@ struct test_get_rows : public test_case {
     const bool v; // view src1
     const bool vs0; // view src0
     const int offset_cols; // // column offset of the view src0
+    const bool same_type; // destination keeps the type of the source (ggml_get_rows_same_type)
 
     std::string vars() override {
-        return VARS_TO_STR9(type, n, m, r, be1, be2, v, vs0, offset_cols);
+        return VARS_TO_STR10(type, n, m, r, be1, be2, v, vs0, offset_cols, same_type);
     }
 
-    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false, bool vs0 = false, int offset_cols = 0)
-        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v), vs0(vs0), offset_cols(offset_cols) {}
+    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false, bool vs0 = false, int offset_cols = 0, bool same_type = false)
+        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v), vs0(vs0), offset_cols(offset_cols), same_type(same_type) {
+        GGML_ASSERT(!same_type || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_F32);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * in;
@@ -2553,13 +2556,13 @@ struct test_get_rows : public test_case {
             ggml_set_name(rows, "view_of_rows");
         }
 
-        const bool grad_supported = !vs0 && ggml_is_matrix(in) && ggml_is_vector(rows);
+        const bool grad_supported = !vs0 && !same_type && ggml_is_matrix(in) && ggml_is_vector(rows);
         if (grad_supported) {
             ggml_set_param(in);
             // rows is a constant input -> no gradients
         }
 
-        ggml_tensor * out = ggml_get_rows(ctx, in, rows);
+        ggml_tensor * out = same_type ? ggml_get_rows_same_type(ctx, in, rows) : ggml_get_rows(ctx, in, rows);
         ggml_set_name(out, "out");
 
         return out;
@@ -11358,6 +11361,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+
+    // same-type destinations: the gathered row is copied verbatim rather than converted to F32. these pin both the
+    // CPU copy path and the CUDA kernel, which take their destination type from the tensor
+    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        for (bool vs0 : { false, true }) {
+            test_cases.emplace_back(new test_get_rows(t, 256, 5, 4, 1, 1, false, vs0, 0, /* same_type = */ true));
+        }
+    }
+    // the shape an attention-bias gather actually has (n_head x extent rows, gathered over the K/V view)
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 24, 1026, 512, 1, 1, false, false, 0, /* same_type = */ true));
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
