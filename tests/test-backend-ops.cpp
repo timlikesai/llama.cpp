@@ -5790,6 +5790,14 @@ struct test_mul_mat : public test_case {
                 backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
+        // mxfp8 weights take the Blackwell block-scaled mma, which quantizes the activations to
+        // e4m3 codes with ue8m0 scales - the same allowance the unscaled fp8 path gets below.
+        // The feature is the one emitted for blackwell_mma_available(), which gates the mxfp8 tile route
+        if (type_a == GGML_TYPE_MXFP8 &&
+                !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT) &&
+                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            return 5e-3;
+        }
         if (type_a == GGML_TYPE_F8_E4M3 && backend_has_feature(backend, "NATIVE_FP8")) {
             return 5e-3;
         }
@@ -6150,6 +6158,12 @@ struct test_mul_mat_id : public test_case {
                 !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT_ID) &&
                 backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
+        }
+        // see the MUL_MAT case: the mxfp8 tile route quantizes activations to e4m3 + ue8m0
+        if (type_a == GGML_TYPE_MXFP8 &&
+                !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT_ID) &&
+                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            return 5e-3;
         }
         if (type_a == GGML_TYPE_F8_E4M3 && backend_has_feature(backend, "NATIVE_FP8")) {
             return 5e-3;
