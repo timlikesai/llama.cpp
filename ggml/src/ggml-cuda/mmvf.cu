@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "common.cuh"
 #include "unary.cuh"
+#include "dequantize.cuh"
 #include "mmvf.cuh"
 #include "mmf.cuh"
 #include "convert.cuh"
@@ -346,6 +347,32 @@ static __global__ void mul_mat_vec_f(
                 }
             }
         }
+    } else if constexpr (std::is_same_v<T, block_mxfp8>) {
+        const float2 * y2 = (const float2 *) y;
+        // x is indexed in units of 33-byte blocks: 16 consecutive col2 pairs are one block of 32 values.
+        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+            const block_mxfp8 * xb = x + (col2 >> 4);
+            const float d = ggml_cuda_e8m0_to_fp32(xb->e);
+            const float2 tmpx = dequantize_mxfp8_pair(xb->qs + 2 * (col2 & 0xf), d);
+            float2 tmpx_gate = {};
+            if constexpr (has_fusion) {
+                if (use_gate) {
+                    const block_mxfp8 * gb = gate_x + (col2 >> 4);
+                    tmpx_gate = dequantize_mxfp8_pair(gb->qs + 2 * (col2 & 0xf), ggml_cuda_e8m0_to_fp32(gb->e));
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const float2 tmpy = y2[j*stride_col_y2 + col2];
+                ggml_cuda_mad(sumf[j], tmpx, tmpy);
+
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        ggml_cuda_mad(sumf_gate[j], tmpx_gate, tmpy);
+                    }
+                }
+            }
+        }
     } else {
         static_assert(std::is_same_v<T, void>, "unsupported type");
     }
@@ -481,7 +508,8 @@ void launch_mul_mat_vec_f_cuda(
         const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
         const int64_t nsamples_or_ntokens, const int64_t ids_stride, cudaStream_t stream) {
     GGML_ASSERT(ncols        % 2 == 0);
-    GGML_ASSERT(stride_row   % 2 == 0);
+    // for MXFP8 the row stride counts 33-byte blocks, each of which holds an even number of values
+    GGML_ASSERT((stride_row % 2 == 0 || std::is_same_v<T, block_mxfp8>));
     GGML_ASSERT(stride_col_y % 2 == 0);
     GGML_ASSERT(ids || nchannels_dst % nchannels_x == 0);
     GGML_ASSERT(       nsamples_dst  % nsamples_x  == 0);
@@ -800,6 +828,12 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                 ne03, ne3, s03, s13, s3, ids_stride, prec, ctx.stream());
         } break;
+        case GGML_TYPE_MXFP8: {
+            const block_mxfp8 * src0_d = (const block_mxfp8 *) src0->data;
+            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+                ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+                ne03, ne3, s03, s13, s3, ids_stride, prec, ctx.stream());
+        } break;
         default:
             GGML_ABORT("unsupported type: %s", ggml_type_name(src0->type));
     }
@@ -878,6 +912,15 @@ bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, 
     const size_t ts = ggml_type_size(type);
     if (src0_nb[0] != ts) {
         return false;
+    }
+
+    if (type == GGML_TYPE_MXFP8) {
+        // 33-byte blocks of 32 values: the kernel reads the payload one byte at a time and indexes x in whole
+        // blocks, so it needs whole blocks per row and per channel, not the 2*ts pair alignment of the
+        // unpacked types (which an odd number of blocks per row could never satisfy).
+        return src0_ne[0] % QK_MXFP8 == 0 &&
+            src0_nb[1] % ts == 0 && src0_nb[2] % ts == 0 && src0_nb[3] % ts == 0 &&
+            ne11 <= MMVF_MAX_BATCH_SIZE;
     }
 
     if (!ggml_cuda_is_aligned(src0, 2*ts)) {
@@ -974,6 +1017,8 @@ bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, 
             }
             return ne11 <= MMVF_MAX_BATCH_SIZE;
         case GGML_TYPE_F8_E4M3:
+            return ne11 <= MMVF_MAX_BATCH_SIZE;
+        case GGML_TYPE_MXFP8:
             return ne11 <= MMVF_MAX_BATCH_SIZE;
         default:
             return false;
