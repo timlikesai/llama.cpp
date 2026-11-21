@@ -61,6 +61,15 @@ static_assert(sizeof(block_q8_1_mmq) == QK8_1_MMQ + 4*sizeof(half2), "Unexpected
 static_assert(sizeof(block_q8_1_mmq) == 4*sizeof(block_q8_1),      "Unexpected block_q8_1_mmq size");
 static_assert(sizeof(block_fp4_mmq)  == sizeof(block_q8_1_mmq),    "Unexpected block_fp4_mmq size");
 
+// this struct is used for the mxfp8 W8A8 mma: 128 e4m3 codes and 1 e8m0 scale per 32 values in the low byte of d4[],
+// because the mma only reads byte 0 of its scale operand. Same size as block_q8_1_mmq and block_fp4_mmq.
+struct block_fp8_mmq {
+    uint32_t d4[QK8_1_MMQ / QK_MXFP8];
+    int8_t   qs[QK8_1_MMQ];
+};
+
+static_assert(sizeof(block_fp8_mmq)  == sizeof(block_q8_1_mmq),  "Unexpected block_fp8_mmq size");
+
 static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
     switch (type_x) {
         case GGML_TYPE_Q1_0:
@@ -750,7 +759,16 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 return ggml_cuda_mmq_util_funcs(
                     -1,
                     ggml_cuda_mmq_load_tiles_mxfp4_fp4<type, J, fallback>,
-                    ggml_cuda_mmq_vec_dot_fp4_fp4_mma<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_block_scaled_mma<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
+            }
+            break;
+        case GGML_TYPE_MXFP8:
+            if (prec_src1 == GGML_PREC_Q4) {
+                return ggml_cuda_mmq_util_funcs(
+                    -1,
+                    ggml_cuda_mmq_load_tiles_mxfp8_fp8<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_block_scaled_mma<type, J, fallback>,
                     ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
             }
             break;
@@ -759,7 +777,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 return ggml_cuda_mmq_util_funcs(
                     -1,
                     ggml_cuda_mmq_load_tiles_nvfp4_nvfp4<type, J, fallback, has_fusion>,
-                    ggml_cuda_mmq_vec_dot_fp4_fp4_mma<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_block_scaled_mma<type, J, fallback>,
                     ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
             }
             break;
@@ -1685,7 +1703,7 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
 #define DECL_MMQ_CASE(type)                                                        \
     template void mul_mat_q_case<type, GGML_PREC_Q8>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 
-// FP4 variant: uses native FP4 MMA instead of keeping src1 at Q8_1.
+// Native block-scaled variant: src1 keeps the block layout of the weight type instead of Q8_1 (FP4 W4A4, mxfp8 W8A8).
 #define DECL_MMQ_CASE_W4A4(type)                                                   \
     template void mul_mat_q_case<type, GGML_PREC_Q4>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 
@@ -1716,6 +1734,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE_W4A4(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
+extern DECL_MMQ_CASE_W4A4(GGML_TYPE_MXFP8); // no Q8_1 src1 route for mxfp8, see ggml_cuda_should_use_mmq
 
 // -------------------------------------------------------------------------------------------------------------------------
 

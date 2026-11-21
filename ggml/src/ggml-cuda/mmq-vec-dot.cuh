@@ -1169,11 +1169,12 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 // ---------------------------------------------------------------------------------------------
 
-// Shared MMA kernel for MXFP4 and NVFP4 on Blackwell.
-// Both quantizations encode values as e2m1 (FP4) and produce one uint32 scale per
-// m16n8k64 MMA call; only the PTX kind (scale_vec::2X ue8m0 vs scale_vec::4X ue4m3)
-// and the per-type stride constant differ.
-template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_fp4_fp4_mma(
+// Shared block-scaled MMA kernel on Blackwell: MXFP4, NVFP4 (m16n8k64) and MXFP8 (m16n8k32).
+// MXFP4 and NVFP4 encode values as e2m1 and produce one uint32 scale per mma call (scale_vec::2X ue8m0 vs
+// scale_vec::4X ue4m3). MXFP8 encodes them as e4m3 and uses one scale word per fragment (scale_vec::1X ue8m0,
+// the instruction only reads byte 0). Tile shapes, fragment register counts and the scale index math are the
+// same for all three: a fragment always covers exactly one scale block.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_block_scaled_mma(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 
     typedef tile<16, 8, int>   tile_A;
@@ -1229,7 +1230,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             tile_C & C = *reinterpret_cast<tile_C *>(sum + (j0 / tile_C::J + n) * tile_C::ne);
 #pragma unroll
             for (int frag = 0; frag < nfrags; ++frag) {
-                mma_block_scaled_fp4<type>(C, A[n][frag], B[frag], scaleA[n][frag], scaleB[frag]);
+                mma_block_scaled<type>(C, A[n][frag], B[frag], scaleA[n][frag], scaleB[frag]);
             }
         }
     }

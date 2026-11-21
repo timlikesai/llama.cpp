@@ -123,6 +123,17 @@ __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
     return static_cast<uint8_t>(biased);
 }
 
+// e4m3 shared exponent: same rounding rule as compute_e8m0_scale for the FP4 codes, which measured closer than rounding up
+static __device__ __forceinline__ uint8_t compute_e8m0_scale_e4m3(float amax) {
+    if (!(amax > 0.0f)) {
+        return 0;
+    }
+
+    const int shared_exp = __float2int_rn(log2f(amax)) - 8; // e4m3 max exponent (unbiased) is 8
+
+    return (uint8_t) min(max(shared_exp + 127, 0), 254);
+}
+
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
 template <bool scatter, bool use_aligned_float8>
 static __global__ void quantize_mmq_nvfp4(
@@ -450,6 +461,83 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
         }
     }
     GGML_UNUSED(n_expert_used);
+}
+
+// mxfp8 activations for the block-scaled mma: one warp per 32-value scale block, the e4m3 codes in K order
+// (byte i == value i) so they line up with the weight tiles, and the e8m0 scale in the low byte of one word per block.
+template <bool scatter>
+static __global__ void quantize_mmq_mxfp8(const float * __restrict__ x,
+                                          const int32_t * __restrict__ ids,
+                                          void * __restrict__ vy,
+                                          const int64_t ne00,
+                                          const int64_t s01,
+                                          const int64_t s02,
+                                          const int64_t s03,
+                                          const int64_t ne0,
+                                          const int     ne1,
+                                          const int     ne2,
+                                          const int     n_expert_used) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    const int nwarps = blockDim.y;
+
+    const int64_t block_start = ((int64_t) blockIdx.y * nwarps + threadIdx.y) * QK_MXFP8;
+
+    if (block_start >= ne0) {
+        return;
+    }
+
+    const int64_t k_block = block_start / QK8_1_MMQ;                    // which y block of 128 values
+    const int     sub     = (block_start % QK8_1_MMQ) / QK_MXFP8;       // which scale word in it
+
+    const int64_t i0 = block_start + threadIdx.x;
+
+    int64_t base_pos;
+    if constexpr (scatter) {
+        base_pos = (int64_t) blockIdx.x * s02; // one physical row per token
+    } else {
+        const int64_t i2  = blockIdx.z % ne2;
+        const int64_t i3  = blockIdx.z / ne2;
+        const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
+        base_pos = i3 * s03 + i2 * s02 + i01 * s01;
+    }
+
+    ggml_cuda_pdl_sync();
+    const float xi = (i0 < ne00) ? x[base_pos + i0] : 0.0f;
+
+    float amax = fabsf(xi);
+#pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        amax = fmaxf(amax, ggml_cuda_shfl_xor(amax, mask, WARP_SIZE));
+    }
+
+    const uint8_t      e   = compute_e8m0_scale_e4m3(amax);
+    const float        inv = (amax == 0.0f) ? 0.0f : __frcp_rn(ggml_cuda_e8m0_to_fp32(e));
+    const uint8_t      q   = ggml_cuda_fp32_to_f8_e4m3(xi * inv);
+
+    block_fp8_mmq * y = (block_fp8_mmq *) vy;
+
+    const int64_t ib0 = scatter ? 0 : blockIdx.z * ((int64_t) ne1 * (ne0 / QK8_1_MMQ));
+
+    if constexpr (scatter) {
+#pragma unroll
+        for (int slot = 0; slot < n_expert_used; ++slot) {
+            block_fp8_mmq * yb = y + (k_block * ne1 + ids[(int64_t) blockIdx.x * n_expert_used + slot]);
+            yb->qs[sub * QK_MXFP8 + threadIdx.x] = q;
+            if (threadIdx.x == 0) {
+                yb->d4[sub] = e;
+            }
+        }
+    } else {
+        block_fp8_mmq * yb = y + (ib0 + k_block * ne1 + blockIdx.x);
+        yb->qs[sub * QK_MXFP8 + threadIdx.x] = q;
+        if (threadIdx.x == 0) {
+            yb->d4[sub] = e;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, n_expert_used);
+    NO_DEVICE_CODE;
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
@@ -888,4 +976,35 @@ void quantize_mmq_fp4_cuda(
 
         quantize_mmq_mxfp4<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
     }
+}
+
+void quantize_mmq_mxfp8_cuda(
+        const float * x, const int32_t * ids, void * vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
+
+    constexpr int nwarps         = 8;
+    constexpr int vals_per_block = nwarps * QK_MXFP8;
+
+    const dim3 block_size(WARP_SIZE, nwarps, 1);
+    const dim3 num_blocks(ne1, (unsigned) ((ne0 + vals_per_block - 1) / vals_per_block), ne2 * ne3);
+
+    quantize_mmq_mxfp8<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+}
+
+void quantize_scatter_mmq_mxfp8_cuda(
+        const float * x, const int32_t * ids_src1_inv, void * vy,
+        const int64_t ne00, const int64_t stride_token, const int64_t ne0,
+        const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream) {
+    GGML_ASSERT(ne0 > 0);
+
+    constexpr int nwarps         = 8;
+    constexpr int vals_per_block = nwarps * QK_MXFP8;
+
+    const dim3 block_size(WARP_SIZE, nwarps, 1);
+    const dim3 num_blocks(n_tokens, (unsigned) ((ne0 + vals_per_block - 1) / vals_per_block), 1);
+
+    quantize_mmq_mxfp8<true><<<num_blocks, block_size, 0, stream>>>(x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0,
+        ne0, /*ne1=*/nrows_dst, /*ne2=*/1, n_expert_used);
 }

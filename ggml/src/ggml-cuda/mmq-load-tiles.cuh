@@ -1723,6 +1723,42 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// MXFP8 tile for the block-scaled mma: the e4m3 payload is already 1 byte per value, so one thread copies a whole
+// 32-value block into the tile and puts its e8m0 scale byte in the low byte of one word per block.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_mxfp8_fp8(
+        const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    GGML_UNUSED(x_gate);
+
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q4) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q4);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback, GGML_PREC_Q4);
+
+    int *      x_qs = (int *) x_tile;
+    uint32_t * x_sc = (uint32_t *) (x_qs + 2 * MMQ_TILE_NE_K);
+
+    constexpr int iter_k = ggml_cuda_mmq_get_K_vram(type, J, fallback, GGML_PREC_Q4);
+
+    constexpr int threads_per_row = iter_k / QK_MXFP8;  // each thread processes 1 block
+    constexpr int rows_per_warp   = warp_size / threads_per_row;
+    const int     kbx             = threadIdx.x % threads_per_row;
+    const int     row_in_warp     = threadIdx.x / threads_per_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += rows_per_warp * nwarps) {
+        int i = i0 + threadIdx.y * rows_per_warp + row_in_warp;
+
+        if constexpr (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_mxfp8 * bxi = (const block_mxfp8 *) x + kbx0 + i * stride + kbx;
+
+        memcpy(x_qs + i*sram_stride + kbx * (QK_MXFP8 / 4), bxi->qs, QK_MXFP8);
+        x_sc[i*sram_stride + kbx] = bxi->e;
+    }
+}
+
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_nvfp4(
         const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kb0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
