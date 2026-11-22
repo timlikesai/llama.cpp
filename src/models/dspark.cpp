@@ -79,17 +79,41 @@ void llama_model_dflash::load_hparams_mistral_large4(llama_model_loader & ml) {
 void llama_model_dflash::load_tensors_dspark(int64_t n_vocab_draft) {
     LLAMA_LOAD_LOCALS;
 
-    const int64_t dspark_markov_rank = ml->get_tensor_meta("markov_w1.weight")->ne[0];
+    const bool is_inkling = variant == VARIANT_INKLING;
 
-    dspark_markov_w1   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), { dspark_markov_rank, n_vocab }, 0);
-    dspark_markov_w2   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), { dspark_markov_rank, n_vocab_draft }, 0);
+    const struct ggml_tensor * w1_meta = ml->get_tensor_meta("markov_w1.weight");
+    const int64_t dspark_markov_rank   = w1_meta->ne[0];
+
+    // the Inkling table is built over the target's padded vocab. ids below n_vocab address a row of it, so
+    // load the stored rows instead of the unpadded count that the draft's own vocab reports
+    const int64_t n_markov_rows = is_inkling ? w1_meta->ne[1] : n_vocab;
+
+    dspark_markov_w1   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), { dspark_markov_rank, n_markov_rows }, 0);
+
+    // Inkling has no markov_w2: the head latent reaches the logits through dspark_hidden_out
+    dspark_markov_w2   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), { dspark_markov_rank, n_vocab_draft }, is_inkling ? TENSOR_NOT_REQUIRED : 0);
     dspark_markov_w2_s = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
 
     dspark_conf_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "weight"), { n_embd + dspark_markov_rank, 1 }, TENSOR_NOT_REQUIRED);
     dspark_conf_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "bias"),   { 1 },             TENSOR_NOT_REQUIRED);
 
-    dspark_joint_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "weight"), { n_embd + 2*dspark_markov_rank, 3*dspark_markov_rank }, TENSOR_NOT_REQUIRED);
+    // the Inkling rnn head is read together with the step context [hidden; f_rnn], upstream with the last hidden state
+    const int64_t n_joint_inp = is_inkling ? 2*dspark_markov_rank + 2*n_embd : n_embd + 2*dspark_markov_rank;
+
+    dspark_joint_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "weight"), { n_joint_inp, 3*dspark_markov_rank }, TENSOR_NOT_REQUIRED);
     dspark_joint_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "bias"),   { 3*dspark_markov_rank }, dspark_joint_proj ? 0 : TENSOR_NOT_REQUIRED);
+
+    if (is_inkling) {
+        // one softmax row over the target taps per draft stage, plus the row the markov head uses
+        dspark_fuse = create_tensor(tn(LLM_TENSOR_DSPARK_FUSE, "weight"), { (int64_t) target_layer_ids.size(), n_layer + 1 }, 0);
+        dspark_norm = create_tensor(tn(LLM_TENSOR_DSPARK_NORM, "weight"), { n_embd }, 0);
+
+        dspark_hidden_out   = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT, "weight"), { dspark_markov_rank, n_embd }, 0);
+        dspark_hidden_out_b = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT, "bias"),   { n_embd }, 0);
+
+        // one mask embedding for every slot of the block, upstream keeps a row per slot
+        dspark_mask_embd = create_tensor(tn(LLM_TENSOR_DSPARK_MASK_EMBD, "weight"), { n_embd }, 0);
+    }
 
     LLAMA_LOG_INFO("%s: DFlash with DSpark markov head (rank = %lld)\n", __func__, (long long) dspark_markov_rank);
 }

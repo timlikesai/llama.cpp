@@ -424,6 +424,13 @@ struct llama_layer {
     struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
     struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
 
+    // Inkling drafts project the target features into the draft cache with their own K/V, they do not
+    // reuse the stage's wk/wv; dflare_norm scales the mixed features of this stage
+    struct ggml_tensor * attn_k_ctx      = nullptr;
+    struct ggml_tensor * attn_v_ctx      = nullptr;
+    struct ggml_tensor * attn_k_ctx_norm = nullptr;
+    struct ggml_tensor * dflare_norm     = nullptr;
+
     struct ggml_tensor * lilicorr_attn_norm       = nullptr;
     struct ggml_tensor * lilicorr_mlp_norm        = nullptr;
     struct ggml_tensor * lilicorr_attn_in_proj    = nullptr;
@@ -950,6 +957,10 @@ struct llama_model {
     struct ggml_tensor * dspark_joint_proj   = nullptr; // rnn markov head
     struct ggml_tensor * dspark_joint_proj_b = nullptr;
     struct ggml_tensor * dspark_mask_embd    = nullptr; // per-slot mask embeddings
+    struct ggml_tensor * dspark_fuse         = nullptr; // Inkling: softmax weights mixing the target taps, per draft stage
+    struct ggml_tensor * dspark_norm         = nullptr; // Inkling: RMSNorm of the markov head context
+    struct ggml_tensor * dspark_hidden_out   = nullptr; // Inkling: markov latent folded into the target lm head
+    struct ggml_tensor * dspark_hidden_out_b = nullptr;
 
     // zaya1
     struct ggml_tensor * res_scale_in   = nullptr;

@@ -40,7 +40,9 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     const bool has_selector = ml.get_tensor_meta("selector_hidden.weight") != nullptr;
     const bool has_lilicorr = ml.get_key(LLM_KV_LILICORR_HIDDEN_SIZE, hparams.lilicorr_hidden_size, false);
     if (has_markov) {
-        variant = VARIANT_DSPARK;
+        // no metadata key names the markov head, so read it from the tensors: only the Inkling draft folds
+        // the head readout into the target lm head (dspark_hidden_out) instead of shipping markov_w2
+        variant = ml.get_tensor_meta("dspark_hidden_out.weight") ? VARIANT_INKLING : VARIANT_DSPARK;
     } else if (has_selector) {
         variant = VARIANT_DFLASH2;
     } else if (has_lilicorr) {
@@ -101,16 +103,20 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     }
 
     switch (variant) {
-        case VARIANT_DSPARK:   load_tensors_dspark(n_vocab_draft); break;
+        case VARIANT_DSPARK:
+        case VARIANT_INKLING:  load_tensors_dspark(n_vocab_draft); break;
         case VARIANT_DFLASH2:  load_tensors_dflash2();             break;
         case VARIANT_LILICORR: load_tensors_lilicorr();            break;
         case VARIANT_DFLASH:                                       break;
     }
 
-    fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
+    // Inkling mixes the target taps inside each draft stage, it has no shared encoder to fuse them
+    const int enc_flags = variant == VARIANT_INKLING ? TENSOR_NOT_REQUIRED : 0;
+
+    fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, enc_flags);
     fc_s            = create_tensor(tn(LLM_TENSOR_FC,              "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
     fc_in_s         = create_tensor(tn(LLM_TENSOR_FC,              "input_scale"), { 1 }, TENSOR_NOT_REQUIRED);
-    output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
+    output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, enc_flags); // encoder hidden_norm (after fc)
     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
 
     // optional: reduced-vocab drafts ship their own lm head, full-vocab drafts can share the target's via ctx_other
@@ -154,6 +160,12 @@ void llama_model_dflash::load_tensors_layers_base() {
 
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
+
+        // Inkling: projections of the target features injected into this stage's cache, see build_inject
+        layer.attn_k_ctx      = create_tensor(tn(LLM_TENSOR_ATTN_K_CTX,      "weight", i), { n_embd, n_embd_k_gqa }, TENSOR_NOT_REQUIRED);
+        layer.attn_v_ctx      = create_tensor(tn(LLM_TENSOR_ATTN_V_CTX,      "weight", i), { n_embd, n_embd_v_gqa }, TENSOR_NOT_REQUIRED);
+        layer.attn_k_ctx_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_CTX_NORM, "weight", i), { n_embd_head_k }, TENSOR_NOT_REQUIRED);
+        layer.dflare_norm     = create_tensor(tn(LLM_TENSOR_DFLARE_NORM,     "weight", i), { n_embd }, TENSOR_NOT_REQUIRED);
 
         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), { n_embd }, TENSOR_NOT_REQUIRED);
         layer.ffn_post_norm  = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM,  "weight", i), { n_embd }, TENSOR_NOT_REQUIRED);
@@ -303,14 +315,23 @@ ggml_tensor * llama_model_dflash::graph_base::build_inject() {
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
 
-        ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g, layer.wk_s);
-        const bool shared_kv = layer.wv == nullptr;
-        ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, inp_g, layer.wv_s);
+        // Inkling keeps the target-context K/V in tensors of their own, the other drafts reuse the stage's wk/wv
+        const bool ctx_kv = layer.attn_k_ctx != nullptr;
+
+        ggml_tensor * wk      = ctx_kv ? layer.attn_k_ctx      : layer.wk;
+        ggml_tensor * wk_s    = ctx_kv ? nullptr               : layer.wk_s;
+        ggml_tensor * wv      = ctx_kv ? layer.attn_v_ctx      : layer.wv;
+        ggml_tensor * wv_s    = ctx_kv ? nullptr               : layer.wv_s;
+        ggml_tensor * wk_norm = ctx_kv ? layer.attn_k_ctx_norm : layer.attn_k_norm;
+
+        ggml_tensor * Kcur = build_lora_mm(wk, inp_g, wk_s);
+        const bool shared_kv = wv == nullptr;
+        ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(wv, inp_g, wv_s);
 
         Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
         Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
-        Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
+        Kcur = build_norm(Kcur, wk_norm, NULL, LLM_NORM_RMS, il);
         if (shared_kv) {
             Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
         }
@@ -530,6 +551,13 @@ llama_model_dflash::graph_dflash::graph_dflash(const llm_graph_params & params) 
 }
 
 std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const llm_graph_params & params) const {
+    // the Inkling tensors load, but its head is not implemented: the taps are mixed per stage (DFlare) and the
+    // markov readout is a recurrent head folded into the target lm head. wrong drafting is silent, the target
+    // verifies every token, so refuse to build a graph instead
+    if (variant == VARIANT_INKLING) {
+        throw std::runtime_error("Inkling DSpark drafts need DFlare tap mixing and the rnn_hidden markov head, which are not implemented");
+    }
+
     switch (params.gtype) {
         case LLM_GRAPH_TYPE_ENCODER:
             return std::make_unique<graph<true>>(params);
@@ -545,6 +573,7 @@ std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const ll
                 case VARIANT_DFLASH:   return std::make_unique<graph_dflash>(params);
                 case VARIANT_DFLASH2:  return std::make_unique<graph_dflash2>(params);
                 case VARIANT_DSPARK:   return std::make_unique<graph_dspark>(params);
+                case VARIANT_INKLING:  break; // rejected above
                 case VARIANT_LILICORR: return std::make_unique<graph_lilicorr>(params);
             }
             GGML_ABORT("invalid DFlash variant");

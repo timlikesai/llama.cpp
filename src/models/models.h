@@ -1623,6 +1623,7 @@ struct llama_model_dflash : public llama_model_base {
         VARIANT_DFLASH,
         VARIANT_DFLASH2,
         VARIANT_DSPARK,
+        VARIANT_INKLING, // dspark with a rnn_hidden markov head and DFlare tap mixing, not runnable yet
         VARIANT_LILICORR,
     };
 
