@@ -2007,18 +2007,21 @@ bool llama_kv_cache::has_cell_ext() const {
     return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
 }
 
-void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent, bool fold_future) const {
+void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent,
+        llama_rel_pos_fold_t fold) const {
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     const int64_t n_kv = dst->ne[0];
-    // with fold_future the empty and the future cells get a bucket of their own (extent + 1), which the model fills
-    // with -INF: the gathered bias then *is* the attention mask and no additive dense mask is consumed
-    const int32_t i_future = fold_future ? (int32_t) extent + 1 : (int32_t) extent;
+    // with folding the empty and the future cells get a bucket of their own (extent + 1), which the model fills
+    // with -INF: the gathered bias then *is* the attention mask and no additive dense mask is consumed. for a
+    // windowed layer the cells past the window are not attended either, so they land in the same bucket
+    const int32_t i_future = fold != LLAMA_REL_POS_FOLD_NONE ? (int32_t) extent + 1 : (int32_t) extent;
+    const int32_t i_far    = fold == LLAMA_REL_POS_FOLD_SWA  ? i_future : (int32_t) extent;
     std::vector<int32_t> data(n_kv * ubatch->n_tokens);
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[i][0]));
         for (int64_t j = 0; j < n_kv; ++j) {
             const int64_t distance = cells.is_empty(j) ? -1 : int64_t(ubatch->pos[i]) - cells.pos_get(j);
-            data[i*n_kv + j] = distance >= 0 ? (distance < extent ? (int32_t) distance : (int32_t) extent) : i_future;
+            data[i*n_kv + j] = distance >= 0 ? (distance < extent ? (int32_t) distance : i_far) : i_future;
         }
     }
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
@@ -3127,8 +3130,9 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
     kv->set_input_pos_bucket(dst, ubatch);
 }
 
-void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent, bool fold_future) const {
-    kv->set_input_relative_pos(dst, ubatch, extent, fold_future);
+void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent,
+        llama_rel_pos_fold_t fold) const {
+    kv->set_input_relative_pos(dst, ubatch, extent, fold);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

@@ -13,6 +13,17 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+// how set_input_relative_pos clamps distances that run past the bias table's extent:
+//   NONE  - the caller passes a separate additive mask; empty, future and distant cells share the clamped row
+//   DENSE - empty and future cells get their own row (extent + 1) holding -INF, so the gathered bias is the whole
+//           mask; distant cells keep the clamped bias, because a dense layer still attends to them
+//   SWA   - as DENSE, but cells past the window are not attended either, so they join the -INF row
+typedef enum {
+    LLAMA_REL_POS_FOLD_NONE  = 0,
+    LLAMA_REL_POS_FOLD_DENSE = 1,
+    LLAMA_REL_POS_FOLD_SWA   = 2,
+} llama_rel_pos_fold_t;
+
 //
 // llama_kv_cache
 //
@@ -249,7 +260,7 @@ public:
 
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
-    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent, bool fold_future = false) const;
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent, llama_rel_pos_fold_t fold = LLAMA_REL_POS_FOLD_NONE) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -454,7 +465,7 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
-    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent, bool fold_future = false) const;
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent, llama_rel_pos_fold_t fold = LLAMA_REL_POS_FOLD_NONE) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;

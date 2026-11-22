@@ -1460,7 +1460,8 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     }
 
     if (self_rel_pos->buffer) {
-        attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent, fold_rel_mask);
+        attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent,
+                fold_rel_mask ? LLAMA_REL_POS_FOLD_DENSE : LLAMA_REL_POS_FOLD_NONE);
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -1469,12 +1470,15 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_swa()->set_input_v_idxs(inp_attn->self_v_idxs_swa, ubatch);
     }
 
-    if (inp_attn->self_attn_mask_swa.raw && inp_attn->self_attn_mask_swa.raw->buffer) {
+    // the swa mask is a pure distance predicate too (causal and within the window), so folding the distances
+    // past the window into the -INF bucket covers it and the host fill is not needed
+    if (!fold_rel_mask_swa && inp_attn->self_attn_mask_swa.raw && inp_attn->self_attn_mask_swa.raw->buffer) {
         attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
     }
 
     if (self_rel_pos_swa->buffer) {
-        attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
+        attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa,
+                fold_rel_mask_swa ? LLAMA_REL_POS_FOLD_SWA : LLAMA_REL_POS_FOLD_NONE);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -4452,6 +4456,9 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     // can live in the bias table as an extra -INF bucket and the gathered bias becomes the complete mask
     inp->fold_rel_mask = cparams.flash_attn && cparams.n_seq_max == 1 && cparams.causal_attn;
 
+    // for the windowed layers the exclusion has to be a distance predicate too, which only the standard window is
+    inp->fold_rel_mask_swa = inp->fold_rel_mask && hparams.swa_type == LLAMA_SWA_TYPE_STANDARD;
+
     inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
     ggml_set_input(inp->self_rel_pos);
     ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
@@ -4486,9 +4493,12 @@ ggml_tensor * llm_graph_context::build_attn(
     GGML_ASSERT(attn_mask.rows == nullptr);
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
-    // when the distances carry the -INF bucket, the gathered bias already is that mask for the dense layers
+    // when the distances carry the -INF bucket, the gathered bias already is that mask - for the dense layers from
+    // the empty and future cells, for the windowed ones also from the cells past the window
+    const bool fold_mask = is_swa ? inp->fold_rel_mask_swa : inp->fold_rel_mask;
+
     ggml_tensor * kq_mask = attn_mask.raw;
-    if (inp->fold_rel_mask && !is_swa) {
+    if (fold_mask) {
         kq_mask = kq_b;
     } else {
         if (kq_mask->type != GGML_TYPE_F32) {

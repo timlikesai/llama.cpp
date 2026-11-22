@@ -494,8 +494,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         // the folded path appends a -INF bucket to the table. the table is only (extent + 1) rows wide, so the fill,
         // the concat and the narrowing are negligible, and gathering into the same type leaves the permute-copy as
         // the only buffer at n_kv width - in half precision. the gathered bias then *is* the mask flash attention
-        // consumes, which removes the broadcast add with the dense mask and the F32 widening of that mask
-        const bool fold_mask = inp->fold_rel_mask && !is_swa;
+        // consumes, which removes the broadcast add with the dense mask and the F32 widening of that mask. for the
+        // windowed layers the same bucket also carries the past-the-window cells, so their mask folds out too
+        const bool fold_mask = is_swa ? inp->fold_rel_mask_swa : inp->fold_rel_mask;
         if (fold_mask) {
             ggml_tensor * far = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_head, 1, n_tokens), -INFINITY);
 

@@ -818,11 +818,14 @@ public:
 
     // distance from the token to the cell, extent for the empty, future and more distant cells
     // with fold_rel_mask the empty and future cells move to their own bucket (extent + 1) holding -INF, so the
-    // gathered bias is the complete attention mask and the dense mask input is neither filled nor consumed
+    // gathered bias is the complete attention mask and the dense mask input is neither filled nor consumed. for a
+    // windowed layer fold_rel_mask_swa also sends the cells past the window into that bucket, which reproduces
+    // LLAMA_SWA_TYPE_STANDARD exactly - the only window form where exclusion is a pure distance predicate
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
-    bool fold_rel_mask = false;
+    bool fold_rel_mask     = false;
+    bool fold_rel_mask_swa = false;
 
     const uint32_t extent;
     const uint32_t extent_swa;
