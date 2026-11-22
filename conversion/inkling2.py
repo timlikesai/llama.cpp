@@ -145,6 +145,11 @@ class Inkling2Model(TextModel):
     supports_native_experts = True
     native_experts = False
 
+    # the drafter is indexed in a second pass over mtp.safetensors; the flag selects its name mapping
+    _indexing_draft = False
+    _draft_beg = 0     # trunk layer count: embedded nextn layers keep absolute block ids from here
+    _draft_count = 0
+
     def __init__(self, dir_model: Path, *args, **kwargs):
         self._expert_quant: dict[str, dict] = {}
         self._packed_experts: dict[str, gguf.LazyChunkedTensor] = {}
@@ -160,8 +165,21 @@ class Inkling2Model(TextModel):
                         if name in self._expert_quant:
                             raise ValueError(f"Inkling2: duplicate hf_quant_config.json scheme for {name}")
                         self._expert_quant[name] = group
+        # the drafter ships inside the checkpoint: mtp.safetensors holds 54 BF16 tensors - 3 draft
+        # stages, the DFlare fuse matrix and the rnn_hidden markov head. Embed it as nextn layers, the
+        # same mechanism the converters that keep MTP in the main file use (deepseek, deepseek41,
+        # bailingmoe, command_r), so the GGUF carries every weight the model was released with.
+        with open(dir_model / "config.json", encoding="utf-8") as f:
+            cfg = json.load(f)
+        self.mtp: dict = cfg.get("mtp_config", {})
+        self.n_draft = int(self.mtp.get("num_hidden_layers", 0))
+        type(self)._draft_beg = int(cfg["text_config"]["num_hidden_layers"])
+        type(self)._draft_count = self.n_draft
+        if self.n_draft and not (dir_model / "mtp.safetensors").is_file():
+            raise ValueError(f"Inkling2: mtp_config declares {self.n_draft} draft layers but mtp.safetensors is missing")
         super().__init__(dir_model, *args, **kwargs)
-        logger.warning("Inkling2: converting the text backbone only; vision and MTP tensors are skipped")
+        logger.warning("Inkling2: converting the text backbone with%s; vision tensors go to the mmproj"
+                       % (f" the {self.n_draft}-layer drafter embedded as nextn layers" if self.n_draft else " no drafter"))
         if self.native_experts:
             logger.warning("Inkling2: --native-experts keeps the MXFP8 and NVFP4 expert layers as native bytes")
         hp = self.hparams
@@ -175,6 +193,48 @@ class Inkling2Model(TextModel):
         if len(types) != self.block_count or set(types) - {"hybrid", "hybrid_sliding"}:
             raise ValueError("Inkling2: invalid layer_types")
         self.is_swa = [t == "hybrid_sliding" for t in types]
+
+    def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
+        tensors = super().index_tensors(remote_hf_model_id)
+        if not self.n_draft or self.no_mtp:
+            return tensors
+
+        type(self)._indexing_draft = True
+        try:
+            draft = self.index_local_tensors("mtp")
+        finally:
+            type(self)._indexing_draft = False
+
+        for name, gen in draft.items():
+            if name in tensors:
+                raise ValueError(f"Inkling2: drafter tensor collides with a trunk tensor: {name}")
+            tensors[name] = gen
+
+        logger.info(f"Inkling2: embedding {len(draft)} drafter tensors as nextn layers, "
+                    f"blk.{self._draft_beg}..{self._draft_beg + self.n_draft - 1}")
+        return tensors
+
+    @classmethod
+    def _draft_name(cls, name: str) -> str:
+        # embedded nextn layers use absolute block ids, as llama.cpp addresses them; globals get the
+        # nextn namespace. Names are otherwise the checkpoint's own, so the mapping is auditable.
+        while name.startswith("mtp."):
+            name = name[len("mtp."):]
+        if name.startswith("layers."):
+            _, stage, rest = name.split(".", 2)
+            bid = int(stage)
+            if not 0 <= bid < cls._draft_count:
+                raise ValueError(f"Inkling2: unexpected drafter stage in {name}")
+            return f"blk.{cls._draft_beg + bid}.nextn.{rest}"
+        if name == "fuse_weight":
+            return "nextn.fuse.weight"         # DFlare: per-stage weights over the target taps
+        if name == "mask_embed":
+            return "nextn.mask_embed.weight"   # block-diffusion noise slot embedding
+        if name == "norm.weight":
+            return "nextn.output_norm.weight"
+        if name.startswith("markov_head."):
+            return f"nextn.{name}"
+        raise ValueError(f"Inkling2: unmapped drafter tensor {name}")
 
     def dequant_model(self):
         for name in list(self.model_tensors):
@@ -301,6 +361,8 @@ class Inkling2Model(TextModel):
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
+        if cls._indexing_draft:
+            return cls._draft_name(name), gen
         if any(p in name for p in ("visual.", "vision_tower.", "mtp.", "markov_head", "nextn_predict")):
             return None
         name = name.replace("model.language_model.", "model.").replace("model.llm.", "model.")
@@ -330,6 +392,31 @@ class Inkling2Model(TextModel):
 
     def set_gguf_parameters(self):
         hp = self.hparams
+        # the drafter widens the per-layer ffn; the expert size stays the trunk's scalar
+        n_ff_expert = hp["intermediate_size"]
+        if self.n_draft:
+            md = self.mtp
+            swa = (hp.get("swa_num_attention_heads", hp["num_attention_heads"]),
+                   hp.get("swa_num_key_value_heads", hp["num_key_value_heads"]),
+                   hp.get("swa_head_dim", hp["head_dim"]))
+            draft = (md["num_attention_heads"], md["num_key_value_heads"], md["head_dim"])
+            if draft != swa:
+                raise ValueError(f"Inkling2: drafter heads {draft} != trunk swa heads {swa}, "
+                                 f"the per-layer arrays below assume they agree")
+            if md.get("hidden_size") != hp["hidden_size"]:
+                raise ValueError("Inkling2: the drafter must share the trunk hidden size")
+            if md.get("rms_norm_eps") != hp.get("rms_norm_eps"):
+                raise ValueError("Inkling2: drafter rms_norm_eps must match the trunk, the loader has one array")
+            if md.get("sliding_window_size") != hp.get("sliding_window_size"):
+                raise ValueError("Inkling2: drafter sliding_window_size must match the trunk")
+            trunk_theta = hp.get("rope_theta")
+            if trunk_theta is not None and md.get("rope_theta") not in (None, trunk_theta):
+                raise ValueError(f"Inkling2: drafter rope_theta {md['rope_theta']} != trunk {trunk_theta}")
+            # local_layer_ids is authoritative: draft layer 0 and 2 window, layer 1 attends fully
+            local = md.get("local_layer_ids", [])
+            self.is_swa = self.is_swa + [i in local for i in range(self.n_draft)]
+            hp["intermediate_size"] = [n_ff_expert] * self.block_count + [md["intermediate_size"]] * self.n_draft
+            self.block_count += self.n_draft
         hp["num_attention_heads"] = [hp.get("swa_num_attention_heads", hp["num_attention_heads"]) if s else hp["num_attention_heads"] for s in self.is_swa]
         hp["num_key_value_heads"] = [hp.get("swa_num_key_value_heads", hp["num_key_value_heads"]) if s else hp["num_key_value_heads"] for s in self.is_swa]
         for name in ("n_routed_experts", "num_experts_per_tok"):
@@ -339,7 +426,7 @@ class Inkling2Model(TextModel):
         w = self.gguf_writer
         w.add_vocab_size(hp["vocab_size"])
         w.add_vocab_size_unpadded(hp["unpadded_vocab_size"])
-        w.add_expert_feed_forward_length(self.find_hparam(["moe_intermediate_size", "intermediate_size"]))
+        w.add_expert_feed_forward_length(n_ff_expert)
         w.add_key_length_swa(hp.get("swa_head_dim", hp["head_dim"]))
         w.add_value_length_swa(hp.get("swa_head_dim", hp["head_dim"]))
         w.add_rope_dimension_count(0)
@@ -347,6 +434,19 @@ class Inkling2Model(TextModel):
         w.add_sliding_window_pattern(self.is_swa)
         w.add_shortconv_l_cache(self.find_hparam(["conv_kernel_size", "sconv_kernel_size"]))
         w.add_expert_weights_scale(hp["route_scale"])
+        if self.n_draft:
+            md = self.mtp
+            w.add_nextn_predict_layers(self.n_draft)
+            p = f"{gguf.MODEL_ARCH_NAMES[self.model_arch]}.mtp"  # self.model_name is unset for this converter
+            w.add_uint32(f"{p}.block_size", md["block_size"])
+            w.add_uint32(f"{p}.markov_rank", md["markov_rank"])
+            w.add_string(f"{p}.markov_head_type", md["markov_head_type"])
+            w.add_array(f"{p}.target_layer_ids", md["target_layer_ids"])
+            if md.get("rope_theta") is not None:
+                # the trunk carries no rope at all (rope_dimension_count 0, absolute positions come from
+                # the relative bias table) while the drafter was trained with theta 1e6. The trunk's
+                # scalar is absent, so the draft graph must not silently inherit the loader default.
+                w.add_float32(f"{p}.rope_frequency_base", md["rope_theta"])
         w.add_activation_situ_beta(hp["mlp_gate_softcap"])
         w.add_activation_situ_linear_beta(hp["mlp_up_softcap"])
         w.add_attn_res_block_size(hp["n_layers_per_attn_res_block"])
@@ -364,6 +464,11 @@ class Inkling2Model(TextModel):
         return super().tensor_force_quant(name, new_name, bid, n_dims)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("nextn.") or ".nextn." in name:
+            # the drafter keeps the name the checkpoint gave it and its shipped dtype (bf16 per
+            # mtp_config.torch_dtype); the trunk tensor map has no entries for these and must not guess
+            yield name, data_torch
+            return
         if name in self._packed_experts:
             target = name.replace(".w13_weight", ".gate_up_proj").replace(".w2_weight", ".down_proj")
             yield self.map_tensor_name(target, try_suffixes=()) + ".weight", cast("Tensor", self._packed_experts[name])
