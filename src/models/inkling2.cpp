@@ -283,12 +283,42 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     }
     states = ggml_rms_norm(ctx0, states, 1e-6f);
 
-    ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
+    // The mix moves the graph's largest transient - n_embd x n_blocks x n_tokens - through a transpose
+    // copy and two batched matmuls. CUDA cannot express the block-axis contraction as a TN gemm, so it
+    // materializes the transpose instead. Running that pass in f16 halves the bytes and puts the
+    // matmuls on tensor cores, with accumulation still in f32 (GGML_PREC_F32 default): measured +8%
+    // prefill at two contexts, perplexity 5.4356 vs 5.4373 (indistinguishable, 8 chunks of wikitext-2).
+    //
+    // Single-token evaluation is the opposite trade: the tensors are one column wide, so the bytes
+    // saved are nothing while the extra cast nodes are real launches - decode came out 3.5% slower.
+    // Casting to the type a tensor already has is not free either (ggml_cast always emits a CPY, see
+    // ggml.c), so the two paths are written out rather than unified behind a type variable.
+    if (n_tokens == 1) {
+        ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
 
+        ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
+        scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
+
+        return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
+    }
+
+    states = ggml_cast(ctx0, states, GGML_TYPE_F16);
+
+    ggml_tensor * queries = ggml_repeat(ctx0, ggml_cast(ctx0, query, GGML_TYPE_F16),
+            ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, n_embd, query->ne[1], n_tokens));
+
+    // f32 accumulation is required, not implied: with the default precision CUDA can accumulate these
+    // two in f16 while the CPU converts to f32, which made greedy output diverge between backends at
+    // 16 tokens. Forcing f32 restores the agreement; the speedup comes from the halved bytes and the
+    // tensor-core path, not from reduced accumulation. (ggml's policy is set on the op result.)
     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
+    GGML_ASSERT(ggml_prec_set_acc(scores, GGML_PREC_F32));
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
-    return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
+    ggml_tensor * mixed = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
+    GGML_ASSERT(ggml_prec_set_acc(mixed, GGML_PREC_F32));
+
+    return ggml_cast(ctx0, mixed, GGML_TYPE_F32);
 }
 
 // causal short convolution with a residual; dynamic adds input-dependent taps per head
