@@ -307,6 +307,12 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         } else {
             bias = g.build_lora_mm(w2, markov, model.dspark_markov_w2_s); // [n_vocab_draft, n_blocks]
         }
+        if (bias->ne[0] > n_vocab) {
+            // the readout goes through the target's padded head, while the logits it biases were
+            // truncated to the real vocabulary in dflash's build_logits - match the operand widths
+            bias = ggml_view_2d(ctx0, bias, n_vocab, bias->ne[1], bias->nb[1], 0);
+        }
+
         if (model.d2t) {
             // reduced draft vocab: scatter the bias to the target rows (base is -inf on the others)
             const int64_t n_draft_vocab = bias->ne[0];
@@ -379,6 +385,9 @@ llama_model_dflash::graph_dspark::graph_dspark(const llm_graph_params & params) 
     // bias the draft logits with the Markov head
     build_dspark_markov_head(*this, model, inp_tokens);
 }
+
+// The Inkling variant needs f_rnn, the mixed target features of the last committed token, which this
+// path cannot see yet; see docs/mxfp8/38 for what running the stages without it measured.
 
 // DSV4 DSpark decoder, dual-mode by batch type (see graph_base):
 //   * embd batch  -> project main_x through each stage's wkv and inject K into the ring cache

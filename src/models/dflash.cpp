@@ -594,6 +594,17 @@ ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur) {
                 ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
         cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
     }
+    // The shared target head spans the padded vocabulary. A draft that proposes an id the tokenizer
+    // does not have is rejected when its batch is built ("failed to add token ... error -2"), so the
+    // draft's logits stop where the vocabulary does - the same rule the Inkling target applies to its
+    // own output. A no-op for targets that carry no padding.
+    const llama_model * m_head = model.output ? &model : llama_get_model(cparams.ctx_other);
+    const int64_t n_vocab_real = m_head ? (int64_t) m_head->hparams.n_vocab_unpadded : 0;
+
+    if (n_vocab_real > 0 && n_vocab_real < cur->ne[0]) {
+        cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, n_vocab_real, cur->ne[1], cur->nb[1], 0));
+    }
+
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
