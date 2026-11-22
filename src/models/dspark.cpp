@@ -229,6 +229,10 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     const int64_t block_size = std::stoi(it->second);
     GGML_ASSERT(block_size > 0);
 
+    // Inkling's head biases logits the verifier reads after a softcap; the other dspark drafts have
+    // always had the bias added to uncapped logits and keep that behaviour
+    const float softcap = model.dspark_fuse ? g.hparams.f_final_logit_softcapping : 0.0f;
+
     // bonus anchor (SpecForge exports): slot 0 is a bonus token, not a prediction slot
     const auto it_anchor          = model.gguf_kv.find("dflash.sample_from_anchor");
     const bool sample_from_anchor = it_anchor == model.gguf_kv.end() || it_anchor->second == "true";
@@ -336,6 +340,12 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]);
         ggml_tensor * col    = ggml_add(ctx0, base_i, bias);
 
+        if (softcap > 0.0f) {
+            // the reference caps after the bias - add_softcap(base_logits, bias, final_logit_softcapping) -
+            // and dflash's build_logits does not cap dspark logits, so this is the only cap on the path
+            col = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, col, 1.0f / softcap)), softcap);
+        }
+
         cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
 
         if (has_conf) {
@@ -426,6 +436,11 @@ llama_model_dflash::graph_dspark::graph_dspark(const llm_graph_params & params) 
     if (ubatch.embd || ubatch.embd_row) {
         build_inject();
         return;
+    }
+
+    // every slot of a block is predicted against the anchor's context window, not its own offset
+    if (model.dspark_mask_embd && use_iswa) {
+        inp_attn_iswa->self_attn_mask_swa.block_uniform = true;
     }
 
     ggml_tensor * inp_tokens = build_inp_tokens();
