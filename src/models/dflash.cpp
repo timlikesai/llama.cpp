@@ -232,8 +232,8 @@ static ggml_tensor * build_inp_target_features(llm_graph_context & g, llm_graph_
     return inp.embd;
 }
 
-// injection batch: the target features fused through the encoder
-ggml_tensor * llama_model_dflash::build_inject_inp(llm_graph_context & g, const llama_model & model) {
+// injection batch: the target features of every token, concatenated as [n_taps * n_embd, n_tokens]
+static ggml_tensor * build_inp_features(llm_graph_context & g) {
     const int64_t n_embd_inp = g.hparams.n_embd_inp_enc();
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
@@ -243,8 +243,53 @@ ggml_tensor * llama_model_dflash::build_inject_inp(llm_graph_context & g, const 
 
     g.res->add_input(std::move(inp));
 
+    return inp_target;
+}
+
+// injection batch: the target features fused through the encoder
+ggml_tensor * llama_model_dflash::build_inject_inp(llm_graph_context & g, const llama_model & model) {
+    ggml_tensor * inp_target = build_inp_features(g);
+
     ggml_tensor * inp_g = g.build_lora_mm(model.fc, inp_target, model.fc_s);
     return g.build_norm(inp_g, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
+}
+
+// DFlare: the mixing weights of every target tap, one column of dspark_fuse per mix
+ggml_tensor * llama_model_dflash::build_dflare_alpha(ggml_context * ctx0, ggml_tensor * fuse) {
+    GGML_ASSERT(fuse->type == GGML_TYPE_F32); // the reference derives the weights from fp32
+
+    // soft max runs along ne[0], which is the tap axis of {n_taps, n_mix}
+    return ggml_soft_max(ctx0, fuse);
+}
+
+// DFlare: the concatenated target taps of an injection batch as {n_taps, n_embd, n_tokens}, ready to weight.
+// every mix reads the same taps, so the copy is done once per injection batch
+ggml_tensor * llama_model_dflash::build_dflare_taps(ggml_context * ctx0, ggml_tensor * feats, int64_t n_embd) {
+    const int64_t n_taps   = feats->ne[0]/n_embd;
+    const int64_t n_tokens = feats->ne[1];
+
+    GGML_ASSERT(n_taps > 0 && feats->ne[0] == n_taps*n_embd); // one concatenated row of taps per token
+
+    ggml_tensor * taps = ggml_reshape_3d(ctx0, feats, n_embd, n_taps, n_tokens);
+
+    return ggml_cont(ctx0, ggml_permute(ctx0, taps, 1, 0, 2, 3));
+}
+
+// DFlare: mix i_mix of the target taps, then normalize the result
+ggml_tensor * llama_model_dflash::build_dflare_mix(
+        ggml_context * ctx0, ggml_tensor * taps, ggml_tensor * alpha, int64_t i_mix, ggml_tensor * norm_w, float eps) {
+    const int64_t n_taps   = taps->ne[0];
+    const int64_t n_embd   = taps->ne[1];
+    const int64_t n_tokens = taps->ne[2];
+
+    GGML_ASSERT(alpha->ne[0] == n_taps && i_mix >= 0 && i_mix < alpha->ne[1]);
+
+    ggml_tensor * cur = ggml_mul(ctx0, taps, ggml_view_3d(ctx0, alpha, n_taps, 1, 1, alpha->nb[1], alpha->nb[2], i_mix*alpha->nb[1]));
+    cur = ggml_sum_rows(ctx0, ggml_reshape_2d(ctx0, cur, n_taps, n_embd*n_tokens));
+    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
+
+    cur = ggml_rms_norm(ctx0, cur, eps);
+    return ggml_mul(ctx0, cur, norm_w);
 }
 
 // tok_embd from the target model (shared via ctx_other) when the draft has none
@@ -309,11 +354,28 @@ ggml_tensor * llama_model_dflash::graph_base::build_rope(ggml_tensor * cur, ggml
 
 // KV cache injection
 ggml_tensor * llama_model_dflash::graph_base::build_inject() {
-    ggml_tensor * inp_g = build_inject_inp(*this, model);
-    cb(inp_g, "inp_g_embeddings", -1);
+    // DFlare mixes the target taps per stage below, the other drafts fuse them once here and share the context
+    const bool dflare = model.dspark_fuse != nullptr;
+
+    ggml_tensor * inp_g = dflare ? build_inp_features(*this) : build_inject_inp(*this, model);
+    ggml_tensor * alpha = nullptr;
+    ggml_tensor * taps  = nullptr;
+
+    if (dflare) {
+        alpha = build_dflare_alpha(ctx0, model.dspark_fuse);
+        taps  = build_dflare_taps(ctx0, inp_g, hparams.n_embd);
+    } else {
+        cb(inp_g, "inp_g_embeddings", -1);
+    }
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
+
+        ggml_tensor * inp_stage = inp_g;
+        if (dflare) {
+            inp_stage = build_dflare_mix(ctx0, taps, alpha, il, layer.dflare_norm, hparams.f_norm_rms_eps);
+            cb(inp_stage, "inp_g_embeddings", il);
+        }
 
         // Inkling keeps the target-context K/V in tensors of their own, the other drafts reuse the stage's wk/wv
         const bool ctx_kv = layer.attn_k_ctx != nullptr;
@@ -324,9 +386,9 @@ ggml_tensor * llama_model_dflash::graph_base::build_inject() {
         ggml_tensor * wv_s    = ctx_kv ? nullptr               : layer.wv_s;
         ggml_tensor * wk_norm = ctx_kv ? layer.attn_k_ctx_norm : layer.attn_k_norm;
 
-        ggml_tensor * Kcur = build_lora_mm(wk, inp_g, wk_s);
+        ggml_tensor * Kcur = build_lora_mm(wk, inp_stage, wk_s);
         const bool shared_kv = wv == nullptr;
-        ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(wv, inp_g, wv_s);
+        ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(wv, inp_stage, wv_s);
 
         Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
         Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
@@ -369,6 +431,7 @@ ggml_tensor * llama_model_dflash::graph_base::build_inject() {
         }
     }
 
+    // for DFlare this is the raw taps, each stage mixed its own copy of them above
     res->t_embd = inp_g;
 
     ggml_build_forward_expand(gf, inp_g);
@@ -551,11 +614,11 @@ llama_model_dflash::graph_dflash::graph_dflash(const llm_graph_params & params) 
 }
 
 std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const llm_graph_params & params) const {
-    // the Inkling tensors load, but its head is not implemented: the taps are mixed per stage (DFlare) and the
-    // markov readout is a recurrent head folded into the target lm head. wrong drafting is silent, the target
-    // verifies every token, so refuse to build a graph instead
+    // the Inkling tensors load, and DFlare mixes its target taps per stage, but its markov head is not
+    // implemented: the readout is a recurrent head folded into the target lm head. wrong drafting is silent,
+    // the target verifies every token, so refuse to build a graph instead
     if (variant == VARIANT_INKLING) {
-        throw std::runtime_error("Inkling DSpark drafts need DFlare tap mixing and the rnn_hidden markov head, which are not implemented");
+        throw std::runtime_error("Inkling DSpark drafts need the rnn_hidden markov head, which is not implemented");
     }
 
     switch (params.gtype) {

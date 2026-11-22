@@ -1623,7 +1623,7 @@ struct llama_model_dflash : public llama_model_base {
         VARIANT_DFLASH,
         VARIANT_DFLASH2,
         VARIANT_DSPARK,
-        VARIANT_INKLING, // dspark with a rnn_hidden markov head and DFlare tap mixing, not runnable yet
+        VARIANT_INKLING, // dspark with DFlare tap mixing and a rnn_hidden markov head, not runnable yet
         VARIANT_LILICORR,
     };
 
@@ -1709,6 +1709,13 @@ struct llama_model_dflash : public llama_model_base {
     static ggml_tensor * build_inject_inp(llm_graph_context & g, const llama_model & model);
     static ggml_tensor * get_tok_embd(const llm_graph_context & g, const llama_model & model);
     static std::pair<ggml_tensor *, ggml_tensor *> get_lm_head(const llm_graph_context & g, const llama_model & model);
+
+    // DFlare tap mixing (docs/mxfp8/33-drafter-reference-semantics.md): the softmax of one dspark_fuse
+    // column weights the target taps of one stage, then that stage's dflare_norm normalizes the mix
+    static ggml_tensor * build_dflare_alpha(ggml_context * ctx0, ggml_tensor * fuse);
+    static ggml_tensor * build_dflare_taps(ggml_context * ctx0, ggml_tensor * feats, int64_t n_embd);
+    static ggml_tensor * build_dflare_mix(ggml_context * ctx0, ggml_tensor * taps, ggml_tensor * alpha,
+            int64_t i_mix, ggml_tensor * norm_w, float eps);
 
     // DFlash2 local conv, run by the base layers of DFlash2 and LiliCorr drafts
     static ggml_tensor * build_dflash2_conv(llm_graph_context & g, ggml_tensor * hidden, ggml_tensor * dynamic, ggml_tensor * base, int side);

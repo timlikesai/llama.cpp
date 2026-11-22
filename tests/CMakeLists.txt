@@ -199,6 +199,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-server-component PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-component PRIVATE server-context)
     llama_build_and_test(test-json-schema-to-grammar.cpp  LABEL behavior)
+    # DFlare tap mixing of Inkling DSpark drafts, against the numpy oracle of tests/test_dflare_mix.py
+    llama_build_and_test(test-dflare-mix.cpp  LABEL behavior  LINK llama)
+    target_include_directories(test-dflare-mix PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/src/models)
 
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
@@ -305,6 +308,12 @@ llama_test_cmd(python3
     LABEL "python behavior"
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
     ARGS -m unittest discover -s tests -p test_kv_cache_scales.py -v
+)
+llama_test_cmd(python3
+    NAME test-dflare-mix-oracle
+    LABEL "python behavior"
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    ARGS -m unittest discover -s tests -p test_dflare_mix.py -v
 )
 llama_build_and_test(test-json-schema.cpp  LABEL behavior)
 llama_build_and_test(test-chat-auto-parser.cpp  LABEL behavior  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
