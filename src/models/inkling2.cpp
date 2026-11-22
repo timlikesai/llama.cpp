@@ -109,6 +109,12 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
         }
 
         ml.get_key(LLM_KV_MTP_ROPE_FREQUENCY_BASE, mtp_rope_freq_base, false);
+
+        // the stages' own windowing, for the non-looping case: without this the draft layers read as
+        // dense and are given full-width KV. The loop model re-applies these after it expands slots.
+        for (int d = 0; d < (int) hparams.n_layer_nextn; ++d) {
+            hparams.is_swa_impl[hparams.n_layer() + d] = mtp_is_swa[d];
+        }
     }
 
     type = LLM_TYPE_UNKNOWN;

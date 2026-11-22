@@ -41,7 +41,7 @@ void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
         const int b = n_phys + d;
         draft[d] = { hparams.n_head_arr[b],        hparams.n_head_kv_arr[b],
                      hparams.n_ff_arr[b],          hparams.n_ff_exp_arr[b],
-                     hparams.n_expert_used_arr[b], hparams.is_swa_impl[b],
+                     hparams.n_expert_used_arr[b], mtp_is_swa.empty() ? hparams.is_swa_impl[b] : mtp_is_swa[d],
                      hparams.is_recr_impl[b] };
     }
 
