@@ -136,6 +136,9 @@ struct llama_context {
     // state rows read from the h_nextn device buffer of ctx_src, see llama_set_ctx_state_src()
     bool set_ctx_state_src(llama_context * ctx_src);
     bool supports_state_row() const;
+
+    // width of the per-token state a batch can carry for this context's model, 0 when it takes none
+    size_t n_embd_state() const;
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
 

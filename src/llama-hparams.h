@@ -306,6 +306,10 @@ struct llama_hparams {
     uint32_t dflash_selector_top_k   = 0;
     uint32_t lilicorr_hidden_size    = 0;
     uint32_t lilicorr_candidate_topk = 0;
+
+    // the draft head consumes the target taps of the last committed token through the batch state
+    // channel (Inkling's rnn_hidden markov head); see llama_batch_ext_select_n_embd_state()
+    bool nextn_state_taps = false;
     uint32_t lilicorr_num_heads      = 0;
     uint32_t lilicorr_layers         = 0;
     float    lilicorr_vector_eps     = 0.0f;

@@ -211,18 +211,24 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
-    ASSERT_EMBD_OR_TOKEN(*ubatch);
-
     const int64_t n_tokens = ubatch->n_tokens;
 
-    if (ubatch->token) {
-        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
-    } else {
-        // note: mtmd embedding input goes through here
-        GGML_ASSERT(ubatch->embd);
-        GGML_ASSERT(n_embd == embd->ne[0]);
+    // a graph that already owns its token input can use this one for the state alone
+    if (tokens || embd) {
+        ASSERT_EMBD_OR_TOKEN(*ubatch);
 
-        ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
+        if (ubatch->token) {
+            GGML_ASSERT(tokens);
+            ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        } else {
+            // note: mtmd embedding input goes through here
+            GGML_ASSERT(embd);
+            GGML_ASSERT(n_embd == embd->ne[0]);
+
+            ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
+        }
+    } else {
+        GGML_ASSERT(h_rows || ubatch->embd_state);
     }
 
     if (h_rows) {
@@ -243,6 +249,12 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     res &= (!params.ubatch.token)      || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)       || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd_state) || (h      && h->ne[1]      == params.ubatch.n_tokens);
+
+    if (h && !h_rows) {
+        // a host state input cannot be filled from a batch that carries no state: presence has to
+        // match as well as width, or the reuse check passes and set_input aborts on the mismatch
+        res &= params.ubatch.embd_state != nullptr;
+    }
 
     const bool has_rows = params.ubatch.data && !params.ubatch.data->embd_state_row.empty();
     res &= has_rows == (h_rows != nullptr);

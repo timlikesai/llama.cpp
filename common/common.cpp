@@ -1427,10 +1427,18 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 // only for warmup and probe decodes, fill zeros as dummy input
-static void common_batch_set_zero_state(common_batch & batch, const llama_model * model, std::vector<float> & zeros) {
-    zeros.assign(llama_model_n_embd_out(model), 0.0f);
+static void common_batch_set_zero_state(common_batch & batch, const llama_model * model,
+        const llama_context * ctx, std::vector<float> & zeros) {
+    // the state width is a property of the model, not always its output width: a draft that takes the
+    // target's layer taps through this channel expects one concatenated row per tap
+    size_t n = ctx ? llama_n_embd_state(ctx) : 0;
+    if (n == 0) {
+        n = llama_model_n_embd_out(model);
+    }
+
+    zeros.assign(n, 0.0f);
     for (int32_t i = 0; i < batch.size(); ++i) {
-        batch.set_embd_state(i, { zeros.data(), 1, zeros.size() });
+        batch.set_embd_state(i, { zeros.data(), 1, n });
     }
 }
 
@@ -1541,7 +1549,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             tmp.resize(std::min(tmp.size(), (size_t) params.n_batch));
             common_batch batch = common_batch_get_one(lctx, tmp);
             std::vector<float> zeros;
-            common_batch_set_zero_state(batch, model, zeros);
+            common_batch_set_zero_state(batch, model, lctx, zeros);
             llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         }
         llama_memory_clear(llama_get_memory(lctx), true);
@@ -1610,7 +1618,7 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     {
         common_batch batch = common_batch_get_one(ctx, tmp);
         std::vector<float> zeros;
-        common_batch_set_zero_state(batch, llama_get_model(ctx), zeros);
+        common_batch_set_zero_state(batch, llama_get_model(ctx), ctx, zeros);
         ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
     }
     if (ret != 0) {

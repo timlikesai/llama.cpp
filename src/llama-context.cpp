@@ -1662,6 +1662,10 @@ bool llama_context::set_ctx_state_src(llama_context * ctx_src) {
     return supports_state_row();
 }
 
+size_t llama_context::n_embd_state() const {
+    return llama_batch_ext_select_n_embd_state(cparams.ctx_type, model.hparams);
+}
+
 bool llama_context::supports_state_row() const {
     // the MTP graphs read the rows, see llm_graph_context::build_inp_embd_state()
     if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
@@ -4731,6 +4735,10 @@ void llama_set_embeddings_layer_inp_dev(llama_context * ctx, bool value) {
 
 bool llama_supports_embd_row(const llama_context * ctx) {
     return ctx->supports_embd_row();
+}
+
+size_t llama_n_embd_state(const llama_context * ctx) {
+    return ctx->n_embd_state();
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {

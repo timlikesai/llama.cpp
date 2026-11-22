@@ -1219,6 +1219,10 @@ size_t llama_batch_ext_select_n_embd_state(llama_context_type ctx_type, const ll
     if (hparams.lilicorr_candidate_topk > 0) {
         return hparams.n_embd_inp();
     }
+    if (hparams.nextn_state_taps) {
+        // one concatenated row of target taps per token, the same layout the encoder features use
+        return hparams.n_embd_inp_enc();
+    }
     return 0;
 }
 
