@@ -485,11 +485,19 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
-        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+        //
+        // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero
+        // sink. rather than subtract it from the projected table - which would materialize another n_extent x n_head x
+        // n_tokens buffer - carry it inside the contraction: one extra table row of -1 times one extra r row holding
+        // the sink reproduces the same value in the single multiply
+        ggml_tensor * rel_bias = ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
+        ggml_tensor * sink_row = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, rel_bias->ne[1]), -1.0f);
+        rel_bias = ggml_concat(ctx0, rel_bias, sink_row, 0);
 
-        // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
-        table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
-        table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+        ggml_tensor * r_sink = ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens);
+        ggml_tensor * r_cur  = ggml_concat(ctx0, Rcur, r_sink, 0);
+
+        ggml_tensor * table = ggml_mul_mat(ctx0, rel_bias, r_cur);
 
         // the folded path appends a -INF bucket to the table. the table is only (extent + 1) rows wide, so the fill,
         // the concat and the narrowing are negligible, and gathering into the same type leaves the permute-copy as
@@ -498,10 +506,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         // windowed layers the same bucket also carries the past-the-window cells, so their mask folds out too
         const bool fold_mask = is_swa ? inp->fold_rel_mask_swa : inp->fold_rel_mask;
         if (fold_mask) {
-            ggml_tensor * far = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_head, 1, n_tokens), -INFINITY);
+            // flash attention takes the mask in F16 and the gather below keeps the table's type, so narrow while
+            // permuting - one copy over a strided source replaces a full-size F32 permute-copy plus a second pass
+            table = ggml_cast(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3), GGML_TYPE_F16);
+
+            ggml_tensor * far = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, n_head, 1, n_tokens), -INFINITY);
 
             table = ggml_concat(ctx0, table, far, 1);
-            table = ggml_cast(ctx0, table, GGML_TYPE_F16);
+        } else {
+            table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
         }
 
         ggml_tensor * kq_b = fold_mask ? ggml_get_rows_same_type(ctx0, table, rel_pos)
