@@ -144,6 +144,7 @@ class Inkling2Model(TextModel):
     # native_experts from --native-experts.
     supports_native_experts = True
     native_experts = False
+    supports_mtp_export = True  # the drafter is embedded as nextn layers; --no-mtp drops it deliberately
 
     # the drafter is indexed in a second pass over mtp.safetensors; the flag selects its name mapping
     _indexing_draft = False
@@ -172,7 +173,9 @@ class Inkling2Model(TextModel):
         with open(dir_model / "config.json", encoding="utf-8") as f:
             cfg = json.load(f)
         self.mtp: dict = cfg.get("mtp_config", {})
-        self.n_draft = int(self.mtp.get("num_hidden_layers", 0))
+        # convert_hf_to_gguf sets no_mtp as a class attribute before constructing, so read it either way
+        no_mtp = bool(kwargs.get("no_mtp", getattr(type(self), "no_mtp", False)))
+        self.n_draft = 0 if no_mtp else int(self.mtp.get("num_hidden_layers", 0))
         type(self)._draft_beg = int(cfg["text_config"]["num_hidden_layers"])
         type(self)._draft_count = self.n_draft
         if self.n_draft and not (dir_model / "mtp.safetensors").is_file():
@@ -412,13 +415,19 @@ class Inkling2Model(TextModel):
             trunk_theta = hp.get("rope_theta")
             if trunk_theta is not None and md.get("rope_theta") not in (None, trunk_theta):
                 raise ValueError(f"Inkling2: drafter rope_theta {md['rope_theta']} != trunk {trunk_theta}")
-            # local_layer_ids is authoritative: draft layer 0 and 2 window, layer 1 attends fully
+            # local_layer_ids is authoritative: draft layer 0 and 2 window, layer 1 attends fully.
+            # Kept out of the trunk's pattern array: inkling2 requires it to be exactly n_layer() long
             local = md.get("local_layer_ids", [])
-            self.is_swa = self.is_swa + [i in local for i in range(self.n_draft)]
+            self.draft_swa = [i in local for i in range(self.n_draft)]
             hp["intermediate_size"] = [n_ff_expert] * self.block_count + [md["intermediate_size"]] * self.n_draft
             self.block_count += self.n_draft
         hp["num_attention_heads"] = [hp.get("swa_num_attention_heads", hp["num_attention_heads"]) if s else hp["num_attention_heads"] for s in self.is_swa]
         hp["num_key_value_heads"] = [hp.get("swa_num_key_value_heads", hp["num_key_value_heads"]) if s else hp["num_key_value_heads"] for s in self.is_swa]
+        if self.n_draft:
+            # these arrays are read with n_layer_all (src/llama-model.cpp:1608-1617), so the draft layers
+            # need entries of their own; sliding_window_pattern is the exception - it is sized n_layer()
+            hp["num_attention_heads"] = hp["num_attention_heads"] + [self.mtp["num_attention_heads"]] * self.n_draft
+            hp["num_key_value_heads"] = hp["num_key_value_heads"] + [self.mtp["num_key_value_heads"]] * self.n_draft
         for name in ("n_routed_experts", "num_experts_per_tok"):
             if name not in hp:
                 raise KeyError(f"Inkling2: missing {name}")
@@ -442,6 +451,14 @@ class Inkling2Model(TextModel):
             w.add_uint32(f"{p}.markov_rank", md["markov_rank"])
             w.add_string(f"{p}.markov_head_type", md["markov_head_type"])
             w.add_array(f"{p}.target_layer_ids", md["target_layer_ids"])
+            # uint32, not bool: llama_model_loader::get_arr<vector<uint32_t>> rejects a BOOL array
+            w.add_array(f"{p}.attention.sliding_window_pattern", [int(x) for x in self.draft_swa])
+            # the drafter's MLP is dense and it has no experts: the per-layer expert arrays are read with
+            # n_layer_all, so the draft entries must be present and zero or generic sizing paths treat
+            # the stages as expert layers
+            n_trunk = self._draft_beg
+            w.add_expert_used_count([hp["num_experts_per_tok"]] * n_trunk + [0] * self.n_draft)
+            w.add_expert_feed_forward_length([n_ff_expert] * n_trunk + [0] * self.n_draft)
             if md.get("rope_theta") is not None:
                 # the trunk carries no rope at all (rope_dimension_count 0, absolute positions come from
                 # the relative bias table) while the drafter was trained with theta 1e6. The trunk's

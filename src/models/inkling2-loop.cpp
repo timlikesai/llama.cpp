@@ -14,20 +14,39 @@ void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_LOOP_VARYING,   varying, false);
 
     n_phys = hparams.n_layer();
-    const uint32_t block = hparams.attn_res_block_size;
+    const uint32_t block   = hparams.attn_res_block_size;
+    const int      n_draft = (int) hparams.n_layer_nextn; // embedded drafter blocks, if any
     // a fixed loop needs at least 2 passes, a variable loop at least 1
     if (n_passes < (varying ? 1u : 2u) || !gate_rank || !core_start || core_start >= core_end || core_end > (uint32_t) n_phys ||
-        core_start % block || core_end % block || hparams.n_layer_nextn) {
+        core_start % block || core_end % block) {
         throw std::runtime_error(format("inkling2_loop: invalid loop core [%u, %u) with block size %u, %u passes or gate rank %u for %d layers",
                 core_start, core_end, block, n_passes, gate_rank, n_phys));
     }
-    const size_t n_slot = n_phys + (size_t) (n_passes - 1)*(core_end - core_start);
-    if (n_slot > LLAMA_MAX_LAYERS) {
-        throw std::runtime_error(format("inkling2_loop: %zu cache slots exceed the maximum of %d", n_slot, LLAMA_MAX_LAYERS));
+    const size_t n_slot   = n_phys + (size_t) (n_passes - 1)*(core_end - core_start); // trunk cache slots
+    const size_t n_layers = n_slot + (size_t) n_draft;
+    if (n_layers > LLAMA_MAX_LAYERS) {
+        throw std::runtime_error(format("inkling2_loop: %zu cache slots exceed the maximum of %d", n_layers, LLAMA_MAX_LAYERS));
+    }
+
+    struct draft_layer_params {
+        uint32_t n_head, n_head_kv, n_ff, n_ff_exp, n_expert_used, is_swa, is_recr;
+    };
+
+    // The drafter occupies file blocks [n_phys, n_phys + n_draft) but its layers live above the alias
+    // region, so no replayed slot can alias over it - layer_phys() and post_arch_tensors() both stop at
+    // n_layer(), which is n_layers - n_draft = n_slot. Its per-layer parameters were read at the file
+    // block index, so carry them across before the alias fill rewrites those entries.
+    std::vector<draft_layer_params> draft(n_draft);
+    for (int d = 0; d < n_draft; ++d) {
+        const int b = n_phys + d;
+        draft[d] = { hparams.n_head_arr[b],        hparams.n_head_kv_arr[b],
+                     hparams.n_ff_arr[b],          hparams.n_ff_exp_arr[b],
+                     hparams.n_expert_used_arr[b], hparams.is_swa_impl[b],
+                     hparams.is_recr_impl[b] };
     }
 
     // expand to the cache slots before load_tensors() allocates the layers and the memory
-    hparams.n_layer_all = n_slot;
+    hparams.n_layer_all = n_layers;
     for (int il = n_phys; il < (int) n_slot; ++il) {
         const int p = layer_phys(il);
         hparams.n_head_arr[il]        = hparams.n_head_arr[p];
@@ -37,6 +56,16 @@ void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
         hparams.n_expert_used_arr[il] = hparams.n_expert_used_arr[p];
         hparams.is_swa_impl[il]       = hparams.is_swa_impl[p];
         hparams.is_recr_impl[il]      = hparams.is_recr_impl[p];
+    }
+    for (int d = 0; d < n_draft; ++d) {
+        const int il = (int) n_slot + d;
+        hparams.n_head_arr[il]        = draft[d].n_head;
+        hparams.n_head_kv_arr[il]     = draft[d].n_head_kv;
+        hparams.n_ff_arr[il]          = draft[d].n_ff;
+        hparams.n_ff_exp_arr[il]      = draft[d].n_ff_exp;
+        hparams.n_expert_used_arr[il] = draft[d].n_expert_used;
+        hparams.is_swa_impl[il]       = draft[d].is_swa;
+        hparams.is_recr_impl[il]      = draft[d].is_recr;
     }
 }
 

@@ -2540,6 +2540,18 @@ struct llama_model_inkling2 : public llama_model_base {
     // the layers stored in the file
     virtual int n_layer_phys() const { return hparams.n_layer(); }
 
+    // The DFlare drafter embedded in the main file (mtp.safetensors, nextn layers). Each stage is an
+    // ordinary dense layer in its own cache slot above the loop's aliases; the markov head reuses the
+    // model's dspark_* tensors, because Inkling's rnn_proj is the same matrix as joint_proj and only
+    // the GGUF name differs. Absent when the file carries no drafter.
+    uint32_t              mtp_block_size = 0;
+    uint32_t              mtp_markov_rank = 0;
+    float                 mtp_rope_freq_base = 0.0f; // the trunk carries no rope; the drafter was trained with 1e6
+    std::string           mtp_head_type;
+    std::vector<int32_t>  mtp_target_layers;
+    std::vector<uint32_t> mtp_is_swa; // per stage; from mtp_config.local_layer_ids
+    struct ggml_tensor *  mtp_output_norm = nullptr;
+
     // message controllers of the q, k, v and ffn inputs of a looped layer (inkling2_loop)
     enum { LOOP_CTRL_Q, LOOP_CTRL_K, LOOP_CTRL_V, LOOP_CTRL_FFN, LOOP_CTRL_COUNT };
 

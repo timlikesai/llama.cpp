@@ -78,6 +78,39 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
 
     hparams.n_sconv_channels = n_channels_max;
 
+    // the drafter's control metadata, when the file embeds one. Names are arch-scoped next to the
+    // trunk's own keys; every read is checked because a silently missing value would change what the
+    // draft head computes rather than failing.
+    if (hparams.n_layer_nextn) {
+        if (!ml.get_key(LLM_KV_MTP_BLOCK_SIZE,  mtp_block_size,  false) ||
+            !ml.get_key(LLM_KV_MTP_MARKOV_RANK, mtp_markov_rank, false) ||
+            !mtp_block_size || !mtp_markov_rank) {
+            throw std::runtime_error("inkling2: the file declares nextn layers but no mtp.block_size / mtp.markov_rank");
+        }
+
+        ml.get_key(LLM_KV_MTP_MARKOV_HEAD_TYPE, mtp_head_type, false);
+
+        if (!ml.get_arr(LLM_KV_MTP_TARGET_LAYER_IDS, mtp_target_layers, false) || mtp_target_layers.empty()) {
+            throw std::runtime_error("inkling2: missing mtp.target_layer_ids");
+        }
+
+        // ids refer to applied layers (the loop's cache slots), not file blocks, so they are bounded by
+        // the maximum layer count rather than by n_layer() at this point in loading
+        for (const auto t : mtp_target_layers) {
+            if (t < 0 || t >= (int32_t) LLAMA_MAX_LAYERS) {
+                throw std::runtime_error("inkling2: mtp.target_layer_ids out of range");
+            }
+        }
+
+        if (!ml.get_arr(LLM_KV_MTP_SLIDING_WINDOW_PATTERN, mtp_is_swa, false) ||
+                mtp_is_swa.size() != hparams.n_layer_nextn) {
+            throw std::runtime_error(format("inkling2: mtp.attention.sliding_window_pattern must give one entry per draft layer (%d)",
+                    (int) hparams.n_layer_nextn));
+        }
+
+        ml.get_key(LLM_KV_MTP_ROPE_FREQUENCY_BASE, mtp_rope_freq_base, false);
+    }
+
     type = LLM_TYPE_UNKNOWN;
 }
 
@@ -154,6 +187,67 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
         layer.ffn_exp_probs_b  = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B,  "bias",   i), {n_expert}, TENSOR_NOT_REQUIRED);
         layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*n_ff_exp, n_expert}, 0);
         layer.ffn_down_exps    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+    }
+
+    // The DFlare drafter embedded as nextn layers. Each stage is a plain dense block; it lives in the
+    // slots above the loop's aliases (layer_phys() and post_arch_tensors() stop at n_layer(), so nothing
+    // aliases over it) while the file stores it at block id n_layer_phys() + d. Dimensions come from
+    // the stage's own per-layer parameters, which load_arch_hparams moved to those slots.
+    for (int d = 0; d < (int) hparams.n_layer_nextn; ++d) {
+        const int slot = (int) hparams.n_layer() + d;
+        const int bid  = n_layer_phys() + d;
+
+        auto & layer = layers[slot];
+
+        const int64_t n_head      = hparams.n_head(slot);
+        const int64_t n_head_kv   = hparams.n_head_kv(slot);
+        const int64_t n_embd_head = hparams.n_embd_head_k(slot);
+        const int64_t n_ff        = hparams.n_ff(slot);
+
+        if (!n_head || !n_head_kv || n_head % n_head_kv || hparams.n_ff_exp(slot)) {
+            throw std::runtime_error(format("inkling2: invalid drafter stage %d: n_head %zu, n_head_kv %zu, expert ffn %zu",
+                    d, (size_t) n_head, (size_t) n_head_kv, (size_t) hparams.n_ff_exp(slot)));
+        }
+
+        layer.wq = create_tensor(tn(LLM_TENSOR_NEXTN_ATTN_Q,   "weight", bid), {n_embd, n_head * n_embd_head}, 0);
+        layer.wk = create_tensor(tn(LLM_TENSOR_NEXTN_ATTN_K,   "weight", bid), {n_embd, n_head_kv * n_embd_head}, 0);
+        layer.wv = create_tensor(tn(LLM_TENSOR_NEXTN_ATTN_V,   "weight", bid), {n_embd, n_head_kv * n_embd_head}, 0);
+        layer.wo = create_tensor(tn(LLM_TENSOR_NEXTN_ATTN_OUT, "weight", bid), {n_head * n_embd_head, n_embd}, 0);
+
+        layer.attn_norm = create_tensor(tn(LLM_TENSOR_NEXTN_IN_NORM, "weight", bid), {n_embd}, 0);
+        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_NEXTN_ATTN_Q_NORM, "weight", bid), {n_embd_head}, 0);
+        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_NEXTN_ATTN_K_NORM, "weight", bid), {n_embd_head}, 0);
+
+        // the drafter projects the target's own hidden states into separate K/V, not through its own wk/wv
+        layer.attn_k_ctx      = create_tensor(tn(LLM_TENSOR_NEXTN_ATTN_K_CTX,      "weight", bid), {n_embd, n_head_kv * n_embd_head}, 0);
+        layer.attn_v_ctx      = create_tensor(tn(LLM_TENSOR_NEXTN_ATTN_V_CTX,      "weight", bid), {n_embd, n_head_kv * n_embd_head}, 0);
+        layer.attn_k_ctx_norm = create_tensor(tn(LLM_TENSOR_NEXTN_ATTN_K_CTX_NORM, "weight", bid), {n_embd_head}, 0);
+
+        layer.dflare_norm = create_tensor(tn(LLM_TENSOR_NEXTN_DFLARE_NORM, "weight", bid), {n_embd}, 0);
+
+        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_NEXTN_POST_NORM, "weight", bid), {n_embd}, 0);
+        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_NEXTN_FFN_GATE,  "weight", bid), {n_embd, n_ff}, 0);
+        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_NEXTN_FFN_UP,    "weight", bid), {n_embd, n_ff}, 0);
+        layer.ffn_down = create_tensor(tn(LLM_TENSOR_NEXTN_FFN_DOWN,  "weight", bid), {n_ff, n_embd}, 0);
+    }
+
+    if (hparams.n_layer_nextn) {
+        const int64_t rank    = mtp_markov_rank;
+        const int64_t n_taps  = (int64_t) mtp_target_layers.size();
+        // one fuse row per stage, plus the row the markov head uses for its context (doc 33 section 3)
+        const int64_t n_mix   = (int64_t) hparams.n_layer_nextn + 1;
+
+        dspark_fuse         = create_tensor(tn(LLM_TENSOR_NEXTN_DFLARE_FUSE,        "weight"), { n_taps, n_mix }, 0);
+        dspark_mask_embd    = create_tensor(tn(LLM_TENSOR_NEXTN_MASK_EMBD,          "weight"), { n_embd }, 0);
+        mtp_output_norm     = create_tensor(tn(LLM_TENSOR_NEXTN_DFLARE_OUT_NORM,    "weight"), { n_embd }, 0);
+        dspark_norm         = create_tensor(tn(LLM_TENSOR_NEXTN_MARKOV_DFLARE_NORM, "weight"), { n_embd }, 0);
+        dspark_markov_w1    = create_tensor(tn(LLM_TENSOR_NEXTN_MARKOV_W1,          "weight"), { rank, n_vocab_padded }, 0);
+        // rnn_proj carries the same role and shape contract as joint_proj under the checkpoint's name:
+        // [state || markov_w1[prev] || hidden || f_rnn] -> gate, candidate, latent
+        dspark_joint_proj   = create_tensor(tn(LLM_TENSOR_NEXTN_MARKOV_RNN_PROJ,    "weight"), { 2*rank + 2*n_embd, 3*rank }, 0);
+        dspark_joint_proj_b = create_tensor(tn(LLM_TENSOR_NEXTN_MARKOV_RNN_PROJ,    "bias"),   { 3*rank }, 0);
+        dspark_hidden_out   = create_tensor(tn(LLM_TENSOR_NEXTN_MARKOV_HIDDEN_OUT,  "weight"), { rank, n_embd }, 0);
+        dspark_hidden_out_b = create_tensor(tn(LLM_TENSOR_NEXTN_MARKOV_HIDDEN_OUT,  "bias"),   { n_embd }, 0);
     }
 }
 
