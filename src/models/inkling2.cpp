@@ -380,7 +380,6 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
 
 ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa);
-    attn = inp->get_attn();
     recr = inp->get_recr();
 
     ggml_tensor * inp_pos = build_inp_pos();
@@ -477,57 +476,28 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         cb(Vcur, "Vcur", il);
         cb(Rcur, "Rcur", il);
 
-        ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
-
-        const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
-        const int64_t n_kv     = rel_pos->ne[0];
-
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
-        // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
+        // project r on the bias table and let attention gather it by distance: the table is n_bins x n_head x
+        // n_tokens, and nothing n_kv wide is materialized here
         //
-        // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero
-        // sink. rather than subtract it from the projected table - which would materialize another n_extent x n_head x
-        // n_tokens buffer - carry it inside the contraction: one extra table row of -1 times one extra r row holding
-        // the sink reproduces the same value in the single multiply
+        // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a
+        // zero sink. carrying it inside the contraction - one extra table row of -1 against one extra r row holding
+        // the sink - yields the projected table from a single multiply, instead of a multiply plus a full-size
+        // subtraction over n_bins x n_head x n_tokens
         ggml_tensor * rel_bias = ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
         ggml_tensor * sink_row = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, rel_bias->ne[1]), -1.0f);
         rel_bias = ggml_concat(ctx0, rel_bias, sink_row, 0);
 
-        ggml_tensor * r_sink = ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens);
-        ggml_tensor * r_cur  = ggml_concat(ctx0, Rcur, r_sink, 0);
+        ggml_tensor * r_cur = ggml_concat(ctx0, Rcur, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens), 0);
 
         ggml_tensor * table = ggml_mul_mat(ctx0, rel_bias, r_cur);
-
-        // the folded path appends a -INF bucket to the table. the table is only (extent + 1) rows wide, so the fill,
-        // the concat and the narrowing are negligible, and gathering into the same type leaves the permute-copy as
-        // the only buffer at n_kv width - in half precision. the gathered bias then *is* the mask flash attention
-        // consumes, which removes the broadcast add with the dense mask and the F32 widening of that mask. for the
-        // windowed layers the same bucket also carries the past-the-window cells, so their mask folds out too
-        const bool fold_mask = is_swa ? inp->fold_rel_mask_swa : inp->fold_rel_mask;
-        if (fold_mask) {
-            // flash attention takes the mask in F16 and the gather below keeps the table's type, so narrow while
-            // permuting - one copy over a strided source replaces a full-size F32 permute-copy plus a second pass
-            table = ggml_cast(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3), GGML_TYPE_F16);
-
-            ggml_tensor * far = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, n_head, 1, n_tokens), -INFINITY);
-
-            table = ggml_concat(ctx0, table, far, 1);
-        } else {
-            table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
-        }
-
-        ggml_tensor * kq_b = fold_mask ? ggml_get_rows_same_type(ctx0, table, rel_pos)
-                                       : ggml_get_rows(ctx0, table, rel_pos);
-        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
-        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
-        cb(kq_b, "kq_b", il);
 
         sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
 
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
+                Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il);
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
