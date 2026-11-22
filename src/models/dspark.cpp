@@ -207,7 +207,10 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
     ggml_tensor * w1 = model.dspark_markov_w1;
     ggml_tensor * w2 = model.dspark_markov_w2;
-    GGML_ASSERT(w1 && w2 && "DSpark markov weights not loaded");
+
+    // the rnn_hidden variant has no markov_w2: its latent reaches the vocabulary through dspark_hidden_out
+    // and the (shared) target lm head, so w2 is only required when there is no readout to replace it
+    GGML_ASSERT(w1 && (w2 || model.dspark_hidden_out) && "DSpark markov weights not loaded");
 
     // confidence head is optional
     const bool has_conf = model.dspark_conf_proj != nullptr;
@@ -286,7 +289,24 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             markov = ggml_tanh(ctx0, chunk(2));
         }
 
-        ggml_tensor * bias = g.build_lora_mm(w2, markov, model.dspark_markov_w2_s); // [n_vocab_draft, n_blocks]
+        ggml_tensor * bias;
+
+        if (model.dspark_hidden_out) {
+            // Inkling (rnn_hidden): the reference pre-computes fold_weight = lm_head @ hidden_out.T in fp64 and
+            // applies it to the latent in one step. That product is associative, so contracting in two steps -
+            // latent -> n_embd through hidden_out, then n_embd -> vocab through the shared target lm head - is
+            // the same map without folding anything into the target. See docs/mxfp8/36 for the measured delta.
+            ggml_tensor * lat = g.build_lora_mm(model.dspark_hidden_out, markov, nullptr); // [n_embd, n_blocks]
+
+            if (model.dspark_hidden_out_b) {
+                lat = ggml_add(ctx0, lat, model.dspark_hidden_out_b);
+            }
+
+            const auto lm_head = llama_model_dflash::get_lm_head(g, model);
+            bias = g.build_lora_mm(lm_head.first, lat, lm_head.second); // [n_vocab, n_blocks]
+        } else {
+            bias = g.build_lora_mm(w2, markov, model.dspark_markov_w2_s); // [n_vocab_draft, n_blocks]
+        }
         if (model.d2t) {
             // reduced draft vocab: scatter the bias to the target rows (base is -inf on the others)
             const int64_t n_draft_vocab = bias->ne[0];
