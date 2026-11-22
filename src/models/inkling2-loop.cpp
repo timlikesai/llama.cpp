@@ -109,7 +109,14 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
 
     auto * cur = build_inputs();
     std::vector<ggml_tensor *> blocks;
+
+    // DSpark target features are indexed by layer visit, not by cache slot: tap 41 names the 41st
+    // application of a layer, which shares weights with an earlier one but is a distinct position in
+    // the sequence the drafter was trained on.
+    int visit = 0;
+
     for (int il = 0; il < start; ++il) {
+        publish_tap(visit++, cur);
         cur = build_layer(il, il, cur, blocks);
     }
 
@@ -128,6 +135,7 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
         }
         for (int ip = start; ip < end; ++ip) {
             const int il = pass == 0 ? ip : m.n_phys + (pass - 1)*(end - start) + (ip - start);
+            publish_tap(visit++, cur);
             if (pass == 0) {
                 cur = build_layer(il, ip, cur, blocks);
                 continue;
@@ -138,7 +146,11 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     }
 
     for (int il = end; il < m.n_phys; ++il) {
+        publish_tap(visit++, cur);
         cur = build_layer(il, il, cur, blocks);
     }
+
+    GGML_ASSERT(visit == n_layer && "the drafter indexes taps by layer visit, so every visit must be counted");
+
     build_output(cur, blocks);
 }

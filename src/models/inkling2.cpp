@@ -407,17 +407,6 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     const auto & layer = model.layers[il];
 
-    // The drafter is conditioned on the attention input of the tapped layers (mtp.target_layer_ids),
-    // which the target publishes to a device buffer the draft reads by row. il is the applied-layer
-    // slot, which is the space the tap ids live in - for this model ids above the physical layer count
-    // name a replayed pass, not a file block.
-    if (il < (int) cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
-        res->t_layer_inp[il] = cur;
-
-        cb(cur, "layer_inp", il);
-        ggml_build_forward_expand(gf, res->t_layer_inp[il]);
-    }
-
     const bool    is_swa       = hparams.is_swa(il);
     const int64_t n_head       = hparams.n_head(il);
     const int64_t n_head_kv    = hparams.n_head_kv(il);
@@ -572,19 +561,33 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     return cur;
 }
 
+// The drafter reads mtp.target_layer_ids from the target's layer-input buffer. The ids count layer
+// *visits*, so on a loop model a replayed pass has its own index even though it shares weights - the
+// call site, not build_layer, is where that index is known.
+void llama_model_inkling2::graph::publish_tap(int visit, ggml_tensor * cur) {
+    if (visit < 0 || visit >= (int) cparams.embeddings_layer_inp.size() || !cparams.embeddings_layer_inp[visit]) {
+        return;
+    }
+
+    res->t_layer_inp[visit] = cur;
+
+    cb(cur, "layer_inp", visit);
+    ggml_build_forward_expand(gf, res->t_layer_inp[visit]);
+}
+
 void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {
     cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
 
-    // a tap id equal to the applied-layer count is the model's final hidden state, before the output
-    // norm: the draft reads layer inputs, and this is what the next layer would have seen
+    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+
+    // a tap id equal to the applied-layer count is the last target feature, which is the *normalized*
+    // output (ref/dspark.py taps the final norm output of every token, not the pre-norm sum)
     if (n_layer < (int) cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
         res->t_layer_inp[n_layer] = cur;
 
         cb(cur, "layer_inp", n_layer);
         ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
     }
-
-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
     if (inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
@@ -614,6 +617,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
 
     std::vector<ggml_tensor *> blocks;
     for (int il = 0; il < n_layer; ++il) {
+        publish_tap(il, cur); // the drafter is conditioned on the attention input of tapped layers
         cur = build_layer(il, il, cur, blocks);
     }
 

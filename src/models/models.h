@@ -2594,6 +2594,8 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
                 ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
         void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+        // record a layer visit as a DSpark target feature; only the caller knows the visit number
+        void publish_tap(int visit, ggml_tensor * cur);
 
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
         llm_graph_input_attn_kv_iswa        * attn = nullptr;
