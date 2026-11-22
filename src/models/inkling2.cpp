@@ -407,6 +407,17 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     const auto & layer = model.layers[il];
 
+    // The drafter is conditioned on the attention input of the tapped layers (mtp.target_layer_ids),
+    // which the target publishes to a device buffer the draft reads by row. il is the applied-layer
+    // slot, which is the space the tap ids live in - for this model ids above the physical layer count
+    // name a replayed pass, not a file block.
+    if (il < (int) cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+        res->t_layer_inp[il] = cur;
+
+        cb(cur, "layer_inp", il);
+        ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+    }
+
     const bool    is_swa       = hparams.is_swa(il);
     const int64_t n_head       = hparams.n_head(il);
     const int64_t n_head_kv    = hparams.n_head_kv(il);
@@ -563,6 +574,16 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
 void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {
     cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
+
+    // a tap id equal to the applied-layer count is the model's final hidden state, before the output
+    // norm: the draft reads layer inputs, and this is what the next layer would have seen
+    if (n_layer < (int) cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
+        res->t_layer_inp[n_layer] = cur;
+
+        cb(cur, "layer_inp", n_layer);
+        ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
+    }
+
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
     if (inp_out_ids) {
