@@ -1500,8 +1500,10 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
 
-            // the rnn head conditions on the block's anchor: its target taps ride along in the state
-            const float * anchor_taps = n_embd_state > 0 ? tap_row(seq_id, dp.pos0 - 1) : nullptr;
+            // the rnn head conditions on the block's anchor. slot 0 of the block carries dp.id_last at
+            // position dp.pos0 (the loop below numbers the block n + i), so the anchor's taps are that
+            // position's - one back is the token before it, which is a real vector and quietly useless
+            const float * anchor_taps = n_embd_state > 0 ? tap_row(seq_id, dp.pos0) : nullptr;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
                 const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
                 if (anchor_taps) {
