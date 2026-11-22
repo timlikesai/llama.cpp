@@ -43,6 +43,11 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         // no metadata key names the markov head, so read it from the tensors: only the Inkling draft folds
         // the head readout into the target lm head (dspark_hidden_out) instead of shipping markov_w2
         variant = ml.get_tensor_meta("dspark_hidden_out.weight") ? VARIANT_INKLING : VARIANT_DSPARK;
+        if (variant == VARIANT_INKLING) {
+            // the markov head needs the anchor token's target taps, which the drafting pass cannot
+            // read from the target itself, so they travel in the batch's state rows
+            hparams.nextn_state_taps = true;
+        }
     } else if (has_selector) {
         variant = VARIANT_DFLASH2;
     } else if (has_lilicorr) {
@@ -292,6 +297,31 @@ ggml_tensor * llama_model_dflash::build_dflare_mix(
     return ggml_mul(ctx0, cur, norm_w);
 }
 
+// Inkling's rnn_hidden head mixes the same target taps as the draft stages, but with the extra row of
+// dspark_fuse and a norm of its own (ref/dspark.py: compute_f_rnn = mix(features, -1, markov_head.dflare_norm)).
+// "the last committed token" is a block's anchor, and the anchor's taps are handed over by the host through
+// the batch state channel, because only the injection pass can read the target's layer inputs.
+ggml_tensor * llama_model_dflash::build_inkling_head_state(llm_graph_context & g) {
+    GGML_ASSERT(g.model.dspark_fuse && g.model.dspark_norm);
+
+    const int64_t n_embd     = g.hparams.n_embd;
+    const int64_t n_embd_enc = g.hparams.n_embd_inp_enc();
+
+    auto inp = std::make_unique<llm_graph_input_embd_h>(0, n_embd_enc);
+
+    inp->h = g.build_inp_embd_state(inp.get(), n_embd_enc); // the helper returns it, the caller stores it
+    ggml_tensor * feats = inp->h;
+    g.cb(feats, "mtp_head_taps", -1);
+
+    g.res->add_input(std::move(inp));
+
+    ggml_tensor * alpha = build_dflare_alpha(g.ctx0, g.model.dspark_fuse);
+    ggml_tensor * taps  = build_dflare_taps(g.ctx0, feats, n_embd);
+
+    // the head's row is the one beyond the draft stages
+    return build_dflare_mix(g.ctx0, taps, alpha, alpha->ne[1] - 1, g.model.dspark_norm, g.hparams.f_norm_rms_eps);
+}
+
 // tok_embd from the target model (shared via ctx_other) when the draft has none
 ggml_tensor * llama_model_dflash::get_tok_embd(const llm_graph_context & g, const llama_model & model) {
     if (model.tok_embd) {
@@ -451,12 +481,15 @@ ggml_tensor * llama_model_dflash::graph_base::build_inp_tokens() {
     return inp_tokens;
 }
 
-ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tokens) {
+ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tokens, ggml_tensor * inpL_pre) {
     const float kq_scale = hparams.f_attention_scale != 0.0f ? hparams.f_attention_scale : 1.0f/sqrtf(float(n_embd_head));
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, get_tok_embd(*this, model), inp_tokens);
-    if (hparams.f_embedding_scale != 0.0f) {
-        inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
+    ggml_tensor * inpL = inpL_pre;
+    if (inpL == nullptr) {
+        inpL = ggml_get_rows(ctx0, get_tok_embd(*this, model), inp_tokens);
+        if (hparams.f_embedding_scale != 0.0f) {
+            inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
+        }
     }
     cb(inpL, "inp_noise_embd", -1);
 
@@ -625,13 +658,6 @@ llama_model_dflash::graph_dflash::graph_dflash(const llm_graph_params & params) 
 }
 
 std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const llm_graph_params & params) const {
-    // the Inkling tensors load, and DFlare mixes its target taps per stage, but its markov head is not
-    // implemented: the readout is a recurrent head folded into the target lm head. wrong drafting is silent,
-    // the target verifies every token, so refuse to build a graph instead
-    if (variant == VARIANT_INKLING) {
-        throw std::runtime_error("Inkling DSpark drafts need the rnn_hidden markov head, which is not implemented");
-    }
-
     switch (params.gtype) {
         case LLM_GRAPH_TYPE_ENCODER:
             return std::make_unique<graph<true>>(params);
@@ -647,7 +673,7 @@ std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const ll
                 case VARIANT_DFLASH:   return std::make_unique<graph_dflash>(params);
                 case VARIANT_DFLASH2:  return std::make_unique<graph_dflash2>(params);
                 case VARIANT_DSPARK:   return std::make_unique<graph_dspark>(params);
-                case VARIANT_INKLING:  break; // rejected above
+                case VARIANT_INKLING:  return std::make_unique<graph_dspark>(params);
                 case VARIANT_LILICORR: return std::make_unique<graph_lilicorr>(params);
             }
             GGML_ABORT("invalid DFlash variant");

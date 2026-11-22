@@ -996,6 +996,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     int32_t n_embd_dec = 0;  // draft hidden size
     int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
+    int32_t n_layer_tgt = 0; // target model layer count; a tap id equal to it means the final hidden state
     int32_t n_embd_tgt = 0;  // target model hidden size
 
     int32_t     block_size    = 0;
@@ -1009,6 +1010,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // inject target features from the target's device buffer instead of host copies (env LLAMA_DFLASH_DEV=0 disables)
     bool use_dev_features = false;
+
+    // the Inkling rnn markov head conditions on the anchor token's target taps; the drafting batch
+    // carries them in its state rows, so keep the last few positions of every sequence
+    int32_t n_embd_state = 0;            // width the draft context expects, 0 when it reads none
+    int32_t n_state_rows = 0;
+    std::vector<float>     state_buf;    // [n_seq * n_state_rows][n_embd_enc]
+    std::vector<llama_pos> state_pos;    // the position each slot holds, -1 when empty
+    std::vector<float>     state_zeros;  // stand-in for a position that was never injected
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
@@ -1114,10 +1123,23 @@ protected:
             }
         }
 
-        // turn on extraction of the target layers' input embeddings
+        // turn on extraction of the target layers' input embeddings. a tap id equal to n_layer is not a
+        // layer but the model's final hidden state: EAGLE3 reads that one from the nextn buffer, but
+        // nextn is the *post*-output-norm vector, and a drafter wants what the next layer would have
+        // seen, i.e. before the norm. models that publish it (Inkling does, at t_layer_inp[n_layer])
+        // are served from the same channel as every other tap.
+        n_layer_tgt = (int32_t) llama_model_n_layer(llama_get_model(ctx_tgt));
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            if (target_layer_ids[k] > (uint32_t) n_layer_tgt) {
+                GGML_ABORT("DFlash: target layer id %d exceeds target n_layer %d", target_layer_ids[k], n_layer_tgt);
+            }
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
+
+        // whether the draft head consumes the target taps through its batch state rows (Inkling's
+        // rnn markov head). such a draft has to use the host copies: enabling the device buffer makes
+        // extract_layer_inputs() skip filling them at all, and the reads then abort
+        n_embd_state = (int32_t) llama_n_embd_state(ctx_dft);
 
         // the device buffer keeps layers in ascending id order, the fc input expects target_layer_ids order
         {
@@ -1125,7 +1147,8 @@ protected:
             const bool ascending = std::adjacent_find(target_layer_ids, target_layer_ids + target_layer_ids_n,
                     [](int32_t a, int32_t b) { return a >= b; }) == target_layer_ids + target_layer_ids_n;
 
-            use_dev_features = opt.dev_features && ascending && (env == nullptr || atoi(env) != 0);
+            use_dev_features = opt.dev_features && ascending && n_embd_state == 0
+                && (env == nullptr || atoi(env) != 0);
             if (use_dev_features) {
                 llama_set_embeddings_layer_inp_dev(ctx_tgt, true);
                 use_dev_features = llama_supports_embd_row(ctx_dft);
@@ -1133,6 +1156,21 @@ protected:
                     llama_set_embeddings_layer_inp_dev(ctx_tgt, false);
                 }
             }
+            if (n_embd_state > 0) {
+                if (n_embd_state != n_embd_enc) {
+                    GGML_ABORT("DFlash: the draft wants %d state floats, the target taps are %d",
+                            n_embd_state, n_embd_enc);
+                }
+
+                n_state_rows = block_size + 2;
+                state_buf.assign((size_t) n_seq * n_state_rows * n_embd_enc, 0.0f);
+                state_pos.assign((size_t) n_seq * n_state_rows, -1);
+                state_zeros.assign(n_embd_enc, 0.0f);
+
+                LOG_INF("%s: draft markov head takes the anchor's target taps (%d floats) from state rows\n",
+                        __func__, n_embd_enc);
+            }
+
             LOG_INF("%s: DFlash target features via %s\n", __func__, use_dev_features ? "device buffer" : "host copies");
         }
 
@@ -1143,6 +1181,25 @@ protected:
     // only LiliCorr uses this, to keep the context features for its scorer; the other heads only need the KV cache
     // called after the host copy injection of a chunk, while h_nextn still holds the context features of batch_inject
     virtual void store_context_features(llama_seq_id /*seq_id*/, int32_t /*n_chunk*/) {}
+
+    // the committed anchor token's target taps; a position that was never injected (an image pinned
+    // out of the window, say) falls back to zeros, which only weakens the draft, never the output
+    const float * tap_row(llama_seq_id seq_id, llama_pos pos) {
+        if (pos < 0 || n_state_rows <= 0) {
+            return state_zeros.empty() ? nullptr : state_zeros.data();
+        }
+        const size_t slot = (size_t) seq_id * n_state_rows + (size_t) pos % n_state_rows;
+        if (state_pos[slot] != pos) {
+            static bool warned = false;
+            if (!warned) {
+                LOG_WRN("%s: no target taps recorded for seq %d position %d, the markov head runs without them\n",
+                        __func__, (int) seq_id, (int) pos);
+                warned = true;
+            }
+            return state_zeros.data();
+        }
+        return state_buf.data() + slot * n_embd_enc;
+    }
 
 public:
     ~common_speculative_impl_draft_dflash() override {
@@ -1260,6 +1317,17 @@ public:
                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
                         const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                    }
+                }
+
+                if (n_embd_state > 0) {
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
+                        const size_t  slot = (size_t) seq_id * n_state_rows + (size_t) p % n_state_rows;
+                        std::memcpy(state_buf.data() + slot * n_embd_enc,
+                                    features_buf.data() + (size_t) i * n_embd_enc,
+                                    (size_t) n_embd_enc * sizeof(float));
+                        state_pos[slot] = p;
                     }
                 }
 
@@ -1431,8 +1499,14 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             const int32_t n_block_tokens = n_draft + (sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
+
+            // the rnn head conditions on the block's anchor: its target taps ride along in the state
+            const float * anchor_taps = n_embd_state > 0 ? tap_row(seq_id, dp.pos0 - 1) : nullptr;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
+                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
+                if (anchor_taps) {
+                    batch.set_embd_state(idx, { (float *) anchor_taps, 1, (size_t) n_embd_enc });
+                }
             }
         }
 

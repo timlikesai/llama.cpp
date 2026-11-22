@@ -1623,7 +1623,7 @@ struct llama_model_dflash : public llama_model_base {
         VARIANT_DFLASH,
         VARIANT_DFLASH2,
         VARIANT_DSPARK,
-        VARIANT_INKLING, // dspark with DFlare tap mixing and a rnn_hidden markov head, not runnable yet
+        VARIANT_INKLING, // dspark with DFlare tap mixing and an rnn_hidden markov head (Inkling)
         VARIANT_LILICORR,
     };
 
@@ -1670,7 +1670,9 @@ struct llama_model_dflash : public llama_model_base {
 
         ggml_tensor * build_inject();
         ggml_tensor * build_inp_tokens();
-        ggml_tensor * build_layers(ggml_tensor * inp_tokens);
+        // inpL bypasses the vocabulary lookup: a draft whose block slots are not token ids (Inkling masks
+        // them with one learned vector) hands in the assembled block embedding directly
+        ggml_tensor * build_layers(ggml_tensor * inp_tokens, ggml_tensor * inpL = nullptr);
         ggml_tensor * build_logits(ggml_tensor * cur);
         ggml_tensor * build_rope(ggml_tensor * cur, ggml_tensor * pos, int il);
     };
@@ -1684,6 +1686,8 @@ struct llama_model_dflash : public llama_model_base {
     };
 
     struct graph_dspark : public graph_base {
+    ggml_tensor * build_block_embd(ggml_tensor * inp_tokens);
+
         graph_dspark(const llm_graph_params & params);
     };
 
@@ -1716,6 +1720,9 @@ struct llama_model_dflash : public llama_model_base {
     static ggml_tensor * build_dflare_taps(ggml_context * ctx0, ggml_tensor * feats, int64_t n_embd);
     static ggml_tensor * build_dflare_mix(ggml_context * ctx0, ggml_tensor * taps, ggml_tensor * alpha,
             int64_t i_mix, ggml_tensor * norm_w, float eps);
+
+    // the rnn_hidden markov head conditions on the last committed token's mixed target taps
+    static ggml_tensor * build_inkling_head_state(llm_graph_context & g);
 
     // DFlash2 local conv, run by the base layers of DFlash2 and LiliCorr drafts
     static ggml_tensor * build_dflash2_conv(llm_graph_context & g, ggml_tensor * hidden, ggml_tensor * dynamic, ggml_tensor * base, int side);

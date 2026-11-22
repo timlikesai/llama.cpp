@@ -201,7 +201,8 @@ void llama_model_dflash::load_tensors_layers_mistral_large4() {
 }
 
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
-static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, ggml_tensor * hidden = nullptr) {
+static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens,
+        ggml_tensor * hidden = nullptr, ggml_tensor * f_rnn = nullptr) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -276,6 +277,14 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             ggml_tensor * hidden_i = ggml_view_2d(ctx0, hidden, hidden->ne[0], n_blocks,
                                                   (size_t) block_drafts * hidden->nb[1], i*hidden->nb[1]);
             ggml_tensor * joint = ggml_concat(ctx0, ggml_concat(ctx0, state, w1_prev, 0), ggml_cont(ctx0, hidden_i), 0);
+
+            if (f_rnn) {
+                // the reference reuses one context for the whole block: f_rnn belongs to the anchor, the
+                // committed token that starts it, so the same column is read at every position i
+                ggml_tensor * anchor = ggml_cont(ctx0, ggml_view_2d(ctx0, f_rnn, f_rnn->ne[0], n_blocks,
+                                            (size_t) block_drafts * f_rnn->nb[1], 0));
+                joint = ggml_concat(ctx0, joint, anchor, 0);
+            }
             joint = ggml_add(ctx0, ggml_mul_mat(ctx0, model.dspark_joint_proj, joint), model.dspark_joint_proj_b); // [3R, n_blocks]
 
             const auto chunk = [&](int64_t k) {
@@ -370,6 +379,48 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     ggml_build_forward_expand(g.gf, out);
 }
 
+// Inkling represents the masked slots of a draft block with one learned vector (mtp.mask_embed), shared
+// by every slot - not with the vocabulary's mask token, and not with a row per slot like the other dspark
+// backbones. Embedding the mask token id instead reads a row of the target's embedding table that has
+// nothing to do with the drafter's training, which shows up as near-zero acceptance rather than an error.
+ggml_tensor * llama_model_dflash::graph_dspark::build_block_embd(ggml_tensor * inp_tokens) {
+    if (model.dspark_mask_embd == nullptr || model.dspark_fuse == nullptr) {
+        return nullptr; // not the Inkling variant
+    }
+    GGML_ASSERT(model.dspark_mask_embd->ne[1] == 1 && "the Inkling mask embedding is one shared vector");
+
+    const int64_t n_embd       = hparams.n_embd;
+    const int64_t n_blocks     = ubatch.n_seqs_unq;
+    const int64_t block_drafts = n_blocks > 0 ? n_tokens / n_blocks : 0;
+
+    if (n_blocks <= 0 || n_tokens % n_blocks != 0 || block_drafts > (int64_t) hparams.dflash_block_size) {
+        return nullptr; // not a draft block (e.g. graph reserve), fall back to the token path
+    }
+
+    // slot 0 of every block is the committed anchor token, the rest are masked
+    ggml_tensor * anchors = ggml_view_2d(ctx0, inp_tokens, 1, n_blocks, (size_t) block_drafts * inp_tokens->nb[0], 0);
+    anchors = ggml_get_rows(ctx0, get_tok_embd(*this, model), ggml_cont_1d(ctx0, anchors, n_blocks));
+
+    // the reference normalizes the anchor embedding with the *target's* embedding norm, which it borrows
+    // at load time (ref/dspark.py: model.embed_norm = target_model.model.embed_norm) - so it is not a
+    // tensor of the draft file, and skipping it leaves slot 0 on a different scale than training saw
+    if (cparams.ctx_other != nullptr) {
+        const llama_model * m_tgt = llama_get_model(cparams.ctx_other);
+        if (m_tgt->tok_norm) {
+            anchors = build_norm(anchors, m_tgt->tok_norm, nullptr, LLM_NORM_RMS, -1);
+            cb(anchors, "inp_anchor_norm", -1);
+        }
+    }
+
+    ggml_tensor * inpL = ggml_reshape_3d(ctx0, anchors, n_embd, 1, n_blocks);
+    if (block_drafts > 1) {
+        ggml_tensor * masks = ggml_repeat_4d(ctx0, model.dspark_mask_embd, n_embd, block_drafts - 1, n_blocks, 1);
+        inpL = ggml_concat(ctx0, inpL, masks, 1);
+    }
+
+    return ggml_reshape_2d(ctx0, inpL, n_embd, n_tokens);
+}
+
 llama_model_dflash::graph_dspark::graph_dspark(const llm_graph_params & params) : graph_base(params) {
     ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.embd || ubatch.embd_row) {
@@ -378,16 +429,18 @@ llama_model_dflash::graph_dspark::graph_dspark(const llm_graph_params & params) 
     }
 
     ggml_tensor * inp_tokens = build_inp_tokens();
-    ggml_tensor * cur        = build_layers(inp_tokens);
+    ggml_tensor * cur        = build_layers(inp_tokens, build_block_embd(inp_tokens));
 
     build_logits(cur);
 
-    // bias the draft logits with the Markov head
-    build_dspark_markov_head(*this, model, inp_tokens);
-}
+    // bias the draft logits with the Markov head. the rnn variant reads the stage hidden states as
+    // well, and Inkling additionally conditions on the anchor token's mixed target taps
+    const bool is_rnn = model.dspark_joint_proj != nullptr;
 
-// The Inkling variant needs f_rnn, the mixed target features of the last committed token, which this
-// path cannot see yet; see docs/mxfp8/38 for what running the stages without it measured.
+    // dspark_fuse is what distinguishes the Inkling head, same test build_inject uses
+    build_dspark_markov_head(*this, model, inp_tokens, is_rnn ? cur : nullptr,
+            model.dspark_fuse ? build_inkling_head_state(*this) : nullptr);
+}
 
 // DSV4 DSpark decoder, dual-mode by batch type (see graph_base):
 //   * embd batch  -> project main_x through each stage's wkv and inject K into the ring cache
