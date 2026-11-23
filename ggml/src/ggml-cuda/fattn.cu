@@ -582,10 +582,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_NONE;
 #endif// FLASH_ATTN_AVAILABLE
 
-    if (ggml_flash_attn_ext_has_indexed_bias(dst)) {
-        return BEST_FATTN_KERNEL_NONE;
-    }
-
+    // Upstream #32740 declines indexed bias here because the CUDA kernels were deliberately left out
+    // of that PR. This branch carries them (#32808), so the dispatch lives further down, after the
+    // KV-type check it depends on. If a CUDA indexed-bias implementation ever lands upstream, delete
+    // the block below and restore the early return.
     const ggml_tensor * KQV   = dst;
     const ggml_tensor * Q     = dst->src[0];
     const ggml_tensor * K     = dst->src[1];
