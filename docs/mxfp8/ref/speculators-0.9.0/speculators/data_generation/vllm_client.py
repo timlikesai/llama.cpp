@@ -1,0 +1,285 @@
+import asyncio
+import fcntl
+import functools
+import logging
+import os
+import time
+from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
+
+import openai
+from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
+from openai.types.completion import Completion
+
+if TYPE_CHECKING:
+    from collections.abc import Coroutine
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_REQUEST_TIMEOUT = 120  # seconds
+DEFAULT_MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 2  # seconds
+
+
+class InvalidResponseError(Exception):
+    pass
+
+
+def _handle_retry_error(
+    error: Exception, attempt: int, total_attempts: int
+) -> float | None:
+    """Handle a retry-eligible error.
+
+    Returns backoff seconds if the caller should retry, or ``None`` on the
+    final attempt.  Raises ``InvalidResponseError`` immediately.
+    """
+    if isinstance(error, InvalidResponseError):
+        raise error
+    if attempt < total_attempts:
+        backoff = RETRY_BACKOFF_BASE**attempt
+        logger.warning(
+            "Request aborted (attempt %d/%d): %s. Retrying in %ds...",
+            attempt,
+            total_attempts,
+            error,
+            backoff,
+        )
+        return backoff
+    logger.error("Request timed out after %d attempts: %s", total_attempts, error)
+    return None
+
+
+def with_retries(fn):
+    """Decorator that adds retry logic with exponential backoff.
+
+    The decorated function gains a ``max_retries`` keyword argument
+    (default ``DEFAULT_MAX_RETRIES``). ``InvalidResponseError`` is never
+    retried. Works for both sync and async functions.
+    """
+    if asyncio.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def async_wrapper(*args, max_retries=DEFAULT_MAX_RETRIES, **kwargs):
+            total_attempts = max_retries + 1
+            last_error: Exception | None = None
+            for attempt in range(1, total_attempts + 1):
+                try:
+                    return await fn(*args, **kwargs)
+                except Exception as e:
+                    last_error = e
+                    backoff = _handle_retry_error(e, attempt, total_attempts)
+                    if backoff is not None:
+                        await asyncio.sleep(backoff)
+            raise last_error  # type: ignore[misc]
+
+        return async_wrapper
+
+    @functools.wraps(fn)
+    def sync_wrapper(*args, max_retries=DEFAULT_MAX_RETRIES, **kwargs):
+        total_attempts = max_retries + 1
+        last_error: Exception | None = None
+        for attempt in range(1, total_attempts + 1):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                last_error = e
+                backoff = _handle_retry_error(e, attempt, total_attempts)
+                if backoff is not None:
+                    time.sleep(backoff)
+        raise last_error  # type: ignore[misc]
+
+    return sync_wrapper
+
+
+def extract_output(
+    response: Completion | ChatCompletion,
+    token_ids: list[int],
+) -> tuple[str, dict[str, Any]]:
+    if isinstance(response, Completion):
+        prompt_token_ids = getattr(response.choices[0], "prompt_token_ids", None)
+    else:
+        prompt_token_ids = getattr(response, "prompt_token_ids", None)
+
+    if prompt_token_ids is None:
+        raise InvalidResponseError("Response missing prompt_token_ids")
+
+    if prompt_token_ids != token_ids:
+        raise InvalidResponseError(
+            f"Prompt token IDs mismatch: expected {token_ids}, got {prompt_token_ids}"
+        )
+
+    kv_transfer_params = getattr(response, "kv_transfer_params", None)
+    if kv_transfer_params is None:
+        raise InvalidResponseError("Response missing kv_transfer_params")
+
+    handle = kv_transfer_params.get("hidden_states_path") or kv_transfer_params.get(
+        "handle"
+    )
+    if handle is None:
+        raise InvalidResponseError(
+            "Response kv_transfer_params missing both 'hidden_states_path' and 'handle'"
+        )
+    return handle, kv_transfer_params
+
+
+class ClientItem(TypedDict):
+    input_ids: list[int]
+    """The input token IDs."""
+
+    messages: NotRequired[list[ChatCompletionMessageParam]]
+    """If provided, pass `messages` to Chat Completions API
+    instead of passing `token_ids` to Completions API."""
+
+
+async def _poll_lock_async(fd, poll_interval):
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            await asyncio.sleep(poll_interval)
+
+
+async def wait_for_lock_async(
+    lock_path,
+    timeout=10.0,  # noqa: ASYNC109
+    poll_interval=0.1,
+):
+    fd = os.open(lock_path, os.O_RDWR)
+    try:
+        async with asyncio.timeout(timeout):
+            await _poll_lock_async(fd, poll_interval)
+    except BaseException:
+        os.close(fd)
+        raise
+    os.close(fd)
+    os.remove(lock_path)
+
+
+def wait_for_lock(lock_path, timeout=10.0, poll_interval=0.1):
+    fd = os.open(lock_path, os.O_RDWR)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out waiting for lock: {lock_path}"
+                    ) from None
+                time.sleep(poll_interval)
+    except BaseException:
+        os.close(fd)
+        raise
+    os.close(fd)
+    os.remove(lock_path)
+
+
+# Models whose chat template appends a trailing EOS on a *closed* final turn that
+# ``input_ids`` omits; open the turn for them to keep prompt_token_ids == input_ids.
+_OPEN_FINAL_TURN_MODEL_MARKERS = ("mistral",)
+
+
+def _continue_final_message_for(model: str) -> bool:
+    """Whether to leave the final assistant turn open when re-rendering the MM
+    chat prompt. Default False (closed, reproducing ``input_ids``); True for
+    Mistral, whose template adds a spurious EOS on close."""
+    # Basename match so the ``mistralai/`` org prefix doesn't sweep in siblings.
+    name = model.rsplit("/", 1)[-1].lower()
+    return any(marker in name for marker in _OPEN_FINAL_TURN_MODEL_MARKERS)
+
+
+@with_retries
+async def generate_hidden_states_async(
+    client: openai.AsyncClient,
+    model: str,
+    client_item: ClientItem,
+    *,
+    timeout: float | None = DEFAULT_REQUEST_TIMEOUT,  # noqa: ASYNC109
+) -> tuple[str, dict[str, Any]]:
+    """
+    Runs decode with ``max_tokens=1`` and returns the generation handle together
+    with the complete ``kv_transfer_params`` returned by vLLM.
+
+    Args:
+        client: The async OpenAI client.
+        model: The model ID.
+        client_item: Inputs to send via the client.
+        timeout: Timeout in seconds for each request attempt. None for no timeout.
+    """
+    token_ids = client_item["input_ids"]
+    messages = client_item.get("messages")
+
+    coro: Coroutine[Any, Any, Completion | ChatCompletion]
+    if messages is None:
+        coro = client.completions.create(
+            model=model,
+            prompt=token_ids,
+            max_tokens=1,
+            extra_body={"return_token_ids": True},
+            timeout=timeout,
+        )
+    else:
+        coro = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=1,
+            extra_body={
+                "add_generation_prompt": False,
+                # Re-render to match the stored ``input_ids`` (model-dependent).
+                "continue_final_message": _continue_final_message_for(model),
+                "return_token_ids": True,
+            },
+            timeout=timeout,
+        )
+
+    res: Completion | ChatCompletion
+    if timeout is not None:
+        async with asyncio.timeout(timeout):
+            res = await coro
+    else:
+        res = await coro
+
+    return extract_output(res, token_ids)
+
+
+@with_retries
+def generate_hidden_states(
+    client: openai.Client,
+    model: str,
+    client_item: ClientItem,
+    *,
+    timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
+) -> tuple[str, dict[str, Any]]:
+    """
+    Runs decode with ``max_tokens=1`` and returns the generation handle together
+    with the complete ``kv_transfer_params`` returned by vLLM.
+    """
+    token_ids = client_item["input_ids"]
+    messages = client_item.get("messages")
+
+    res: Completion | ChatCompletion
+    if messages is None:
+        res = client.completions.create(
+            model=model,
+            prompt=token_ids,
+            max_tokens=1,
+            extra_body={"return_token_ids": True},
+            timeout=timeout,
+        )
+    else:
+        res = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=1,
+            extra_body={
+                "add_generation_prompt": False,
+                # Re-render to match the stored ``input_ids`` (model-dependent).
+                "continue_final_message": _continue_final_message_for(model),
+                "return_token_ids": True,
+            },
+            timeout=timeout,
+        )
+
+    return extract_output(res, token_ids)

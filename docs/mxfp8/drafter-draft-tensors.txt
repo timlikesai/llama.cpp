@@ -1,0 +1,236 @@
+===== /home/tim/models/unsloth/Inkling-2-Mini-GGUF/dspark-Inkling-2-Mini-Q8_0.gguf
+n_tensors 54
+KV GGUF.kv_count = 41
+KV GGUF.tensor_count = 54
+KV GGUF.version = 3
+KV dflash.attention.causal = False
+KV dflash.attention.head_count = 24
+KV dflash.attention.head_count_kv = 8
+KV dflash.attention.key_length = 128
+KV dflash.attention.layer_norm_rms_epsilon = 9.999999974752427e-07
+KV dflash.attention.sliding_window = 1024
+KV dflash.attention.sliding_window_pattern = [True, False, True]
+KV dflash.attention.value_length = 128
+KV dflash.block_count = 3
+KV dflash.block_size = 8
+KV dflash.context_length = 1048576
+KV dflash.dspark.markov_rank = 256
+KV dflash.embedding_length = 2304
+KV dflash.feed_forward_length = 9216
+KV dflash.final_logit_softcapping = 30.0
+KV dflash.has_confidence_head = False
+KV dflash.rope.dimension_count = 128
+KV dflash.rope.freq_base = 1000000.0
+KV dflash.sample_from_anchor = False
+KV dflash.target_layers = [5, 23, 41, 48]
+KV dflash.vocab_size = 201024
+KV dflash.vocab_size_unpadded = 200058
+KV general.architecture = dflash
+KV general.basename = Inkling-2-Mini
+KV general.file_type = 7
+KV general.name = Inkling-2-Mini
+KV general.quantization_version = 2
+KV general.size_label = 318M
+KV general.type = model
+KV tokenizer.chat_template = <big, omitted>
+KV tokenizer.ggml.add_bos_token = False
+KV tokenizer.ggml.add_eos_token = False
+KV tokenizer.ggml.clean_spaces = False
+KV tokenizer.ggml.eos_token_id = 200006
+KV tokenizer.ggml.eot_token_id = 200006
+KV tokenizer.ggml.mask_token_id = 0
+KV tokenizer.ggml.merges = <big, omitted>
+KV tokenizer.ggml.model = gpt2
+KV tokenizer.ggml.pre = inkling2
+KV tokenizer.ggml.token_type = <big, omitted>
+KV tokenizer.ggml.tokens = <big, omitted>
+--- tensors, GGML ne order (Tensor.shape) ---
+blk.0.attn_k.weight [2304, 1024] Q8_0
+blk.0.attn_k_ctx.weight [2304, 1024] Q8_0
+blk.0.attn_k_ctx_norm.weight [128] F32
+blk.0.attn_k_norm.weight [128] F32
+blk.0.attn_norm.weight [2304] F32
+blk.0.attn_output.weight [3072, 2304] Q8_0
+blk.0.attn_q.weight [2304, 3072] Q8_0
+blk.0.attn_q_norm.weight [128] F32
+blk.0.attn_v.weight [2304, 1024] Q8_0
+blk.0.attn_v_ctx.weight [2304, 1024] Q8_0
+blk.0.dflare_norm.weight [2304] F32
+blk.0.ffn_down.weight [9216, 2304] Q8_0
+blk.0.ffn_gate.weight [2304, 9216] Q8_0
+blk.0.ffn_norm.weight [2304] F32
+blk.0.ffn_up.weight [2304, 9216] Q8_0
+blk.1.attn_k.weight [2304, 1024] Q8_0
+blk.1.attn_k_ctx.weight [2304, 1024] Q8_0
+blk.1.attn_k_ctx_norm.weight [128] F32
+blk.1.attn_k_norm.weight [128] F32
+blk.1.attn_norm.weight [2304] F32
+blk.1.attn_output.weight [3072, 2304] Q8_0
+blk.1.attn_q.weight [2304, 3072] Q8_0
+blk.1.attn_q_norm.weight [128] F32
+blk.1.attn_v.weight [2304, 1024] Q8_0
+blk.1.attn_v_ctx.weight [2304, 1024] Q8_0
+blk.1.dflare_norm.weight [2304] F32
+blk.1.ffn_down.weight [9216, 2304] Q8_0
+blk.1.ffn_gate.weight [2304, 9216] Q8_0
+blk.1.ffn_norm.weight [2304] F32
+blk.1.ffn_up.weight [2304, 9216] Q8_0
+blk.2.attn_k.weight [2304, 1024] Q8_0
+blk.2.attn_k_ctx.weight [2304, 1024] Q8_0
+blk.2.attn_k_ctx_norm.weight [128] F32
+blk.2.attn_k_norm.weight [128] F32
+blk.2.attn_norm.weight [2304] F32
+blk.2.attn_output.weight [3072, 2304] Q8_0
+blk.2.attn_q.weight [2304, 3072] Q8_0
+blk.2.attn_q_norm.weight [128] F32
+blk.2.attn_v.weight [2304, 1024] Q8_0
+blk.2.attn_v_ctx.weight [2304, 1024] Q8_0
+blk.2.dflare_norm.weight [2304] F32
+blk.2.ffn_down.weight [9216, 2304] Q8_0
+blk.2.ffn_gate.weight [2304, 9216] Q8_0
+blk.2.ffn_norm.weight [2304] F32
+blk.2.ffn_up.weight [2304, 9216] Q8_0
+dspark_fuse.weight [4, 4] F32
+dspark_hidden_out.bias [2304] F32
+dspark_hidden_out.weight [256, 2304] BF16
+dspark_norm.weight [2304] F32
+joint_proj.bias [768] F32
+joint_proj.weight [5120, 768] BF16
+markov_w1.weight [256, 201024] BF16
+mask_embd.weight [2304] F32
+output_norm.weight [2304] F32
+===== /home/tim/models/z-lab/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
+n_tensors 81
+KV GGUF.kv_count = 48
+KV GGUF.tensor_count = 81
+KV GGUF.version = 3
+KV dflash.attention.causal = False
+KV dflash.attention.head_count = 32
+KV dflash.attention.head_count_kv = 8
+KV dflash.attention.key_length = 128
+KV dflash.attention.layer_norm_rms_epsilon = 9.999999974752427e-07
+KV dflash.attention.sliding_window = 2048
+KV dflash.attention.sliding_window_pattern = [True, True, True, True, True]
+KV dflash.attention.value_length = 128
+KV dflash.block_count = 5
+KV dflash.block_size = 8
+KV dflash.context_length = 262144
+KV dflash.conv_group_size = 16
+KV dflash.conv_kernel_size = 2
+KV dflash.embedding_length = 5120
+KV dflash.feed_forward_length = 17408
+KV dflash.rope.dimension_sections = [64, 0, 0, 0]
+KV dflash.rope.freq_base = 10000000.0
+KV dflash.selector_rank = 256
+KV dflash.selector_top_k = 16
+KV dflash.target_layers = [6, 20, 34, 48, 62]
+KV general.architecture = dflash
+KV general.author = Inco AI
+KV general.base_model.0.name = Qwen3.8 27B
+KV general.base_model.0.organization = Qwen
+KV general.base_model.0.repo_url = https://huggingface.co/Qwen/Qwen3.8-27B
+KV general.base_model.count = 1
+KV general.basename = Qwen3.8-27B
+KV general.file_type = 15
+KV general.finetune = DFlash2
+KV general.license = apache-2.0
+KV general.name = Qwen3.8-27B-DFlash2
+KV general.organization = z-lab
+KV general.quantization_version = 2
+KV general.size_label = 1.9B
+KV general.source.url = https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2
+KV general.tags = ['dflash2', 'speculative-decoding', 'block-diffusion', 'draft-model', 'sglang', 'text-generation']
+KV general.type = model
+KV tokenizer.chat_template = <big, omitted>
+KV tokenizer.ggml.add_bos_token = False
+KV tokenizer.ggml.bos_token_id = 248044
+KV tokenizer.ggml.eos_token_id = 248046
+KV tokenizer.ggml.mask_token_id = 248070
+KV tokenizer.ggml.merges = <big, omitted>
+KV tokenizer.ggml.model = gpt2
+KV tokenizer.ggml.padding_token_id = 248044
+KV tokenizer.ggml.pre = qwen35
+KV tokenizer.ggml.token_type = <big, omitted>
+KV tokenizer.ggml.tokens = <big, omitted>
+--- tensors, GGML ne order (Tensor.shape) ---
+blk.0.attn_conv_base [5120, 2, 2] F32
+blk.0.attn_conv_proj.weight [5120, 1280] Q4_K
+blk.0.attn_k.weight [5120, 1024] Q4_K
+blk.0.attn_k_norm.weight [128] F32
+blk.0.attn_norm.weight [5120] F32
+blk.0.attn_output.weight [4096, 5120] Q4_K
+blk.0.attn_q.weight [5120, 4096] Q4_K
+blk.0.attn_q_norm.weight [128] F32
+blk.0.attn_v.weight [5120, 1024] Q4_K
+blk.0.ffn_conv_base [5120, 2, 2] F32
+blk.0.ffn_conv_proj.weight [5120, 1280] Q4_K
+blk.0.ffn_down.weight [17408, 5120] Q4_K
+blk.0.ffn_gate.weight [5120, 17408] Q4_K
+blk.0.ffn_norm.weight [5120] F32
+blk.0.ffn_up.weight [5120, 17408] Q4_K
+blk.1.attn_conv_base [5120, 2, 2] F32
+blk.1.attn_conv_proj.weight [5120, 1280] Q4_K
+blk.1.attn_k.weight [5120, 1024] Q4_K
+blk.1.attn_k_norm.weight [128] F32
+blk.1.attn_norm.weight [5120] F32
+blk.1.attn_output.weight [4096, 5120] Q4_K
+blk.1.attn_q.weight [5120, 4096] Q4_K
+blk.1.attn_q_norm.weight [128] F32
+blk.1.attn_v.weight [5120, 1024] Q4_K
+blk.1.ffn_conv_base [5120, 2, 2] F32
+blk.1.ffn_conv_proj.weight [5120, 1280] Q4_K
+blk.1.ffn_down.weight [17408, 5120] Q4_K
+blk.1.ffn_gate.weight [5120, 17408] Q4_K
+blk.1.ffn_norm.weight [5120] F32
+blk.1.ffn_up.weight [5120, 17408] Q4_K
+blk.2.attn_conv_base [5120, 2, 2] F32
+blk.2.attn_conv_proj.weight [5120, 1280] Q4_K
+blk.2.attn_k.weight [5120, 1024] Q4_K
+blk.2.attn_k_norm.weight [128] F32
+blk.2.attn_norm.weight [5120] F32
+blk.2.attn_output.weight [4096, 5120] Q4_K
+blk.2.attn_q.weight [5120, 4096] Q4_K
+blk.2.attn_q_norm.weight [128] F32
+blk.2.attn_v.weight [5120, 1024] Q6_K
+blk.2.ffn_conv_base [5120, 2, 2] F32
+blk.2.ffn_conv_proj.weight [5120, 1280] Q4_K
+blk.2.ffn_down.weight [17408, 5120] Q6_K
+blk.2.ffn_gate.weight [5120, 17408] Q4_K
+blk.2.ffn_norm.weight [5120] F32
+blk.2.ffn_up.weight [5120, 17408] Q4_K
+blk.3.attn_conv_base [5120, 2, 2] F32
+blk.3.attn_conv_proj.weight [5120, 1280] Q4_K
+blk.3.attn_k.weight [5120, 1024] Q4_K
+blk.3.attn_k_norm.weight [128] F32
+blk.3.attn_norm.weight [5120] F32
+blk.3.attn_output.weight [4096, 5120] Q4_K
+blk.3.attn_q.weight [5120, 4096] Q4_K
+blk.3.attn_q_norm.weight [128] F32
+blk.3.attn_v.weight [5120, 1024] Q4_K
+blk.3.ffn_conv_base [5120, 2, 2] F32
+blk.3.ffn_conv_proj.weight [5120, 1280] Q4_K
+blk.3.ffn_down.weight [17408, 5120] Q4_K
+blk.3.ffn_gate.weight [5120, 17408] Q4_K
+blk.3.ffn_norm.weight [5120] F32
+blk.3.ffn_up.weight [5120, 17408] Q4_K
+blk.4.attn_conv_base [5120, 2, 2] F32
+blk.4.attn_conv_proj.weight [5120, 1280] Q4_K
+blk.4.attn_k.weight [5120, 1024] Q4_K
+blk.4.attn_k_norm.weight [128] F32
+blk.4.attn_norm.weight [5120] F32
+blk.4.attn_output.weight [4096, 5120] Q4_K
+blk.4.attn_q.weight [5120, 4096] Q4_K
+blk.4.attn_q_norm.weight [128] F32
+blk.4.attn_v.weight [5120, 1024] Q6_K
+blk.4.ffn_conv_base [5120, 2, 2] F32
+blk.4.ffn_conv_proj.weight [5120, 1280] Q4_K
+blk.4.ffn_down.weight [17408, 5120] Q6_K
+blk.4.ffn_gate.weight [5120, 17408] Q4_K
+blk.4.ffn_norm.weight [5120] F32
+blk.4.ffn_up.weight [5120, 17408] Q4_K
+enc.output_norm.weight [5120] F32
+fc.weight [25600, 5120] Q4_K
+output_norm.weight [5120] F32
+selector_hidden.weight [5120, 256] Q4_K
+selector_predecessor.weight [256, 248320] Q4_K
+selector_successor.weight [256, 248320] Q4_K

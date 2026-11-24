@@ -1,0 +1,69 @@
+--- a/vllm/models/inkling2/nvidia/dspark.py
++++ b/vllm/models/inkling2/nvidia/dspark.py
+@@ -35,6 +35,8 @@
+     FlashAttentionMetadata,
+ )
+ from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
++from vllm.triton_utils import tl, triton
++from vllm.platforms import current_platform
+ 
+ from ..configs import Inkling2DSparkConfig
+ from ..speculator_config import Inkling2DSparkSpeculatorConfig
+@@ -50,6 +52,40 @@
+ from .ops.linear import linear
+ 
+ 
++@triton.jit
++def _sm120_write_kv_kernel(K, V, KC, VC, SLOT, sk_t, sk_h, sv_t, sv_h,
++                           sc_b, sc_p, sc_h, PAGE: tl.constexpr, D: tl.constexpr):
++    # One program per (token, kv head): copy K/V rows into the paged cache.
++    t = tl.program_id(0).to(tl.int64)
++    h = tl.program_id(1).to(tl.int64)
++    slot = tl.load(SLOT + t).to(tl.int64)
++    if slot < 0:
++        return
++    blk = slot // PAGE
++    off = slot % PAGE
++    d = tl.arange(0, D)
++    dst = blk * sc_b + off * sc_p + h * sc_h + d
++    tl.store(KC + dst, tl.load(K + t * sk_t + h * sk_h + d))
++    tl.store(VC + dst, tl.load(V + t * sv_t + h * sv_h + d))
++
++
++def _sm120_write_kv(k, v, kv_cache, head_dim, slot_mapping):
++    """reshape_and_cache_flash replacement for the draft's (B, H, page, 2D)
++    bf16 cache: this vLLM build ships no sm_120 kernel for that layout."""
++    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
++    n = slot_mapping.shape[0]
++    if n == 0:
++        return
++    assert key_cache.stride(3) == 1 and k.stride(2) == 1 and v.stride(2) == 1
++    assert key_cache.stride() == value_cache.stride()
++    _sm120_write_kv_kernel[(n, k.shape[1])](
++        k, v, key_cache, value_cache, slot_mapping,
++        k.stride(0), k.stride(1), v.stride(0), v.stride(1),
++        key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
++        PAGE=key_cache.shape[1], D=head_dim,
++    )
++
++
+ class _RMSNorm(nn.Module):
+     def __init__(self, hidden_size: int, eps: float) -> None:
+         super().__init__()
+@@ -189,7 +225,15 @@
+         self, k: torch.Tensor, v: torch.Tensor, slot_mapping: torch.Tensor
+     ) -> None:
+         impl = cast(FlashAttentionImpl, self.attn.impl)
+-        impl.do_kv_cache_update(self.attn, k, v, self.attn.kv_cache, slot_mapping)
++        cache = self.attn.kv_cache
++        if (
++            current_platform.is_device_capability_family(120)
++            and impl.kv_cache_dtype == "auto"
++            and cache.dtype == k.dtype
++        ):
++            _sm120_write_kv(k, v, cache, self.head_dim, slot_mapping)
++            return
++        impl.do_kv_cache_update(self.attn, k, v, cache, slot_mapping)
+ 
+     def forward(
+         self, positions: torch.Tensor, x: torch.Tensor, cos_sin_cache: torch.Tensor

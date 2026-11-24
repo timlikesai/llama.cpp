@@ -1,0 +1,4 @@
+tokens_predicted 128
+timings {"cache_n": 0, "prompt_n": 737, "prompt_ms": 957.276, "prompt_per_token_ms": 1.2988819538670284, "prompt_per_second": 769.8929044497095, "predicted_n": 128, "predicted_ms": 1300.776, "predicted_per_token_ms": 10.242330708661418, "predicted_per_second": 97.63402768808771, "draft_n": 146, "draft_n_accepted": 106}
+content_sha1 07c3d88b8094f06b71a94d71733baa33db9c0b73
+content_repr 'riet Kent , Fraser Ayres , Sophie Stanton and Dominic Hall .\n\n= = = 2006 – 2011 = = =\n\nIn 2006 , Boulter starred alongside Whishaw in the play Citizenship written by Mark Ravenhill . He appeared on a 2006 episode of the television series , Doctors , followed by a role in the 2007 theatre production of How to Curse directed by Josie Rourke . How to Curse was performed at Bush Theatre in the Lo

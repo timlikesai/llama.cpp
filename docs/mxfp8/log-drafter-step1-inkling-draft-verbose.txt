@@ -1,0 +1,139 @@
+0.00.411.727 I llama_completion: llama backend init
+0.00.411.736 I llama_completion: load the model and apply lora adapter, if any
+0.00.411.746 I cmn  common_fit_a: fitting params to device memory ...
+0.00.411.746 I cmn  common_fit_a: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.00.411.784 I common_params_fit_impl: getting device memory data for initial parameters:
+0.00.735.785 E llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set (this warning is normal during memory fitting)
+0.00.756.222 E common_fit_params: encountered an error while trying to fit params to free device memory: failed to create llama_context from model
+0.00.756.230 I common_fit_params: fitting params to free memory took 0.34 seconds
+0.00.783.152 I llama_model_loader: loaded meta data with 41 key-value pairs and 54 tensors from /home/tim/models/unsloth/Inkling-2-Mini-GGUF/dspark-Inkling-2-Mini-Q8_0.gguf (version GGUF V3 (latest))
+0.00.783.159 I llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+0.00.783.162 I llama_model_loader: - kv   0:                       general.architecture str              = dflash
+0.00.783.162 I llama_model_loader: - kv   1:                               general.type str              = model
+0.00.783.162 I llama_model_loader: - kv   2:                               general.name str              = Inkling-2-Mini
+0.00.783.163 I llama_model_loader: - kv   3:                         general.size_label str              = 318M
+0.00.783.163 I llama_model_loader: - kv   4:                         dflash.block_count u32              = 3
+0.00.783.164 I llama_model_loader: - kv   5:                      dflash.context_length u32              = 1048576
+0.00.783.164 I llama_model_loader: - kv   6:                    dflash.embedding_length u32              = 2304
+0.00.783.164 I llama_model_loader: - kv   7:                 dflash.feed_forward_length u32              = 9216
+0.00.783.164 I llama_model_loader: - kv   8:                dflash.attention.head_count u32              = 24
+0.00.783.164 I llama_model_loader: - kv   9:             dflash.attention.head_count_kv u32              = 8
+0.00.783.167 I llama_model_loader: - kv  10:                      dflash.rope.freq_base f32              = 1000000.000000
+0.00.783.168 I llama_model_loader: - kv  11:    dflash.attention.layer_norm_rms_epsilon f32              = 0.000001
+0.00.783.168 I llama_model_loader: - kv  12:                dflash.attention.key_length u32              = 128
+0.00.783.168 I llama_model_loader: - kv  13:              dflash.attention.value_length u32              = 128
+0.00.783.168 I llama_model_loader: - kv  14:                          dflash.vocab_size u32              = 201024
+0.00.783.169 I llama_model_loader: - kv  15:                 dflash.vocab_size_unpadded u32              = 200058
+0.00.783.169 I llama_model_loader: - kv  16:                          dflash.block_size u32              = 8
+0.00.783.170 I llama_model_loader: - kv  17:                       dflash.target_layers arr[i32,4]       = [5, 23, 41, 48]
+0.00.783.171 I llama_model_loader: - kv  18:                  dflash.dspark.markov_rank u32              = 256
+0.00.783.171 I llama_model_loader: - kv  19:                  dflash.sample_from_anchor bool             = false
+0.00.783.172 I llama_model_loader: - kv  20:                 dflash.has_confidence_head bool             = false
+0.00.783.172 I llama_model_loader: - kv  21:                    dflash.attention.causal bool             = false
+0.00.783.172 I llama_model_loader: - kv  22:            dflash.attention.sliding_window u32              = 1024
+0.00.783.173 I llama_model_loader: - kv  23:    dflash.attention.sliding_window_pattern arr[bool,3]      = [true, false, true]
+0.00.783.173 I llama_model_loader: - kv  24:                dflash.rope.dimension_count u32              = 128
+0.00.783.174 I llama_model_loader: - kv  25:             dflash.final_logit_softcapping f32              = 30.000000
+0.00.783.174 I llama_model_loader: - kv  26:                       tokenizer.ggml.model str              = gpt2
+0.00.783.174 I llama_model_loader: - kv  27:                         tokenizer.ggml.pre str              = inkling2
+0.00.783.175 I llama_model_loader: - kv  28:                      tokenizer.ggml.tokens arr[str,200058]  = ["!", "\"", "#", "$", "%", "&", "'", ...
+0.00.783.176 I llama_model_loader: - kv  29:                  tokenizer.ggml.token_type arr[i32,200058]  = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, ...
+0.00.783.177 I llama_model_loader: - kv  30:                      tokenizer.ggml.merges arr[str,424413]  = ["i n", "e r", "t h", "a n", "o n", "...
+0.00.783.177 I llama_model_loader: - kv  31:                tokenizer.ggml.eos_token_id u32              = 200006
+0.00.783.177 I llama_model_loader: - kv  32:                tokenizer.ggml.eot_token_id u32              = 200006
+0.00.783.178 I llama_model_loader: - kv  33:               tokenizer.ggml.add_bos_token bool             = false
+0.00.783.178 I llama_model_loader: - kv  34:               tokenizer.ggml.add_eos_token bool             = false
+0.00.783.178 I llama_model_loader: - kv  35:                    tokenizer.chat_template str              = {%- set effort_map = {"none": 0.0, "m...
+0.00.783.179 I llama_model_loader: - kv  36:                tokenizer.ggml.clean_spaces bool             = false
+0.00.783.179 I llama_model_loader: - kv  37:               tokenizer.ggml.mask_token_id u32              = 0
+0.00.783.179 I llama_model_loader: - kv  38:                           general.basename str              = Inkling-2-Mini
+0.00.783.179 I llama_model_loader: - kv  39:               general.quantization_version u32              = 2
+0.00.783.179 I llama_model_loader: - kv  40:                          general.file_type u32              = 7
+0.00.783.180 I llama_model_loader: - type  f32:   24 tensors
+0.00.783.180 I llama_model_loader: - type q8_0:   27 tensors
+0.00.783.180 I llama_model_loader: - type bf16:    3 tensors
+0.00.783.181 I print_info: file format = GGUF V3 (latest)
+0.00.783.182 I print_info: file type   = Q8_0
+0.00.783.182 I print_info: file size   = 372.26 MiB (9.82 BPW) 
+0.00.783.343 I llama_prepare_model_devices: using device CUDA0 (NVIDIA GeForce RTX 5060 Ti) (0000:02:00.0) - 15792 MiB free
+0.00.783.362 I llama_prepare_model_devices: using device CUDA1 (NVIDIA GeForce RTX 5060 Ti) (0000:03:00.0) - 15792 MiB free
+0.00.783.395 I load_arch_hparams: DFlash extract_layers = [5, 23, 41, 48]
+0.00.839.842 I load: 45 unused tokens
+0.00.849.676 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.00.849.677 I load: printing all EOG tokens:
+0.00.849.678 I load:   - 199999 ('<|endoftext|>')
+0.00.849.678 I load:   - 200006 ('<|content_model_end_sampling|>')
+0.00.849.900 I load: special tokens cache size = 60
+0.00.861.445 I load: token to piece cache size = 1.2012 MB
+0.00.861.453 I print_info: arch                  = dflash
+0.00.861.454 I print_info: vocab_only            = 0
+0.00.861.454 I print_info: no_alloc              = 0
+0.00.861.454 I print_info: n_ctx_train           = 1048576
+0.00.861.454 I print_info: n_embd_inp            = 2304
+0.00.861.454 I print_info: n_embd                = 2304
+0.00.861.455 I print_info: n_embd_out            = 2304
+0.00.861.455 I print_info: n_layer               = 3
+0.00.861.455 I print_info: n_layer_all           = 3
+0.00.861.460 I print_info: n_head                = 24
+0.00.861.461 I print_info: n_head_kv             = 8
+0.00.861.461 I print_info: n_rot                 = 128
+0.00.861.461 I print_info: n_swa                 = 1024
+0.00.861.461 I print_info: is_swa_any            = 1
+0.00.861.461 I print_info: non_causal_type       = 0
+0.00.861.461 I print_info: n_embd_head_k         = 128
+0.00.861.461 I print_info: n_embd_head_v         = 128
+0.00.861.462 I print_info: n_gqa                 = 3
+0.00.861.462 I print_info: n_embd_k_gqa          = 1024
+0.00.861.463 I print_info: n_embd_v_gqa          = 1024
+0.00.861.463 I print_info: f_norm_eps            = 0.0e+00
+0.00.861.464 I print_info: f_norm_rms_eps        = 1.0e-06
+0.00.861.464 I print_info: f_clamp_kqv           = 0.0e+00
+0.00.861.464 I print_info: f_max_alibi_bias      = 0.0e+00
+0.00.861.464 I print_info: f_logit_scale         = 0.0e+00
+0.00.861.464 I print_info: f_attn_scale          = 0.0e+00
+0.00.861.465 I print_info: f_attn_value_scale    = 0.0000
+0.00.861.465 I print_info: n_ff                  = 9216
+0.00.861.465 I print_info: n_expert              = 0
+0.00.861.465 I print_info: n_expert_used         = 0
+0.00.861.465 I print_info: n_expert_groups       = 0
+0.00.861.465 I print_info: n_group_used          = 0
+0.00.861.465 I print_info: causal attn           = 0
+0.00.861.466 I print_info: pooling type          = -1
+0.00.861.466 I print_info: rope type             = 2
+0.00.861.466 I print_info: rope scaling          = linear
+0.00.861.467 I print_info: freq_base_train       = 1000000.0
+0.00.861.467 I print_info: freq_scale_train      = 1
+0.00.861.467 I print_info: freq_base_swa         = 1000000.0
+0.00.861.467 I print_info: freq_scale_swa        = 1
+0.00.861.467 I print_info: n_embd_head_k_swa     = 128
+0.00.861.467 I print_info: n_embd_head_v_swa     = 128
+0.00.861.467 I print_info: n_rot_swa             = 128
+0.00.861.467 I print_info: n_ctx_orig_yarn       = 1048576
+0.00.861.468 I print_info: rope_yarn_log_mul     = 0.0000
+0.00.861.468 I print_info: rope_finetuned        = unknown
+0.00.861.468 I print_info: model type            = ?B
+0.00.861.469 I print_info: model params          = 317.90 M
+0.00.861.469 I print_info: general.name          = Inkling-2-Mini
+0.00.861.470 I print_info: vocab type            = BPE
+0.00.861.470 I print_info: n_vocab               = 200058
+0.00.861.470 I print_info: n_merges              = 424413
+0.00.861.470 I print_info: EOS token             = 200006 '<|content_model_end_sampling|>'
+0.00.861.470 I print_info: EOT token             = 200006 '<|content_model_end_sampling|>'
+0.00.861.470 I print_info: MASK token            = 0 '!'
+0.00.861.471 I print_info: LF token              = 198 'Ċ'
+0.00.861.471 I print_info: EOG token             = 199999 '<|endoftext|>'
+0.00.861.471 I print_info: EOG token             = 200006 '<|content_model_end_sampling|>'
+0.00.861.471 I print_info: max token length      = 92
+0.00.861.593 I load_tensors: loading model tensors, this can take a while... (load_mode = mmap)
+0.00.861.673 I load_tensors_dspark: DFlash with DSpark markov head (rank = 256)
+0.00.864.763 I load_tensors: offloading 0 repeating layers to GPU
+0.00.864.764 I load_tensors: offloaded 0/4 layers to GPU
+0.00.864.766 I load_tensors:   CPU_Mapped model buffer size =   372.26 MiB
+........................
+0.00.867.411 I cmn  common_init_: added <|endoftext|> logit bias = -inf
+0.00.867.412 I cmn  common_init_: added <|content_model_end_sampling|> logit bias = -inf
+0.00.867.464 I llama_context: constructing llama_context
+0.00.867.484 E llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set (this warning is normal during memory fitting)
+0.00.867.485 E cmn  common_init_: failed to create context with model '/home/tim/models/unsloth/Inkling-2-Mini-GGUF/dspark-Inkling-2-Mini-Q8_0.gguf'
+0.00.867.487 E cmn  common_init_: failed to create context with model '/home/tim/models/unsloth/Inkling-2-Mini-GGUF/dspark-Inkling-2-Mini-Q8_0.gguf'
+0.00.867.490 E llama_completion: error: unable to create context

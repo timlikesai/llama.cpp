@@ -1,0 +1,750 @@
+0.00.360.002 I ggml_cuda_init: found 2 CUDA devices (Total VRAM: 31882 MiB):
+0.00.377.943 I   Device 0: NVIDIA GeForce RTX 5060 Ti, compute capability 12.0, VMM: yes, VRAM: 15941 MiB
+0.00.392.182 I   Device 1: NVIDIA GeForce RTX 5060 Ti, compute capability 12.0, VMM: yes, VRAM: 15941 MiB
+0.00.399.150 I main: using seed 266286619, stdev 0.100000
+|     Model arch.|                              Device|Config|   NMSE vs. CPU|Roundtrip|    Mixed batch|
+|----------------|------------------------------------|------|---------------|---------|---------------|
+|            clip|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|            clip|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|            clip|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|            clip|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|           llama|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (1.04e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.05e-09)|
+|           llama|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (1.04e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.05e-09)|
+|           llama|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.15e-15)|
+|           llama|                                Meta| Dense|  [1;32mOK[0m (1.05e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.63e-09)|
+|           llama|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.54e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.63e-09)|
+|           llama|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.54e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.63e-09)|
+|           llama|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.58e-15)|
+|           llama|                                Meta|   MoE|  [1;32mOK[0m (8.67e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.32e-09)|
+|          llama4|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (9.00e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.80e-08)|
+|          llama4|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (9.00e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.80e-08)|
+|          llama4|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (8.19e-15)|
+|          llama4|                                Meta|   MoE|  [1;32mOK[0m (1.82e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (3.92e-08)|
+|            deci|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (1.04e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.05e-09)|
+|            deci|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (1.04e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.05e-09)|
+|            deci|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.15e-15)|
+|            deci|                                Meta| Dense|  [1;32mOK[0m (1.05e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.63e-09)|
+|          falcon|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (7.76e-08)|       [1;32mOK[0m|  [1;32mOK[0m (6.72e-10)|
+|          falcon|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (7.76e-08)|       [1;32mOK[0m|  [1;32mOK[0m (6.72e-10)|
+|          falcon|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.35e-15)|
+|          falcon|                                Meta| Dense|  [1;32mOK[0m (7.83e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.43e-09)|
+|        baichuan|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.81e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.95e-09)|
+|        baichuan|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.81e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.95e-09)|
+|        baichuan|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.12e-15)|
+|        baichuan|                                Meta| Dense|  [1;32mOK[0m (9.29e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.03e-09)|
+|            grok|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.51e-08)|       [1;32mOK[0m|  [1;32mOK[0m (9.47e-15)|
+|            grok|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.51e-08)|       [1;32mOK[0m|  [1;32mOK[0m (9.47e-15)|
+|            grok|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|            grok|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|            gpt2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.25e-08)|       [1;32mOK[0m|  [1;32mOK[0m (6.86e-10)|
+|            gpt2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.25e-08)|       [1;32mOK[0m|  [1;32mOK[0m (6.86e-10)|
+|            gpt2|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.05e-15)|
+|            gpt2|                                Meta| Dense|  [1;32mOK[0m (8.40e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.72e-09)|
+|            gptj|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|            gptj|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|            gptj|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|            gptj|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|         gptneox|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (1.01e-07)|       [1;32mOK[0m|  [1;32mOK[0m (7.10e-10)|
+|         gptneox|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (1.01e-07)|       [1;32mOK[0m|  [1;32mOK[0m (7.10e-10)|
+|         gptneox|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.58e-15)|
+|         gptneox|                                Meta| Dense|  [1;32mOK[0m (1.02e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.91e-09)|
+|             mpt|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (9.85e-08)|       [1;32mOK[0m|  [1;32mOK[0m (8.10e-10)|
+|             mpt|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (9.85e-08)|       [1;32mOK[0m|  [1;32mOK[0m (8.10e-10)|
+|             mpt|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.28e-15)|
+|             mpt|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       starcoder|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (9.82e-08)|       [1;32mOK[0m|  [1;32mOK[0m (8.17e-10)|
+|       starcoder|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (9.82e-08)|       [1;32mOK[0m|  [1;32mOK[0m (8.17e-10)|
+|       starcoder|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.10e-15)|
+|       starcoder|                                Meta| Dense|  [1;32mOK[0m (9.99e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.04e-09)|
+|          refact|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.64e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.69e-09)|
+|          refact|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.64e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.69e-09)|
+|          refact|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.44e-15)|
+|          refact|                                Meta| Dense|  [1;32mOK[0m (1.84e-06)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.49e-09)|
+|          refact|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.33e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.10e-09)|
+|          refact|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.33e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.10e-09)|
+|          refact|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.29e-15)|
+|          refact|                                Meta|   MoE|  [1;32mOK[0m (1.69e-06)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.24e-09)|
+|            bert|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|            bert|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|            bert|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|            bert|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|     modern-bert|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|     modern-bert|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|     modern-bert|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|     modern-bert|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|      nomic-bert|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|      nomic-bert|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|      nomic-bert|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|      nomic-bert|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|  nomic-bert-moe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|  nomic-bert-moe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|  nomic-bert-moe|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|  nomic-bert-moe|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|        neo-bert|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|        neo-bert|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|        neo-bert|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|        neo-bert|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|    jina-bert-v2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|    jina-bert-v2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|    jina-bert-v2|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|    jina-bert-v2|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|    jina-bert-v3|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|    jina-bert-v3|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|    jina-bert-v3|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|    jina-bert-v3|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|        eurobert|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|        eurobert|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|        eurobert|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|        eurobert|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|           bloom|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (9.55e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.42e-09)|
+|           bloom|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (9.55e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.42e-09)|
+|           bloom|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.52e-15)|
+|           bloom|                                Meta| Dense|  [1;32mOK[0m (1.49e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.80e-09)|
+|        stablelm|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (7.70e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.93e-09)|
+|        stablelm|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (7.70e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.93e-09)|
+|        stablelm|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.91e-15)|
+|        stablelm|                                Meta| Dense|  [1;32mOK[0m (8.02e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (3.92e-09)|
+|            qwen|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.59e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.81e-09)|
+|            qwen|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.59e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.81e-09)|
+|            qwen|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.00e-15)|
+|            qwen|                                Meta| Dense|  [1;32mOK[0m (9.16e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (7.09e-09)|
+|           qwen2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (6.33e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.93e-09)|
+|           qwen2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (6.33e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.93e-09)|
+|           qwen2|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.97e-15)|
+|           qwen2|                                Meta| Dense|  [1;32mOK[0m (6.73e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.40e-09)|
+|        qwen2moe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.82e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.65e-09)|
+|        qwen2moe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.82e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.65e-09)|
+|        qwen2moe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.41e-15)|
+|        qwen2moe|                                Meta|   MoE|  [1;32mOK[0m (9.35e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.91e-09)|
+|         qwen2vl|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.64e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.80e-09)|
+|         qwen2vl|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.64e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.80e-09)|
+|         qwen2vl|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.75e-15)|
+|         qwen2vl|                                Meta| Dense|  [1;32mOK[0m (9.15e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.69e-09)|
+|    sensenova_u1|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.80e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (7.71e-09)|
+|    sensenova_u1|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.80e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (7.71e-09)|
+|    sensenova_u1|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|  [1;32mOK[0m (3.94e-11)|
+|    sensenova_u1|                                Meta| Dense|  [1;32mOK[0m (9.30e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.08e-08)|
+|           qwen3|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.86e-08)|       [1;32mOK[0m|  [1;32mOK[0m (9.62e-15)|
+|           qwen3|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.86e-08)|       [1;32mOK[0m|  [1;32mOK[0m (9.62e-15)|
+|           qwen3|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.33e-15)|
+|           qwen3|                                Meta| Dense|  [1;32mOK[0m (9.59e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (0.00e+00)|
+|        qwen3moe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.75e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.96e-09)|
+|        qwen3moe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.75e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.96e-09)|
+|        qwen3moe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.06e-15)|
+|        qwen3moe|                                Meta|   MoE|  [1;32mOK[0m (9.09e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.31e-09)|
+|           flint|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.76e-08)|       [1;32mOK[0m|  [1;32mOK[0m (4.47e-09)|
+|           flint|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.76e-08)|       [1;32mOK[0m|  [1;32mOK[0m (4.47e-09)|
+|           flint|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.22e-15)|
+|           flint|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       qwen3next|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.50e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.20e-10)|
+|       qwen3next|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.50e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.20e-10)|
+|       qwen3next|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (3.98e-16)|
+|       qwen3next|                                Meta|   MoE|  [1;32mOK[0m (8.53e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.90e-10)|
+|         qwen3vl|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.79e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.54e-09)|
+|         qwen3vl|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.79e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.54e-09)|
+|         qwen3vl|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.41e-15)|
+|         qwen3vl|                                Meta| Dense|  [1;32mOK[0m (9.33e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.19e-09)|
+|      qwen3vlmoe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.75e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.96e-09)|
+|      qwen3vlmoe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.75e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.96e-09)|
+|      qwen3vlmoe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.06e-15)|
+|      qwen3vlmoe|                                Meta|   MoE|  [1;32mOK[0m (9.09e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.31e-09)|
+|          qwen35|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.64e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.37e-10)|
+|          qwen35|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.64e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.37e-10)|
+|          qwen35|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.57e-16)|
+|          qwen35|                                Meta| Dense|  [1;32mOK[0m (8.62e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.46e-10)|
+|       qwen35moe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.50e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.94e-10)|
+|       qwen35moe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.50e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.94e-10)|
+|       qwen35moe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.87e-16)|
+|       qwen35moe|                                Meta|   MoE|  [1;32mOK[0m (8.52e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (6.14e-10)|
+|            clef|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|            clef|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|            clef|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|            clef|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|  vllm-decision2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|  vllm-decision2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|  vllm-decision2|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|  vllm-decision2|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|      clover_moe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.57e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.75e-10)|
+|      clover_moe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.57e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.75e-10)|
+|      clover_moe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.39e-16)|
+|      clover_moe|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|        qwen4exp|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.78e-08)|       [1;32mOK[0m|  [1;32mOK[0m (5.46e-13)|
+|        qwen4exp|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.78e-08)|       [1;32mOK[0m|  [1;32mOK[0m (5.46e-13)|
+|        qwen4exp|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.12e-17)|
+|        qwen4exp|                                Meta|   MoE|  [1;32mOK[0m (8.80e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (6.47e-13)|
+|            phi2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.33e-08)|       [1;32mOK[0m|  [1;32mOK[0m (9.87e-10)|
+|            phi2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.33e-08)|       [1;32mOK[0m|  [1;32mOK[0m (9.87e-10)|
+|            phi2|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.06e-15)|
+|            phi2|                                Meta| Dense|  [1;32mOK[0m (8.41e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.68e-09)|
+|            phi3|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.71e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.31e-09)|
+|            phi3|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.71e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.31e-09)|
+|            phi3|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.15e-15)|
+|            phi3|                                Meta| Dense|  [1;32mOK[0m (9.42e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (6.69e-09)|
+|          phimoe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (7.13e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.15e-09)|
+|          phimoe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (7.13e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.15e-09)|
+|          phimoe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.11e-15)|
+|          phimoe|                                Meta|   MoE|  [1;32mOK[0m (7.16e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.02e-09)|
+|           plamo|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.79e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.51e-09)|
+|           plamo|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.79e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.51e-09)|
+|           plamo|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.17e-15)|
+|           plamo|                                Meta| Dense|  [1;32mOK[0m (9.34e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.39e-09)|
+|          plamo2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.86e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.46e-09)|
+|          plamo2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.86e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.46e-09)|
+|          plamo2|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.54e-15)|
+|          plamo2|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|          plamo3|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.77e-08)|       [1;32mOK[0m|  [1;32mOK[0m (4.99e-09)|
+|          plamo3|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.77e-08)|       [1;32mOK[0m|  [1;32mOK[0m (4.99e-09)|
+|          plamo3|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (5.31e-15)|
+|          plamo3|                                Meta| Dense|  [1;32mOK[0m (1.11e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (8.73e-09)|
+|       codeshell|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (9.87e-08)|       [1;32mOK[0m|  [1;32mOK[0m (6.96e-10)|
+|       codeshell|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (9.87e-08)|       [1;32mOK[0m|  [1;32mOK[0m (6.96e-10)|
+|       codeshell|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.02e-15)|
+|       codeshell|                                Meta| Dense|  [1;32mOK[0m (9.99e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.95e-09)|
+|           orion|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (7.63e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.15e-09)|
+|           orion|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (7.63e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.15e-09)|
+|           orion|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.85e-15)|
+|           orion|                                Meta| Dense|  [1;32mOK[0m (8.09e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.07e-09)|
+|       internlm2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.73e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.59e-09)|
+|       internlm2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.73e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.59e-09)|
+|       internlm2|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.43e-15)|
+|       internlm2|                                Meta| Dense|  [1;32mOK[0m (9.31e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.94e-09)|
+|         minicpm|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (9.09e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.03e-09)|
+|         minicpm|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (9.09e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.03e-09)|
+|         minicpm|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (8.42e-16)|
+|         minicpm|                                Meta| Dense|  [1;32mOK[0m (9.12e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.26e-09)|
+|         minicpm|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.70e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.32e-09)|
+|         minicpm|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.70e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.32e-09)|
+|         minicpm|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (7.12e-16)|
+|         minicpm|                                Meta|   MoE|  [1;32mOK[0m (8.77e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.08e-09)|
+|        minicpm3|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.71e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.13e-10)|
+|        minicpm3|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.71e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.13e-10)|
+|        minicpm3|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.15e-16)|
+|        minicpm3|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|           gemma|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.24e-08)|       [1;32mOK[0m|  [1;32mOK[0m (5.63e-11)|
+|           gemma|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.24e-08)|       [1;32mOK[0m|  [1;32mOK[0m (5.63e-11)|
+|           gemma|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (4.14e-16)|
+|           gemma|                                Meta| Dense|  [1;32mOK[0m (8.25e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.48e-10)|
+|          gemma2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.55e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.46e-09)|
+|          gemma2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.55e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.46e-09)|
+|          gemma2|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.90e-15)|
+|          gemma2|                                Meta| Dense|  [1;32mOK[0m (9.17e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.52e-09)|
+|          gemma3|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.81e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.67e-08)|
+|          gemma3|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.81e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.67e-08)|
+|          gemma3|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (7.38e-15)|
+|          gemma3|                                Meta| Dense|  [1;32mOK[0m (9.48e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.74e-07)|
+|         gemma3n|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (3.00e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.78e-07)|
+|         gemma3n|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (3.00e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.78e-07)|
+|         gemma3n|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.88e-11)|
+|         gemma3n|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|          gemma4|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.82e-07)|       [1;32mOK[0m|  [1;32mOK[0m (4.18e-07)|
+|          gemma4|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.82e-07)|       [1;32mOK[0m|  [1;32mOK[0m (4.18e-07)|
+|          gemma4|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.42e-08)|
+|          gemma4|                                Meta| Dense|  [1;32mOK[0m (8.56e-06)|     [1;33mSKIP[0m|  [1;32mOK[0m (3.57e-06)|
+| gemma-embedding|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+| gemma-embedding|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+| gemma-embedding|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+| gemma-embedding|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|gemma-embedding2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|gemma-embedding2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|gemma-embedding2|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|gemma-embedding2|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|      starcoder2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (9.87e-08)|       [1;32mOK[0m|  [1;32mOK[0m (6.96e-10)|
+|      starcoder2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (9.87e-08)|       [1;32mOK[0m|  [1;32mOK[0m (6.96e-10)|
+|      starcoder2|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.02e-15)|
+|      starcoder2|                                Meta| Dense|  [1;32mOK[0m (9.99e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.95e-09)|
+|           mamba|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.57e-08)|       [1;32mOK[0m|  [1;32mOK[0m (9.85e-15)|
+|           mamba|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.57e-08)|       [1;32mOK[0m|  [1;32mOK[0m (9.85e-15)|
+|           mamba|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|           mamba|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|          mamba2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.69e-08)|       [1;32mOK[0m|  [1;32mOK[0m (9.47e-15)|
+|          mamba2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.69e-08)|       [1;32mOK[0m|  [1;32mOK[0m (9.47e-15)|
+|          mamba2|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|          mamba2|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|           maple|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.73e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.48e-09)|
+|           maple|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.73e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.48e-09)|
+|           maple|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.28e-15)|
+|           maple|                                Meta|   MoE|  [1;32mOK[0m (9.30e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (6.38e-09)|
+|           jamba|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.66e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.88e-09)|
+|           jamba|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.66e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.88e-09)|
+|           jamba|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.70e-15)|
+|           jamba|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       falcon-h1|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (9.05e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.60e-09)|
+|       falcon-h1|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (9.05e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.60e-09)|
+|       falcon-h1|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.17e-15)|
+|       falcon-h1|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|          xverse|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.73e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.59e-09)|
+|          xverse|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.73e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.59e-09)|
+|          xverse|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.43e-15)|
+|          xverse|                                Meta| Dense|  [1;32mOK[0m (9.31e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.94e-09)|
+|       command-r|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.48e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.97e-09)|
+|       command-r|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.48e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.97e-09)|
+|       command-r|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.43e-15)|
+|       command-r|                                Meta| Dense|  [1;32mOK[0m (9.11e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.51e-09)|
+|         cohere2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.38e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.65e-09)|
+|         cohere2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.38e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.65e-09)|
+|         cohere2|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.26e-15)|
+|         cohere2|                                Meta| Dense|  [1;32mOK[0m (8.90e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.05e-09)|
+|      cohere2moe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.64e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.33e-09)|
+|      cohere2moe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.64e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.33e-09)|
+|      cohere2moe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.24e-15)|
+|      cohere2moe|                                Meta|   MoE|  [1;32mOK[0m (9.20e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.17e-09)|
+|            dbrx|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.74e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.54e-10)|
+|            dbrx|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.74e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.54e-10)|
+|            dbrx|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.90e-16)|
+|            dbrx|                                Meta|   MoE|  [1;32mOK[0m (8.75e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.78e-10)|
+|            olmo|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.47e-08)|       [1;32mOK[0m|  [1;32mOK[0m (4.65e-09)|
+|            olmo|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.47e-08)|       [1;32mOK[0m|  [1;32mOK[0m (4.65e-09)|
+|            olmo|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (4.79e-15)|
+|            olmo|                                Meta| Dense|  [1;32mOK[0m (9.33e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (7.72e-09)|
+|           olmo2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (1.55e-07)|       [1;32mOK[0m|  [1;32mOK[0m (5.88e-08)|
+|           olmo2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (1.55e-07)|       [1;32mOK[0m|  [1;32mOK[0m (5.88e-08)|
+|           olmo2|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (3.99e-14)|
+|           olmo2|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|           olmoe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.81e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.55e-09)|
+|           olmoe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.81e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.55e-09)|
+|           olmoe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.14e-15)|
+|           olmoe|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|    muse-glimmer|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.98e-08)|       [1;32mOK[0m|  [1;32mOK[0m (8.37e-11)|
+|    muse-glimmer|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.98e-08)|       [1;32mOK[0m|  [1;32mOK[0m (8.37e-11)|
+|    muse-glimmer|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (4.41e-15)|
+|    muse-glimmer|                                Meta| Dense|  [1;32mOK[0m (1.50e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.76e-10)|
+|      muse-spark|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (1.53e-07)|       [1;32mOK[0m|  [1;32mOK[0m (5.99e-08)|
+|      muse-spark|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (1.53e-07)|       [1;32mOK[0m|  [1;32mOK[0m (5.99e-08)|
+|      muse-spark|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.52e-14)|
+|      muse-spark|                                Meta|   MoE|  [1;32mOK[0m (1.29e-06)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.73e-07)|
+|         openelm|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.54e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.25e-10)|
+|         openelm|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.54e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.25e-10)|
+|         openelm|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (3.23e-16)|
+|         openelm|                                Meta| Dense|  [1;32mOK[0m (8.54e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (3.61e-10)|
+|          arctic|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.66e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.04e-09)|
+|          arctic|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.66e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.04e-09)|
+|          arctic|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.44e-15)|
+|          arctic|                                Meta|   MoE|  [1;32mOK[0m (9.21e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.67e-09)|
+|        deepseek|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.74e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.86e-09)|
+|        deepseek|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.74e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.86e-09)|
+|        deepseek|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.13e-15)|
+|        deepseek|                                Meta|   MoE|  [1;32mOK[0m (9.34e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.48e-09)|
+|       deepseek2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.66e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|       deepseek2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.66e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|       deepseek2|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.50e-15)|
+|       deepseek2|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       deepseek2|                        Host experts|   MoE|  [1;32mOK[0m (8.66e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|       deepseek2|                           MoE cache|   MoE|  [1;32mOK[0m (7.06e-12)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|       deepseek2|              MoE cache, layer split|   MoE|  [1;32mOK[0m (7.06e-12)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|   deepseek2-ocr|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|   deepseek2-ocr|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|   deepseek2-ocr|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|   deepseek2-ocr|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|      deepseek32|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.63e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|      deepseek32|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.63e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|      deepseek32|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.52e-15)|
+|      deepseek32|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       deepseek4|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (3.20e-07)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|       deepseek4|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (3.20e-07)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|       deepseek4|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|       deepseek4|                                Meta|   MoE|  [1;32mOK[0m (1.62e-06)|     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|      deepseek41|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (2.62e-07)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|      deepseek41|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (2.62e-07)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|      deepseek41|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|      deepseek41|                                Meta|   MoE|  [1;32mOK[0m (9.64e-07)|     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|         xing4_0|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.63e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|         xing4_0|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.63e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|         xing4_0|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.15e-14)|
+|         xing4_0|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|         chatglm|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.81e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.32e-09)|
+|         chatglm|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.81e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.32e-09)|
+|         chatglm|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.25e-15)|
+|         chatglm|                                Meta| Dense|  [1;32mOK[0m (9.45e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.03e-09)|
+|            glm4|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (1.52e-07)|       [1;32mOK[0m|  [1;32mOK[0m (5.86e-08)|
+|            glm4|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (1.52e-07)|       [1;32mOK[0m|  [1;32mOK[0m (5.86e-08)|
+|            glm4|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.46e-14)|
+|            glm4|                                Meta| Dense|  [1;32mOK[0m (1.31e-06)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.98e-07)|
+|         glm4moe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.81e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.65e-09)|
+|         glm4moe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.81e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.65e-09)|
+|         glm4moe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.30e-15)|
+|         glm4moe|                                Meta|   MoE|  [1;32mOK[0m (9.47e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (6.05e-09)|
+|         glm-dsa|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.63e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|         glm-dsa|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.63e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|         glm-dsa|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.52e-15)|
+|         glm-dsa|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|          bitnet|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.43e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.33e-09)|
+|          bitnet|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.43e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.33e-09)|
+|          bitnet|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.12e-15)|
+|          bitnet|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|              t5|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (3.04e-07)|     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|              t5|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (3.04e-07)|     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|              t5|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|              t5|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       t5encoder|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       t5encoder|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       t5encoder|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       t5encoder|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|            jais|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (9.92e-08)|       [1;32mOK[0m|  [1;32mOK[0m (8.34e-10)|
+|            jais|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (9.92e-08)|       [1;32mOK[0m|  [1;32mOK[0m (8.34e-10)|
+|            jais|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.21e-15)|
+|            jais|                                Meta| Dense|  [1;32mOK[0m (1.93e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.49e-09)|
+|           jais2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (9.94e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.32e-09)|
+|           jais2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (9.94e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.32e-09)|
+|           jais2|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.65e-15)|
+|           jais2|                                Meta| Dense|  [1;32mOK[0m (1.00e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.54e-09)|
+|        nemotron|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (9.94e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.32e-09)|
+|        nemotron|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (9.94e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.32e-09)|
+|        nemotron|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.65e-15)|
+|        nemotron|                                Meta| Dense|  [1;32mOK[0m (1.00e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.54e-09)|
+|      nemotron_h|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.24e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.82e-09)|
+|      nemotron_h|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.24e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.82e-09)|
+|      nemotron_h|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.23e-15)|
+|      nemotron_h|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|  nemotron_h_moe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.24e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.82e-09)|
+|  nemotron_h_moe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.24e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.82e-09)|
+|  nemotron_h_moe|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.23e-15)|
+|  nemotron_h_moe|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|         metis16|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (1.65e-07)|       [1;32mOK[0m|  [1;32mOK[0m (5.10e-09)|
+|         metis16|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (1.65e-07)|       [1;32mOK[0m|  [1;32mOK[0m (5.10e-09)|
+|         metis16|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (4.46e-15)|
+|         metis16|                                Meta|   MoE|  [1;32mOK[0m (1.65e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.10e-09)|
+|          exaone|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.69e-08)|       [1;32mOK[0m|  [1;32mOK[0m (4.05e-09)|
+|          exaone|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.69e-08)|       [1;32mOK[0m|  [1;32mOK[0m (4.05e-09)|
+|          exaone|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.84e-15)|
+|          exaone|                                Meta| Dense|  [1;32mOK[0m (9.31e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.98e-09)|
+|         exaone4|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (1.52e-07)|       [1;32mOK[0m|  [1;32mOK[0m (5.57e-08)|
+|         exaone4|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (1.52e-07)|       [1;32mOK[0m|  [1;32mOK[0m (5.57e-08)|
+|         exaone4|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.44e-14)|
+|         exaone4|                                Meta| Dense|  [1;32mOK[0m (1.22e-06)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.79e-07)|
+|      exaone-moe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.58e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.13e-09)|
+|      exaone-moe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.58e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.13e-09)|
+|      exaone-moe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.03e-15)|
+|      exaone-moe|                                Meta|   MoE|  [1;32mOK[0m (9.12e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.09e-09)|
+|           rwkv6|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|           rwkv6|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|           rwkv6|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|           rwkv6|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|      rwkv6qwen2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|      rwkv6qwen2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|      rwkv6qwen2|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|      rwkv6qwen2|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|           rwkv7|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|           rwkv7|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|           rwkv7|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|           rwkv7|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|          arwkv7|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|          arwkv7|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|          arwkv7|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|          arwkv7|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|         granite|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (1.09e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.44e-09)|
+|         granite|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (1.09e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.44e-09)|
+|         granite|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.22e-15)|
+|         granite|                                Meta| Dense|  [1;32mOK[0m (1.10e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.10e-09)|
+|         granite|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.49e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.96e-09)|
+|         granite|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.49e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.96e-09)|
+|         granite|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.27e-15)|
+|         granite|                                Meta|   MoE|  [1;32mOK[0m (8.69e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.82e-09)|
+|      granitemoe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (1.09e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.44e-09)|
+|      granitemoe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (1.09e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.44e-09)|
+|      granitemoe|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.22e-15)|
+|      granitemoe|                                Meta| Dense|  [1;32mOK[0m (1.10e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.10e-09)|
+|      granitemoe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.49e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.96e-09)|
+|      granitemoe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.49e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.96e-09)|
+|      granitemoe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.27e-15)|
+|      granitemoe|                                Meta|   MoE|  [1;32mOK[0m (8.69e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.82e-09)|
+|   granitehybrid|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (1.05e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.17e-09)|
+|   granitehybrid|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (1.05e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.17e-09)|
+|   granitehybrid|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.37e-15)|
+|   granitehybrid|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|   graniteswitch|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|   graniteswitch|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|   graniteswitch|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|   graniteswitch|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|     granite_swa|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (1.07e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.61e-09)|
+|     granite_swa|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (1.07e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.61e-09)|
+|     granite_swa|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.25e-15)|
+|     granite_swa|                                Meta| Dense|  [1;32mOK[0m (1.08e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (3.25e-09)|
+|       chameleon|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       chameleon|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       chameleon|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       chameleon|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|wavtokenizer-dec|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|wavtokenizer-dec|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|wavtokenizer-dec|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|wavtokenizer-dec|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|             plm|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|             plm|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|             plm|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|             plm|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|      bailingmoe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.58e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.96e-09)|
+|      bailingmoe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.58e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.96e-09)|
+|      bailingmoe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.80e-15)|
+|      bailingmoe|                                Meta|   MoE|  [1;32mOK[0m (9.11e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (6.52e-09)|
+|     bailingmoe2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.70e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.05e-10)|
+|     bailingmoe2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.70e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.05e-10)|
+|     bailingmoe2|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (6.14e-16)|
+|     bailingmoe2|                                Meta|   MoE|  [1;32mOK[0m (8.69e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (6.37e-10)|
+|     bailingmoe3|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (1.17e-07)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|     bailingmoe3|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (1.17e-07)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|     bailingmoe3|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (7.22e-15)|
+|     bailingmoe3|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|           dots1|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.74e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.77e-09)|
+|           dots1|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.74e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.77e-09)|
+|           dots1|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.59e-15)|
+|           dots1|                                Meta|   MoE|  [1;32mOK[0m (9.25e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.03e-09)|
+|       dots3note|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.82e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|       dots3note|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.82e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|       dots3note|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (3.84e-16)|
+|       dots3note|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|           arcee|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.76e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.32e-09)|
+|           arcee|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.76e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.32e-09)|
+|           arcee|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.27e-15)|
+|           arcee|                                Meta| Dense|  [1;32mOK[0m (9.33e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.78e-09)|
+|           afmoe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.54e-08)|       [1;32mOK[0m|  [1;32mOK[0m (7.08e-13)|
+|           afmoe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.54e-08)|       [1;32mOK[0m|  [1;32mOK[0m (7.08e-13)|
+|           afmoe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.40e-15)|
+|           afmoe|                                Meta|   MoE|  [1;32mOK[0m (8.89e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (0.00e+00)|
+|          laguna|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.67e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.75e-09)|
+|          laguna|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.67e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.75e-09)|
+|          laguna|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.15e-15)|
+|          laguna|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|        ernie4_5|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.73e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.59e-09)|
+|        ernie4_5|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.73e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.59e-09)|
+|        ernie4_5|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.43e-15)|
+|        ernie4_5|                                Meta|   MoE|  [1;32mOK[0m (9.31e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.94e-09)|
+|    ernie4_5-moe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.71e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.10e-09)|
+|    ernie4_5-moe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.71e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.10e-09)|
+|    ernie4_5-moe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.03e-15)|
+|    ernie4_5-moe|                                Meta|   MoE|  [1;32mOK[0m (9.30e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.88e-09)|
+|     hunyuan-moe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.79e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.90e-09)|
+|     hunyuan-moe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.79e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.90e-09)|
+|     hunyuan-moe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.25e-15)|
+|     hunyuan-moe|                                Meta|   MoE|  [1;32mOK[0m (9.30e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.95e-09)|
+|   hunyuan-dense|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.80e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.06e-09)|
+|   hunyuan-dense|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.80e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.06e-09)|
+|   hunyuan-dense|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.37e-15)|
+|   hunyuan-dense|                                Meta| Dense|  [1;32mOK[0m (9.33e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.69e-09)|
+|      hunyuan_vl|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.80e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.06e-09)|
+|      hunyuan_vl|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.80e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.06e-09)|
+|      hunyuan_vl|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.37e-15)|
+|      hunyuan_vl|                                Meta| Dense|  [1;32mOK[0m (9.33e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.69e-09)|
+|           hy_v3|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.73e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.52e-09)|
+|           hy_v3|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.73e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.52e-09)|
+|           hy_v3|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.24e-15)|
+|           hy_v3|                                Meta|   MoE|  [1;32mOK[0m (9.29e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.62e-09)|
+|           hy_v4|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.97e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|           hy_v4|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.97e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|           hy_v4|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (9.12e-16)|
+|           hy_v4|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|         smollm3|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.73e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.59e-09)|
+|         smollm3|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.73e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.59e-09)|
+|         smollm3|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.43e-15)|
+|         smollm3|                                Meta| Dense|  [1;32mOK[0m (9.31e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.94e-09)|
+|         gpt-oss|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (9.10e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.41e-09)|
+|         gpt-oss|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (9.10e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.41e-09)|
+|         gpt-oss|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.60e-15)|
+|         gpt-oss|                                Meta|   MoE|  [1;32mOK[0m (3.79e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (7.70e-09)|
+|            lfm2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.82e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.51e-09)|
+|            lfm2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.82e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.51e-09)|
+|            lfm2|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.88e-15)|
+|            lfm2|                                Meta| Dense|  [1;32mOK[0m (9.43e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (3.99e-09)|
+|         lfm2moe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.60e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.15e-09)|
+|         lfm2moe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.60e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.15e-09)|
+|         lfm2moe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.00e-15)|
+|         lfm2moe|                                Meta|   MoE|  [1;32mOK[0m (9.07e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.74e-09)|
+|            lfm3|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (1.80e-07)|       [1;32mOK[0m|  [1;32mOK[0m (6.28e-08)|
+|            lfm3|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (1.80e-07)|       [1;32mOK[0m|  [1;32mOK[0m (6.28e-08)|
+|            lfm3|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (3.26e-14)|
+|            lfm3|                                Meta| Dense|  [1;32mOK[0m (1.40e-06)|     [1;33mSKIP[0m|  [1;32mOK[0m (3.13e-07)|
+|           zaya1|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.82e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.29e-11)|
+|           zaya1|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.82e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.29e-11)|
+|           zaya1|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.06e-18)|
+|           zaya1|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|           dream|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.65e-08)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|           dream|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.65e-08)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|           dream|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|           dream|                                Meta| Dense|  [1;32mOK[0m (9.11e-08)|     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|    smallthinker|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.76e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.60e-09)|
+|    smallthinker|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.76e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.60e-09)|
+|    smallthinker|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (3.33e-15)|
+|    smallthinker|                                Meta|   MoE|  [1;32mOK[0m (9.32e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.08e-09)|
+|           llada|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.69e-08)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|           llada|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.69e-08)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|           llada|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|           llada|                                Meta| Dense|  [1;32mOK[0m (9.16e-08)|     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       llada-moe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.76e-08)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|       llada-moe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.76e-08)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|       llada-moe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|       llada-moe|                                Meta|   MoE|  [1;32mOK[0m (9.09e-08)|     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|        seed_oss|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.82e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.87e-09)|
+|        seed_oss|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.82e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.87e-09)|
+|        seed_oss|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.10e-15)|
+|        seed_oss|                                Meta| Dense|  [1;32mOK[0m (9.35e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.61e-09)|
+|        grovemoe|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.75e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.96e-09)|
+|        grovemoe|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.75e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.96e-09)|
+|        grovemoe|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.20e-15)|
+|        grovemoe|                                Meta|   MoE|  [1;32mOK[0m (9.10e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.42e-09)|
+|         apertus|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.59e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.17e-09)|
+|         apertus|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.59e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.17e-09)|
+|         apertus|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.28e-15)|
+|         apertus|                                Meta| Dense|  [1;32mOK[0m (8.74e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.15e-09)|
+|      minimax-m2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.77e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.47e-09)|
+|      minimax-m2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.77e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.47e-09)|
+|      minimax-m2|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.98e-15)|
+|      minimax-m2|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|          cogvlm|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.68e-08)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|          cogvlm|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.68e-08)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|          cogvlm|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|          cogvlm|                                Meta| Dense|  [1;32mOK[0m (8.68e-08)|     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|            rnd1|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.76e-08)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|            rnd1|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.76e-08)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|            rnd1|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|            rnd1|                                Meta|   MoE|  [1;32mOK[0m (9.09e-08)|     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|  pangu-embedded|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.79e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.20e-09)|
+|  pangu-embedded|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.79e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.20e-09)|
+|  pangu-embedded|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.20e-15)|
+|  pangu-embedded|                                Meta| Dense|  [1;32mOK[0m (8.89e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.36e-09)|
+|        mistral3|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (1.04e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.05e-09)|
+|        mistral3|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (1.04e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.05e-09)|
+|        mistral3|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.15e-15)|
+|        mistral3|                                Meta| Dense|  [1;32mOK[0m (1.05e-07)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.63e-09)|
+|        mistral3|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.54e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.63e-09)|
+|        mistral3|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.54e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.63e-09)|
+|        mistral3|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.58e-15)|
+|        mistral3|                                Meta|   MoE|  [1;32mOK[0m (8.67e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.32e-09)|
+|        mistral4|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.68e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|        mistral4|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.68e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|        mistral4|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.48e-15)|
+|        mistral4|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|  mistral-large4|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.58e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|  mistral-large4|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.58e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|  mistral-large4|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.65e-14)|
+|  mistral-large4|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       paddleocr|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.79e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.20e-09)|
+|       paddleocr|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.79e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.20e-09)|
+|       paddleocr|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.20e-15)|
+|       paddleocr|                                Meta|   MoE|  [1;32mOK[0m (8.89e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.36e-09)|
+|           mimo2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.79e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.03e-10)|
+|           mimo2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.79e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.03e-10)|
+|           mimo2|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.76e-16)|
+|           mimo2|                                Meta|   MoE|  [1;32mOK[0m (8.77e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.82e-10)|
+|          step35|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.27e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.51e-09)|
+|          step35|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.27e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.51e-09)|
+|          step35|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|  [1;32mOK[0m (7.13e-16)|
+|          step35|                                Meta|   MoE|  [1;32mOK[0m (8.32e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.85e-09)|
+|        spark2_5|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.80e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.30e-09)|
+|        spark2_5|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.80e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.30e-09)|
+|        spark2_5|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.26e-15)|
+|        spark2_5|                                Meta| Dense|  [1;32mOK[0m (9.01e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.91e-09)|
+|     llama-embed|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|     llama-embed|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|     llama-embed|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|     llama-embed|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|     llama-embed|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|     llama-embed|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|     llama-embed|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|     llama-embed|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       maincoder|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.75e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.07e-09)|
+|       maincoder|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.75e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.07e-09)|
+|       maincoder|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.19e-15)|
+|       maincoder|                                Meta| Dense|  [1;32mOK[0m (9.33e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.40e-09)|
+|     maion-coder|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (1.64e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.12e-08)|
+|     maion-coder|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (1.64e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.12e-08)|
+|     maion-coder|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (5.34e-14)|
+|     maion-coder|                                Meta|   MoE|  [1;32mOK[0m (1.61e-06)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.94e-08)|
+|     kimi-linear|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.81e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|     kimi-linear|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.81e-08)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|     kimi-linear|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.51e-15)|
+|     kimi-linear|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|         kimi-k3|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (1.33e-07)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|         kimi-k3|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (1.33e-07)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|         kimi-k3|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (9.02e-15)|
+|         kimi-k3|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|        kimi-k31|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (1.33e-07)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|        kimi-k31|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (1.33e-07)|       [1;32mOK[0m|  [1;32mOK[0m (0.00e+00)|
+|        kimi-k31|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (9.02e-15)|
+|        kimi-k31|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       glm5-next|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (5.12e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.85e-08)|
+|       glm5-next|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (5.12e-07)|       [1;32mOK[0m|  [1;32mOK[0m (1.85e-08)|
+|       glm5-next|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (5.68e-14)|
+|       glm5-next|                                Meta|   MoE|  [1;32mOK[0m (3.16e-06)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.30e-07)|
+|          talkie|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.37e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.85e-10)|
+|          talkie|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.37e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.85e-10)|
+|          talkie|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (4.88e-16)|
+|          talkie|                                Meta| Dense|  [1;32mOK[0m (8.42e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (5.68e-10)|
+|          mellum|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.73e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.02e-09)|
+|          mellum|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.73e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.02e-09)|
+|          mellum|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.87e-15)|
+|          mellum|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|      minimax-m3|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.88e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.03e-09)|
+|      minimax-m3|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.88e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.03e-09)|
+|      minimax-m3|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (3.95e-15)|
+|      minimax-m3|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|        nanbeige|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.82e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.40e-09)|
+|        nanbeige|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.82e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.40e-09)|
+|        nanbeige|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.30e-15)|
+|        nanbeige|                                Meta| Dense|  [1;32mOK[0m (9.34e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (6.33e-09)|
+|        qwen3tts|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.70e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.52e-09)|
+|        qwen3tts|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.70e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.52e-09)|
+|        qwen3tts|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.43e-15)|
+|        qwen3tts|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       pockettts|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.18e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.23e-09)|
+|       pockettts|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.18e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.23e-09)|
+|       pockettts|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.44e-15)|
+|       pockettts|                                Meta| Dense|  [1;32mOK[0m (8.49e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.50e-09)|
+|           moshi|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.76e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.84e-09)|
+|           moshi|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.76e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.84e-09)|
+|           moshi|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.23e-15)|
+|           moshi|                                Meta| Dense|  [1;32mOK[0m (9.55e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (4.38e-09)|
+|          zonos3|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.25e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.27e-10)|
+|          zonos3|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.25e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.27e-10)|
+|          zonos3|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (6.34e-16)|
+|          zonos3|                                Meta|   MoE|  [1;32mOK[0m (8.28e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.14e-10)|
+|          kokoro|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|          kokoro|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|          kokoro|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|          kokoro|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       tiny-voca|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       tiny-voca|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       tiny-voca|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       tiny-voca|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|      minimax-01|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (9.56e-08)|       [1;32mOK[0m|  [1;32mOK[0m (6.72e-11)|
+|      minimax-01|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (9.56e-08)|       [1;32mOK[0m|  [1;32mOK[0m (6.72e-11)|
+|      minimax-01|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.45e-16)|
+|      minimax-01|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|        hrm_text|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.56e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.47e-09)|
+|        hrm_text|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.56e-08)|       [1;32mOK[0m|  [1;32mOK[0m (3.47e-09)|
+|        hrm_text|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (4.76e-15)|
+|        hrm_text|                                Meta| Dense|  [1;32mOK[0m (8.56e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (3.47e-09)|
+|      k2-horizon|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.54e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.83e-10)|
+|      k2-horizon|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.54e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.83e-10)|
+|      k2-horizon|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.61e-16)|
+|      k2-horizon|                                Meta| Dense|  [1;32mOK[0m (8.54e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (3.01e-10)|
+|      k2-horizon|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (8.60e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.10e-10)|
+|      k2-horizon|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (8.60e-08)|       [1;32mOK[0m|  [1;32mOK[0m (2.10e-10)|
+|      k2-horizon|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (2.82e-16)|
+|      k2-horizon|                                Meta|   MoE|  [1;32mOK[0m (8.61e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (1.68e-10)|
+|            beam|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (1.53e-07)|       [1;32mOK[0m|  [1;32mOK[0m (3.91e-09)|
+|            beam|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (1.53e-07)|       [1;32mOK[0m|  [1;32mOK[0m (3.91e-09)|
+|            beam|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (3.07e-14)|
+|            beam|                                Meta|   MoE|  [1;32mOK[0m (1.37e-06)|     [1;33mSKIP[0m|  [1;32mOK[0m (7.08e-09)|
+|        kolibri1|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (1.52e-07)|       [1;32mOK[0m|  [1;32mOK[0m (5.98e-08)|
+|        kolibri1|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (1.52e-07)|       [1;32mOK[0m|  [1;32mOK[0m (5.98e-08)|
+|        kolibri1|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.59e-14)|
+|        kolibri1|                                Meta|   MoE|  [1;32mOK[0m (1.31e-06)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.97e-07)|
+|          limite|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (7.27e-09)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|          limite|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (7.27e-09)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|          limite|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|          limite|                                Meta| Dense|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       ricursive|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (8.83e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.05e-11)|
+|       ricursive|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (8.83e-08)|       [1;32mOK[0m|  [1;32mOK[0m (1.05e-11)|
+|       ricursive|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.31e-15)|
+|       ricursive|                                Meta| Dense|  [1;32mOK[0m (9.09e-08)|     [1;33mSKIP[0m|  [1;32mOK[0m (0.00e+00)|
+|        inkling2|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (2.16e-07)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|        inkling2|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (2.16e-07)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|        inkling2|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|[1;33mSKIP[0m           |
+|        inkling2|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|   inkling2_loop|  NVIDIA GeForce RTX 5060 Ti (CUDA0)|   MoE|  [1;32mOK[0m (2.51e-07)|     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|   inkling2_loop|  NVIDIA GeForce RTX 5060 Ti (CUDA1)|   MoE|  [1;32mOK[0m (2.51e-07)|     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|   inkling2_loop|Intel(R) Core(TM) Ultra 9 285K (CPU)|   MoE|  [1;32mOK[0m (0.00e+00)|     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|   inkling2_loop|                                Meta|   MoE|[1;33mSKIP[0m           |     [1;33mSKIP[0m|[1;33mSKIP[0m           |
+|       domynedge|  NVIDIA GeForce RTX 5060 Ti (CUDA0)| Dense|  [1;32mOK[0m (1.50e-07)|       [1;32mOK[0m|  [1;32mOK[0m (5.22e-08)|
+|       domynedge|  NVIDIA GeForce RTX 5060 Ti (CUDA1)| Dense|  [1;32mOK[0m (1.50e-07)|       [1;32mOK[0m|  [1;32mOK[0m (5.22e-08)|
+|       domynedge|Intel(R) Core(TM) Ultra 9 285K (CPU)| Dense|  [1;32mOK[0m (0.00e+00)|       [1;32mOK[0m|  [1;32mOK[0m (1.39e-14)|
+|       domynedge|                                Meta| Dense|  [1;32mOK[0m (1.26e-06)|     [1;33mSKIP[0m|  [1;32mOK[0m (2.11e-07)|
+Summary: all 591 test(s) passed

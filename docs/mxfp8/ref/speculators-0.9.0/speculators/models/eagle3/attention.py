@@ -1,0 +1,158 @@
+import torch
+from torch.nn.attention.flex_attention import (
+    BlockMask,
+    and_masks,
+    or_masks,
+)
+
+from speculators.models.attention import ALL_ATTENTION_FUNCTIONS  # noqa: F401
+
+
+def create_combined_mask_mod(
+    document_ids: torch.Tensor,
+    total_seq_len: int,
+    sliding_window: int | None = None,
+):
+    def causal_mask_mod(_b, _h, q_idx, kv_idx):
+        causal = q_idx >= kv_idx
+        if sliding_window is not None:
+            causal = causal & (kv_idx > q_idx - sliding_window)
+        return causal
+
+    def document_mask_mod(_b, _h, q_idx, kv_idx):
+        # Exclude padding tokens in attention mask
+        return torch.logical_and(
+            document_ids[q_idx] != -1,
+            document_ids[q_idx] == document_ids[kv_idx % total_seq_len],
+        )
+
+    def diagonal_draft_mask_mod(_b, _h, q_idx, kv_idx):
+        return kv_idx % total_seq_len == q_idx
+
+    return or_masks(
+        and_masks(causal_mask_mod, document_mask_mod), diagonal_draft_mask_mod
+    )
+
+
+@torch.compiler.disable
+def extend_mask_for_draft_tokens(block_mask):
+    """
+    Extend the block mask to include new draft tokens. Concatenates a diagonal mask for
+    the new draft tokens.
+
+    Assumptions:
+    - block_mask BLOCK_SIZE := KV_BLOCK_SIZE == Q_BLOCK_SIZE
+    - The number of query values is the original total_seq_len (or equivalently the
+    number of query blocks is the original total_seq_len // BLOCK_SIZE)
+
+    i.e. if block_mask is:
+    [
+        [
+            [1, 0, 0],
+            [1, 1, 0],
+            [0, 0, 1],
+        ]
+    ]
+    the result will be:
+    [
+        [
+            [1, 0, 0, 1, 0, 0],
+            [1, 1, 0, 0, 1, 0],
+            [0, 0, 1, 0, 0, 1],
+        ]
+    ]
+    and then calling again will give:
+    [
+        [
+            [1, 0, 0, 1, 0, 0, 1, 0, 0],
+            [1, 1, 0, 0, 1, 0, 0, 1, 0],
+            [0, 0, 1, 0, 0, 1, 0, 0, 1],
+        ]
+    ]
+
+    """
+    kv_num_blocks = block_mask.kv_num_blocks
+    # shape: [B, H, Q_LEN // BLOCK_SIZE]
+
+    kv_indices = block_mask.kv_indices
+    # shape: [B, H, Q_LEN // BLOCK_SIZE, KV_LEN // BLOCK_SIZE]
+    b, h, q_blocks, kv_blocks = kv_indices.shape
+
+    # extend kv indices if needed
+    kv_indices = torch.cat(
+        [kv_indices, kv_indices.new_zeros((b, h, q_blocks, q_blocks))], dim=-1
+    )
+    new_block_indices = torch.arange(
+        kv_blocks,
+        kv_blocks + q_blocks,
+        dtype=kv_indices.dtype,
+        device=kv_indices.device,
+    ).reshape(1, 1, q_blocks, 1)
+    kv_indices.scatter_(
+        dim=-1, index=kv_num_blocks.unsqueeze(-1), src=new_block_indices
+    )
+
+    kv_num_blocks = kv_num_blocks + 1
+    if block_mask.full_kv_indices is not None:
+        extended_full_kv_indices = torch.cat(
+            [
+                block_mask.full_kv_indices,
+                block_mask.full_kv_indices.new_zeros((b, h, q_blocks, q_blocks)),
+            ],
+            dim=-1,
+        )
+    else:
+        extended_full_kv_indices = None
+    return BlockMask.from_kv_blocks(
+        kv_num_blocks,
+        kv_indices,
+        block_mask.full_kv_num_blocks,
+        extended_full_kv_indices,
+        mask_mod=block_mask.mask_mod,
+    )
+
+
+def extend_dense_mask_for_draft_tokens(mask: torch.Tensor, total_seq_len: int):
+    """Extend a dense attention mask with a diagonal block for new draft tokens.
+
+    Dense-mask equivalent of extend_mask_for_draft_tokens (which operates on
+    BlockMask). Appends total_seq_len new KV columns where only position
+    (q, new_offset + q) is attended (the same diagonal pattern).
+
+    The appended block follows the input mask's semantics: 0 / -inf for an
+    additive float mask (the eager / SDPA path built by create_float_mask,
+    where 0 means attend and -inf blocked), and True/False (or 1/0) for a
+    boolean or integral mask.
+
+    Args:
+        mask: Dense boolean or additive float mask of shape
+            [1, 1, total_seq_len, kv_len].
+        total_seq_len: Number of query positions (= original sequence length).
+
+    Returns:
+        Extended mask of shape [1, 1, total_seq_len, kv_len + total_seq_len].
+    """
+    idx = torch.arange(total_seq_len, device=mask.device)
+    diag = idx.unsqueeze(1) == idx.unsqueeze(0)
+    if mask.dtype.is_floating_point:
+        new_cols = torch.zeros(diag.shape, dtype=mask.dtype, device=mask.device)
+        new_cols.masked_fill_(~diag, float("-inf"))
+    else:
+        new_cols = diag.to(dtype=mask.dtype)
+    new_cols = new_cols.unsqueeze(0).unsqueeze(0)
+    return torch.cat([mask, new_cols], dim=-1)
+
+
+def block_mask_to_dense_attention_mask(
+    block_mask: BlockMask, device: torch.device, dtype: torch.dtype
+):
+    attention_mask = torch.ones(block_mask.shape, device=device, dtype=dtype)
+
+    for q_idx in range(attention_mask.shape[2]):
+        attention_mask[0, 0, q_idx, :] = block_mask.mask_mod(
+            torch.zeros(1, device=device, dtype=torch.long),
+            torch.zeros(1, device=device, dtype=torch.long),
+            torch.ones(1, device=device, dtype=torch.long) * q_idx,
+            torch.arange(attention_mask.shape[3], device=device, dtype=torch.long),
+        )
+    return attention_mask

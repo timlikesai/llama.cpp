@@ -1,0 +1,1 @@
+tokenspredicted 128 timings {"cache_n": 0, "prompt_n": 737, "prompt_ms": 954.911, "prompt_per_token_ms": 1.2956729986431479, "prompt_per_second": 771.7996755718597, "predicted_n": 128, "predicted_ms": 1304.689, "predicted_per_token_ms": 10.273141732283465, "predicted_per_second": 97.34120545202725, "draft_n": 146, "draft_n_accepted": 106}

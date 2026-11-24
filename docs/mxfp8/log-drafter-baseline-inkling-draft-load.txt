@@ -1,0 +1,10 @@
+0.00.362.878 I llama_completion: llama backend init
+0.00.362.888 I llama_completion: load the model and apply lora adapter, if any
+0.00.662.615 E llama_model_load: error loading model: check_tensor_dims: tensor 'markov_w1.weight' has wrong shape; expected    256, 200058, got    256, 201024,      1,      1
+0.00.662.628 E llama_model_load_from_file_impl: failed to load model
+0.00.662.665 E common_fit_params: encountered an error while trying to fit params to free device memory: failed to load model
+0.00.762.226 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.00.796.708 E llama_model_load: error loading model: check_tensor_dims: tensor 'markov_w1.weight' has wrong shape; expected    256, 200058, got    256, 201024,      1,      1
+0.00.796.712 E llama_model_load_from_file_impl: failed to load model
+0.00.796.718 E cmn  common_init_: failed to load model '/home/tim/models/unsloth/Inkling-2-Mini-GGUF/dspark-Inkling-2-Mini-Q8_0.gguf'
+0.00.796.722 E llama_completion: error: unable to create context

@@ -1,0 +1,240 @@
+Metadata-Version: 2.4
+Name: speculators
+Version: 0.9.0
+Summary: A unified library for creating, representing, and storing speculative decoding algorithms for LLM serving such as in vLLM.
+Author: Red Hat
+License-Expression: Apache-2.0
+Project-URL: homepage, https://github.com/vllm-project/speculators
+Project-URL: source, https://github.com/vllm-project/speculators
+Project-URL: issues, https://github.com/vllm-project/speculators/issues
+Keywords: speculative decoding,transformers,llm,inference,vllm,machine learning,deep learning,nlp,language models,serving,standard format,productization,decoding algorithms,inference server
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: aiohttp
+Requires-Dist: click
+Requires-Dist: datasets<=5.1.0,>=4.0.0
+Requires-Dist: httpx
+Requires-Dist: huggingface-hub
+Requires-Dist: loguru<=0.7.3,>=0.7.2
+Requires-Dist: numpy<=2.5.4,>=2.0.0
+Requires-Dist: openai>=2.0.0
+Requires-Dist: protobuf
+Requires-Dist: psutil
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: pydantic-settings>=2.0.0
+Requires-Dist: rich
+Requires-Dist: safetensors
+Requires-Dist: torch<=2.14.1,>=2.9.0
+Requires-Dist: torchaudio
+Requires-Dist: torchvision
+Requires-Dist: tqdm<=4.70.1,>=4.66.3
+Requires-Dist: transformers<=5.19.0,>=5.0.0
+Requires-Dist: typer>=0.12.0
+Requires-Dist: hs-connectors==0.9.0
+Provides-Extra: mooncake-cuda
+Requires-Dist: mooncake-transfer-engine>=0.3.12; extra == "mooncake-cuda"
+Provides-Extra: mooncake-cuda13
+Requires-Dist: mooncake-transfer-engine-cuda13>=0.3.13.post1; extra == "mooncake-cuda13"
+Provides-Extra: dev
+Requires-Dist: build>=1.6.1; extra == "dev"
+Requires-Dist: setuptools>=84.0.0; extra == "dev"
+Requires-Dist: setuptools-git-versioning<3,>=2.0; extra == "dev"
+Requires-Dist: mike~=2.2.0; extra == "dev"
+Requires-Dist: mkdocs~=1.6.1; extra == "dev"
+Requires-Dist: mkdocs-material[imaging]~=9.7.7; extra == "dev"
+Requires-Dist: markdown~=3.10.2; extra == "dev"
+Requires-Dist: pymdown-extensions~=12.1.0; extra == "dev"
+Requires-Dist: mkdocs-section-index~=0.3.12; extra == "dev"
+Requires-Dist: mkdocs-minify-plugin~=0.8.0; extra == "dev"
+Requires-Dist: mkdocs-api-autonav~=0.4.0; extra == "dev"
+Requires-Dist: mkdocs-awesome-nav~=3.3; extra == "dev"
+Requires-Dist: mkdocstrings-python~=2.0.9; extra == "dev"
+Requires-Dist: mkdocs-gen-files~=0.6.1; extra == "dev"
+Requires-Dist: mkdocs-nav-weight~=0.3.0; extra == "dev"
+Requires-Dist: mkdocs-redirects~=1.2.3; extra == "dev"
+Requires-Dist: pygments<2.22.0; extra == "dev"
+Requires-Dist: sphinx~=8.1.3; extra == "dev"
+Requires-Dist: pytest~=9.1.1; extra == "dev"
+Requires-Dist: pytest-asyncio~=1.4.0; extra == "dev"
+Requires-Dist: pytest-cov~=7.1.0; extra == "dev"
+Requires-Dist: pytest-mock~=3.16.0; extra == "dev"
+Requires-Dist: pytest-rerunfailures~=16.7; extra == "dev"
+Requires-Dist: scipy; extra == "dev"
+Requires-Dist: plotly; extra == "dev"
+Requires-Dist: mypy~=2.1.0; extra == "dev"
+Requires-Dist: ruff~=0.15.20; extra == "dev"
+Requires-Dist: pre-commit~=4.6; extra == "dev"
+Requires-Dist: mdformat~=1.0.0; extra == "dev"
+Requires-Dist: mdformat-footnote~=0.1.3; extra == "dev"
+Requires-Dist: mdformat-frontmatter~=2.1.2; extra == "dev"
+Requires-Dist: mdformat-gfm~=1.0.0; extra == "dev"
+Requires-Dist: mdformat-admon~=2.1.1; extra == "dev"
+Requires-Dist: mdformat-gfm-alerts~=2.0.0; extra == "dev"
+Requires-Dist: types-click~=7.1.8; extra == "dev"
+Requires-Dist: types-PyYAML~=6.0.12; extra == "dev"
+Requires-Dist: types-requests~=2.33.0; extra == "dev"
+Requires-Dist: types-toml; extra == "dev"
+Requires-Dist: types-tqdm; extra == "dev"
+Requires-Dist: mkdocs-linkcheck~=1.0.6; extra == "dev"
+Dynamic: license-file
+Dynamic: requires-dist
+
+<div align="center">
+
+<picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/speculators/main/docs/assets/branding/speculators-logo-white.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/vllm-project/speculators/main/docs/assets/branding/speculators-logo-black.svg" />
+    <img alt="Speculators logo" src="https://raw.githubusercontent.com/vllm-project/speculators/main/docs/assets/branding/speculators-logo-black.svg" height="64" />
+  </picture>
+
+[![License](https://img.shields.io/github/license/vllm-project/speculators.svg)](https://github.com/vllm-project/speculators/blob/main/LICENSE) [![Python Versions](https://img.shields.io/badge/Python-3.11--3.13-orange)](https://pypi.org/project/speculators/) [![docs](https://img.shields.io/badge/docs-Speculators-blue)](https://docs.vllm.ai/projects/speculators/en/latest/) [![PyPI](https://img.shields.io/pypi/v/speculators.svg)](https://pypi.org/project/speculators/) [![tests](https://badge.buildkite.com/ec24a960c7238e18953364f4e7117a5301185b37e60283b5b0.svg?branch=main)](https://buildkite.com/vllm/speculators)
+
+</div>
+
+## Overview
+
+Speculators is a library for training speculative decoding draft models that deploy directly to LLM inference engines like vLLM. Speculative decoding is a lossless technique that speeds up LLM inference by using a smaller, faster draft model (i.e. "the speculator") to propose tokens, which are then verified by the larger base model, reducing latency without compromising output quality. The speculator intelligently drafts multiple tokens ahead of time, and the base model verifies them in a single forward pass. This approach boosts performance without sacrificing output quality, as every accepted token is guaranteed to match what the main model would have generated on its own.
+
+Speculators standardizes this process by providing a productionized end-to-end framework to train draft models with reusable formats and tools. Trained models can seamlessly run in vLLM, enabling the deployment of speculative decoding in production-grade inference servers.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/speculators/main/docs/assets/branding/speculators-user-flow-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/vllm-project/speculators/main/docs/assets/branding/speculators-user-flow-light.svg" />
+    <img alt="Speculators user flow diagram" src="https://raw.githubusercontent.com/vllm-project/speculators/main/docs/assets/branding/speculators-user-flow-light.svg" />
+  </picture>
+</p>
+
+______________________________________________________________________
+
+💬 Join us on the [vLLM Community Slack](https://inviter.co/vllm-slack) and share your questions, thoughts, or ideas in:
+
+- `#speculators`
+- `#feat-spec-decode`
+
+🎥 Watch our Office Hours presentation: [Video](https://www.youtube.com/live/2ISAr_JVGLs) | [Slides](https://docs.google.com/presentation/d/1s4eAb7v-rdZt8smyULBJWGXjJXrgFTZWnwqYa2-h1l4/edit?slide=id.g3365e070742_6_0#slide=id.g3365e070742_6_0)
+
+______________________________________________________________________
+
+## 🚀 What's New!
+
+Big updates have landed in Speculators! To get a more in-depth look, check out the [Speculators documentation](https://docs.vllm.ai/projects/speculators/en/latest/).
+
+Some of the exciting new features include:
+
+- **Multi-Node Online Training via hs_connectors**: Added the [`hs_connectors`](https://github.com/vllm-project/speculators/tree/main/hs_connectors) plugin package with pluggable backends for transferring hidden states between vLLM and the trainer across nodes. The file-based backend uses a shared filesystem, while the Mooncake backend leverages a distributed store for environments without shared storage, enabling online speculator training at multi-node scale.
+- **DSpark Training Algorithm**: Added support for the DSpark training algorithm, which extends DFlash's anchored-block drafting with a Markov head that conditions each draft position on the previous token within the block, plus a confidence head that predicts per-position acceptance probability. DSpark checkpoints can warm-start from existing DFlash checkpoints.
+- **P-EAGLE Training Support**: Added support for the [P-EAGLE training algorithm](https://docs.vllm.ai/projects/speculators/en/latest/user_guide/algorithms/peagle), which extends EAGLE-3's architecture with parallel multi-token prediction via Conditional-On-Distribution (COD) sampling. Rather than generating draft tokens sequentially, P-EAGLE predicts multiple tokens in a single forward pass, reducing drafting latency. The Red Hat team published a [P-EAGLE speculator for Qwen3-8B](https://huggingface.co/RedHatAI/Qwen3-8B-speculator.peagle).
+- **MTP Finetuning Support**: Added support for finetuning the native Multi-Token Prediction (MTP) heads of models like Qwen3-Next on domain-specific data, following the [FastMTP](https://arxiv.org/abs/2509.18362) approach. Because the MTP head is small (~100M–400M params), it can be trained on pre-extracted hidden states without loading the full verifier
+- **Sliding Window Attention for DFlash and DSpark**: DFlash and DSpark speculators use sliding window attention on all draft layers by default. Use `--sliding-window` to set the window size and `--full-attention-indices` to opt specific layers into full attention. Sliding window attention reduces KV cache allocation for long-context sequences and can improve per-position acceptance rates compared to full attention.
+- **DFlash Training Algorithm**: Added support for the DFlash training algorithm with anchored-block drafting, using auxiliary hidden states from multiple verifier layers. Includes CLI options for block size and max anchors, plus DFlash metrics, utilities, and draft model. DFlash models trained through Speculators can now run seamlessly in vLLM as of [vLLM PR #38300](https://github.com/vllm-project/vllm/pull/38300).
+
+______________________________________________________________________
+
+## Key Features
+
+- **Offline Training Data Generation using vLLM:** Enable the generation of hidden states using vLLM. Data samples are saved to disk and can be used for draft model training.
+- **Draft Model Training Support:** E2E training support of single and multi-layer draft models. Training is supported for MoE, non-MoE, and Vision Language models.
+- **Standardized, Extensible Format:** Provides a Hugging Face-compatible format for defining speculative models, with tools to convert from external research repositories into a standard speculators format for easy adoption.
+- **Seamless vLLM Integration:** Built for direct deployment into vLLM, enabling low-latency, production-grade inference with minimal overhead.
+
+> [!TIP]
+> Read more about Speculators features in this [vLLM blog post](https://blog.vllm.ai/2025/12/13/speculators-v030.html).
+
+## Supported Models
+
+Browse trained speculators and their evaluation results on the [Speculators dashboard](https://neuralmagic.github.io/speculators-dashboard/).
+
+## vLLM Inference
+
+Models trained through Speculators can run seamlessly in vLLM using a simple `vllm serve <speculator_model>` command. This will run the model in vLLM using default arguments, defined in the `speculator_config` of the model's config.json.
+
+```bash
+vllm serve RedHatAI/Qwen3-8B-speculator.eagle3
+```
+
+### Performance Benchmarking
+
+Served models can then be benchmarked using [GuideLLM](https://github.com/vllm-project/guidellm), enabled by the benchmarking tooling in [`scripts/evaluate`](https://github.com/vllm-project/speculators/tree/main/scripts/evaluate). Below, we show sample benchmark results for [NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16) with a trained DSpark speculator, [RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B.dspark](https://huggingface.co/RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B.dspark), and show further optimization by combining it with the quantized FP8 verifier, [RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-FP8](https://huggingface.co/RedHatAI/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-FP8), on Hopper GPUs.
+
+<p align="center">
+  <img alt="HumanEval benchmark results comparing DSpark and FP8+DSpark speculative decoding" src="docs/assets/humaneval_dspark_fp8_dspark.png" width=180%>
+</p>
+
+<p align="center">
+  <img alt="Math reasoning benchmark results comparing DSpark and FP8+DSpark speculative decoding" src="docs/assets/math_reasoning_dspark_fp8_dspark.png" width=180%>
+</p>
+
+## Additional Utility Scripts
+
+- [Regenerate responses to enhance your training data](https://github.com/vllm-project/speculators/tree/main/scripts/response_regeneration)
+
+## Getting Started
+
+### Installation
+
+#### Prerequisites
+
+Before installing, ensure you have the following:
+
+- **Operating System:** Linux or macOS
+- **Python:** 3.11 or higher
+- **Package Manager:** pip (recommended) or conda
+
+#### Install from PyPI (Recommended)
+
+Install the latest stable release from PyPI:
+
+```bash
+pip install speculators
+```
+
+#### Install from Source
+
+For the latest development version or to contribute to the project:
+
+```bash
+git clone https://github.com/vllm-project/speculators.git
+cd speculators
+
+pip install -e .
+```
+
+For development with additional tools:
+
+```bash
+pip install -e ".[dev]"
+```
+
+#### Verify Installation
+
+You can verify your installation by checking the version:
+
+```bash
+speculators --version
+```
+
+Or by importing the package in Python:
+
+```python
+import speculators
+print(speculators.__version__)
+```
+
+## License
+
+Speculators is licensed under the [Apache License 2.0](https://github.com/vllm-project/speculators/blob/main/LICENSE).
+
+## Cite
+
+If you find Speculators helpful in your research or projects, please consider citing it:
+
+```bibtex
+@misc{speculators2025,
+  title={Speculators: A Unified Library for Speculative Decoding Algorithms in LLM Serving},
+  author={Red Hat},
+  year={2025},
+  howpublished={\url{https://github.com/vllm-project/speculators}},
+}
+```

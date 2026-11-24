@@ -1,0 +1,9 @@
+0.00.361.549 I llama_completion: llama backend init
+0.00.361.558 I llama_completion: load the model and apply lora adapter, if any
+0.00.666.769 E llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set (this warning is normal during memory fitting)
+0.00.691.327 E common_fit_params: encountered an error while trying to fit params to free device memory: failed to create llama_context from model
+0.00.795.361 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.00.831.411 E llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set (this warning is normal during memory fitting)
+0.00.831.414 E cmn  common_init_: failed to create context with model '/home/tim/models/unsloth/Inkling-2-Mini-GGUF/dspark-Inkling-2-Mini-Q8_0.gguf'
+0.00.831.417 E cmn  common_init_: failed to create context with model '/home/tim/models/unsloth/Inkling-2-Mini-GGUF/dspark-Inkling-2-Mini-Q8_0.gguf'
+0.00.831.421 E llama_completion: error: unable to create context
