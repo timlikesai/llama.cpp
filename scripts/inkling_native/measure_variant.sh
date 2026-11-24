@@ -31,6 +31,7 @@ VAR=$MODELS/Inkling-2-Mini-FULL-vocabq8.gguf
 DRAFT=$MODELS/Inkling-2-Mini-DSpark-BF16.gguf
 CORPUS=$REPO/logs/corpora/wiki.test.slice64k.raw
 NEEDLE=$REPO/logs/needle-256k-deep.txt
+MMPROJ_FILE=${MMPROJ_FILE:-/home/tim/models/timlikesai/Inkling-2-Mini-vision-mmproj.gguf}
 # which file the retrieval/needle modes test (the A/B modes name both files explicitly)
 MODEL=${MODEL:-$FULL}
 LOGS=$REPO/logs
@@ -457,6 +458,131 @@ mode_ubfrontier() {
     done
 }
 
+# Is the FITTER (not the ngram chain) what blocks -ub 512? shapeacc ran 131072/-ub 512 clean with
+# --fit off -ngl 99 and dspark-only; ubfrontier failed the same shape with --fit on and the chain.
+# Cross the two variables: {fit on, fit off} x {dspark, chain} at the shape that should work.
+mode_fitab() {
+    local m="${MODEL:-$FULL}"
+    local CHAIN=(--spec-type draft-dspark,ngram-mod,ngram-map-k)
+    local DS=(--spec-type draft-dspark)
+    for fit in "on" "off"; do
+        for spec in chain dspark; do
+            local extra=(); [ "$spec" = chain ] && extra=("${CHAIN[@]}") || extra=("${DS[@]}")
+            local pin=(); [ "$fit" = off ] && pin=(-ngl 99)
+            local out="$LOGS/mv-fitab-fit${fit}-${spec}.log"
+            echo "--- fit $fit, spec $spec"
+            "$BIN/llama-cli" -m "$m" -sm layer -fa on -b 2048 -ub 512 -c 131072 \
+                -ctk q4_1 -ctv q4_1 --jinja --fit "$fit" "${pin[@]}" "${extra[@]}" \
+                --spec-draft-model "$DRAFT" --spec-draft-type-k q4_1 --spec-draft-type-v q4_1 \
+                --spec-draft-n-max 2 --spec-draft-n-ubatch 64 \
+                -f "$LOGS/prompt-code.txt" -n 384 --temp 0 -s 42 --no-display-prompt -v \
+                < /dev/null > "$out" 2>&1
+            echo "    exit=$? retries=$(grep -ac 'failed to allocate' "$out")"
+        done
+    done
+}
+
+# Can --fit off unlock -ub 512 at the DEPLOYED 262,144? fitab proved the fitter (not the chain) is
+# what blocks -ub 512 at 131,072: --fit on failed with either spec config, --fit off -ngl 99 ran
+# clean. If 256K/-ub 512 fits with the fitter off, that is a strict win over the deployed
+# 256K/-ub 256 (1024.7 prefill, 50.35 decode, 0.44423 acceptance with the chain).
+mode_256k512() {
+    local m="${MODEL:-$FULL}"
+    for spec in dspark chain; do
+        local extra=()
+        [ "$spec" = chain ] && extra=(--spec-type draft-dspark,ngram-mod,ngram-map-k) || extra=(--spec-type draft-dspark)
+        for rep in 1 2; do
+            local out="$LOGS/mv-256k512-$spec-$rep.log"
+            echo "--- 262144, -ub 512, fit off, $spec, rep $rep"
+            "$BIN/llama-cli" -m "$m" -sm layer -fa on -b 2048 -ub 512 -c 262144 \
+                -ctk q4_1 -ctv q4_1 --jinja --fit off -ngl 99 "${extra[@]}" \
+                --spec-draft-model "$DRAFT" --spec-draft-type-k q4_1 --spec-draft-type-v q4_1 \
+                --spec-draft-n-max 2 --spec-draft-n-ubatch 64 \
+                -f "$LOGS/prompt-code.txt" -n 384 --temp 0 -s 42 --no-display-prompt -v \
+                < /dev/null > "$out" 2>&1
+            echo "    exit=$? retries=$(grep -ac 'failed to allocate' "$out") host=$(grep -aoE 'Host +[0-9]+ MiB' "$out" | tail -1)"
+        done
+    done
+}
+
+# The missing cell of the 2x2: deployed context, deployed -ub 256, deployed --fit on, but dspark-only
+# (no ngram chain). Without it the -ub 512 result cannot be read as a win or a loss.
+mode_256k256() {
+    local m="${MODEL:-$FULL}"
+    for spec in dspark chain; do
+        local extra=()
+        [ "$spec" = chain ] && extra=(--spec-type draft-dspark,ngram-mod,ngram-map-k) || extra=(--spec-type draft-dspark)
+        for rep in 1 2; do
+            local out="$LOGS/mv-256k256-$spec-$rep.log"
+            echo "--- 262144, -ub 256, fit on, $spec, rep $rep"
+            "$BIN/llama-cli" -m "$m" -sm layer -fa on -b 2048 -ub 256 -c 262144 \
+                -ctk q4_1 -ctv q4_1 --jinja --fit on "${extra[@]}" \
+                --spec-draft-model "$DRAFT" --spec-draft-type-k q4_1 --spec-draft-type-v q4_1 \
+                --spec-draft-n-max 2 --spec-draft-n-ubatch 64 \
+                -f "$LOGS/prompt-code.txt" -n 384 --temp 0 -s 42 --no-display-prompt -v \
+                < /dev/null > "$out" 2>&1
+            echo "    exit=$? retries=$(grep -ac 'failed to allocate' "$out")"
+        done
+    done
+}
+
+# --fit off + -ub 512 freed 3.4 GiB of compute buffer at 262,144 (4,894 vs 8,302 MiB). f8_e4m3 target
+# KV measured +14% decode but never fit at 262,144. Spend the freed space: f8 caches, and -ub 1024
+# (if 512 beat 256, the trend may continue - and there is now room for it).
+mode_freespace() {
+    local m="${MODEL:-$FULL}"
+    for cfg in "512 q4_1" "1024 q4_1" "512 f8_e4m3" "1024 f8_e4m3" "256 f8_e4m3"; do
+        set -- $cfg
+        local ub=$1 ct=$2
+        local out="$LOGS/mv-free-ub${ub}-${ct}.log"
+        echo "--- -ub $ub, target cache $ct, ctx 262144, fit off, dspark only"
+        "$BIN/llama-cli" -m "$m" -sm layer -fa on -b 2048 -ub "$ub" -c 262144 \
+            -ctk "$ct" -ctv "$ct" --jinja --fit off -ngl 99 --spec-type draft-dspark \
+            --spec-draft-model "$DRAFT" --spec-draft-type-k q4_1 --spec-draft-type-v q4_1 \
+            --spec-draft-n-max 2 --spec-draft-n-ubatch 64 \
+            -f "$LOGS/prompt-code.txt" -n 384 --temp 0 -s 42 --no-display-prompt -v \
+            < /dev/null > "$out" 2>&1
+        echo "    exit=$? retries=$(grep -ac 'failed to allocate' "$out")"
+    done
+}
+
+# Validate the candidate config against the REAL deployment: vision on (the container runs -mm with
+# the CPU tower, whose buffers were never in the CLI runs above), across all three prompt domains,
+# with the memory breakdown. The candidate came from code-prompt-only, no-vision, single-sequence
+# runs - each of those is a confound this closes or exposes.
+mode_candidate() {
+    local m="${MODEL:-$FULL}"
+    local MM=()
+    [ "${VISION:-0}" = 1 ] && MM=(-mm "$MMPROJ_FILE" --no-mmproj-offload)
+    # g0-prompt-long.txt is the repetitive technical text (2,817 tokens of near-duplicate
+    # lines) that the acceptance matrix used as its third domain.
+    for dom in code prose repetitive; do
+        local pf="$LOGS/prompt-$dom.txt"
+        [ "$dom" = repetitive ] && pf="$LOGS/g0-prompt-long.txt"
+        [ -r "$pf" ] || { echo "skip $dom (no $pf)"; continue; }
+        for cfg in ${CFGS:-deployed candidate}; do
+            local flags
+            local shape=(); local spec=()
+            case "$cfg" in
+              deployed)     shape=(-ub 256 -ctk q4_1 -ctv q4_1 --fit on);        spec=(--spec-type draft-dspark,ngram-mod,ngram-map-k) ;;
+              candidate)    shape=(-ub 512 -ctk f8_e4m3 -ctv f8_e4m3 --fit off -ngl 99); spec=(--spec-type draft-dspark) ;;
+              cand-chain)   shape=(-ub 512 -ctk f8_e4m3 -ctv f8_e4m3 --fit off -ngl 99); spec=(--spec-type draft-dspark,ngram-mod,ngram-map-k) ;;
+              dep-dspark)   shape=(-ub 256 -ctk q4_1 -ctv q4_1 --fit on);        spec=(--spec-type draft-dspark) ;;
+            esac
+            flags=("${shape[@]}" "${spec[@]}")
+            local out="$LOGS/mv-cand-$dom-$cfg${VISION:+-vision}.log"
+            echo "--- $dom / $cfg (vision=${VISION:-0})"
+            "$BIN/llama-cli" -m "$m" -sm layer -fa on -b 2048 -c 262144 --jinja \
+                "${MM[@]}" "${flags[@]}" \
+                --spec-draft-model "$DRAFT" --spec-draft-type-k q4_1 --spec-draft-type-v q4_1 \
+                --spec-draft-n-max 2 --spec-draft-n-ubatch 64 \
+                -f "$pf" -n 384 --temp 0 -s 42 --no-display-prompt -v \
+                < /dev/null > "$out" 2>&1
+            echo "    exit=$? retries=$(grep -ac 'failed to allocate' "$out")"
+        done
+    done
+}
+
 mode_splitsprobe() {
     local m="${MODEL:-$FULL}"
     local c="${CORPUS:-$LOGS/corpora/wiki.tiny.raw}"
@@ -689,6 +815,11 @@ case "$MODE" in
     shapeacc)  mode_shapeacc ;;
     ub256k)    mode_ub256k ;;
     ubfrontier) mode_ubfrontier ;;
+    fitab)     mode_fitab ;;
+    k512)      mode_256k512 ;;
+    k256)      mode_256k256 ;;
+    freespace) mode_freespace ;;
+    candidate) mode_candidate ;;
     gates)     mode_gates ;;
     adapt)     mode_adapt ;;
     pminsweep) mode_pminsweep ;;
