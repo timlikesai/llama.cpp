@@ -164,3 +164,53 @@ better for code-heavy use (+10.2% decode), and slightly worse for prose (−6.0%
 **The 3.4 GiB the fitter was wasting is the more valuable asset than the throughput delta.** It is
 what let `f8_e4m3` KV fit at 262,144 for the first time, and it is available for other things — most
 plausibly `--parallel 2`, which for a serving box is probably worth more than 10% of prefill.
+
+## What the freed memory is actually worth: concurrency, measured
+
+`--parallel N` divides the context (`n_ctx_seq = n_ctx / N` — verified: 262,144 with `-np 2` reports
+`n_ctx_seq = 131072`), so it does not multiply KV. It also *reduces* compute buffers, because those
+scale with per-slot context: at ctx 262,144 the candidate shape reserves 4,883 MiB with `-np 1` and
+**1,641 MiB with `-np 2`**.
+
+Whether that is a win depends on a question the single-stream numbers cannot answer: does the server
+actually run requests concurrently? Measured with `llama-server`, candidate shape, two identical
+256-token requests sequentially and then simultaneously:
+
+| | per-stream decode | wall time, 2×256 tok | aggregate |
+|---|---|---:|---:|
+| `-np 1` sequential | 50.26 / 50.65 | 10.5 s | 48.8 t/s |
+| `-np 1` **concurrent** | 50.76 / 50.81 | **10.2 s** | 50.2 t/s |
+| `-np 2` sequential | 49.91 / 50.03 | 10.6 s | 48.3 t/s |
+| `-np 2` **concurrent** | 33.01 / 31.58 | **8.2 s** | **62.4 t/s** |
+
+**Three findings:**
+
+1. **`--parallel 1` does not overlap requests at all** — two simultaneous requests take the same
+   10.2 s as two sequential ones, each keeping full speed. The server queues them. So "single stream
+   at 50 t/s" is also "two streams at 50 t/s, one after the other".
+2. **`--parallel 2` genuinely overlaps them**: 8.2 s wall for the same work, **+24% aggregate
+   throughput**, at −36% per stream (33 t/s each).
+3. **`--parallel 2` costs nothing when only one request is in flight** (49.91 vs 50.26 — within
+   noise). The penalty appears only under actual concurrency.
+
+**Trying to have both fails on capacity.** The model trains at `n_ctx_train = 1,048,576`, so doubling
+the total to 524,288 with `-np 2` would give each slot the full 262,144. It does not fit: 524,288 with
+`f8_e4m3` failed after 5 allocation retries, 524,288 with `q4_1` after 4, and 393,216 with `f8_e4m3`
+after 7. Arithmetic agrees — 2 slots × 4,147 MiB of f8 KV + 17.66 GiB of weights + compute is ~27.6
+GiB against 32 GiB of cards that also carry the CUDA context and the draft.
+
+### The decision this leaves
+
+| | max context per conversation | single stream | two streams |
+|---|---|---:|---:|
+| **A** `-np 1 -c 262144` | **262,144** | 55.6 t/s | 50 t/s each, serialized |
+| **B** `-np 2 -c 262144` | 131,072 | ~50 t/s | ~32 t/s each, **62 t/s aggregate** |
+
+Both use the candidate shape (`-ub 512 --fit off -ngl 99 -ctk/-ctv f8_e4m3 --spec-type
+draft-dspark`). A is the right default for long-context work; B is the right default if two or more
+agents hit the box at once and 131K is enough per conversation. It is a workload question, not a
+technical one.
+
+(Note the absolute decode figures differ between the CLI table above and this server table — 55.6 vs
+50.3 — because the server test used a short inline prompt and the CLI used the 6 KB code file.
+Acceptance moves with the prompt: 0.722 vs 0.585. Only within-table comparisons are valid.)

@@ -583,6 +583,111 @@ mode_candidate() {
     done
 }
 
+# Spend the 3.4 GiB the fitter was wasting (--fit off -ub 512 reserves 4,883 MiB vs 8,302) on
+# concurrency instead of throughput. Does --parallel 2 fit at 262,144 with f8_e4m3 KV, and what does
+# it cost single-stream? f8 KV at 262,144 measured 4,147 MiB, so two slots is ~8.3 GiB + 17.66 GiB
+# weights + 4.9 GiB compute = ~30.9 of 32 - borderline. 131,072 x 2 slots should be comfortable.
+# Acceptance will move because concurrency changes batch shape (doc 60/61) - compare parallel-2 to
+# parallel-2 at the same context, never to the single-sequence table.
+mode_parallel() {
+    local m="${MODEL:-$FULL}"
+    for cfg in "262144 1" "262144 2" "131072 2" "196608 2" "262144 4" "131072 4"; do
+        set -- $cfg
+        local ctx=$1 par=$2
+        local out="$LOGS/mv-par-c${ctx}-p${par}.log"
+        echo "--- ctx $ctx, --parallel $par, candidate shape (-ub 512, f8, fit off, dspark)"
+        "$BIN/llama-cli" -m "$m" -sm layer -fa on -b 2048 -ub 512 -c "$ctx" \
+            -ctk f8_e4m3 -ctv f8_e4m3 --jinja --fit off -ngl 99 --spec-type draft-dspark \
+            --parallel "$par" -np "$par" \
+            --spec-draft-model "$DRAFT" --spec-draft-type-k q4_1 --spec-draft-type-v q4_1 \
+            --spec-draft-n-max 2 --spec-draft-n-ubatch 64 \
+            -f "$LOGS/prompt-code.txt" -n 384 --temp 0 -s 42 --no-display-prompt -v \
+            < /dev/null > "$out" 2>&1
+        echo "    exit=$? retries=$(grep -ac 'failed to allocate' "$out") host=$(grep -aoE 'Host +[0-9]+ MiB' "$out" | tail -1)"
+    done
+}
+
+# Does --parallel 2 actually deliver concurrency? The single-request measurement says it costs
+# nothing and frees 3.2 GiB of compute buffer, but that only proves it does not HURT one stream.
+# Start a server, then compare: 2 requests sequentially vs 2 requests simultaneously. Aggregate
+# throughput under load is the number that decides whether to move the deployment to --parallel 2.
+mode_conc() {
+    local m="${MODEL:-$FULL}"
+    local port="${PORT:-8123}"
+    local base=(-m "$m" -sm layer -fa on -b 2048 -ub 512 -c 262144 -ctk f8_e4m3 -ctv f8_e4m3
+                --jinja --fit off -ngl 99 --spec-type draft-dspark --spec-draft-model "$DRAFT"
+                --spec-draft-type-k q4_1 --spec-draft-type-v q4_1 --spec-draft-n-max 2
+                --spec-draft-n-ubatch 64 --host 127.0.0.1 --port "$port")
+    for par in 1 2; do
+        echo "=== --parallel $par ==="
+        "$BIN/llama-server" "${base[@]}" -np "$par" > "$LOGS/mv-conc-p$par-server.log" 2>&1 &
+        local spid=$!
+        local ok=0
+        for _ in $(seq 1 60); do
+            curl -s --max-time 5 "http://127.0.0.1:$port/health" | grep -q '"ok"' && { ok=1; break; }
+            sleep 2
+        done
+        if [ "$ok" != 1 ]; then echo "  server p$par did not come up"; tail -5 "$LOGS/mv-conc-p$par-server.log"; kill $spid 2>/dev/null; continue; fi
+        # The request body goes in a FILE. Embedding JSON in a bash double-quoted string needs the
+        # inner quotes escaped for both the shell and whatever wrote the line; getting it wrong yields
+        # an empty body and a confident-looking 0 t/s, which is exactly what happened first.
+        local bodyf="$LOGS/mv-conc-body.json"
+        printf '%s' '{"model":"inkling","messages":[{"role":"user","content":"Write a python function that deduplicates a list preserving order, with type hints and a docstring."}],"max_tokens":256,"temperature":0}' > "$bodyf"
+        # sequential
+        local t0=$(date +%s.%N)
+        curl -s --max-time 600 "http://127.0.0.1:$port/v1/chat/completions" -H "Content-Type: application/json" -d @"$bodyf" > "$LOGS/mv-conc-p$par-seq1.json"
+        curl -s --max-time 600 "http://127.0.0.1:$port/v1/chat/completions" -H "Content-Type: application/json" -d @"$bodyf" > "$LOGS/mv-conc-p$par-seq2.json"
+        local t1=$(date +%s.%N)
+        echo "  sequential 2x256 tok: $(echo "$t1 $t0" | awk '{printf "%.1f s", $1-$2}')"
+        # concurrent
+        local t2=$(date +%s.%N)
+        curl -s --max-time 600 "http://127.0.0.1:$port/v1/chat/completions" -H "Content-Type: application/json" -d @"$bodyf" > "$LOGS/mv-conc-p$par-con1.json" &
+        local c1=$!
+        curl -s --max-time 600 "http://127.0.0.1:$port/v1/chat/completions" -H "Content-Type: application/json" -d @"$bodyf" > "$LOGS/mv-conc-p$par-con2.json" &
+        local c2=$!
+        wait $c1; wait $c2
+        local t3=$(date +%s.%N)
+        echo "  concurrent 2x256 tok: $(echo "$t3 $t2" | awk '{printf "%.1f s", $1-$2}')"
+        python3 - "$par" <<'PY2'
+import json, sys, glob
+par = sys.argv[1]
+for kind in ("seq", "con"):
+    for i in (1, 2):
+        try:
+            d = json.load(open(f"logs/mv-conc-p{par}-{kind}{i}.json"))
+            t = d.get("timings", {})
+            print("    p%s %s%d: predicted %4d in %7.1f ms -> %6.2f t/s  draft %d/%d" % (
+                par, kind, i, t.get("predicted_n", 0), t.get("predicted_ms", 0),
+                t.get("predicted_per_second", 0), t.get("draft_n_accepted", 0), t.get("draft_n", 0)))
+        except Exception as e:
+            print("    p%s %s%d: %s" % (par, kind, i, e))
+PY2
+        kill $spid 2>/dev/null
+        sleep 6
+    done
+}
+
+# --parallel 2 delivers +24% aggregate throughput but n_ctx_seq = n_ctx / n_parallel, so each slot
+# loses half the context. The model trains at n_ctx_train = 1,048,576, so doubling the TOTAL may buy
+# 2 slots at full 262,144 each. f8 KV at 262,144 is 4,147 MiB per slot, so 2 slots = 8.3 GiB + 17.66
+# GiB weights + ~1.6 GiB compute = ~27.6 of 32 GiB. Find out whether it fits and what it costs.
+mode_bigpar() {
+    local m="${MODEL:-$FULL}"
+    for cfg in "524288 2" "524288 2 q4_1" "393216 2" "524288 2 512"; do
+        set -- $cfg
+        local ctx=$1 par=$2 ct=${3:-f8_e4m3} ub=${4:-512}
+        local out="$LOGS/mv-big-c${ctx}-p${par}-${ct}-ub${ub}.log"
+        echo "--- total ctx $ctx, --parallel $par (=> $((ctx/par)) per slot), cache $ct, -ub $ub"
+        "$BIN/llama-cli" -m "$m" -sm layer -fa on -b 2048 -ub "$ub" -c "$ctx" \
+            -ctk "$ct" -ctv "$ct" --jinja --fit off -ngl 99 --spec-type draft-dspark -np "$par" \
+            --spec-draft-model "$DRAFT" --spec-draft-type-k q4_1 --spec-draft-type-v q4_1 \
+            --spec-draft-n-max 2 --spec-draft-n-ubatch 64 \
+            -f "$LOGS/prompt-code.txt" -n 384 --temp 0 -s 42 --no-display-prompt -v \
+            < /dev/null > "$out" 2>&1
+        echo "    exit=$? retries=$(grep -ac 'failed to allocate' "$out")"
+    done
+}
+
 mode_splitsprobe() {
     local m="${MODEL:-$FULL}"
     local c="${CORPUS:-$LOGS/corpora/wiki.tiny.raw}"
@@ -820,6 +925,9 @@ case "$MODE" in
     k256)      mode_256k256 ;;
     freespace) mode_freespace ;;
     candidate) mode_candidate ;;
+    parallel)  mode_parallel ;;
+    conc)      mode_conc ;;
+    bigpar)    mode_bigpar ;;
     gates)     mode_gates ;;
     adapt)     mode_adapt ;;
     pminsweep) mode_pminsweep ;;
