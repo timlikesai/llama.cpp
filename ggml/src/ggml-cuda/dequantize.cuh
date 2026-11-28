@@ -119,6 +119,26 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.y *= d;
 }
 
+// MXFP8 holds one E4M3 byte per value, so a pair of values is a pair of adjacent bytes. Unlike the
+// F8_E4M3 payload these bytes are not 2-byte aligned: a block is 33 bytes, so rows alternate parity.
+static __device__ __forceinline__ float2 dequantize_mxfp8_pair(const uint8_t * q, float d) {
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    __nv_fp8x2_e4m3 x2;
+    x2.__x = (uint16_t) q[0] | ((uint16_t) q[1] << 8);
+    const float2 v = ggml_cuda_cast<float2>(x2);
+    return make_float2(d * v.x, d * v.y);
+#else
+    return make_float2(d * ggml_cuda_f8_e4m3_to_fp32(q[0]), d * ggml_cuda_f8_e4m3_to_fp32(q[1]));
+#endif
+}
+
+static __device__ __forceinline__ void dequantize_mxfp8(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_mxfp8 * x = (const block_mxfp8 *) vx;
+
+    // the E8M0 scale is used as is, MXFP4 halves its scale because kvalues_mxfp4 is doubled
+    v = dequantize_mxfp8_pair(x[ib].qs + iqs, ggml_cuda_e8m0_to_fp32(x[ib].e));
+}
+
 //================================== k-quants
 
 // Each call dequantizes one super-block of QK_K values into y using the

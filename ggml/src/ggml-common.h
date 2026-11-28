@@ -112,6 +112,10 @@ typedef sycl::half2 ggml_half2;
 #define QI_NVFP4 (QK_NVFP4 / (4 * QR_NVFP4))
 #define QR_NVFP4 2
 
+// MXFP8: one E4M3 byte per element, so the payload is 8 32-bit words per block like Q8_0
+#define QI_MXFP8 (QK_MXFP8 / (4 * QR_MXFP8))
+#define QR_MXFP8 1
+
 #define QI5_0 (QK5_0 / (4 * QR5_0))
 #define QR5_0 2
 
@@ -225,6 +229,13 @@ typedef struct {
     uint8_t qs[QK_NVFP4/2];           // packed 4-bit E2M1 values (32 bytes)
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
+
+#define QK_MXFP8 32
+typedef struct {
+    uint8_t e;            // E8M0
+    uint8_t qs[QK_MXFP8]; // E4M3 values
+} block_mxfp8;
+static_assert(sizeof(block_mxfp8) == sizeof(uint8_t) + QK_MXFP8, "wrong mxfp8 block size/padding");
 
 #define QK5_0 32
 typedef struct {

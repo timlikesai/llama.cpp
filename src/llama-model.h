@@ -1035,6 +1035,11 @@ struct llama_model {
     ggml_backend_dev_t dev_layer(int il) const;
     ggml_backend_dev_t dev_output() const;
 
+    // the physical layer whose tensors cache slot il reads: identity, unless the model replays layers and
+    // the slot aliases an earlier one. contract: il below the number of physical layers returns il, so the
+    // result is also the rank of the slot among the unique layers - which is what device placement uses
+    virtual int layer_phys(int il) const { return il; }
+
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;

@@ -2298,7 +2298,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     }
 
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
-        if (ggml_is_quantized(src0->type)) {
+        if (ggml_cuda_mmvq_supported(src0->type)) {
             if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                 return false;
             }
@@ -2353,7 +2353,7 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (!use_mmq_few && ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type)) {
+            if (ggml_cuda_mmvq_supported(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
                     const bool fold = scale_fold && ggml_cuda_should_fuse_mul_mat_vec_q(dst);
@@ -4259,6 +4259,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_MXFP4:
+                    case GGML_TYPE_MXFP8:
                     case GGML_TYPE_NVFP4:
                     case GGML_TYPE_F8_E4M3:
                     case GGML_TYPE_Q2_K:
@@ -4318,6 +4319,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         // 32-value sub-blocks, the row size does not guarantee
                         // the QK_K super-blocks the get_rows kernel iterates on
                         return op->src[0]->ne[0] % QK_K == 0;
+                    case GGML_TYPE_MXFP8:
+                        // the kernel addresses the payload in pairs of values inside a 32-value block
+                        return op->src[0]->ne[0] % QK_MXFP8 == 0;
                     default:
                         return false;
                 }

@@ -324,8 +324,19 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
+// MMVQ needs a per-type vec_dot kernel (see get_vec_dot_q_cuda). Types without one, MXFP8 today, are
+// served by MMVF or the cuBLAS dequant fallback.
+bool ggml_cuda_mmvq_supported(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_MXFP8:
+            return false;
+        default:
+            return ggml_is_quantized(type);
+    }
+}
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
-    if (!ggml_is_quantized(type)) {
+    if (!ggml_cuda_mmvq_supported(type)) {
         return false;
     }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.

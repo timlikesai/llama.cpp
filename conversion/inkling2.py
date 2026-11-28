@@ -28,6 +28,7 @@ def _e4m3_table() -> np.ndarray:
 _E4M3 = _e4m3_table()
 _E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], dtype=np.float32)
 _EXPERT_CHUNK_ROWS = 128
+_QK_MXFP8 = 32  # ggml/src/ggml-common.h: QK_MXFP8, one ue8m0 scale per 32 e4m3 codes
 
 
 def _dequant_expert_chunk(weight: Callable[[], Tensor], scale: Callable[[], Tensor], amax: Callable[[], Tensor] | None, denominator: Callable[[], Tensor] | None, name: str, expert: int, rows: slice) -> np.ndarray:
@@ -84,6 +85,35 @@ def _repack_nvfp4_expert(weight: Callable[[], Tensor], scale: Callable[[], Tenso
         return _repack_nvfp4_rows(packed, scales, name, expert)
     return np.concatenate([_repack_nvfp4_rows(packed[half::2], scales[half::2], name, expert) for half in (0, 1)])
 
+def _expert_row_slices(experts: int, rows: int, w13: bool) -> Iterable[tuple[int, slice]]:
+    # Row chunks of a stacked expert tensor, in GGUF row order. A fused w13 interleaves
+    # gate and up rows in the checkpoint but is stored as all gate rows then all up rows,
+    # so both chunks and the slice step depend on w13. One slice selects payload rows and
+    # their scale rows, so the two can never be permuted differently.
+    for expert in range(experts):
+        for half in range(2 if w13 else 1):
+            for start in range(0, rows // 2 if w13 else rows, _EXPERT_CHUNK_ROWS):
+                stop = min(start + _EXPERT_CHUNK_ROWS, rows // 2 if w13 else rows)
+                yield expert, (slice(2 * start + half, 2 * stop + half, 2) if w13 else slice(start, stop))
+
+
+def _pack_mxfp8_chunk(weight: Callable[[], Tensor], scale: Callable[[], Tensor], name: str, expert: int, rows: slice) -> np.ndarray:
+    # Lossless: the e4m3 codes and the ue8m0 scale bytes are copied verbatim into the
+    # ggml block_mxfp8 order, one scale byte per 32 code bytes. Only bytes move, no value is recomputed.
+    packed = LazyTorchTensor.to_eager(weight().view(torch.uint8)[expert, rows]).numpy()
+    scales = LazyTorchTensor.to_eager(scale().view(torch.uint8)[expert, rows]).numpy()
+    if np.any(scales == 255):
+        raise ValueError(f"Inkling2: {name}_scale expert {expert}: UE8M0 byte 255 is NaN")
+    values = _E4M3[packed]
+    if np.isnan(values).any():
+        raise ValueError(f"Inkling2: {name} expert {expert}: E4M3FN NaN")
+    blocks = packed.reshape(packed.shape[0], -1, _QK_MXFP8)
+    raw = np.empty(blocks.shape[:2] + (_QK_MXFP8 + 1,), dtype=np.uint8)
+    raw[:, :, 0] = scales
+    raw[:, :, 1:] = blocks
+    return raw.reshape(packed.shape[0], -1)
+
+
 
 def _is_inkling2(dir_model: Path) -> bool:
     if not (dir_model / "config.json").is_file():
@@ -104,6 +134,16 @@ def _load_inkling2_hparams(dir_model: Path):
 class Inkling2Model(TextModel):
     model_arch = gguf.MODEL_ARCH.INKLING2
 
+    # The checkpoint's mxfp8_nearest experts are already ggml MXFP8 values, so they can be
+    # repacked bit-exactly instead of dequantized. Opt-in: convert_hf_to_gguf.py sets
+    # native_experts from --native-experts.
+    #
+    # NVFP4 used to be dequantize-only on this branch; upstream #33062 now preserves those
+    # experts automatically whenever the output type is auto (hence _preserve_nvfp4 below),
+    # which is also why our duplicate NVFP4 repack was dropped.
+    supports_native_experts = True
+    native_experts = False
+
     def __init__(self, dir_model: Path, ftype: gguf.LlamaFileType, *args, **kwargs):
         self._expert_quant: dict[str, dict] = {}
         self._packed_experts: dict[str, gguf.LazyChunkedTensor] = {}
@@ -123,6 +163,8 @@ class Inkling2Model(TextModel):
                         self._expert_quant[name] = group
         super().__init__(dir_model, ftype, *args, **kwargs)
         logger.warning("Inkling2: converting the text backbone only; vision and MTP tensors are skipped")
+        if self.native_experts:
+            logger.warning("Inkling2: --native-experts keeps the MXFP8 expert layers as native bytes")
         hp = self.hparams
         for name, default in (("q_bias", False), ("o_bias", False), ("n_shared_experts", 0), ("use_value_norm_no_gamma", True), ("attn_res_normalize_values", True), ("scoring_func", "sigmoid")):
             if hp.get(name, default) != default:
@@ -187,6 +229,16 @@ class Inkling2Model(TextModel):
                     t = gen()
                     if t.dtype != torch.float32 or tuple(t.shape) != expected:
                         raise ValueError(f"Inkling2: {companion}: expected F32 {expected}, got {t.dtype} {tuple(t.shape)}")
+            # MXFP8: bit-exact repack, this branch only (upstream has no type 44 and would
+            # dequantize). Checked before the NVFP4 choice so --native-experts stays
+            # authoritative for the scheme it was written for.
+            if self.native_experts and not nvfp4:
+                self.add_native_mxfp8_experts(name, weight, scale, shape, w13)
+                del self.model_tensors[name]
+                for companion in required:
+                    del self.model_tensors[companion]
+                continue
+
             preserve_nvfp4 = nvfp4 and self._preserve_nvfp4
             if preserve_nvfp4 and cols % 64 != 0:
                 logger.warning("Inkling2: %s: %d columns are not a multiple of 64; dequantizing NVFP4", name, cols)
@@ -227,6 +279,20 @@ class Inkling2Model(TextModel):
             if not t.dtype.is_floating_point or t.element_size() == 1 or name.endswith(("_weight_scale", "_weight_amax", "_weight_outer_scale_denominator")):
                 raise ValueError(f"Inkling2: unexpected packed tensor or orphan companion {name}")
         self._is_nvfp4 = bool(self._native_experts)
+
+    def add_native_mxfp8_experts(self, name: str, weight: Callable[[], Tensor], scale: Callable[[], Tensor], shape: tuple[int, int, int], w13: bool) -> None:
+        # Writes one stacked [n_expert, rows, cols] MXFP8 tensor straight to the gguf writer,
+        # chunked so only one expert row block is materialized while it is streamed.
+        experts, rows, cols = shape
+        byte_shape = (experts, rows, cols // _QK_MXFP8 * (_QK_MXFP8 + 1))
+        chunks: list[Callable[[], np.ndarray]] = [
+            partial(_pack_mxfp8_chunk, weight, scale, name, expert, row_slice)
+            for expert, row_slice in _expert_row_slices(experts, rows, w13)
+        ]
+        target = name.replace(".w13_weight", ".gate_up_proj").replace(".w2_weight", ".down_proj")
+        new_name = self.map_tensor_name(target, try_suffixes=()) + ".weight"
+        logger.info("Inkling2: %s: %s, kept as MXFP8, shape = %s", new_name, name, tuple(reversed(shape)))
+        self.gguf_writer.add_tensor(new_name, gguf.LazyChunkedTensor(chunks, byte_shape, np.uint8), raw_dtype=gguf.GGMLQuantizationType.MXFP8)
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
